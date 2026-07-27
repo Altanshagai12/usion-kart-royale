@@ -1,7 +1,8 @@
 import type { Ctx, IInput, InputState } from '../types';
+import { TouchControls } from './TouchControls';
 
 /**
- * Keyboard + gamepad input.
+ * Keyboard + gamepad + on-screen touch input.
  *
  * Every consumer in the game reads `state` once per frame, so the edge flags
  * (`driftPressed`, `itemPressed`, `pausePressed`, `anyPressed`) are computed
@@ -31,6 +32,7 @@ export class Input implements IInput {
   private wasPause = false;
   private wasAny = false;
   private padIndex = -1;
+  private pad = new TouchControls();
 
   init(_ctx: Ctx) {
     addEventListener('keydown', this.onDown);
@@ -38,7 +40,14 @@ export class Input implements IInput {
     addEventListener('blur', this.onBlur);
     addEventListener('gamepadconnected', this.onPad);
     addEventListener('gamepaddisconnected', this.onPadOff);
-    this.touch = matchMedia?.('(pointer: coarse)')?.matches ?? false;
+    addEventListener('keydown', this.onFirstKey, { once: true });
+
+    // Coarse pointer is the signal, not user-agent sniffing — it correctly
+    // catches touch laptops and correctly ignores a phone-sized desktop window.
+    // A Bluetooth keyboard paired to a tablet then hides the pad again, below.
+    this.touch = (matchMedia?.('(pointer: coarse)')?.matches ?? false) ||
+      navigator.maxTouchPoints > 0;
+    if (this.touch) this.pad.mount();
   }
 
   dispose() {
@@ -47,7 +56,17 @@ export class Input implements IInput {
     removeEventListener('blur', this.onBlur);
     removeEventListener('gamepadconnected', this.onPad);
     removeEventListener('gamepaddisconnected', this.onPadOff);
+    removeEventListener('keydown', this.onFirstKey);
+    this.pad.unmount();
   }
+
+  /** A real keypress means a real keyboard; the on-screen pad is then clutter. */
+  private onFirstKey = () => {
+    if (this.touch) {
+      this.touch = false;
+      this.pad.unmount();
+    }
+  };
 
   private onDown = (e: KeyboardEvent) => {
     this.keys.add(e.code);
@@ -73,11 +92,30 @@ export class Input implements IInput {
     let look = has('KeyQ', 'AltLeft');
     let pause = has('Escape', 'KeyP');
 
+    // Analogue sources report an absolute stick position, so they must not go
+    // through the digital ramp below — that ramp exists to fake an axis out of
+    // a key, and applying it to a real axis just adds lag.
+    let analogue = false;
+
+    // --- on-screen pad, if this is a touch device ----------------------------
+    if (this.touch) {
+      this.pad.update();
+      const t = this.pad.state;
+      if (t.steer !== 0) { steerTarget = t.steer; analogue = true; }
+      accel = Math.max(accel, t.accel);
+      brake = Math.max(brake, t.brake);
+      drift = drift || t.drift;
+      item = item || t.item;
+      look = look || t.look;
+      pause = pause || this.pad.consumePause();
+    }
+
     // --- gamepad, if one is attached -----------------------------------------
     const pad = this.padIndex >= 0 ? navigator.getGamepads?.()?.[this.padIndex] : null;
     if (pad) {
       const ax = pad.axes[0] ?? 0;
       if (Math.abs(ax) > DEADZONE) {
+        analogue = true;
         // rescale past the dead zone so the first live degree isn't a jump
         steerTarget = Math.sign(ax) * ((Math.abs(ax) - DEADZONE) / (1 - DEADZONE));
       }
@@ -91,7 +129,11 @@ export class Input implements IInput {
     }
 
     // --- analogue-feeling steer ----------------------------------------------
-    if (steerTarget !== 0) {
+    if (analogue) {
+      // Track the physical stick closely; the light smoothing is only there to
+      // take the jitter off a thumb resting on glass.
+      s.steer += (steerTarget - s.steer) * Math.min(1, dt * 24);
+    } else if (steerTarget !== 0) {
       const rate = Math.sign(steerTarget) === Math.sign(s.steer) || s.steer === 0
         ? STEER_RATE
         : STEER_RATE * 2.1; // crossing centre must be quick or it feels dead

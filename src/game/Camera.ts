@@ -114,6 +114,14 @@ const VISTA_AIM_UP = 1.0;    // aim rises less than the eye -> ~7 deg of pitch
 /** lean the eye out over the drop — the cheapest metre of sightline there is */
 const VISTA_EYE_LAT = 1.6;
 
+/**
+ * How far below the view axis the player's kart is allowed to sit, radians.
+ * ~20 degrees, which at the stock 64 degree vertical FOV lands it a fifth of
+ * the way up from the bottom edge: low in frame, the way a chase camera should
+ * sit, but clear of the speedo and unambiguously *in* the frame.
+ */
+const MAX_SUBJECT_DROP = 0.35;
+
 const CAM_RADIUS = 0.55;     // collision probe radius
 const GROUND_CLEAR = 0.85;   // minimum metres between the eye and the ground
 const ARM_RECOVER = 0.55;    // seconds for the arm to ease back out after a hit
@@ -711,6 +719,47 @@ export class ChaseCamera implements System {
       const yaw = DRIFT_YAW * this.driftSigned * (0.55 + 0.45 * this.tierAmt);
       _aim.addScaledVector(_right, Math.tan(yaw) * aimDist);
     }
+
+    this.clampSubjectPitch(k);
+  }
+
+  /**
+   * Floor on how low in frame the subject may end up.
+   *
+   * Every offset above composes around something that is not the kart — the
+   * vista lift is sized off the kerb crest it has to see over, the drift yaw
+   * off the corner exit it wants to open up — and none of them knows where
+   * that leaves the player's own kart. They stack, and on the bay traverse
+   * they stacked it straight off the bottom of the screen. Measured over a lap
+   * of ordinary driving: a quarter of the circuit framed the kart below -0.6
+   * in NDC, and three sections averaged -0.92 with minima past -1.0, which is
+   * off-frame and behind the speedo. The rig was lifting for the view and
+   * losing the thing the view is supposed to be behind.
+   *
+   * So pitch the aim back down toward the kart, but only once it has fallen
+   * further than the limit below the view axis. This is a floor, not a
+   * framing: on the three quarters of the lap already composed sensibly it
+   * changes nothing, and where it does bite it gives up some of the horizon
+   * rather than the subject. Runs before the springs, so it eases in.
+   */
+  private clampSubjectPitch(k: IKart) {
+    _tmp.copy(_aim).sub(_eye);          // view axis
+    _tmp2.copy(k.position).sub(_eye);   // subject
+
+    const upA = _tmp.dot(this.upSm);
+    const upB = _tmp2.dot(this.upSm);
+    // runs in the plane the camera up defines, so track slope never leaks in
+    const flatA = Math.sqrt(Math.max(1e-6, _tmp.lengthSq() - upA * upA));
+    const flatB = Math.sqrt(Math.max(1e-6, _tmp2.lengthSq() - upB * upB));
+
+    const axis = Math.atan2(upA, flatA);
+    const subject = Math.atan2(upB, flatB);
+    if (axis - subject <= MAX_SUBJECT_DROP) return;
+
+    // Drop the aim to sit exactly the limit above the subject. Only the
+    // vertical component moves, so the bearing the drift yaw just set — and
+    // the distance the springs are tuned against — both survive.
+    _aim.addScaledVector(this.upSm, flatA * Math.tan(subject + MAX_SUBJECT_DROP) - upA);
   }
 
   /**

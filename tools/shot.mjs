@@ -70,6 +70,15 @@ const HOLD = 0.62;
 /** how long to wait for a kart to drive onto its mark before giving up, seconds */
 const APPROACH_TIMEOUT = 30;
 /**
+ * The drift shot gets its own, longer budget. It is not waiting on an approach
+ * — a mark arrives once per lap and thirty seconds always covers one — it is
+ * waiting on a *state*, and the only two corners on this circuit long enough to
+ * charge a tier 2 come round once a lap between them. Thirty seconds bought
+ * three attempts, and a slide that ends up off the road is correctly refused,
+ * so the hunt could fail with the mechanism working perfectly.
+ */
+const DRIFT_TIMEOUT = 120;
+/**
  * Upper bound on the pace the AI actually holds, m/s, used to size the run-up.
  *
  * A shot's `speed` is a *look* — what the speedo, the speed lines and the lens
@@ -221,11 +230,57 @@ const main = async () => {
       // charge builds and the kart holds the angle through the corner it is
       // already in. Hand it straight back at tier 2 — that is the frame, and
       // past it the corner runs out.
+      //
+      // The lock alone still put one slide in three into the scenery, charged
+      // to tier 2 thirty-seven metres off the road, so the road gets a vote —
+      // but only once the kart is genuinely leaving it. The correction is
+      // deadbanded at the road edge deliberately: a lap of normal AI driving
+      // sits a median 0.5 half-widths off the centreline and touches 1.3 on the
+      // kerbs, because that is where the racing line *is*, and a term that
+      // pulled from zero would just drag the kart off the apex and undo the
+      // lock it is there to support. Note the sign — `Race.drive` hands the
+      // override an *already negated* steer (the AI solves in the yaw frame,
+      // the drive input is screen-right), so closing a +binormal offset here is
+      // a negative steer, the opposite of the AI's own cross-track term.
       if (s.drift) {
+        const smp = track.sample(0);
+        // signed offset from the centreline, in units of the road's half-width
+        const offset = () => {
+          track.sample(player.t, smp);
+          const c =
+            (player.position.x - smp.pos.x) * smp.binormal.x +
+            (player.position.y - smp.pos.y) * smp.binormal.y +
+            (player.position.z - smp.pos.z) * smp.binormal.z;
+          return c / Math.max(1, smp.halfWidth);
+        };
         race.driveOverride = (cmd) => {
-          if (player.driftDir === 0 || player.driftTier >= 2) return;
+          if (player.driftDir === 0) return;
+          // Never voluntarily let go. Releasing is what cashes the mini-turbo,
+          // and handing the button back the instant tier 2 landed did exactly
+          // that: the AI dropped it, `releaseDrift` fired, and the shutter — a
+          // round-trip later — opened on a boost flame behind a kart pointing
+          // dead straight. Hold it until the frame is in the bag.
           cmd.drift = true;
-          cmd.steer = Math.max(-1, Math.min(1, cmd.steer + player.driftDir * 0.5));
+          // Steering it is only needed while the charge is building; past tier
+          // 2 the shot is banked and the lock would just start the circles.
+          if (player.driftTier >= 2) return;
+
+          // Lock in only until the slide is as sideways as charging actually
+          // rewards. `driftCharge` saturates at 0.39 rad of slip and the drift
+          // model's own slip target tops out at 0.42, so past that the lock
+          // buys no charge at all — it just keeps yawing the kart. Held flat at
+          // 0.5 it reached 0.95 rad, which is not a drift but a spin, and the
+          // chase rig composes for the modelled envelope: it follows the travel
+          // heading, so a chassis half a radian off it goes to the edge of
+          // frame and then out of it. That is the shot that came back as an
+          // empty road with the kart behind the speedo.
+          const beta = Math.abs(player.driftBeta || 0);
+          const lock = Math.max(0, Math.min(1, (0.38 - beta) / 0.15)) * 0.5;
+
+          const u = offset();
+          const wide = Math.max(0, Math.abs(u) - 1) * Math.sign(u);
+          cmd.steer = Math.max(-1, Math.min(1,
+            cmd.steer + player.driftDir * lock - Math.max(-1, Math.min(1, wide)) * 1.5));
           cmd.throttle = 1;
           cmd.brake = 0;
         };
@@ -257,28 +312,82 @@ const main = async () => {
       const len = ctx.track.length;
       const t0 = performance.now();
 
+      // A slide can charge to tier 2 with the kart in the scenery — one came
+      // back parked on the grass bank among the spectators, sparking away — so
+      // `drift` waits on the kart being on the circuit as well as on the tier.
+      //
+      // Ask the physics rather than measuring metres. Two hand-tuned distance
+      // gates were tried first and both were wrong, in opposite directions: the
+      // racing line legitimately runs wide over the kerbs, so a tight gate
+      // refused good frames (sixty-nine in one hunt, and the shot failed with
+      // the mechanism working perfectly), and a loose enough gate to admit
+      // those also admitted four metres of grass. `dominantSurface` is what the
+      // handling model itself uses to decide the kart has left the road, which
+      // makes it the same question the frame is really asking.
+      //   0 Road, 4 Boost = on the circuit; Dirt/Grass/Sand/OffTrack/Water are not.
+      const onCircuit = () => {
+        const s = k.suspension?.dominantSurface;
+        return s === 0 || s === 4;
+      };
+
+      // ...and on the kart being somewhere worth pointing a camera at. A slide
+      // is a composition as much as a state: the rig deliberately throws the
+      // kart toward the outside of frame while it is sideways, and on the wrong
+      // half of the wrong corner that lands it in the bottom-right — which is
+      // exactly where the speedo is, so the shot came back as an acre of empty
+      // asphalt with the subject peeking out from behind the dial. The slide
+      // that reads is the one where the kart is still in the frame's business,
+      // so hold out for it: the hunt gets several corners, and the ones that
+      // throw the kart the other way frame it properly.
+      const framed = () => {
+        const n = k.position.clone().project(ctx.camera);
+        if (!(n.z < 1)) return false;                 // behind the camera
+        if (Math.abs(n.x) > 0.5 || n.y < -0.72) return false;
+        // the speedo's corner, in NDC
+        return !(n.x > 0.3 && n.y < -0.45);
+      };
+
       // Stop short by the distance the hold beat will cover, so the shutter
       // fires on the mark rather than just past it.
       const mark = ((s.t - (s.speed * hold) / len) % 1 + 1) % 1;
       const gap = (a, b) => Math.abs(((a - b + 0.5) % 1 + 1) % 1 - 0.5);
 
+      // A failed hunt used to report only where it gave up, which says nothing
+      // about why. Track what the kart actually managed so the warning can.
+      const seen = { slides: 0, maxTier: 0, offRoadRejects: 0 };
+      let sliding = false;
+
       const tick = () => {
         const elapsed = (performance.now() - t0) / 1000;
+        if (k.driftDir !== 0) {
+          if (!sliding) { sliding = true; seen.slides++; }
+          if (k.driftTier > seen.maxTier) seen.maxTier = k.driftTier;
+        } else sliding = false;
+
         if (elapsed >= s.settle) {
           // `grid` must not move at all; the drift shot is waiting on a state
           // rather than a place. Everything else waits for the mark.
           if (s.hold_still) return done({ ok: true, why: 'stationary' });
           if (s.drift) {
-            if (k.driftDir !== 0 && k.driftTier >= 2) return done({ ok: true, why: 'tier-2 slide' });
+            if (k.driftDir !== 0 && k.driftTier >= 2) {
+              if (onCircuit() && framed()) return done({ ok: true, why: 'tier-2 slide' });
+              seen.offRoadRejects++;
+            }
           } else if (gap(k.t, mark) < 0.004) {
             return done({ ok: true, why: 'on mark' });
           }
         }
-        if (elapsed > timeout) return done({ ok: false, why: `gave up after ${timeout}s at t=${k.t.toFixed(3)}` });
+        if (elapsed > timeout) {
+          const detail = s.drift
+            ? ` (${seen.slides} slides, best tier ${seen.maxTier}, ${seen.offRoadRejects} rejected off-road)`
+            : '';
+          return done({ ok: false, why: `gave up after ${timeout}s at t=${k.t.toFixed(3)}${detail}` });
+        }
         requestAnimationFrame(tick);
       };
       requestAnimationFrame(tick);
-    }), { ...shot, settle: shot.settle ?? SETTLE, hold_still: shot.name === "grid" }, hold, APPROACH_TIMEOUT);
+    }), { ...shot, settle: shot.settle ?? SETTLE, hold_still: shot.name === "grid" }, hold,
+       shot.drift ? DRIFT_TIMEOUT : APPROACH_TIMEOUT);
 
     if (!waited.ok) {
       warnings.push(`shot "${shot.name}" never reached its mark: ${waited.why}`);
@@ -322,7 +431,18 @@ const main = async () => {
         }
         if (s.boost && k.boostTime < 0.6) k.applyBoost(1.2, 1.2);
         if (performance.now() < until) requestAnimationFrame(tick);
-        else done({ t: k.t, driftDir: k.driftDir, driftTier: k.driftTier, speed: k.forwardSpeed });
+        else done({
+          t: k.t, driftDir: k.driftDir, driftTier: k.driftTier, speed: k.forwardSpeed,
+          // Slip angle at the shutter. The chase rig follows the travel
+          // heading, so this is also how far off frame centre the chassis is
+          // rotated — a drift frame that reads wrong reads wrong here first.
+          //
+          // Only meaningful while a slide is live: `driftBeta` is written by
+          // the drift branch of the tyre model and keeps its last value
+          // otherwise, so reading it unconditionally reported a quarter radian
+          // of slip on shots of a kart travelling perfectly straight.
+          beta: k.driftDir !== 0 ? k.driftBeta || 0 : null,
+        });
       };
       requestAnimationFrame(tick);
     }), { ...shot, hold_still: shot.name === "grid" }, hold);
@@ -339,6 +459,7 @@ const main = async () => {
       targetT: shot.drift ? null : shot.t,
       actualT: arrived ? +arrived.t.toFixed(4) : null,
       driftTier: arrived ? arrived.driftTier : null,
+      slipRad: arrived && arrived.beta !== null ? +arrived.beta.toFixed(3) : null,
       speed: arrived ? +arrived.speed.toFixed(1) : null,
       reachedMark: waited.ok,
     });
