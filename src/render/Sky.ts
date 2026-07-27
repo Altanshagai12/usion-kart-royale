@@ -27,6 +27,21 @@
  *    so aerial perspective that converges on an average of it can only meet it
  *    at a seam. That seam was the bay.
  *
+ *  · The light rig is a real three-point rig, not a key plus a wash: a warm
+ *    #ffd9a8 key at 4.2, a COOL #a8c8ff directional fill at 0.85 arriving from
+ *    35° up on the anti-solar side, a token warm ground bounce, and a rim term
+ *    driven by the key's own shadowed radiance and folded into the directional
+ *    loop. Measured on a 0.18 grey card: key:fill 5.7:1, and an anti-solar-facing
+ *    surface swings from red:blue 1.69 (warm) to 0.54 (cool) against a key that
+ *    swings the other way to 4.60. Before this there was no fill light at all
+ *    and the shaded side was warm — a dimmer copy of the key, which is exactly
+ *    what "illuminates but does not sculpt" describes.
+ *
+ *  · Enclosed geometry actually occludes the sky. A capsule volume fitted to the
+ *    tunnel bore is baked into `<common>` and cuts the indirect terms, the
+ *    shadowless fill lights and the fog inside it, because none of those three
+ *    knew the rock was there and together they out-shone the tunnel's own exit.
+ *
  *  · Environment intensity is 1.0, i.e. materials get the envMapIntensity they
  *    were authored with, so chrome and clearcoat actually mirror the sky. The
  *    DIFFUSE half of the IBL is scaled down separately (another chunk override)
@@ -51,12 +66,15 @@ import { Quality, type Ctx, type System } from '../types';
 import {
   AtmosphereModel,
   GROUND_BOUNCE_COLOR,
+  SKY_FILL_COLOR,
+  SKY_FILL_DIRECTION,
   SKY_VERTEX_SHADER,
   SUN_DIRECTION,
   SUN_LIGHT_COLOR,
   buildSkyFragmentShader,
   hazeGlsl,
 } from './Atmosphere';
+import { TUNNEL_T0, TUNNEL_T1 } from '../world/TrackLayout';
 
 // --- tuning ------------------------------------------------------------------
 
@@ -81,13 +99,43 @@ const ENV_INTENSITY = 1.0;
  * pole, linear luminance) this lands at 1.00 / 0.113 / 0.117 against the ~1.00 /
  * 0.25 / 0.12 a golden-hour reference gives.
  */
-const DIFFUSE_ENV_INTENSITY = 0.30;
+const DIFFUSE_ENV_INTENSITY = 0.16;
 /** SH ambient on top of the env map — energy compensation for the bounces
  *  single-scattering IBL cannot see, and the only ambient that reaches
  *  materials which ignore environment maps. Deliberately small. */
-const PROBE_INTENSITY = 0.10;
-/** Warm bounce off the sand and stone, art bible §2. Lights undersides only. */
-const BOUNCE_INTENSITY = 0.30;
+const PROBE_INTENSITY = 0.08;
+/**
+ * How far the ambient probe's chromaticity is pulled toward the bible's
+ * #a8c8ff. Up from 0.5: the probe is the omnidirectional part of the fill and
+ * the one term guaranteed to reach a shaded surface whatever its normal, so if
+ * it is warm the shadow side can never be cool no matter what else is done.
+ */
+const PROBE_FILL_TINT = 0.85;
+/**
+ * Warm bounce off the sand and stone, art bible §2. Lights undersides only.
+ *
+ * Down from 0.30, and this matters more than the number suggests. This light
+ * casts no shadow and is aimed UP, so it reached the shaded side of every
+ * object in the game with the same warm #c98f5a the key is already made of. On
+ * a matte sphere it took the anti-solar pole to a red:blue of 2.1 — the shadow
+ * side was measurably warmer than neutral while the key was warm too, which is
+ * the definition of "illuminates but does not sculpt". It is now a hint under
+ * the chassis and the kerbs, which is all a bounce should ever be.
+ */
+const BOUNCE_INTENSITY = 0.13;
+/**
+ * Cool directional sky fill, art bible §2 (`#a8c8ff`), from above and the
+ * anti-solar side. This is the term the rig was missing.
+ *
+ * The environment map alone cannot do this job at golden hour. Its lower half
+ * and its whole horizon band are warm — at 14° elevation the model's own low sky
+ * runs #fef8f3 down-sun to #fbc89b behind, i.e. warm all the way round the
+ * compass — so IBL irradiance on a side-facing normal is warm no matter which
+ * way the object is turned. Only the HIGH sky is blue, and only a directional
+ * term weighted to it can put that blue on the shaded side. One extra
+ * DirectionalLight, no shadow map, no draw calls.
+ */
+const SKY_FILL_INTENSITY = 0.85;
 
 // --- aerial perspective ------------------------------------------------------
 // Replaces FogExp2. The old single exp2 term at density 0.0019 reached 44% at
@@ -166,9 +214,86 @@ const UP = new THREE.Vector3(0, 1, 0);
 // and restored on dispose so a second Sky in the same page is not a landmine.
 
 const PATCHED_CHUNKS = [
-  'fog_pars_fragment', 'fog_fragment', 'envmap_physical_pars_fragment',
-  'shadowmap_pars_fragment', 'lights_fragment_begin',
+  'common', 'fog_pars_fragment', 'fog_fragment', 'envmap_physical_pars_fragment',
+  'shadowmap_pars_fragment', 'lights_pars_begin', 'lights_fragment_begin',
+  'lights_fragment_maps',
 ] as const;
+
+// --- interior volumes --------------------------------------------------------
+// THE TUNNEL WAS BRIGHTER INSIDE THAN THE DAYLIGHT OUTSIDE IT.
+//
+// The bore casts shadows, so the KEY was correctly blocked. Everything else was
+// not, and everything else adds up to more than the key: `scene.environment` is
+// a full sky probe sampled with no notion of what is between the fragment and
+// the sky, the SH ambient likewise, and the warm ground bounce is a
+// DirectionalLight with `castShadow = false` — i.e. a light that passes through
+// solid rock by construction. Aerial perspective piled a third of a stop of warm
+// haze on top. A fragment 60 m inside a hillside was receiving the entire
+// hemisphere of a golden-hour sky, and the mouths were the one part of frame
+// where you could see the sky BEING that bright, so the exit read as the dark
+// end of the shot. That is an inversion, and no amount of retuning the sodium
+// lamps can fix it, because the problem is that the rock is not occluding
+// anything.
+//
+// So: a real occlusion volume. A capsule chain fitted to the bore's own
+// centreline, tapered in from each mouth, baked into `common` as literals and
+// applied to the indirect terms, to the shadowless fill lights and to the fog.
+// Inside the bore, indirect light is cut to a few percent and the only things
+// left are the sodium strips, the daylight spilling in at the mouths, and the
+// bore's own baked vertex-colour rhythm. The exit is then a genuinely bright
+// hole, which is what it always should have been.
+
+/** Fraction of indirect diffuse removed at the centre of an interior volume. */
+const INTERIOR_IRRADIANCE_CUT = 0.90;
+/** Same for the specular half of the IBL. Slightly gentler: a wet floor and the
+ *  karts' chrome still need something to reflect, and what they should reflect
+ *  in there is mostly the lamps, which N8AO and the point lights supply. */
+const INTERIOR_RADIANCE_CUT = 0.86;
+/** Fraction of the shadowless fill/bounce lights removed. Near-total: these are
+ *  the lights that were literally shining through the hillside. */
+const INTERIOR_FILL_CUT = 0.95;
+/** Fraction of aerial perspective removed. Fog is skylight in suspension; there
+ *  is no sky in there for it to be. */
+const INTERIOR_FOG_CUT = 0.88;
+/** Radial extent of the bore volume around the centreline: full effect inside
+ *  the first, none beyond the second. The bore is ~13 m half-width by 8.6 m, so
+ *  the far edge is ~16 m off the centreline; anything past that is solid rock. */
+const INTERIOR_R_IN = 17;
+const INTERIOR_R_OUT = 25;
+/** How far in from each mouth the interior reaches full strength, metres. This
+ *  is the daylight spill, and it is what makes the mouth read as a portal
+ *  instead of as a line. */
+const INTERIOR_MOUTH = 20;
+/** Capsule segments fitted to the tunnel centreline. Ten over ~140 m is a 14 m
+ *  chord, which tracks the bore's curvature to well inside a metre. */
+const INTERIOR_SEGMENTS = 10;
+
+/** One capsule of the interior chain, in world space. */
+interface InteriorSegment {
+  ax: number; ay: number; az: number;
+  bx: number; by: number; bz: number;
+  /** arc distance from the volume's start at A and at B */
+  s0: number; s1: number;
+}
+
+interface InteriorVolume {
+  segments: InteriorSegment[];
+  /** bounding sphere, for the one-test early-out every other fragment takes */
+  cx: number; cy: number; cz: number; radius: number;
+  total: number;
+}
+
+// --- the sun rim -------------------------------------------------------------
+/**
+ * Strength of the rim, as a fraction of the key's own radiance added straight to
+ * direct specular. A silhouette edge fully side-on to a 4.2 key picks up ~1.2
+ * scene-linear, which lands just under display white through the shoulder — a
+ * bright edge with colour still in it, not a white outline.
+ */
+const RIM_STRENGTH = 0.34;
+/** How tightly the rim hugs the silhouette. 3.0 confines it to roughly the last
+ *  20° of grazing angle; lower and it becomes a wash over the whole side. */
+const RIM_POWER = 3.0;
 
 /**
  * How far into a shadow map its own contribution starts fading out. This is a
@@ -202,10 +327,13 @@ function glslFloat(x: number): string {
  *
  *  4. The colour is sampled per VIEW AZIMUTH out of the same atmosphere model
  *     the dome is drawn from, instead of being one constant. See
- *     `AtmosphereModel.hazePoly`: at 14° elevation the horizon runs from a hot
- *     #ffc98a down-sun to a cool violet-grey behind, and a single averaged haze
- *     guarantees that in most camera directions the sea and the sky converge on
- *     two different colours — which is precisely the hard bay/sky seam. There is
+ *     `AtmosphereModel.hazePoly`: at 14° elevation the horizon runs from a pale
+ *     #f1e3d9 straight down-sun to a dusty #f7bf92 behind, an 1.8:1 luminance
+ *     swing and a full hue swing, and a single averaged haze guarantees that in
+ *     most camera directions the sea and the sky converge on two different
+ *     colours — which is half of the hard bay/sky seam. (The other half was the
+ *     dome only welding 34% of the way onto that haze; see
+ *     `HORIZON_WELD_BAND`.) There is
  *     no uniform channel into this chunk (three merges `UniformsLib.fog` into
  *     `ShaderLib` at its own module-init time), so the fit is baked in as
  *     literals by `hazeGlsl`.
@@ -283,11 +411,131 @@ ${hazeGlsl(model, 'krFogHaze')}
 
 	float fogFactor = min( 1.0 - exp( -( ${K.SEA} * krAvg + krGlobal ) * krD ), ${K.MAX} );
 
+	// Aerial perspective is skylight scattered in the air between here and the
+	// eye. Inside the bore there is no sky above that air, and a third of a stop
+	// of warm haze laid over the interior was a good part of why the tunnel
+	// out-shone its own exit.
+	fogFactor *= 1.0 - krInterior * ${glslFloat(INTERIOR_FOG_CUT)};
+
 	gl_FragColor.rgb = mix( gl_FragColor.rgb, krFogHaze( krFwd.xz ), fogFactor );
 
 #endif
 `,
   };
+}
+
+/**
+ * Everything scene-wide that needs to be visible from BOTH the lighting chunks
+ * and the fog chunk goes into `<common>`, which is the one chunk every fragment
+ * shader in three includes — lit, unlit, and hand-rolled ShaderMaterials that
+ * pull three's chunks piecemeal. `krInterior` therefore always exists, and reads
+ * 0 for anything that never runs the lighting path, which is exactly right: an
+ * unlit material has no indirect term to occlude.
+ */
+function commonChunk(original: string, volume: InteriorVolume | null): string {
+  const F = glslFloat;
+  let body = '\treturn 0.0;';
+
+  if (volume !== null && volume.segments.length > 0) {
+    const lines: string[] = [
+      `\tvec3 krD = p - vec3( ${F(volume.cx)}, ${F(volume.cy)}, ${F(volume.cz)} );`,
+      `\tif ( dot( krD, krD ) > ${F(volume.radius * volume.radius)} ) return 0.0;`,
+      '\tfloat m = 0.0;',
+      '\tvec3 ap, q; float t, s;',
+    ];
+    // Every segment is expressed RELATIVE to the volume centre, and the test
+    // runs on `krD` rather than on `p`. The circuit sits a few hundred metres
+    // from the origin and this is squaring distances; keeping the operands under
+    // a hundred metres costs nothing and keeps the whole test comfortably inside
+    // float precision even where a driver decides mediump is good enough.
+    for (const seg of volume.segments) {
+      const dx = seg.bx - seg.ax, dy = seg.by - seg.ay, dz = seg.bz - seg.az;
+      const inv = 1 / Math.max(dx * dx + dy * dy + dz * dz, 1e-6);
+      lines.push(
+        `\tap = krD - vec3( ${F(seg.ax - volume.cx)}, ${F(seg.ay - volume.cy)}, ` +
+          `${F(seg.az - volume.cz)} );`,
+        `\tt = clamp( dot( ap, vec3( ${F(dx)}, ${F(dy)}, ${F(dz)} ) ) * ${F(inv)}, 0.0, 1.0 );`,
+        `\tq = ap - vec3( ${F(dx)}, ${F(dy)}, ${F(dz)} ) * t;`,
+        `\ts = ${F(seg.s0)} + ${F(seg.s1 - seg.s0)} * t;`,
+        `\tm = max( m, ( 1.0 - smoothstep( ${F(INTERIOR_R_IN * INTERIOR_R_IN)}, ` +
+          `${F(INTERIOR_R_OUT * INTERIOR_R_OUT)}, dot( q, q ) ) )` +
+          ` * smoothstep( 0.0, ${F(INTERIOR_MOUTH)}, s )` +
+          ` * smoothstep( 0.0, ${F(INTERIOR_MOUTH)}, ${F(volume.total)} - s ) );`,
+      );
+    }
+    lines.push('\treturn m;');
+    body = lines.join('\n');
+  }
+
+  return `${original}
+
+// --- Kart Royale: scene-wide lighting state ---------------------------------
+// 1 deep inside an enclosed volume, 0 in the open. Written once per fragment by
+// the patched <lights_fragment_begin>; read by the indirect terms, by the
+// shadowless fill lights and by aerial perspective.
+float krInterior = 0.0;
+
+float krInteriorAt( vec3 p ) {
+${body}
+}
+
+/**
+ * The low sun grazing a silhouette.
+ *
+ * Not a physical term and not pretending to be — it is the third light of a
+ * three-point rig, expressed as a function of geometry rather than as another
+ * DirectionalLight, because a rim that is a light has to be re-aimed every time
+ * the subject turns and there are eight subjects. Driven by the KEY's already
+ * shadowed radiance, so it vanishes in shadow and inside the tunnel exactly as
+ * a real one would.
+ *
+ * The 'lit' factor is what keeps it honest: the rim appears only on the edge that is
+ * turned toward the sun, so a kart with the sun behind it gets a hot outline and
+ * a kart driving into the sun gets none, which is the correct read.
+ *
+ * The floor mask is not cosmetic. Vectors here are VIEW space, so the world-up
+ * component has to be recovered from the view matrix; without the mask, every
+ * road fragment past about twelve metres is grazing and the rim becomes a second
+ * uncontrolled specular smeared over the whole carriageway.
+ */
+vec3 krSunRim( const in vec3 lightColor, const in vec3 lightDir,
+	const in vec3 N, const in vec3 V, const in float rough ) {
+	float graze = 1.0 - saturate( dot( N, V ) );
+	float lit = saturate( dot( N, lightDir ) );
+	float worldY = dot( N, vec3( viewMatrix[ 0 ][ 1 ], viewMatrix[ 1 ][ 1 ], viewMatrix[ 2 ][ 1 ] ) );
+	float mask = 1.0 - smoothstep( 0.25, 0.95, worldY );
+	float k = ${F(RIM_STRENGTH)} * pow( graze, ${F(RIM_POWER)} ) * lit * mask;
+	return lightColor * ( k * ( 1.0 - 0.65 * rough ) );
+}
+`;
+}
+
+/** Set `krInterior` before anything reads it, from the world position three
+ *  itself reconstructs the same way for its light-probe grid. */
+function interiorLightsChunk(original: string): string {
+  const anchor = 'vec3 geometryClearcoatNormal = vec3( 0.0 );';
+  if (!original.includes(anchor)) {
+    console.warn('[sky] lights_fragment_begin layout changed; interior volume skipped');
+    return original;
+  }
+  return original.replace(anchor, `${anchor}
+
+	krInterior = krInteriorAt( ( ( vec4( geometryPosition, 1.0 ) - viewMatrix[ 3 ] ) * viewMatrix ).xyz );
+`);
+}
+
+/** Occlude the indirect terms inside an interior volume. */
+function interiorMapsChunk(original: string): string {
+  return `${original}
+#if defined( RE_IndirectDiffuse )
+	irradiance *= 1.0 - krInterior * ${glslFloat(INTERIOR_IRRADIANCE_CUT)};
+	iblIrradiance *= 1.0 - krInterior * ${glslFloat(INTERIOR_IRRADIANCE_CUT)};
+#endif
+#if defined( RE_IndirectSpecular )
+	radiance *= 1.0 - krInterior * ${glslFloat(INTERIOR_RADIANCE_CUT)};
+	clearcoatRadiance *= 1.0 - krInterior * ${glslFloat(INTERIOR_RADIANCE_CUT)};
+#endif
+`;
 }
 
 /**
@@ -433,13 +681,43 @@ function cascadeLightsChunk(original: string): string {
     return original;
   }
 
+  const reLine = '		RE_Direct( directLight, geometryPosition, geometryNormal, ' +
+    'geometryViewDir, geometryClearcoatNormal, material, reflectedLight );';
+
   // Cascade 0 resolves both maps itself.
-  const body = original.slice(h + head.length, t).replace(shadowLine, `		directionalLightShadow = directionalLightShadows[ i ];
+  let body = original.slice(h + head.length, t).replace(shadowLine, `		directionalLightShadow = directionalLightShadows[ i ];
 		#if ( NUM_DIR_LIGHT_SHADOWS > 1 ) && ( UNROLLED_LOOP_INDEX == 0 )
 		directLight.color *= ( directLight.visible && receiveShadow ) ? krCascadeShadow() : 1.0;
 		#else
 ${shadowLine.split('\n')[1]}
 		#endif`);
+
+  // Two more things hang off this loop, both keyed on the unrolled index:
+  //
+  //  · Directional lights past the shadow-casting ones are the cool sky fill and
+  //    the warm ground bounce. They cast nothing, which is what let them shine
+  //    straight through a hillside; inside an interior volume they are cut.
+  //    (Three sorts shadow casters to the front of the array, so the test is
+  //    exactly "is this a fill".) When shadows are off entirely the sun itself
+  //    lands in that bucket, which is also correct — with no map to occlude it,
+  //    the volume is the only thing that can.
+  //
+  //  · Light 0 is always the key, and after it has been shaded and shadowed it
+  //    is also the only correct source for a rim.
+  if (body.includes(reLine)) {
+    body = body.replace(reLine, `		#if ( UNROLLED_LOOP_INDEX >= NUM_DIR_LIGHT_SHADOWS )
+		directLight.color *= 1.0 - krInterior * ${glslFloat(INTERIOR_FILL_CUT)};
+		#endif
+
+${reLine}
+
+		#if ( UNROLLED_LOOP_INDEX == 0 ) && defined( STANDARD ) && defined( RE_Direct )
+		reflectedLight.directSpecular += krSunRim( directLight.color, directLight.direction,
+			geometryNormal, geometryViewDir, material.roughness );
+		#endif`);
+  } else {
+    console.warn('[sky] RE_Direct call moved; rim and interior fill occlusion skipped');
+  }
 
   // Cascade 1 drops out of the loop completely: no light info, no shadow test,
   // no RE_Direct. One BRDF evaluation per fragment cheaper than the rig this
@@ -536,7 +814,9 @@ export class Sky implements System {
   private lut!: THREE.DataTexture;
   private noise!: THREE.DataTexture;
   private probe!: THREE.LightProbe;
+  private skyFill!: THREE.DirectionalLight;
   private bounce!: THREE.DirectionalLight;
+  private interiorInstalled = false;
   private cubeRT: THREE.WebGLCubeRenderTarget | null = null;
   private envRT: THREE.WebGLRenderTarget | null = null;
   private cascades: Cascade[] = [];
@@ -553,8 +833,9 @@ export class Sky implements System {
     const exposure = ctx.renderer?.toneMappingExposure || 1.05;
     this.model = new AtmosphereModel(exposure);
 
-    // Before anything is drawn, therefore before any program is compiled.
-    this.installShaderPatches();
+    // Before anything is drawn, therefore before any program is compiled. The
+    // interior volume is filled in on the first frame; see buildInteriorVolume.
+    this.installShaderPatches(null);
     this.buildDome(ctx);
     this.buildFog(ctx);
     this.buildLights(ctx);
@@ -586,7 +867,7 @@ export class Sky implements System {
    * Install the ShaderChunk overrides. Idempotent, and it snapshots the stock
    * chunks the first time so `dispose` can put them back.
    */
-  private installShaderPatches(): void {
+  private installShaderPatches(volume: InteriorVolume | null): void {
     const chunks = THREE.ShaderChunk as unknown as Record<string, string>;
     if (_originalChunks === null) {
       _originalChunks = {};
@@ -597,11 +878,76 @@ export class Sky implements System {
     const fog = fogChunks(this.model, stock.fog_pars_fragment);
     for (const name of Object.keys(fog)) chunks[name] = fog[name];
 
+    chunks.common = commonChunk(stock.common, volume);
     chunks.envmap_physical_pars_fragment =
       envDiffuseChunk(stock.envmap_physical_pars_fragment, DIFFUSE_ENV_INTENSITY);
     chunks.shadowmap_pars_fragment =
       cascadeShadowChunk(shadowBorderChunk(stock.shadowmap_pars_fragment));
-    chunks.lights_fragment_begin = cascadeLightsChunk(stock.lights_fragment_begin);
+    chunks.lights_pars_begin = stock.lights_pars_begin;
+    chunks.lights_fragment_begin =
+      interiorLightsChunk(cascadeLightsChunk(stock.lights_fragment_begin));
+    chunks.lights_fragment_maps = interiorMapsChunk(stock.lights_fragment_maps);
+  }
+
+  /**
+   * Fit the interior volume to the tunnel bore.
+   *
+   * This has to happen after `Track.init`, and Sky inits before Track because
+   * everything downstream of Sky needs the env map and the key light at ITS
+   * init. So the chunks go in twice: once at boot with an empty volume, so that
+   * nothing can possibly compile against a half-built patch set, and once on the
+   * first frame with the real one. Nothing has been rendered by then, so nothing
+   * has been compiled either and the second install is free — the
+   * `needsUpdate` sweep below is belt and braces for a future system that
+   * decides to warm a shader during its own init.
+   */
+  private buildInteriorVolume(ctx: Ctx): InteriorVolume | null {
+    const track = ctx.track;
+    if (!track || !(track.length > 1)) return null;
+
+    const pts: THREE.Vector3[] = [];
+    const arc: number[] = [];
+    const span = TUNNEL_T1 - TUNNEL_T0;
+    // The bore geometry is built a touch outside the layout's t range; match it
+    // so the volume covers the whole lining rather than stopping short of it.
+    const t0 = TUNNEL_T0 - 0.005;
+    let total = 0;
+    for (let i = 0; i <= INTERIOR_SEGMENTS; i++) {
+      const t = t0 + ((span + 0.01) * i) / INTERIOR_SEGMENTS;
+      const p = track.sample(t - Math.floor(t)).pos.clone();
+      // The centreline sits on the carriageway; the bore's mass is above it, so
+      // lift the axis to the middle of the section. That keeps the capsule
+      // radius honest instead of having to cover the crown from the floor.
+      p.y += 3.4;
+      if (i > 0) total += p.distanceTo(pts[i - 1]);
+      pts.push(p);
+      arc.push(total);
+    }
+    if (!(total > 1)) return null;
+
+    const segments: InteriorSegment[] = [];
+    for (let i = 0; i < INTERIOR_SEGMENTS; i++) {
+      const a = pts[i], b = pts[i + 1];
+      segments.push({
+        ax: a.x, ay: a.y, az: a.z, bx: b.x, by: b.y, bz: b.z,
+        s0: arc[i], s1: arc[i + 1],
+      });
+    }
+
+    const box = new THREE.Box3();
+    for (const p of pts) box.expandByPoint(p);
+    const c = box.getCenter(new THREE.Vector3());
+    let radius = 0;
+    for (const p of pts) radius = Math.max(radius, p.distanceTo(c));
+
+    return {
+      segments,
+      cx: c.x, cy: c.y, cz: c.z,
+      // The bounding sphere is a REJECT test, so it has to be generous: a
+      // fragment is inside the volume out to INTERIOR_R_OUT off the axis.
+      radius: radius + INTERIOR_R_OUT + 1,
+      total,
+    };
   }
 
   private buildDome(ctx: Ctx): void {
@@ -722,8 +1068,25 @@ export class Sky implements System {
     // SH ambient projected from our own sky — strictly better than a hemisphere
     // light because it carries the azimuthal asymmetry (the side of an object
     // facing the sun's half of the sky picks up more skylight).
-    this.probe = new THREE.LightProbe(this.model.projectSH(), PROBE_INTENSITY);
+    this.probe = new THREE.LightProbe(
+      this.model.projectSH(2048, PROBE_FILL_TINT), PROBE_INTENSITY);
     ctx.scene.add(this.probe);
+
+    // The FILL. Cool, directional, from above and behind the sun's shoulder.
+    // This and the key are the whole warm/cool axis of the frame; the bounce
+    // below is a garnish and the IBL irradiance is a floor.
+    //
+    // Order matters: three sorts shadow casters to the front of the directional
+    // array and is stable otherwise, so this and the bounce land after the
+    // cascades and are picked up by the interior-occlusion test in
+    // `cascadeLightsChunk`. Neither casts a shadow, and a light that casts
+    // nothing has to be told where the walls are.
+    this.skyFill = new THREE.DirectionalLight(SKY_FILL_COLOR, SKY_FILL_INTENSITY);
+    this.skyFill.position.copy(SKY_FILL_DIRECTION).multiplyScalar(100);
+    this.skyFill.castShadow = false;
+    this.skyFill.name = 'SkyFill';
+    ctx.scene.add(this.skyFill);
+    ctx.scene.add(this.skyFill.target);
 
     // Warm bounce from the sand and stone below, tilted toward the sun's
     // azimuth because that is the ground actually receiving the key.
@@ -731,6 +1094,7 @@ export class Sky implements System {
     this.bounce.position.set(this.sunDirection.x * 0.55, -1, this.sunDirection.z * 0.55)
       .normalize().multiplyScalar(100);
     this.bounce.castShadow = false;
+    this.bounce.name = 'GroundBounce';
     ctx.scene.add(this.bounce);
     ctx.scene.add(this.bounce.target);
   }
@@ -822,6 +1186,24 @@ export class Sky implements System {
   // -- frame ------------------------------------------------------------------
 
   update(ctx: Ctx, _dt: number): void {
+    if (!this.interiorInstalled) {
+      this.interiorInstalled = true;
+      const volume = this.buildInteriorVolume(ctx);
+      if (volume !== null) {
+        this.installShaderPatches(volume);
+        // Nothing has rendered yet, so nothing has compiled and this sweep is a
+        // no-op — but it is the difference between "correct" and "correct as
+        // long as no one warms a shader during init".
+        ctx.scene.traverse((o) => {
+          const mat = (o as THREE.Mesh).material as THREE.Material | THREE.Material[] | undefined;
+          if (Array.isArray(mat)) for (const m of mat) m.needsUpdate = true;
+          else if (mat) mat.needsUpdate = true;
+        });
+      } else {
+        console.warn('[sky] track unavailable; tunnel interior will not be occluded');
+      }
+    }
+
     const u = this.material.uniforms;
     u.uTime.value = ctx.time;
     // True translational parallax between the cloud planes as the kart moves —
@@ -955,6 +1337,7 @@ export class Sky implements System {
     }
     this.cascades.length = 0;
     this.probe?.parent?.remove(this.probe);
+    this.skyFill?.parent?.remove(this.skyFill);
     this.bounce?.parent?.remove(this.bounce);
   }
 }

@@ -165,23 +165,28 @@ export class Water {
 // ---------------------------------------------------------------------------
 
 const WAVES = /* glsl */ `
-// Four directional octaves. Returns height in .x and d/dx, d/dz in .yz so the
+// Five directional octaves. Returns height in .x and d/dx, d/dz in .yz so the
 // normal is analytic — no normal map, therefore no tiling to spot.
+//
+// W0 is the SWELL: 118 m and 0.62 m of it. A Mediterranean bay at golden hour
+// has a long, low ground swell running through it, and it is the reason the
+// far water has any form at all; without it the sea past 200 m is a plate.
 vec3 waveSet(vec2 p, float t, float atten, float chop) {
   vec3 acc = vec3(0.0);
   // (dirx, dirz, wavelength, amplitude)
-  const vec4 W0 = vec4( 0.86,  0.51, 46.0, 0.46);
-  const vec4 W1 = vec4(-0.42,  0.91, 21.0, 0.24);
-  const vec4 W2 = vec4( 0.97, -0.24,  9.4, 0.105);
-  const vec4 W3 = vec4( 0.24,  0.97,  4.3, 0.042);
-  vec4 ws[4];
-  ws[0] = W0; ws[1] = W1; ws[2] = W2; ws[3] = W3;
-  for (int i = 0; i < 4; i++) {
+  const vec4 W0 = vec4( 0.66,  0.75, 118.0, 0.62);
+  const vec4 W1 = vec4( 0.86,  0.51,  46.0, 0.40);
+  const vec4 W2 = vec4(-0.42,  0.91,  21.0, 0.21);
+  const vec4 W3 = vec4( 0.97, -0.24,   9.4, 0.098);
+  const vec4 W4 = vec4( 0.24,  0.97,   4.3, 0.040);
+  vec4 ws[5];
+  ws[0] = W0; ws[1] = W1; ws[2] = W2; ws[3] = W3; ws[4] = W4;
+  for (int i = 0; i < 5; i++) {
     vec4 w = ws[i];
     float k = 6.28318 / w.z;
     float sp = sqrt(9.81 / k);            // deep-water dispersion: long swell moves fast
     float ph = dot(w.xy, p) * k + t * sp * 0.55;
-    float a = w.w * atten * (i > 1 ? chop : 1.0);
+    float a = w.w * atten * (i > 2 ? chop : 1.0);
     // sharpened crests / flattened troughs, Gerstner-ish without the xz shear
     float s = sin(ph);
     float sh = s * (0.78 + 0.22 * s);
@@ -219,12 +224,14 @@ void main() {
   // Fade displacement out toward the horizon so the far rings stay flat and
   // the silhouette of the sea meets the sky cleanly.
   float dist = length(wp.xz - uCam.xz);
-  atten *= 1.0 - smoothstep(260.0, 900.0, dist);
+  // The swell has to survive a lot further out than the chop does, or the bay
+  // becomes a flat plate exactly where the establishing shots look at it.
+  atten *= 1.0 - smoothstep(700.0, 2000.0, dist);
   vec3 w = waveSet(wp.xz, uTime, atten, uChop);
   // Displacement fades toward the horizon so the far rings meet the sky
   // cleanly — but the SLOPE must not, or the distant bay becomes a mirror with
   // no sun track on it at all. Height and slope are attenuated separately.
-  float horizonFade = 1.0 - smoothstep(320.0, 1100.0, dist);
+  float horizonFade = 1.0 - smoothstep(900.0, 2300.0, dist);
   wp.y = uLevel + w.x * horizonFade;
   vWorld = wp.xyz;
   vWaveD = vec3(w.x * horizonFade, w.yz);
@@ -264,11 +271,21 @@ const vec3 SHALLOW = vec3(0.0508, 0.5841, 0.5457);   // #3fc9c4
 const vec3 DEEP    = vec3(0.0040, 0.1022, 0.1946);   // #0d5a7a
 const vec3 FOAM    = vec3(0.8549, 0.9559, 1.0000);   // #eefaff
 
+// The horizon is NOT one colour. At 14° of sun elevation it runs from a hot
+// #ffd0a0 down-sun to a dusky violet counter-glow behind you, and that spread
+// is most of what makes a golden-hour sea look like a sea. The previous version
+// reflected the warm value in every direction, which is precisely why the whole
+// bay came out as one flat white-grey plate with a hard seam on it.
+const vec3 HZ_ANTI = vec3(0.1000, 0.1180, 0.2050);   // counter-glow, violet-grey
+
 vec3 skyDome(vec3 d) {
   float up = clamp(d.y, 0.0, 1.0);
-  vec3 c = mix(HORIZON, ZENITH, pow(up, 0.42));
+  float az = dot(normalize(vec3(d.x, 0.0, d.z) + vec3(1e-5, 0.0, 1e-5)),
+                 normalize(vec3(uSunDir.x, 0.0, uSunDir.z) + vec3(1e-5, 0.0, 1e-5)));
+  vec3 hz = mix(HZ_ANTI, HORIZON, smoothstep(-0.75, 0.92, az));
+  vec3 c = mix(hz, ZENITH, pow(up, 0.42));
   // below the horizon the reflection ray sees haze over distant water
-  c = mix(vec3(0.085, 0.115, 0.135), c, smoothstep(-0.10, 0.015, d.y));
+  c = mix(vec3(0.072, 0.092, 0.118), c, smoothstep(-0.10, 0.015, d.y));
   float mu = max(dot(d, uSunDir), 0.0);
   c += uSunCol * pow(mu, 8.0) * 0.35;        // Mie forward lobe
   c += uSunCol * pow(mu, 90.0) * 1.8;        // tight halo
@@ -312,14 +329,24 @@ void main() {
   N = normalize(mix(N, vec3(0.0, 1.0, 0.0), flatten01));
 
   float ndv = max(dot(N, V), 0.0);
-  float fres = 0.02 + 0.98 * pow(1.0 - ndv, 5.0);
+  // Capped Fresnel. Physically the grazing limit is 1.0 and the sea becomes a
+  // pure mirror; pictorially that throws away the entire #3fc9c4 -> #0d5a7a
+  // depth ramp the bible asks for, because from a kart 3 m off the deck almost
+  // all of the visible water IS at grazing. 12% of body colour always survives.
+  float fres = 0.02 + 0.86 * pow(1.0 - ndv, 5.0);
 
   vec3 R = reflect(-V, N);
   R.y = max(R.y, 0.008);                       // never sample under the sea
   vec3 refl = envSample(R);
 
   // --- body colour: depth ramp plus a warm upwelling on the sun-facing faces
-  float depth01 = vShore.r;
+  // The baked shore field only knows about distance to the circuit, so past
+  // ~90 m it saturates and the whole outer bay is one value. A pair of very
+  // long-wavelength terms stands in for bathymetry — banks, channels and the
+  // colour change over them — and is what stops the open water being a plate.
+  float bath = sin(vWorld.x * 0.0031 + 1.7) * sin(vWorld.z * 0.0027 - 0.6)
+             + 0.45 * sin(vWorld.x * 0.0089 - 2.2) * sin(vWorld.z * 0.0071 + 0.9);
+  float depth01 = clamp(vShore.r + bath * 0.13, 0.0, 1.0);
   vec3 body = mix(SHALLOW, DEEP, depth01 * depth01);
   float upwell = clamp(dot(N, uSunDir) * 0.5 + 0.5, 0.0, 1.0);
   float crest = clamp(vWaveD.x * 1.6 + 0.35, 0.0, 1.0);
@@ -337,18 +364,26 @@ void main() {
   // normals were flattened away — that wide lobe IS the sun path across the bay,
   // and without it a golden-hour coastal shot has a dead sea in it.
   float tight = pow(ndh, 1500.0) * ndl * 7.0 * (1.0 - flatten01);
-  float broad = pow(ndh, mix(400.0, 34.0, flatten01)) * ndl * mix(1.2, 4.6, flatten01);
-  // the path is stretched toward the viewer, so lift it where the reflected
-  // ray and the sun share an azimuth even when the elevations disagree
-  float track = pow(max(dot(normalize(vec2(reflect(-V, N).xz)), normalize(uSunDir.xz)), 0.0), 26.0);
-  broad *= 0.55 + 0.45 * track;
+  float broad = pow(ndh, mix(400.0, 34.0, flatten01)) * ndl * mix(1.0, 3.4, flatten01);
+  // THE SUN PATH. The glitter is stretched toward the viewer along the sun's
+  // own azimuth and nowhere else — a bright road running across the bay to your
+  // feet, which at golden hour is the single most beautiful thing in the frame.
+  // The old floor of 0.55 meant the broad lobe fired over the WHOLE sea, which
+  // is why every seaward shot came back as one blown-out white plate with no
+  // path in it at all. The floor is now 0.08: off-axis water is dark water.
+  float track = pow(max(dot(normalize(vec2(reflect(-V, N).xz) + vec2(1e-5)), normalize(uSunDir.xz)), 0.0), 14.0);
+  // Cats-paws: slow wind streaks running down the bay, so the path has texture
+  // across it instead of being a smooth airbrushed cone.
+  float streak = 0.72 + 0.28 * sin(dot(vWorld.xz, vec2(0.86, 0.51)) * 0.013 + uTime * 0.09)
+                            * sin(dot(vWorld.xz, vec2(-0.51, 0.86)) * 0.021 - uTime * 0.05);
+  broad *= (0.08 + 0.92 * track) * streak;
   // sparkle: sparse sub-pixel facets riding the lobe, so the glitter path
   // reads as individual points of light rather than a smooth smear
   float sp = hash21(floor(vWorld.xz * 6.0 + vec2(uTime * 0.6, -uTime * 0.4)));
-  float sparkle = pow(ndh, 220.0) * step(0.86, sp) * 8.0 * detailFade;
+  float sparkle = pow(ndh, 220.0) * step(0.86, sp) * 8.0 * detailFade * (0.25 + 0.75 * track);
   // a coarser, slower facet field that survives out to the horizon
   float spF = hash21(floor(vWorld.xz * 0.55 + vec2(uTime * 0.11, -uTime * 0.07)));
-  float glint = pow(ndh, mix(240.0, 70.0, flatten01)) * step(0.82, spF) * 3.2 * flatten01;
+  float glint = pow(ndh, mix(240.0, 70.0, flatten01)) * step(0.82, spF) * 3.2 * flatten01 * (0.12 + 0.88 * track);
   vec3 sun = uSunCol * (tight + broad + sparkle + glint);
 
   // --- foam
@@ -368,6 +403,15 @@ void main() {
   col = mix(col, FOAM * (0.70 + 0.55 * upwell), foam * 0.88);
   // foam kills the mirror, and the wet edge stays slightly brighter
   col += FOAM * foam * uSunCol * 0.10;
+
+  // --- the horizon must DISSOLVE, not terminate.
+  // The scene fog stops at 92% by design (it is what keeps the four backdrop
+  // layers from fusing), and 8% of a bright sea against the sky is still a hard
+  // bright line. So the water is walked toward the sky it is standing in front
+  // of — sampled in its OWN azimuth, from the same dome the reflection uses, so
+  // the two agree exactly — before the fog is ever applied.
+  vec3 skyline = skyDome(normalize(vec3(-V.x, 0.010, -V.z)));
+  col = mix(col, skyline, smoothstep(700.0, 2500.0, viewDist) * 0.9);
 
   gl_FragColor = vec4(col, 1.0);
   #include <tonemapping_fragment>

@@ -87,9 +87,10 @@ export class Fields {
     this.height = new Float32Array(size * size);
     this.albedo.fill(255);
     this.orm.fill(255);
-    // ORM alpha carries a low-frequency "macro variation" signal that the
-    // tiling-breakup shader injection samples at a non-integer scale. It has to
-    // average 0.5 or the breakup would bias the whole surface brighter/darker.
+    // ORM alpha is pinned at a mid grey and read by nothing. It used to carry
+    // the macro layer; see the note below the class for why that was a mistake
+    // and where the macro layer lives now. Left at 128 rather than 255 so the
+    // canvas' premultiply round trip stays in its well-conditioned range.
     for (let k = 3; k < this.orm.length; k += 4) this.orm[k] = 128;
   }
 
@@ -119,10 +120,62 @@ export class Fields {
     this.orm[k + 2] = metalness * 255;
   }
 
-  /** large-scale variation signal, 0..1, read by the tiling-breakup injection */
-  macro(i: number, v: number): void {
-    this.orm[i * 4 + 3] = v * 255;
+}
+
+/*
+ * Historical note, because it is the kind of bug that gets reintroduced.
+ *
+ * The macro layer used to travel in this texture's ALPHA channel, written by a
+ * `Fields.macro(i, v)` that no longer exists. Two reasons it moved out, and the
+ * second is a correctness bug rather than a taste call.
+ *
+ * 1. A macro signal smuggled into ORM.a has to be sampled from a 1024² map
+ *    magnified over 30 m of world, which is 37 texels per metre of a field whose
+ *    entire content is four lattice cells. It cost a full-resolution channel on
+ *    the largest surfaces in the frame to store information that fits in 128².
+ * 2. A 2D canvas backing store is alpha-premultiplied. Uploading one to WebGL
+ *    with `UNPACK_PREMULTIPLY_ALPHA_WEBGL` false makes the browser undo that
+ *    multiply, and un-premultiplying at low alpha amplifies the 8-bit
+ *    quantisation of the RGB it is dividing. At alpha 128 the error is under
+ *    half a percent and nobody notices; at alpha 8 a stored 200 comes back as
+ *    255. The old macro fields never went near zero — an un-normalised fbm lives
+ *    inside 0.35..0.65 — so this never fired. A *properly contrast-stretched*
+ *    macro field does reach zero by construction, which would have turned every
+ *    dark patch of the macro layer into a hole punched through the roughness map
+ *    underneath it.
+ *
+ * So ORM alpha stays pinned at the constructor's 128 and the macro layer gets
+ * its own small opaque texture — see `macroTexture` below.
+ */
+
+/**
+ * The macro layer's own texture: three independent low-frequency fields packed
+ * RGB, at a resolution matched to what a low-frequency field actually contains.
+ *
+ * Alpha is a hard 255, which is the whole point — nothing here goes through the
+ * premultiply round trip that made the alpha-channel version unsafe.
+ *
+ *   R — the primary variation: colour drift, patches, weathering zones
+ *   G — an independent second field: pooling, damp, wear
+ *   B — an anisotropic source, sampled in the tile's own UV frame
+ */
+export function macroTexture(
+  res: number,
+  r: Float32Array,
+  g?: Float32Array | null,
+  b?: Float32Array | null,
+): THREE.Texture {
+  const bytes = new Uint8ClampedArray(res * res * 4);
+  for (let i = 0, k = 0; i < res * res; i++, k += 4) {
+    bytes[k] = r[i] * 255;
+    bytes[k + 1] = (g ? g[i] : 0.5) * 255;
+    bytes[k + 2] = (b ? b[i] : 0.5) * 255;
+    bytes[k + 3] = 255;
   }
+  // Anisotropy 1 on purpose: this map is magnified almost everywhere it is read
+  // (128 texels spread over 30 m), so anisotropic taps would buy nothing and
+  // cost bandwidth on the largest surfaces in the frame.
+  return bytesTexture(res, bytes, { srgb: false, wrap: THREE.RepeatWrapping, anisotropy: 1 });
 }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +217,27 @@ export function sobelNormalBytes(height: Float32Array, size: number, strength: n
       const k = (r1 + x) * 4;
       out[k] = (nx * 0.5 + 0.5) * 255;
       out[k + 1] = (ny * 0.5 + 0.5) * 255;
-      out[k + 2] = inv * 255;
+      // All three channels are signed data in a UNORM texture, so all three get
+      // the same `v * 0.5 + 0.5` encode — because every consumer, three's own
+      // <normal_fragment_maps> included, decodes with `texture * 2.0 - 1.0`.
+      //
+      // This channel used to be written as a bare `inv * 255`. Z is a cosine and
+      // never negative, so storing it unmapped looks harmless and round-trips
+      // fine at shallow angles — but the decode still runs, so the shader was
+      // reconstructing `2 * cos(theta) - 1` where it wanted `cos(theta)`:
+      //
+      //     true tilt   10°    20°    30°    40°    50°    60°    70°
+      //     shader saw  10°    21°    34°    50°    70°    90°   109°
+      //
+      // Below about 20° the error is invisible, which is why this survived. Past
+      // 60° the reconstructed normal lies flat against the surface and then
+      // tips BELOW it, so those texels shade as if they faced away from the
+      // geometry they are on. On tarmac that was 2.8% of texels — a few
+      // scattered per chipping — each one a facet pointed somewhere arbitrary,
+      // which under a low sun and a warm-sun / blue-zenith sky is a pinpoint
+      // that lands orange or cyan depending on where it happened to point.
+      // That was the rainbow speckle on the road.
+      out[k + 2] = (inv * 0.5 + 0.5) * 255;
       out[k + 3] = 255;
     }
   }

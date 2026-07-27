@@ -101,7 +101,11 @@ function frame(now: number) {
   const raw = (now - last) / 1000;
   last = now;
   // Clamp so a stalled tab or a breakpoint never teleports anything.
-  const dt = Math.min(raw, 1 / 20);
+  // `__freeze` holds the simulation still while the screenshot harness retries a
+  // torn capture: rendering continues, so the compositor can produce a clean
+  // frame, but nothing advances — otherwise a retry lands seconds down the road
+  // and the shot no longer shows what it was aimed at.
+  const dt = (window as any).__freeze ? 0 : Math.min(raw, 1 / 20);
   ctx.dt = dt;
   ctx.time += dt;
   ctx.frame++;

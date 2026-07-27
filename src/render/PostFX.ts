@@ -53,11 +53,12 @@ uniform mat4 invViewProj;
 uniform vec4 grade;   // x exposure, y S-curve amount, z saturation, w vignette
 uniform vec4 lens;    // x aberration, y grain, z speed-line gain, w shutter
 uniform vec2 rush;    // x radial blur amount, y gated speed intensity
-uniform vec2 hold;    // near-field blur hold-out: x full hold, y full blur (metres)
+uniform vec3 subject; // world-space centre of the player's kart
+uniform vec2 hold;    // hold-out radii about the subject: x fully sharp, y fully blurred (metres)
 uniform vec3 coolTint;
 uniform vec3 warmTint;
 uniform vec3 shadowLift;
-uniform vec2 rolloff; // x highlight knee (scene-linear), y compression exponent
+uniform vec4 rolloff; // x knee (scene-linear), y exponent, z highlight desat, w desat span
 
 const vec3 KR_LUMA = vec3(0.2126, 0.7152, 0.0722);
 
@@ -85,10 +86,8 @@ float krValueNoise(float x) {
 // The curve is a power law above the knee, not a saturating exponential. An
 // asymptote would buy separation at the cost of never reaching white, and the
 // art bible is explicit that chrome and water must clip to white and bloom;
-// x^0.38 keeps climbing forever, so a specular two orders of magnitude up still
-// gets there. Measured through the full chain (shoulder, ACES, S-curve, split
-// tone, sRGB), scene-linear 1.2 / 2 / 4 / 8 / 20 now land on 0.93 / 0.95 / 0.97 /
-// 0.98 / 1.00 instead of all five landing on 1.00.
+// x^0.30 keeps climbing forever, so a specular two orders of magnitude up still
+// gets there.
 //
 // It is gated on the brightest channel rather than on luminance: a saturated red
 // at 1.2 linear has a luminance of only 0.49, so a luminance gate would let it
@@ -96,17 +95,30 @@ float krValueNoise(float x) {
 // highlight breaks to a flat primary. max(rgb) compresses the channel that is
 // actually about to clip.
 //
-// The mix at the end is the rolloff the art bible asks for by name: as a pixel
-// climbs it is pulled toward its own luminance, so an over-exposed area
-// desaturates smoothly to white instead of going neon. Bloom then sits on
-// hue-stable highlights.
+// rolloff.z is the highlight desaturation and it is the thing that was wrong.
+// At 0.55 over a span of 12x the knee, EVERY bright coloured thing in the game
+// arrived at white well before it arrived at 255: measured through the whole
+// chain, a tier-3 drift plume at scene-linear (12, 4, 20) came out rgb(243, 225,
+// 238) — chroma 0.07, i.e. grey — a blue boost pad at (4, 9, 14) came out
+// rgb(241, 241, 238), chroma 0.01, and a boost flame at (22, 11, 3) came out
+// rgb(250, 242, 234), chroma 0.06. The brief's "boost pads clipping to
+// featureless white" was not the shoulder failing to compress; it was the
+// shoulder deliberately bleaching the colour out first, and then bloom spreading
+// the result. At 0.14 over 40x the same three land at chroma 0.19 / 0.07 / 0.21
+// — highlights that roll off INTO colour, as the bible asks — while the sun disc
+// and sun-on-chrome, which are another half-order up again, still reach white
+// and still bloom, because that part of the bible is also non-negotiable.
+//
+// The knee moved with it, 0.90 -> 0.75. It has to sit just above sunlit diffuse
+// white (a 0.18 grey card under the 4.2 key measures ~0.70 scene-linear) so the
+// shoulder shapes specular and emission and leaves the key's own falloff alone.
 vec3 krHighlightRolloff(vec3 c) {
   float m = max(max(c.r, c.g), c.b);
   float knee = rolloff.x;
   if (m <= knee) return c;
   float mc = knee * pow(m / knee, rolloff.y);
   vec3 scaled = c * (mc / max(m, 1e-5));
-  float desat = smoothstep(knee, knee * 12.0, m) * 0.55;
+  float desat = smoothstep(knee, knee * rolloff.w, m) * rolloff.z;
   return mix(scaled, vec3(dot(scaled, KR_LUMA)), desat);
 }
 
@@ -144,17 +156,49 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, const in float depth,
   vec2 prevUv = prevClip.xy / max(prevClip.w, 1e-4) * 0.5 + 0.5;
   vec2 velocity = (uv - prevUv) * lens.w;
 
+  velocity += fromCentre * rush.x;              // arcade zoom-blur under boost
+
+  // --- hero hold-out --------------------------------------------------------
   // The player's kart is rigidly bolted to the camera, so a camera-only
   // reprojection sees its pixels as *static world geometry rushing backwards*
   // and smears the hero subject harder than anything else in frame — at speed
   // the model, its livery and the driver dissolve completely. There is no
-  // per-object velocity buffer to solve it properly, so the near field is held
-  // out instead: the hold range is driven from the live camera-to-kart distance, so
-  // the subject stays legible under both the chase rig and the close rig while
-  // the world beyond it still carries all the speed.
-  velocity *= smoothstep(hold.x, hold.y, -getViewZ(depth));
+  // per-object velocity buffer to solve it properly, so the subject is masked
+  // out of the velocity here instead.
+  //
+  // The mask is a sphere in WORLD space, centred on the kart, and that is the
+  // whole point. The previous attempt was a *depth band* driven off the
+  // camera-to-kart distance (hold out everything nearer than 1.3x the arm), and
+  // it fails for a reason that is easy to miss on a straight and impossible to
+  // miss under boost: the chase rig's surge pulls the eye in to about 4.5 m on a
+  // boost, so 1.3x the arm is only 1.4 m of clearance — while the kart is 2.1 m
+  // long and the camera is looking *down* the length of it. The band therefore
+  // cut straight through the model, and because screen-vertical maps to depth
+  // under a rig that looks down, it cut horizontally: the helmet, the roll bar
+  // and the spoiler (nearest the eye) stayed sharp and the fenders, the nose and
+  // the number plate (furthest) took the full streak. That is precisely the
+  // half-sharp, half-dissolved kart in shots/r4/boost.png and scenery.png, and
+  // no amount of widening fixes it, because the failure is that a scalar depth
+  // band cannot describe a 2 m object viewed end-on from 4 m away.
+  //
+  // Measuring distance from the kart's own centre has none of that geometry in
+  // it. The world position is already reconstructed for the reprojection above,
+  // so the test costs one subtract and one length. It holds at any arm length, any
+  // pitch and any camera mode, and — unlike a depth band — it holds ONLY the
+  // kart: a rival two metres to the side sits outside the sphere and keeps its
+  // streak, where the depth band was wrongly freezing every kart in the same
+  // slice of the frame.
+  //
+  // The radii are sized off the model. The worst corner of the bodywork is about
+  // 1.7 m from the chassis centre of mass (0.87 lateral, 1.05 longitudinal, 1.05
+  // to the top of the helmet), so hold.x adds a third of a metre on top of that:
+  // a gather needs its *neighbours* masked too, or the road pixels just outside
+  // the silhouette pick the kart up along their own streak and drag it outward —
+  // the translucent wings hanging off both fenders in the r4 frames. hold.y then
+  // releases over another 1.3 m so the tarmac eases back into the streak instead
+  // of stepping into it.
+  velocity *= smoothstep(hold.x, hold.y, distance(world.xyz, subject));
 
-  velocity += fromCentre * rush.x;              // arcade zoom-blur under boost
   float travel = length(velocity);
   // Capped so the fixed tap budget always covers the streak — an unbounded
   // travel with MB_SAMPLES taps turns the dither jitter into visible noise
@@ -175,6 +219,18 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, const in float depth,
 
   // Aberration grows with r^2 so the centre of frame stays clean.
   vec2 fringe = fromCentre * lens.x * (0.35 + dot(fromCentre, fromCentre) * 3.4);
+  // ...and is rolled off once the smear gets long. R and B are fetched at a
+  // FIXED lateral offset while the tap itself walks along the streak, so the
+  // three channels integrate three different sets of specular highlights. Over
+  // a calm surface that is invisible; over the grazing sun sheen on the near
+  // road it decorrelates the channels and the smear comes out as rainbow
+  // speckle rather than a clean radial fringe. Nothing showed this until the
+  // hero hold-out replaced the old depth band, because the band had been
+  // freezing exactly that stretch of road to zero velocity. A long exposure
+  // has no business carrying crisp lateral colour separation anyway.
+  // length(velocity) here is post-cap and post-hold-out, so it is 0 on the
+  // subject and 0 on the single-tap capture path — both keep full aberration.
+  fringe *= 1.0 - 0.75 * smoothstep(0.0, 0.010, length(velocity));
 
   vec2 lo = texelSize;
   vec2 hi = vec2(1.0) - texelSize;
@@ -225,7 +281,7 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, const in float depth,
   lum = dot(c, KR_LUMA);
   // Saturation lift, rolled off in the highlights so bloomed chrome and the
   // sun on water go white rather than neon.
-  c = max(mix(vec3(lum), c, grade.z * (1.0 - 0.55 * smoothstep(0.70, 1.0, lum))), 0.0);
+  c = max(mix(vec3(lum), c, grade.z * (1.0 - 0.40 * smoothstep(0.70, 1.0, lum))), 0.0);
 
   // Normalised so 1.0 is the frame corner at any aspect ratio — otherwise the
   // vignette and the streak band drift as the window is resized.
@@ -278,7 +334,10 @@ export class GradeEffect extends Effect {
           new THREE.Vector4(opts.exposure, opts.contrast, opts.saturation, opts.vignette))],
         ['lens', new THREE.Uniform(new THREE.Vector4(0.0007, opts.grain, 0.15, 0.0))],
         ['rush', new THREE.Uniform(new THREE.Vector2(0, 0))],
-        ['hold', new THREE.Uniform(new THREE.Vector2(6, 13))],
+        ['subject', new THREE.Uniform(new THREE.Vector3())],
+        // Released until `sync` finds a player kart: with a negative outer
+        // radius the smoothstep returns 1 everywhere and nothing is held.
+        ['hold', new THREE.Uniform(new THREE.Vector2(-2, -1))],
         // Teal-leaning shadows / warm highlights, both near-luminance-neutral.
         // The cool side leans on green as well as blue: a purely blue shadow
         // against a #ffd9a8 key reads as violet, which is the exact hue the
@@ -289,9 +348,11 @@ export class GradeEffect extends Effect {
         // a #a8c8ff sky fill in the shadows, and nothing multiplicative can
         // produce it. Sized to sit just above the noise floor of an 8-bit write.
         ['shadowLift', new THREE.Uniform(new THREE.Vector3(-0.0015, 0.0035, 0.0092))],
-        // Highlight shoulder: knee at scene-linear 1.0 (just past display
-        // white at exposure 1.05), then x^0.45 above it.
-        ['rolloff', new THREE.Uniform(new THREE.Vector2(0.90, 0.38))],
+        // Highlight shoulder: knee just above sunlit diffuse white, then
+        // x^0.30 above it, with only a light pull toward luminance so a hot
+        // colour stays a colour until it is genuinely an order of magnitude
+        // over. See krHighlightRolloff.
+        ['rolloff', new THREE.Uniform(new THREE.Vector4(0.75, 0.30, 0.14, 40.0))],
       ]),
     });
   }
@@ -299,6 +360,7 @@ export class GradeEffect extends Effect {
   get grade(): THREE.Vector4 { return this.uniforms.get('grade')!.value; }
   get lens(): THREE.Vector4 { return this.uniforms.get('lens')!.value; }
   get rush(): THREE.Vector2 { return this.uniforms.get('rush')!.value; }
+  get subject(): THREE.Vector3 { return this.uniforms.get('subject')!.value; }
   get hold(): THREE.Vector2 { return this.uniforms.get('hold')!.value; }
   get prevViewProj(): THREE.Matrix4 { return this.uniforms.get('prevViewProj')!.value; }
   get invViewProj(): THREE.Matrix4 { return this.uniforms.get('invViewProj')!.value; }
@@ -313,6 +375,17 @@ const _dofTarget = new THREE.Vector3();
 /** How aggressively speedIntensity is allowed to move the lens, per tier. */
 const CA_REST = 0.0007;  // ~0.0004 uv of separation at the frame edge
 const CA_BOOST = 0.0032; // ~0.0018 uv at the frame edge
+
+/**
+ * Radius around the player kart's centre of mass, in metres, inside which the
+ * reprojection blur is switched off completely, and the radius at which it is
+ * fully back. See the hero hold-out block in GRADE_FRAGMENT for the sizing.
+ *
+ * These are world units, so they do not care how long the chase arm is, which
+ * is the entire reason this replaced a depth band.
+ */
+const SUBJECT_HOLD = 2.05;
+const SUBJECT_FADE = 3.40;
 
 export interface PostFXOptions {
   /** true when we detected a software rasteriser (headless capture / CI) */
@@ -535,18 +608,18 @@ export class PostFX {
 
     const player = ctx.race?.player;
 
-    // Keep the blur hold-out just outside the hero kart. The chase rig sits at
-    // ~10 m and the close rig at ~4 m, so a fixed pair of distances cannot work
-    // for both; tracking the actual subject distance does.
-    const subject = player !== undefined && player !== null
-      ? camera.position.distanceTo(player.position)
-      : 9;
+    // Park the hold-out sphere on the hero kart. Nothing here is derived from
+    // the camera: the arm length, the rig's pitch and the camera mode all move
+    // the kart around the frame and around the depth range, and none of them
+    // move it relative to itself.
     const hold = grade.hold;
-    // 1.30 clears the kart's own tail (it spans roughly 0.85–1.15 of the
-    // subject distance) with a bump's worth of margin; past 2.2 the world
-    // carries the full streak.
-    hold.x = subject * 1.30;
-    hold.y = subject * 2.20;
+    if (player !== undefined && player !== null) {
+      grade.subject.copy(player.position);
+      hold.set(SUBJECT_HOLD, SUBJECT_FADE);
+    } else {
+      // No subject to protect — release the mask and let the whole frame blur.
+      hold.set(-2, -1);
+    }
 
     if (this.dof !== null) {
       if (player !== undefined && player !== null) {

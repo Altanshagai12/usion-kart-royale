@@ -46,8 +46,26 @@ export const KERB_W = 1.6;
  * about as steep as a kart can cross at speed without the kerb turning into a
  * launch ramp.
  */
-export const KERB_QS = [0, 0.06, 0.20, 0.26, 0.34, 1.16, 1.30, 1.46, KERB_W];
-export const KERB_HS = [0, 0, 0.086, 0.112, 0.128, 0.128, 0.100, 0.012, -0.055];
+export const KERB_QS = [0, 0.06, 0.20, 0.26, 0.34, 0.62, 1.16, 1.30, 1.46, KERB_W];
+export const KERB_HS = [0, 0, 0.086, 0.112, 0.133, 0.131, 0.122, 0.100, 0.012, -0.055];
+
+/**
+ * Ripple ridden on the kerb crown: amplitude in metres, wavelength in metres.
+ *
+ * Both moved when the road narrowed. The kerb used to be 1.6 m of a 26 m road —
+ * 6% of the corridor, and comfortably sub-pixel at any distance, so nobody could
+ * see that the ripple was being sampled at almost exactly Nyquist (a 3.2 m
+ * wavelength against 1.5 m rings). At 1.6 m of a 13 m road it is 12% of the
+ * corridor and it is the second-brightest thing in most frames, so the aliasing
+ * that used to hide now reads as a crawling beat along the kerb.
+ *
+ * Fix is at both ends: `buildKerbs` halves its ring spacing to 1 m, and the
+ * wavelength goes to 4.2 m. 4.2 samples per period instead of 2.1 — comfortably
+ * clear of Nyquist — and the amplitude can go up 25% without the extra relief
+ * turning into fizz.
+ */
+export const KERB_RIPPLE_A = 0.020;
+export const KERB_RIPPLE_K = (2 * Math.PI) / 4.2;
 /** vertical offset the kerb band ends on, so the shoulder joins it cleanly */
 export const KERB_END = KERB_HS[KERB_HS.length - 1];
 /**
@@ -101,6 +119,62 @@ export const BRIDGE_T0 = 0.893;
 export const BRIDGE_T1 = 0.950;
 
 // ---------------------------------------------------------------------------
+//  Structure clearances, measured OUTWARD FROM THE ROAD EDGE (`halfWidth`).
+//
+//  Every one of these used to be a magic number sitting in TrackGeometry, which
+//  was survivable while the road was 26 m across because a metre either way
+//  disappeared into the acreage. It is not survivable now: the kerb corridor is
+//  1.6 m, and a parapet placed 1.9 m out has its inner face 1.28 m out — i.e.
+//  *inside* the corridor the physics is happily letting karts drive on. They
+//  live here so the wall table below, the collision offsets and the meshes are
+//  all derived from one number apiece.
+// ---------------------------------------------------------------------------
+/** Half-width the tunnel bore springs from: road edge + kerb + a reveal. */
+export const TUNNEL_CLEAR = KERB_W + 0.8;
+/** Crown height of the bore above the road plane. */
+export const TUNNEL_H = 7.6;
+/** Outer plane of the bridge parapet; its coping chamfers 0.62 m back inboard. */
+export const PARAPET_OFF = KERB_W + 0.70;
+/** Inboard face of that parapet — what a kart actually hits. */
+export const PARAPET_FACE = PARAPET_OFF - 0.62;
+/** Deck fascia / spandrel wall, just outboard of the parapet. */
+export const FASCIA_OFF = PARAPET_OFF + 0.12;
+
+// ---------------------------------------------------------------------------
+//  The standing grid.
+//
+//  Authored once, here, because three places need to agree about it exactly:
+//  `Track.buildStartGrid` (where the karts stand), `buildMarkings` (the painted
+//  slot boxes) and the start-line checker (which scrubs its paint thin in the
+//  two launch corridors). Round 3 had the numbers copy-pasted into all three,
+//  and the lateral offset was additionally clamped against the road width, so
+//  narrowing the road silently walked the karts off their own painted boxes.
+//
+//  A kart is ~1.7 m across the tyres and ~2.1 m long. ±3.2 m puts 1.8 m of
+//  clear air between the two cars of a row and leaves 3.6 m from the outer tyre
+//  to the kerb on an 8.8 m half-width start straight — close enough that eight
+//  karts read as a *pack* rather than as a car park, which was the point.
+// ---------------------------------------------------------------------------
+export const GRID_LAT = 3.2;
+/** metres between rows, and how far the outside car of each row is set back */
+export const GRID_ROW_DS = 8.0;
+export const GRID_STAGGER = 4.0;
+/** pole position's distance behind the start line */
+export const GRID_BACK0 = 11;
+/** painted slot box: half-length and half-width, metres */
+export const GRID_BOX_HL = 1.7;
+export const GRID_BOX_HW = 1.25;
+
+/** Slot `k` of the grid; index 0 is pole. Distance is *behind* the line. */
+export function gridSlot(k: number): { back: number; lat: number } {
+  const row = k >> 1, col = k & 1;
+  return {
+    back: GRID_BACK0 + row * GRID_ROW_DS + col * GRID_STAGGER,
+    lat: (col === 0 ? -1 : 1) * GRID_LAT,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // The leg table.  [length metres, heading change degrees]  (negative = left)
 // ---------------------------------------------------------------------------
 const LEGS: [number, number][] = [
@@ -141,12 +215,62 @@ const ELEVATION: Keys = [
   [0.982, 4.6], [0.995, 3.15],
 ];
 
+/**
+ * Road half-width, metres.
+ *
+ * ===========================================================================
+ *  THE SINGLE MOST IMPORTANT TABLE IN THE FILE. Read the reasoning before
+ *  touching a number in it.
+ * ===========================================================================
+ *
+ * Rounds 1–3 ran 13 m half-width — a 26 m road. A kart is 1.7 m across the
+ * tyres, so that is *fifteen karts abreast*. The consequences were visible in
+ * every frame shipped and were reported by the composition critic three times:
+ *
+ *   • a third to a half of the image was empty featureless asphalt,
+ *   • the player's kart was a speck and the hero asset could not be read,
+ *   • an eight-kart field spread across 26 m never bunches, so nothing about
+ *     the frame said "race",
+ *   • and everything Scenery places is anchored at `halfWidth + offset`, so a
+ *     26 m road physically pushed the entire world 13 m further out on each
+ *     side and left the road bounded by void.
+ *
+ * The fix is not a tweak. A Mario Kart road is four to five karts wide — wide
+ * enough for a pack of four abreast plus a passing line, and no wider. That is
+ * 7–8 m of half-width, going to ~9 only where the layout genuinely needs room
+ * (the standing start, and the 20° banked 180 where the whole field takes a
+ * different line), and down to 5.4 on the cliff ledge where narrow *is* the
+ * drama.
+ *
+ * Every consumer of this number scales off it rather than duplicating it —
+ * `race` (the ideal line), `planRoadLats`, the kerb corridor, the skirt, the
+ * barrier offsets, the tunnel bore, the bridge parapets, the AI's lateral
+ * targets, item-box rows, and roughly sixty scenery anchors. So this table
+ * moves the world, which is the entire point of it living here.
+ *
+ * Interpolated with `cyclicMonotone`, not `cyclic`: see the note there. An
+ * overshooting spline on this channel is a width bulge or pinch that no
+ * keyframe asked for, and at these amplitudes it is visible.
+ */
 const HALF_WIDTH: Keys = [
-  [0.000, 13.0], [0.080, 12.6], [0.160, 12.0], [0.220, 10.6],
-  [0.300, 9.6], [0.360, 9.0], [0.400, 8.0], [0.460, 7.4],
-  [0.520, 8.6], [0.560, 9.0], [0.620, 11.0], [0.700, 12.4],
-  [0.760, 13.0], [0.820, 13.0], [0.880, 10.2], [0.930, 10.0],
-  [0.970, 12.0],
+  [0.000, 8.8],   // start straight — the pack launches eight-up, needs the room
+  [0.070, 8.6],
+  [0.140, 8.1],   // harbour sweep, tightening
+  [0.210, 7.5],
+  [0.270, 7.0],   // village: terraced houses press in on both sides
+  [0.330, 6.8],
+  [0.380, 6.4],   // cliff traverse begins
+  [0.440, 5.7],
+  [0.480, 5.4],   // narrowest point of the circuit — 10.8 m of ledge
+  [0.521, 5.9],   // tunnel mouth opens back out a little
+  [0.560, 6.3],
+  [0.620, 6.9],   // beach descent, fast, opening
+  [0.700, 7.6],
+  [0.760, 8.8],   // banked coastal 180 — the money shot, and a real passing lane
+  [0.830, 8.7],
+  [0.880, 7.2],   // bridge approach pinches
+  [0.930, 7.0],   // bridge deck, between the parapets
+  [0.968, 8.2],   // back onto the harbour front
 ];
 
 /** degrees; positive = right side raised (types.ts convention) */
@@ -195,33 +319,48 @@ interface ZoneDef {
   kerb: number;
 }
 
+/**
+ * Wall offsets are metres OUTBOARD OF THE ROAD EDGE, and they moved with the
+ * width cut. They used to sit at 4.0–4.5 m, i.e. 2.4–2.9 m of bare shoulder
+ * between the outside of the kerb and the barrier. On a 26 m road that gap was
+ * 9% of the corridor and invisible; on a 15 m road it is a fifth of it, and a
+ * barrier standing that far back from a narrow road reads as fencing round a
+ * field rather than as the edge of a circuit.
+ *
+ * 2.7–3.6 m puts the Armco 1.1–2.0 m outboard of the kerb: close enough to
+ * frame the road and give the low sun something to cast along, far enough that
+ * a kart that has run wide onto the shoulder still gets a moment to gather it
+ * up before the barrier collects them.
+ */
 export const ZONES: ZoneDef[] = [
   { t0: 0.000, fade: 0.016, name: 'start',
-    nearL: [0, -0.4, 1.6], farL: 16, farDL: 110, rockL: 0.1, shoulderL: 7, surfL: Surface.Grass, wallL: WALL_GUARDRAIL, wallOffL: 4.0,
-    nearR: [-0.4, -1.6, -3.4], farR: -6, farDR: 60, rockR: 0.25, shoulderR: 7, surfR: Surface.Dirt, wallR: WALL_GUARDRAIL, wallOffR: 4.2,
+    nearL: [0, -0.4, 1.6], farL: 16, farDL: 110, rockL: 0.1, shoulderL: 7, surfL: Surface.Grass, wallL: WALL_GUARDRAIL, wallOffL: 3.4,
+    nearR: [-0.4, -1.6, -3.4], farR: -6, farDR: 60, rockR: 0.25, shoulderR: 7, surfR: Surface.Dirt, wallR: WALL_GUARDRAIL, wallOffR: 3.6,
     cobble: 0, kerb: 1 },
   { t0: 0.100, fade: 0.016, name: 'harbour',
-    nearL: [0, -0.4, 2.0], farL: 22, farDL: 130, rockL: 0.12, shoulderL: 7, surfL: Surface.Grass, wallL: WALL_GUARDRAIL, wallOffL: 4.0,
-    nearR: [-0.4, -1.8, -3.6], farR: -6, farDR: 50, rockR: 0.3, shoulderR: 5, surfR: Surface.Dirt, wallR: WALL_GUARDRAIL, wallOffR: 3.2,
+    nearL: [0, -0.4, 2.0], farL: 22, farDL: 130, rockL: 0.12, shoulderL: 7, surfL: Surface.Grass, wallL: WALL_GUARDRAIL, wallOffL: 3.4,
+    nearR: [-0.4, -1.8, -3.6], farR: -6, farDR: 50, rockR: 0.3, shoulderR: 5, surfR: Surface.Dirt, wallR: WALL_GUARDRAIL, wallOffR: 2.9,
     cobble: 0, kerb: 1 },
   { t0: 0.220, fade: 0.020, name: 'village',
-    nearL: [0, -0.5, 2.6], farL: 34, farDL: 120, rockL: 0.2, shoulderL: 5, surfL: Surface.Dirt, wallL: WALL_GUARDRAIL, wallOffL: 3.0,
-    nearR: [-0.3, -1.4, -4.0], farR: -6, farDR: 130, rockR: 0.3, shoulderR: 5, surfR: Surface.Dirt, wallR: WALL_GUARDRAIL, wallOffR: 3.0,
+    nearL: [0, -0.5, 2.6], farL: 34, farDL: 120, rockL: 0.2, shoulderL: 5, surfL: Surface.Dirt, wallL: WALL_GUARDRAIL, wallOffL: 2.7,
+    nearR: [-0.3, -1.4, -4.0], farR: -6, farDR: 130, rockR: 0.3, shoulderR: 5, surfR: Surface.Dirt, wallR: WALL_GUARDRAIL, wallOffR: 2.7,
     cobble: 1, kerb: 1 },
   { t0: 0.380, fade: 0.014, name: 'cliff',
-    nearL: [0, 1.6, 14], farL: 64, farDL: 100, rockL: 0.95, shoulderL: 6, surfL: Surface.Dirt, wallL: WALL_ROCK, wallOffL: 3.4,
+    nearL: [0, 1.6, 14], farL: 64, farDL: 100, rockL: 0.95, shoulderL: 6, surfL: Surface.Dirt, wallL: WALL_ROCK, wallOffL: 2.9,
     nearR: [-1.4, -9, -32], farR: -7, farDR: 38, rockR: 0.95, shoulderR: 1.5, surfR: Surface.Dirt, wallR: WALL_NONE, wallOffR: 0,
     cobble: 0, kerb: 1 },
   { t0: 0.521, fade: 0.013, name: 'tunnel',
-    nearL: [0, 2.6, 15], farL: 54, farDL: 90, rockL: 1, shoulderL: 3, surfL: Surface.Dirt, wallL: WALL_ROCK, wallOffL: 2.2,
-    nearR: [0, 1.0, 10], farR: 40, farDR: 90, rockR: 1, shoulderR: 3, surfR: Surface.Dirt, wallR: WALL_ROCK, wallOffR: 2.2,
+    // 0.15 m inboard of the bore wall, so the collision catches a kart before
+    // the camera can see it kiss the rock rather than 1.4 m early as before
+    nearL: [0, 2.6, 15], farL: 54, farDL: 90, rockL: 1, shoulderL: 3, surfL: Surface.Dirt, wallL: WALL_ROCK, wallOffL: TUNNEL_CLEAR - 0.15,
+    nearR: [0, 1.0, 10], farR: 40, farDR: 90, rockR: 1, shoulderR: 3, surfR: Surface.Dirt, wallR: WALL_ROCK, wallOffR: TUNNEL_CLEAR - 0.15,
     cobble: 0, kerb: 1 },
   { t0: 0.600, fade: 0.024, name: 'beach',
     nearL: [0, -0.5, 1.5], farL: 26, farDL: 130, rockL: 0.35, shoulderL: 8, surfL: Surface.Grass, wallL: WALL_NONE, wallOffL: 0,
     nearR: [-0.4, -1.6, -3.0], farR: -6, farDR: 90, rockR: 0.05, shoulderR: 12, surfR: Surface.Sand, wallR: WALL_NONE, wallOffR: 0,
     cobble: 0, kerb: 1 },
   { t0: 0.740, fade: 0.016, name: 'banked',
-    nearL: [0, -0.4, 2.5], farL: 34, farDL: 140, rockL: 0.3, shoulderL: 8, surfL: Surface.Grass, wallL: WALL_GUARDRAIL, wallOffL: 4.5,
+    nearL: [0, -0.4, 2.5], farL: 34, farDL: 140, rockL: 0.3, shoulderL: 8, surfL: Surface.Grass, wallL: WALL_GUARDRAIL, wallOffL: 3.6,
     nearR: [-1.0, -4.5, -15], farR: -7, farDR: 46, rockR: 0.55, shoulderR: 10, surfR: Surface.Sand, wallR: WALL_NONE, wallOffR: 0,
     cobble: 0, kerb: 1 },
   { t0: 0.860, fade: 0.012, name: 'approach',
@@ -229,22 +368,35 @@ export const ZONES: ZoneDef[] = [
     nearR: [-0.5, -2.0, -6], farR: -7, farDR: 90, rockR: 0.45, shoulderR: 7, surfR: Surface.Grass, wallR: WALL_NONE, wallOffR: 0,
     cobble: 0, kerb: 1 },
   { t0: 0.893, fade: 0.006, name: 'bridge',
-    nearL: [-1.5, -9, -20], farL: -6, farDL: 46, rockL: 0.8, shoulderL: 0.6, surfL: Surface.Dirt, wallL: WALL_PARAPET, wallOffL: 1.7,
-    nearR: [-1.5, -9, -20], farR: -6, farDR: 46, rockR: 0.8, shoulderR: 0.6, surfR: Surface.Dirt, wallR: WALL_PARAPET, wallOffR: 1.7,
+    // PARAPET_FACE, not a hand-typed 1.7: the old number put the collision
+    // plane 0.4 m OUTBOARD of the stone the kart can see, so on a narrow deck
+    // karts visibly buried a corner in the parapet before anything stopped them
+    nearL: [-1.5, -9, -20], farL: -6, farDL: 46, rockL: 0.8, shoulderL: 0.6, surfL: Surface.Dirt, wallL: WALL_PARAPET, wallOffL: PARAPET_FACE,
+    nearR: [-1.5, -9, -20], farR: -6, farDR: 46, rockR: 0.8, shoulderR: 0.6, surfR: Surface.Dirt, wallR: WALL_PARAPET, wallOffR: PARAPET_FACE,
     cobble: 0.55, kerb: 0 },
   { t0: 0.950, fade: 0.008, name: 'return',
-    nearL: [0, -0.4, 1.4], farL: 18, farDL: 120, rockL: 0.15, shoulderL: 7, surfL: Surface.Grass, wallL: WALL_GUARDRAIL, wallOffL: 4.0,
-    nearR: [-0.4, -1.8, -4.0], farR: -6, farDR: 80, rockR: 0.25, shoulderR: 7, surfR: Surface.Grass, wallR: WALL_GUARDRAIL, wallOffR: 4.0,
+    nearL: [0, -0.4, 1.4], farL: 18, farDL: 120, rockL: 0.15, shoulderL: 7, surfL: Surface.Grass, wallL: WALL_GUARDRAIL, wallOffL: 3.4,
+    nearR: [-0.4, -1.8, -4.0], farR: -6, farDR: 80, rockR: 0.25, shoulderR: 7, surfR: Surface.Grass, wallR: WALL_GUARDRAIL, wallOffR: 3.4,
     cobble: 0, kerb: 1 },
 ];
 
-/** Boost strips: tunnel pair, tunnel centre, and the run out of the bridge. */
+/**
+ * Boost strips: tunnel pair, tunnel centre, and the run out of the bridge.
+ *
+ * Every one of these was authored against a 26 m road. The tunnel pair sat at
+ * ±4.6 with a 2.9 m half-width, so its outer edge was 7.5 m from the centreline
+ * — a metre *past* the road edge on the 6.1 m half-width the tunnel now runs.
+ * A boost pad hanging over the kerb is both a rendering fault and a gameplay
+ * one, because `probe()` reports `Surface.Boost` out there whatever the mesh is
+ * doing. Retuned so every strip stays inside `halfWidth − 1.0` at its narrowest
+ * station, which is the edge line.
+ */
 export const BOOST_PADS: { t0: number; t1: number; lat: number; hw: number }[] = [
-  { t0: 0.5380, t1: 0.5555, lat: -4.6, hw: 2.9 },
-  { t0: 0.5380, t1: 0.5555, lat: 4.6, hw: 2.9 },
-  { t0: 0.5720, t1: 0.5895, lat: 0.0, hw: 3.4 },
-  { t0: 0.9575, t1: 0.9740, lat: -3.6, hw: 2.9 },
-  { t0: 0.9575, t1: 0.9740, lat: 3.6, hw: 2.9 },
+  { t0: 0.5380, t1: 0.5555, lat: -2.9, hw: 1.9 },
+  { t0: 0.5380, t1: 0.5555, lat: 2.9, hw: 1.9 },
+  { t0: 0.5720, t1: 0.5895, lat: 0.0, hw: 2.6 },
+  { t0: 0.9575, t1: 0.9740, lat: -3.1, hw: 2.2 },
+  { t0: 0.9575, t1: 0.9740, lat: 3.1, hw: 2.2 },
 ];
 
 // ---------------------------------------------------------------------------
@@ -269,6 +421,51 @@ function cyclic(keys: Keys, t: number): number {
   const u2 = u * u, u3 = u2 * u;
   return (2 * u3 - 3 * u2 + 1) * k1[1] + (u3 - 2 * u2 + u) * m1
        + (-2 * u3 + 3 * u2) * k2[1] + (u3 - u2) * m2;
+}
+
+/**
+ * Cyclic **monotone** cubic Hermite (Fritsch–Carlson) over keyframes.
+ *
+ * Catmull-Rom is the right interpolant for elevation and banking: it wants to
+ * overshoot slightly, and that overshoot is what turns a keyed crest into a
+ * crest with a shoulder on it. It is the wrong interpolant for road width.
+ *
+ * A tangent taken from the neighbours can send the curve *outside* the interval
+ * its two keys bracket, which on this channel means a stretch of road that is
+ * wider than either keyframe asked for — a bulge — or narrower, a pinch. On the
+ * cliff traverse, where the schedule falls 6.4 → 5.7 → 5.4 in quick succession,
+ * plain Catmull-Rom undershoots 5.4 by around 15 cm and then comes back, so the
+ * ledge has a waist in it that nobody authored and that the kerbs, the edge
+ * lines, the skirt and the barriers all faithfully reproduce.
+ *
+ * Fritsch–Carlson zeroes the tangent at every local extremum and takes the
+ * harmonic mean of the two secants elsewhere. The result is still C1 — no
+ * crease, nothing to snap as the player drives through it — but the curve is
+ * confined to the box its keys bracket, so the width the table says is the
+ * width the road is.
+ */
+function cyclicMonotone(keys: Keys, t: number): number {
+  const n = keys.length;
+  t -= Math.floor(t);
+  let i = n - 1;
+  for (let k = 0; k < n; k++) if (keys[k][0] <= t) i = k; else break;
+  const k0 = keys[(i - 1 + n) % n], k1 = keys[i], k2 = keys[(i + 1) % n], k3 = keys[(i + 2) % n];
+  let x0 = k0[0], x1 = k1[0], x2 = k2[0], x3 = k3[0];
+  if (x1 > t) x1 -= 1;
+  while (x0 > x1) x0 -= 1;
+  while (x2 < x1) x2 += 1;
+  while (x3 < x2) x3 += 1;
+  const h = x2 - x1;
+  const d0 = (k1[1] - k0[1]) / (x1 - x0);
+  const d1 = (k2[1] - k1[1]) / h;
+  const d2 = (k3[1] - k2[1]) / (x3 - x2);
+  // harmonic mean of the bracketing secants; zero wherever they disagree in
+  // sign, which is exactly the condition for a local extremum
+  const hm = (a: number, b: number) => (a * b <= 0 ? 0 : (2 * a * b) / (a + b));
+  const m1 = hm(d0, d1), m2 = hm(d1, d2);
+  const u = (t - x1) / h, u2 = u * u, u3 = u2 * u;
+  return (2 * u3 - 3 * u2 + 1) * k1[1] + (u3 - 2 * u2 + u) * h * m1
+       + (-2 * u3 + 3 * u2) * k2[1] + (u3 - u2) * h * m2;
 }
 
 // ---------------------------------------------------------------------------
@@ -467,7 +664,7 @@ export function buildCenterline(): Centerline {
   // ---- widths, banking, banked frame, curvature --------------------------
   for (let i = 0; i < count; i++) {
     const t = i / count;
-    cl.half[i] = cyclic(HALF_WIDTH, t);
+    cl.half[i] = cyclicMonotone(HALF_WIDTH, t);
     const b = cyclic(BANK, t) * THREE.MathUtils.DEG2RAD;
     cl.bank[i] = b;
 

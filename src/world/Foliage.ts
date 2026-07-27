@@ -511,6 +511,63 @@ export class Foliage {
     if (scale > 0.9) this.shadows.push({ p: p.clone(), r: 0.9 * scale, t });
   }
 
+  // -------------------------------------------------------------------------
+  // The 40–150 m band
+  // -------------------------------------------------------------------------
+  //
+  // Everything above is authored for the near field and LODs out between 45 and
+  // 130 m, which is correct for what it is and is also exactly why the 40–150 m
+  // band was the emptiest part of every frame: the near planting had already
+  // collapsed and the backdrop had not started. These three fill it.
+  //
+  // All of them ride the EXISTING instance sets — the same shrub mesh, the same
+  // cypress mesh, the same draw call — with a far LOD cut and a distance-
+  // appropriate tint. A terraced grove at 90 m therefore costs zero additional
+  // draw calls, which is the only reason it can exist inside a 250-call budget
+  // that was already at ~200.
+
+  /**
+   * An olive: a low silver-green dome. No trunk, deliberately — at 60 m a 1.5 m
+   * olive trunk under a 4 m canopy is two pixels of aliasing, and the thing that
+   * makes a grove read at that distance is the canopy VALUE (olives are the
+   * palest green in a Mediterranean landscape and they catch a low sun as a
+   * distinct silver band) and the row spacing, not the anatomy.
+   */
+  olive(p: THREE.Vector3, scale: number, yaw: number) {
+    const rng = this.rng;
+    this.shrub.add(
+      _mat.compose(p, _quat.setFromEuler(_euler.set(0, yaw, 0, 'YXZ')), _scl.set(scale * (1.0 + rng() * 0.35), scale * (0.78 + rng() * 0.3), scale * (1.0 + rng() * 0.35))).clone(),
+      {
+        wind: new THREE.Vector4(rng() * 100, 1.25, 0, 0.4),
+        lod: 340,
+        color: _col.setHSL(0.19 + rng() * 0.03, 0.13 + rng() * 0.07, 0.70 + rng() * 0.12).clone(),
+      }
+    );
+  }
+
+  /** A vine row segment: wide, low and flat, so a run of them reads as combing. */
+  vine(p: THREE.Vector3, scale: number, yaw: number) {
+    const rng = this.rng;
+    this.shrub.add(_mat.compose(p, _quat.setFromEuler(_euler.set(0, yaw, 0, 'YXZ')), _scl.set(scale * 1.9, scale * 0.55, scale * 0.62)).clone(), {
+      wind: new THREE.Vector4(rng() * 100, 1.2, 0, 0.35),
+      lod: 240,
+      color: _col.setHSL(0.24 + rng() * 0.03, 0.19 + rng() * 0.09, 0.50 + rng() * 0.12).clone(),
+    });
+  }
+
+  /** A cypress that survives to the backdrop — the midground's vertical accent. */
+  cypFar(p: THREE.Vector3, scale: number, yaw: number) {
+    const rng = this.rng;
+    this.cypress.add(
+      _mat.compose(p, _quat.setFromEuler(_euler.set(0, yaw, 0, 'YXZ')), _scl.set(scale * (0.8 + rng() * 0.25), scale, scale * (0.8 + rng() * 0.25))).clone(),
+      {
+        wind: new THREE.Vector4(rng() * 100, 1.95, 0, 0.2),
+        lod: 360,
+        color: _col.setHSL(0.26 + rng() * 0.03, 0.13 + rng() * 0.10, 0.44 + rng() * 0.14).clone(),
+      }
+    );
+  }
+
   /**
    * A hero grass clump for the 12 m band either side of the road.
    *

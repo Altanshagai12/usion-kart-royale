@@ -16,11 +16,20 @@ import { createNoise2D } from 'simplex-noise';
  *  constant gravity), which gives believable terminal velocity for smoke and
  *  debris alike from a single `exp()` — no per-frame integration, no drift.
  *
- *  Soft particles: the alpha layer fades where it would intersect geometry.
- *  If the render pipeline publishes a depth texture (see `setDepthTexture`)
- *  we do a proper depth comparison; we ALWAYS additionally fade against the
- *  emitter's ground plane, which is what stops dust and smoke from slicing a
- *  hard line through the tarmac even with no depth buffer available.
+ *  Soft particles, three independent mechanisms, none of which needs the
+ *  render pipeline's cooperation:
+ *
+ *    1. A real ground-PLANE fade. Every emitter hands us the surface under it
+ *       from `ctx.track.probe` — height *and* normal — and the fragment shader
+ *       fades on the signed distance to that plane. Correct through banking.
+ *    2. A camera-facing bias: the sprite centre is nudged toward the eye by up
+ *       to a few tens of centimetres before billboarding, so it simply stops
+ *       intersecting the surface it was about to cut.
+ *    3. Soft-edged tiles: no sprite in the atlas reaches full alpha anywhere
+ *       except a pinpoint core, so there is no hard silhouette to reveal.
+ *
+ *  If the pipeline ever does publish a depth texture (see `setDepthTexture`)
+ *  a proper depth comparison stacks on top of all three.
  * ============================================================================
  */
 
@@ -79,13 +88,27 @@ export interface EmitParams {
   fadeIn: number;
   /** world Y of the surface this particle should not cut through */
   groundY: number;
+  /**
+   * Unit normal of that surface. The soft fade is a real plane test, not a
+   * height test: on the 20-degree banked coastal curve a horizontal-plane fade
+   * is out by two thirds of a metre across a 2 m puff, which is exactly the
+   * width of the hard intersection line craft keeps flagging.
+   */
+  gnx: number; gny: number; gnz: number;
   /** metres of soft-fade depth. 0 disables both soft tests. */
   softness: number;
+  /**
+   * Metres to pull the sprite toward the camera before it is billboarded.
+   * The cheapest half of "soft particles": a quad biased 0.2–0.4 m toward the
+   * eye simply stops intersecting the thing it was about to slice through, and
+   * at these sizes the parallax error is invisible.
+   */
+  camBias: number;
   count: number;
 }
 
-// 7 x vec4 — kept at exactly 28 floats so every attribute is vec4-aligned.
-const STRIDE = 28;
+// 8 x vec4 — kept at exactly 32 floats so every attribute is vec4-aligned.
+const STRIDE = 32;
 
 // ---------------------------------------------------------------------------
 // Procedural atlas
@@ -202,15 +225,23 @@ function particleTiles(): TileFn[] {
     //     exactly the "blue confetti" the drift sparks were reading as. A
     //     gaussian flare band and a wide power-law halo survive minification —
     //     the sprite just gets softer as it shrinks instead of harder.
+    //
+    //     Round 4: the profile is now dominated by *falloff*. The previous
+    //     `core + 0.34*halo` reached alpha 1 by 40% of the radius, so with an
+    //     additively-authored colour the whole inner disc saturated and the
+    //     sprite arrived as a hard-edged chip — the torn-purple-confetti read on
+    //     the tier-2 drift frame. A tight gaussian core riding a long power-law
+    //     skirt spends almost all of its area below the clip point, which is
+    //     what makes a spark look like a spark instead of a decal.
     (u, v, o) => {
       const x = (u - 0.5) * 2, y = (v - 0.5) * 2;
       const d = Math.hypot(x, y);
       const f = Math.max(0, 1 - d);
-      const core = Math.pow(f, 5.5);
-      const halo = 0.34 * Math.pow(f, 1.6);
-      const fall = Math.pow(f, 2.8);
-      const flare = Math.exp(-y * y * 26) + Math.exp(-x * x * 26);
-      const a = core + halo + 0.40 * fall * flare;
+      const core = Math.exp(-d * d * 34);
+      const halo = 0.16 * Math.pow(f, 2.2);
+      const fall = Math.pow(f, 3.2);
+      const flare = Math.exp(-y * y * 18) + Math.exp(-x * x * 18);
+      const a = core + halo + 0.22 * fall * flare;
       // slightly warm core so additive stacking does not read as dead white
       o[0] = 1; o[1] = 0.97; o[2] = 0.93; o[3] = Math.min(1, a) * border(u, v);
     },
@@ -254,14 +285,22 @@ function particleTiles(): TileFn[] {
       o[2] = 0.04 + 0.56 * c * c;
       o[3] = a * border(u, v);
     },
-    // 4 — Star: five points with a soft halo.
+    // 4 — Star: a four-point sparkle, authored as *light* rather than as a
+    //     shape. The old five-lobed disc had a filled body with a hard rim: at
+    //     twenty pixels across it read as a white flower petal pasted over the
+    //     kart, which is what the closeup frame was showing beside the driver.
+    //     Two crossed gaussian bars plus a bright pinpoint and a wide skirt
+    //     minify into a soft twinkle instead of a solid glyph.
     (u, v, o) => {
       const x = (u - 0.5) * 2, y = (v - 0.5) * 2;
       const r = Math.hypot(x, y);
-      const ang = Math.atan2(y, x) + Math.PI / 2;
-      const shape = 0.30 + 0.52 * Math.pow(Math.abs(Math.cos(ang * 2.5)), 0.62);
-      let a = 1 - sstep(shape * 0.68, shape, r);
-      a = Math.min(1, a + 0.28 * Math.pow(Math.max(0, 1 - r), 3.2));
+      const fade = Math.max(0, 1 - r);
+      const bar = Math.exp(-y * y * 150) * Math.exp(-x * x * 1.6)
+        + Math.exp(-x * x * 150) * Math.exp(-y * y * 1.6);
+      const dia = 0.42 * (Math.exp(-(x - y) * (x - y) * 220) + Math.exp(-(x + y) * (x + y) * 220))
+        * Math.exp(-r * r * 2.4);
+      const point = Math.exp(-r * r * 90);
+      const a = Math.min(1, (0.62 * bar + dia) * Math.pow(fade, 1.4) + point + 0.10 * Math.pow(fade, 3.0));
       o[0] = 1; o[1] = 0.985; o[2] = 0.95; o[3] = a * border(u, v);
     },
     // 5 — Streak: soft capsule along +v, for stretched sparks and debris. A
@@ -319,13 +358,15 @@ attribute vec4 aSize;   // x size0, y size1, z stretch, w fadeIn
 attribute vec4 aColA;   // rgb at birth, a alpha at birth
 attribute vec4 aColB;   // rgb at death, a alpha at death
 attribute vec4 aMisc;   // x tile, y seed, z groundY, w softness
+attribute vec4 aGrnd;   // xyz ground normal, w camera bias in metres
 
 varying vec4 vColor;
 varying vec2 vUv;
 varying vec2 vSprite;
 varying vec3 vWorld;
 varying float vViewZ;
-varying float vGroundY;
+/** xyz ground-plane normal, w = -dot(normal, pointOnPlane) */
+varying vec4 vPlane;
 varying float vSoft;
 varying float vNear;
 varying float vHot;
@@ -340,7 +381,8 @@ void main() {
   // buffer stay a fixed-size, allocation-free draw.
   if (age < 0.0 || u >= 1.0) {
     vColor = vec4(0.0); vUv = vec2(0.0); vSprite = vec2(0.0);
-    vWorld = vec3(0.0); vViewZ = 1.0; vGroundY = 0.0; vSoft = 0.0; vNear = 0.0;
+    vWorld = vec3(0.0); vViewZ = 1.0; vPlane = vec4(0.0, 1.0, 0.0, 0.0);
+    vSoft = 0.0; vNear = 0.0;
     vHot = 0.0;
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
     return;
@@ -360,6 +402,24 @@ void main() {
   vec3 g = vec3(0.0, aDyn.x, 0.0);
   vec3 gk = g / k;
   vec3 wp = aStart.xyz + (aVel.xyz + gk) * (1.0 - decay) / k - gk * age;
+
+  // The ground plane this particle must not cut through, captured at spawn from
+  // ctx.track.probe. Encoded as a plane equation so the fragment shader gets a
+  // true signed distance and the fade follows the banking of the road.
+  vec3 gN = aGrnd.xyz;
+  float gl2 = dot(gN, gN);
+  gN = gl2 > 1e-6 ? gN * inversesqrt(gl2) : vec3(0.0, 1.0, 0.0);
+  vPlane = vec4(gN, -dot(gN, vec3(aStart.x, aMisc.z, aStart.z)));
+
+  // Camera-facing bias. Applied to the particle CENTRE, before billboarding, so
+  // the whole quad shifts rigidly and the bias cannot swim across the sprite.
+  // Clamped to a fraction of the distance to the eye so a particle spawned on
+  // top of the lens is not shoved through it.
+  vec3 toCam = cameraPosition - wp;
+  float toCamLen = length(toCam);
+  if (aGrnd.w > 0.0 && toCamLen > 1e-4) {
+    wp += (toCam / toCamLen) * min(aGrnd.w, toCamLen * 0.35);
+  }
 
   float sz = mix(aSize.x, aSize.y, u);
   float alpha = mix(aColA.a, aColB.a, u) * smoothstep(0.0, max(aSize.w, 1e-4), u);
@@ -424,7 +484,6 @@ void main() {
   vec4 mv = viewMatrix * vec4(vert, 1.0);
   vViewZ = -mv.z;
   vWorld = vert;
-  vGroundY = aMisc.z;
   vSoft = aMisc.w;
   vSprite = position.xy * 2.0;
   // Lens fade. Nothing should be legible in the first metre in front of the
@@ -444,6 +503,17 @@ void main() {
 const FRAG = /* glsl */ `
 uniform sampler2D uAtlas;
 uniform float uGain;
+/**
+ * Per-fragment additive shoulder. Additive effects must ADD to a scene, not
+ * replace it: without a bound, ten overlapping spark cores authored at 3x a
+ * saturated primary put 30 units of radiance through one pixel and the tone
+ * mapper has nothing left to do but return white. rgb / (1 + rgb * uClip)
+ * is a Reinhard shoulder applied to the *emission*, so a lone core still
+ * clears the 2.0 bloom threshold and a pile of them asymptotes just above it
+ * instead of running away. Cheap, monotonic, and it never dims a single
+ * particle enough to notice.
+ */
+uniform float uClip;
 #ifdef LIT
 uniform vec3 uSunDir;      // direction TOWARD the sun
 uniform vec3 uSunColor;
@@ -461,7 +531,7 @@ varying vec2 vUv;
 varying vec2 vSprite;
 varying vec3 vWorld;
 varying float vViewZ;
-varying float vGroundY;
+varying vec4 vPlane;
 varying float vSoft;
 varying float vNear;
 varying float vHot;
@@ -523,13 +593,20 @@ void main() {
     soft *= clamp((sceneZ - vViewZ) / vSoft, 0.0, 1.0);
 #endif
     // Ground-plane fade. Cheap, always on, and on its own it already removes
-    // the hard intersection line where a billboard sinks into the tarmac.
-    soft *= smoothstep(-0.28 * vSoft, vSoft * 0.85, vWorld.y - vGroundY);
+    // the hard intersection line where a billboard sinks into the tarmac. The
+    // plane carries the surface normal from ctx.track.probe, so this stays
+    // correct through 20 degrees of banking and over the cliff camber.
+    float h = dot(vPlane.xyz, vWorld) + vPlane.w;
+    soft *= smoothstep(-0.30 * vSoft, vSoft * 0.85, h);
   }
   a *= soft;
   if (a < 0.004) discard;
 
-  gl_FragColor = vec4(rgb * uGain, a);
+  rgb *= uGain;
+#ifdef ADDITIVE
+  rgb = rgb / (1.0 + rgb * uClip);
+#endif
+  gl_FragColor = vec4(rgb, a);
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
 }
@@ -570,7 +647,7 @@ class Layer {
     this.data = new Float32Array(capacity * STRIDE);
     this.buffer = new THREE.InstancedInterleavedBuffer(this.data, STRIDE, 1);
     this.buffer.setUsage(THREE.DynamicDrawUsage);
-    const names = ['aStart', 'aVel', 'aDyn', 'aSize', 'aColA', 'aColB', 'aMisc'];
+    const names = ['aStart', 'aVel', 'aDyn', 'aSize', 'aColA', 'aColB', 'aMisc', 'aGrnd'];
     for (let i = 0; i < names.length; i++) {
       this.geo.setAttribute(names[i], new THREE.InterleavedBufferAttribute(this.buffer, 4, i * 4));
     }
@@ -582,6 +659,7 @@ class Layer {
         uAtlas: { value: atlas },
         uAtlasTiles: { value: new THREE.Vector2(4, 2) },
         uGain: { value: 1 },
+        uClip: { value: additive ? 0.19 : 0.0 },
         // 0.40 of viewport height. Big enough for an explosion fireball to feel
         // enormous, small enough that no single sprite can ever become the
         // frame — which is what the boost plume was doing into the chase cam.
@@ -660,6 +738,9 @@ class Layer {
     d[o + 26] = p.groundY;
     d[o + 27] = p.softness;
 
+    d[o + 28] = p.gnx; d[o + 29] = p.gny; d[o + 30] = p.gnz;
+    d[o + 31] = p.camBias;
+
     const until = now + life;
     if (until > this.liveUntil) this.liveUntil = until;
   }
@@ -729,7 +810,7 @@ export class Particles {
     r1: 1, g1: 1, b1: 1, a1: 0,
     gravity: 0, drag: 1, spin: 0,
     tile: PTile.Glow, mode: PMode.Billboard, stretch: 0, fadeIn: 0.08,
-    groundY: -1e4, softness: 0, count: 1,
+    groundY: -1e4, gnx: 0, gny: 1, gnz: 0, softness: 0, camBias: 0, count: 1,
   };
 
   constructor(additiveCapacity: number, alphaCapacity: number) {
@@ -753,7 +834,20 @@ export class Particles {
     p.r1 = p.g1 = p.b1 = 1; p.a1 = 0;
     p.gravity = 0; p.drag = 1; p.spin = 0;
     p.tile = PTile.Glow; p.mode = PMode.Billboard; p.stretch = 0; p.fadeIn = 0.08;
-    p.groundY = -1e4; p.softness = 0; p.count = 1;
+    p.groundY = -1e4; p.gnx = 0; p.gny = 1; p.gnz = 0;
+    p.softness = 0; p.camBias = 0; p.count = 1;
+    return p;
+  }
+
+  /**
+   * Declare the surface this emission sits on. Every emitter should call this:
+   * it is what drives the soft fade *and* the camera-facing bias, and the two
+   * together are the whole reason particles stop slicing through the road.
+   */
+  ground(y: number, n: { x: number; y: number; z: number }, softness: number, camBias = 0.22): EmitParams {
+    const p = this.p;
+    p.groundY = y; p.gnx = n.x; p.gny = n.y; p.gnz = n.z;
+    p.softness = softness; p.camBias = camBias;
     return p;
   }
 

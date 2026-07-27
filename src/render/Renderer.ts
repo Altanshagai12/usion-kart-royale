@@ -125,6 +125,10 @@ export class RenderPipeline implements System {
 
     this.renderer = renderer;
     ctx.renderer = renderer;
+    // Same contract as `window.__drawBudget`: the capture and perf harnesses
+    // need to read the device profile and reach into the effect chain (which
+    // is deliberately not on Ctx) to A/B a single pass.
+    (globalThis as unknown as { __render?: RenderPipeline }).__render = this;
 
     this.width = Math.max(1, ctx.width);
     this.height = Math.max(1, ctx.height);

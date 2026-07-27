@@ -156,6 +156,20 @@ async function measure(page, buf) {
 
 async function capture(page, file) {
   let best = null;
+  // Hold the simulation still for the whole retry loop. Without this a retry
+  // re-fires the shutter while the sim runs on, so the kart has driven to a
+  // different part of the circuit — three frames in one run were captured at
+  // walking pace, or in the wrong section entirely, and read as rendering bugs.
+  await page.evaluate(() => { window.__freeze = true; });
+  try {
+    return await captureAttempts(page, file);
+  } finally {
+    await page.evaluate(() => { window.__freeze = false; });
+  }
+}
+
+async function captureAttempts(page, file) {
+  let best = null;
   for (let attempt = 1; attempt <= CAPTURE_ATTEMPTS; attempt++) {
     const buf = await page.screenshot({ type: 'png' });
     const m = await measure(page, buf);
@@ -581,7 +595,7 @@ const main = async () => {
   if (server) server.kill();
 
   console.log(`\n${report.shots.length} shots -> ${OUT}`);
-  console.log(`fps(swiftshader, not indicative of real hw): ${report.fps}`);
+  console.log(`fps(headless capture): ${report.fps}`);
   if (errors.length) {
     console.log(`\n!! ${errors.length} console/page errors:`);
     for (const e of errors.slice(0, 20)) console.log('  - ' + e.slice(0, 400));

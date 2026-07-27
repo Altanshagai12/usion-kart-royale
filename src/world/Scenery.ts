@@ -46,6 +46,7 @@ import {
   flowerBoxGeo,
   grandstandGeo,
   gullGeo,
+  islandGeo,
   landmassGeo,
   lampGeo,
   lerp,
@@ -61,6 +62,9 @@ import {
   patchBob,
   patchTint,
   pick,
+  ridgeContour,
+  ridgeGeo,
+  ribbonStrip,
   ropeGeo,
   shutterGeo,
   smoothstep,
@@ -72,6 +76,7 @@ import {
   tyreGeo,
   wallSignGeo,
   windmillGeo,
+  type RidgeFlank,
   type RNG,
   type Shared,
 } from './Props';
@@ -96,6 +101,101 @@ const _dm = new THREE.Matrix4();
 const _dsc = new THREE.Vector3();
 
 const SEA_FIELD_RES = 288;
+
+/** Azimuth bins in the land/sea bearing table. See `buildSeaBearings`. */
+const SEA_AZ_BINS = 128;
+
+/** Neutral pale the band keys are pre-faded toward — a warm violet-grey, which
+ *  is what a Mediterranean range actually goes at 14° of sun, not blue. */
+const _bandHaze = new THREE.Color(0xc9c3c6);
+
+/** One layer of the horizon. See `Scenery.buildBackdrop`. */
+interface BackdropBand {
+  /** metres beyond the circuit envelope; also roughly the viewing distance */
+  offset: number;
+  /** number of tangential slots around the ring */
+  slots: number;
+  /** ± fraction of the radius each slot is jittered by, so the ring layers */
+  jitter: number;
+  height: [number, number];
+  depth: [number, number];
+  jag: number;
+  /** 0 = ends dive to the waterline, 1 = ends stay up and the range continues */
+  shoulder: number;
+  segs: number;
+  rings: number;
+  /** vertex keys at the crest and at the toe */
+  crest: number;
+  foot: number;
+  /** pre-fade toward `_bandHaze`, on top of what the scene fog does */
+  haze: number;
+  /** chance a water slot gets an island at all — the rest stays open bay */
+  seaChance: number;
+  /** island height as a fraction of the band's land height (far shores are low) */
+  seaH: number;
+  /** spires / towns on the crest */
+  dress: boolean;
+  /** terraces and a switchback road on the front flank */
+  terraces: boolean;
+}
+
+/**
+ * Four ranges at four distances, quoted from the circuit envelope, so from the
+ * near side of the track they read at roughly 240 m, 580 m, 1.15 km and 1.95 km.
+ *
+ * ---------------------------------------------------------------------------
+ *  WHY NOT 4 km, WHICH IS WHAT THE BRIEF ASKED FOR
+ * ---------------------------------------------------------------------------
+ *  `src/game/Camera.ts` sets `ctx.camera.far = 3000`. The circuit's own radius
+ *  is ~318 m, so a ridge sitting at radius R from the circuit centre is (R + cr)
+ *  from a camera on the OPPOSITE side of the track. The previous table put the
+ *  outermost band at offset 3400 — radius ~3920, i.e. 3.6–4.2 km from the
+ *  camera. Every triangle of it was behind the far plane. It was built, merged,
+ *  uploaded and clipped away, every frame, and the horizon lost its deepest
+ *  layer entirely. That is a large part of "the world stops and the horizon has
+ *  nothing in it": the layer that was supposed to be the last silhouette before
+ *  the sky did not exist on screen.
+ *
+ *  Distance in a landscape is not read off a range-finder, it is read off
+ *  ANGULAR SIZE and AERIAL PERSPECTIVE. So the far band is brought inside the
+ *  frustum at 1.95 km and made proportionally larger — 430–740 m of relief at
+ *  2 km subtends 12–21°, which is what a 900–1500 m range at 4 km would — and
+ *  the haze ladder is retuned (see `patchAerial`) so it still lands at ~85–90%
+ *  atmosphere. It reads as 4 km and it is actually on screen.
+ *
+ *  `buildBackdrop` re-derives the fit from `ctx.camera.far` at build time, so if
+ *  the camera agent ever moves the far plane the ladder follows it instead of
+ *  silently losing a layer again.
+ *
+ * The keys get cooler and paler as they go back. That is not decoration: warm
+ * saturated hills at distance are the single loudest amateur tell in a
+ * landscape, and the ladder of hue is what the eye reads as distance before it
+ * reads anything else.
+ *
+ * ---------------------------------------------------------------------------
+ *  ON `depth`, WHICH ROUND 4 ROUGHLY DOUBLED ON THE TWO FAR BANDS
+ * ---------------------------------------------------------------------------
+ *  `depth` is the run of the cross-section, and the crest sits about a third of
+ *  the way across it, so the FRONT FLANK — the face the circuit looks at — is
+ *  only ~0.35 * depth wide. The far band was authored 360–520 m deep against
+ *  430–740 m of height: a front flank 160 m wide holding up 600 m of hill, i.e.
+ *  a 75° face. There is no such landform; that is a spire, and it is half of
+ *  why the horizon read as cones no matter what the crest profile did. At
+ *  660–980 m the same hill presents a ~50° face, which is a mountain, and the
+ *  extra footprint also makes the bands overlap and occlude each other instead
+ *  of standing apart like fence posts. Cost is zero draw calls and ~9 k
+ *  triangles inside the one merged backdrop mesh.
+ */
+const BACKDROP_BANDS: BackdropBand[] = [
+  // coast — headlands and islands you could almost throw a stone at
+  { offset: 40, slots: 20, jitter: 0.14, height: [26, 62], depth: [150, 250], jag: 1.15, shoulder: 0.1, segs: 52, rings: 9, crest: 0xbcab88, foot: 0x74804f, haze: 0.05, seaChance: 0.5, seaH: 1.0, dress: true, terraces: true },
+  // near — the cypress-crested hills the village climbs into
+  { offset: 380, slots: 18, jitter: 0.12, height: [80, 175], depth: [300, 460], jag: 1.05, shoulder: 0.28, segs: 56, rings: 9, crest: 0xa89e83, foot: 0x62714d, haze: 0.2, seaChance: 0.62, seaH: 0.85, dress: true, terraces: true },
+  // range — a real mountain range across the bay
+  { offset: 950, slots: 16, jitter: 0.10, height: [190, 330], depth: [520, 760], jag: 1.3, shoulder: 0.4, segs: 56, rings: 8, crest: 0x9ba0a2, foot: 0x6e7a80, haze: 0.44, seaChance: 0.38, seaH: 0.55, dress: false, terraces: false },
+  // far — the last silhouette before the sky
+  { offset: 1750, slots: 14, jitter: 0.08, height: [430, 740], depth: [660, 980], jag: 1.4, shoulder: 0.6, segs: 56, rings: 7, crest: 0xa9b2c0, foot: 0x8590a2, haze: 0.66, seaChance: 0.28, seaH: 0.42, dress: false, terraces: false },
+];
 
 export class Scenery implements System {
   readonly group = new THREE.Group();
@@ -147,6 +247,9 @@ export class Scenery implements System {
     this.dressBridgeAndHeadland();
     this.dressOpenWater();
     this.dressLandBands();
+    // Before the backdrop, so the coverage assertion and the balance pass both
+    // see what the midground has already put in the frame.
+    this.dressMidground();
     // Backdrop before the balance pass: the balance pass asks "is this side of
     // the frame empty?", and a landmark on the horizon is one of the answers.
     this.buildBackdrop();
@@ -178,6 +281,9 @@ export class Scenery implements System {
 
     _n.copy(ctx.sunDirection).transformDirection(ctx.camera.matrixWorldInverse);
     u.uSunView.value.copy(_n);
+    // World-space sun: the backdrop's aerial haze runs warm looking into it and
+    // cool-violet looking away, which is what the sky itself does at 14°.
+    u.uSunWorld.value.copy(ctx.sunDirection);
     if (ctx.sun) u.uSunCol.value.copy(ctx.sun.color).multiplyScalar(clamp(ctx.sun.intensity * 0.14, 0.2, 1.1));
 
     this.cheerTarget = Math.max(0, this.cheerTarget - dt * 0.5);
@@ -1235,26 +1341,34 @@ export class Scenery implements System {
       if (t > 0.49 && t < 0.63) return;
       // Occlusion height per side: how far the ground rises above the road
       // within the near band. A cliff wall reads 8–20 m here, a verge ~1 m.
-      let hi = -1;
-      let occl = 0;
-      for (const side of [-1, 1]) {
-        let rise = 0;
+      // ROUND 4: the gate used to be `the tallest side must rise 6 m or more`,
+      // i.e. this only ran where one side was literally a cliff. On a coastal
+      // boulevard, a harbour front or a beach descent — most of the circuit —
+      // neither side rises 6 m, so it fired nowhere, and the composition note
+      // "one side is a wall, the other is a void" stood for three rounds.
+      //
+      // There is ALWAYS an open side: it is just the flatter of the two. Fill
+      // that one, unless something already stands there.
+      const rise: number[] = [0, 0];
+      for (let k = 0; k < 2; k++) {
+        const side = k === 0 ? -1 : 1;
         for (const d of [8, 16, 26]) {
           this.at(t, side * (s.halfWidth + d), _p, s);
-          rise = Math.max(rise, (this.flatWorld ? s.pos.y : this.groundY(_p, t)) - s.pos.y);
-        }
-        if (rise > occl) {
-          occl = rise;
-          hi = side;
+          rise[k] = Math.max(rise[k], (this.flatWorld ? s.pos.y : this.groundY(_p, t)) - s.pos.y);
         }
       }
-      if (occl < 6 || hi === 0) return;
-      const open = -hi;
-      // Only fill a side that is genuinely empty: if the open side also has
-      // structure, the frame already has a midground and another cluster is
-      // clutter, not depth.
-      this.at(t, open * (s.halfWidth + 22), _p2, s);
-      if (!this.flatWorld && this.groundY(_p2, t) - s.pos.y > 3.5) return;
+      const open = rise[0] <= rise[1] ? -1 : 1;
+      // Thin it out: a cluster every 25 m down both verges is a hedge, not a
+      // composition. Roughly half the samples, chosen by hash so the spacing
+      // does not beat against the walk.
+      if (this.hash1(idx, 0x40e1) > 0.55) return;
+      // Skip anywhere an authored structure already claims the band — that side
+      // of the frame is not a hole.
+      this.at(t, open * (s.halfWidth + 30), _p2, s);
+      if (this.blocked(_p2, 22)) return;
+      // ...and skip a slope that is climbing away hard, which is a wall of its
+      // own and does not need a second one in front of it.
+      if (!this.flatWorld && this.groundY(_p2, t) - s.pos.y > 9) return;
 
       const dist = 26 + this.hash1(idx, 0x71) * 44;
       const lat = open * (s.halfWidth + dist);
@@ -1319,8 +1433,41 @@ export class Scenery implements System {
       if (this.blocked(_p, 5)) return;
       if (!this.flatWorld && this.surfaceAt(_p, t) === Surface.Road) return;
       const inward = Math.atan2(-s.binormal.x * open, -s.binormal.z * open);
+      const yawT = Math.atan2(s.tangent.x, s.tangent.z);
       const kind = this.hash1(idx, 0xe8);
-      if (kind < 0.4) {
+      if (kind < 0.16) {
+        // --- A LINE OF CYPRESSES. The single most efficient answer to "the eye
+        // finds a hole in the frame": eight verticals at 30 m read at thumbnail
+        // size, they are unmistakably deliberate, and they cost no draw call.
+        const n = 6 + ((rng() * 5) | 0);
+        for (let k = 0; k < n; k++) {
+          this.at(t + ((k - n / 2) * 6.5) / (this.ctx.track.length || 1), open * (s.halfWidth + dist + (rng() - 0.5) * 4), _p2, s);
+          this.settle(_p2, t);
+          if (_p2.y < this.seaLevel + 0.5 || this.blocked(_p2, 2)) continue;
+          this.foliage.cypFar(_p2.clone(), 1.5 + rng() * 0.7, rng() * 6.28);
+        }
+        this.stoneRun(t, s, open * (s.halfWidth + dist - 4), 20 + rng() * 14, rng);
+      } else if (kind < 0.30) {
+        // --- a fence line strung with bunting, and a row of parasols behind it.
+        // Colour and repetition at a readable distance; §1's beach and harbour
+        // both want this and neither had it.
+        const n = 5 + ((rng() * 4) | 0);
+        for (let k = 0; k < n; k++) {
+          this.at(t + ((k - n / 2) * 5.5) / (this.ctx.track.length || 1), open * (s.halfWidth + dist), _p2, s);
+          this.settle(_p2, t);
+          if (_p2.y < this.seaLevel + 0.5) continue;
+          this.sets.marshal.add(trs(_p2.x, _p2.y, _p2.z, yawT, 1.0 + rng() * 0.2), { color: _col.set(0xcfc0a6).clone(), uv: new THREE.Vector4(1, 1, 0, 0), lod: 220 });
+          this.sets.bunting.add(trs(_p2.x, _p2.y + 1.9, _p2.z, yawT, 1.5 + rng() * 0.5), {
+            color: _col.set(pick(rng, [0xe0453f, 0x4fc3ff, 0xff9d2e, 0xf2ece0, 0x2f6ba0])).clone(),
+            lod: 260,
+          });
+          if (k % 2 === 0) {
+            _p.set(_p2.x + s.binormal.x * open * 6, _p2.y, _p2.z + s.binormal.z * open * 6);
+            this.settle(_p, t);
+            if (_p.y > this.seaLevel + 0.4) this.parasol(_p, t, rng);
+          }
+        }
+      } else if (kind < 0.52) {
         // fishing shack / field barn: one gable, one lean-to, two crates
         const w = 5.5 + rng() * 3;
         const h = 3.4 + rng() * 1.6;
@@ -1337,7 +1484,7 @@ export class Scenery implements System {
           this.settle(_p2, t);
           this.sets.crate.add(trs(_p2.x, _p2.y, _p2.z, rng() * 6.28), { color: _col.setHSL(0.09, 0.26, 0.5).clone(), uv: new THREE.Vector4(1, 1, 0, 0), lod: 140 });
         }
-      } else if (kind < 0.72) {
+      } else if (kind < 0.78) {
         // stand of pines with understorey — a soft mass, not a wall
         for (let k = 0; k < 4; k++) {
           _p2.set(_p.x + (rng() - 0.5) * 13, _p.y, _p.z + (rng() - 0.5) * 13);
@@ -2528,99 +2675,416 @@ export class Scenery implements System {
   // ==========================================================================
 
   /**
-   * The background silhouette ring.
+   * The horizon: four ranges of real landforms at four real distances.
    *
-   * Round 1's version placed everything along ONE azimuth — the average
-   * outward-sea direction from the circuit centroid — in a perpendicular band.
-   * That works for exactly the viewpoints that happen to look down that
-   * azimuth, and for every other one the horizon is empty: hero.png's entire
-   * right half was flat sea meeting an empty gradient, and closeup.png had no
-   * world behind the kart at all. Nintendo never leaves the horizon empty.
+   * WHAT WAS WRONG. Rounds 1–3 built this out of `landmassGeo` — a dome: one
+   * radius wobble, one height curve, no crest line. Sixteen of them sat in a
+   * single ring at 420–1150 m, all tinted from the same tan rock albedo and all
+   * then flattened onto one cream value by an aerial-perspective patch that ran
+   * AFTER the scene fog and overwrote it (see `patchAerial`). The result is the
+   * thing the composition critic named twice: faceted cardboard cut-outs in one
+   * tone, no silhouette, no separation, and a world that stops dead.
    *
-   * So this is a RING, not a band, and it is verified rather than hoped for:
-   *   • 16 slots all the way round the circuit at 420–1150 m, kind chosen from
-   *     whether that bearing is water or land — islands, monasteries and
-   *     lighthouse spits over the sea, terraced town stacks and cypress ridges
-   *     over the land;
-   *   • two far layers at 1500 m and 2400 m for aerial-perspective depth;
-   *   • then a COVERAGE PASS: the centreline is walked every 40 m and, if the
-   *     forward 60° cone at that sample contains no landmark, one is inserted on
-   *     that bearing. That assertion is the whole point — placement authored by
-   *     eye against a track this module does not own will always leave holes.
+   * WHAT THIS DOES. Four bands, each a continuous tangential ring of RIDGES —
+   * crest lines with summits, saddles, spurs and flanks (`ridgeGeo`) — placed so
+   * that from anywhere on the circuit they read at roughly:
    *
-   * Everything goes into the `backdrop` accumulator, which is the only material
-   * carrying `patchAerial`, so all of it tints toward the sky with distance and
-   * height and reads as depth rather than cardboard.
+   *     coast   ~200 m   headlands running into the sea, terraced, town-topped
+   *     near    ~600 m   cypress-crested hills, hill towns, switchback roads
+   *     range  ~1500 m   a proper mountain range across the bay
+   *     far    ~4000 m   the last silhouette before the sky
+   *
+   * Each successive band sits further toward the sky and further toward grey:
+   * partly baked into the vertex colour here, mostly delivered by the sky
+   * system's Beer fog, which — now that nothing stamps over it — lands the four
+   * bands near 20% / 45% / 78% / 92% haze. That ladder is the depth.
+   *
+   * Because the bands are CONTINUOUS RINGS centred on the circuit, coverage is
+   * a property of the construction rather than something to hope for; the walk
+   * at the end is kept only as an assertion, and inserts a headland if a
+   * pathological layout ever manages to look through a gap.
+   *
+   * Cost: ~55 k triangles, all of it in the single merged `backdrop` mesh — one
+   * draw call for the entire horizon, and it casts no shadow.
    */
   private buildBackdrop() {
     const track = this.ctx.track;
     const b = track.bounds;
-    const cx = (b.min.x + b.max.x) * 0.5 || 0;
-    const cz = (b.min.z + b.max.z) * 0.5 || 0;
+    const cx = (this.cx = (b.min.x + b.max.x) * 0.5 || 0);
+    const cz = (this.cz = (b.min.z + b.max.z) * 0.5 || 0);
     let cr = 0;
     for (let i = 0; i < 96; i++) {
       const p = track.sample(i / 96).pos;
       cr = Math.max(cr, Math.hypot(p.x - cx, p.z - cz));
     }
-    // Everything sits clear of this so no landmark can ever intersect the
-    // circuit, however the track agent reshapes it.
-    const inner = cr + 260;
+    this.cr = cr;
+    // Nothing may intersect the circuit however the track agent reshapes it.
+    // Band radii are quoted from here, so the viewing distance from the near
+    // side of the track is roughly the band's own offset.
+    const inner = cr + 200;
+
+    // --- fit the ladder inside the camera's far plane -----------------------
+    // The worst case is a camera on the near side of the circuit looking at a
+    // ridge on the far side of the ring: that is (R + cr) metres. Past the far
+    // plane the layer is clipped and simply does not exist on screen, which is
+    // exactly how the outermost band went missing (see the table's note). 0.94
+    // leaves room for the ridge's own back flank, which is hidden behind its
+    // crest but still has to survive clipping or the mesh tears.
+    const far = this.ctx.camera.far || 3000;
+    const maxOffset = Math.max(400, far * 0.94 - cr - inner);
+    const authored = BACKDROP_BANDS[BACKDROP_BANDS.length - 1].offset;
+    // Compress the ladder as a whole rather than clamping the far band onto the
+    // one in front of it — four layers that all land at the same radius is the
+    // same failure with extra triangles.
+    const fit = Math.min(1, maxOffset / authored);
+
+    this.buildSeaBearings(cx, cz, cr);
 
     const rng = mulberry32(776553);
     let seed = 11;
 
-    // --- ring
-    const SLOTS = 16;
-    for (let i = 0; i < SLOTS; i++) {
-      const az = (i / SLOTS) * Math.PI * 2 + (rng() - 0.5) * 0.16;
-      const dist = inner + 160 + rng() * 630;
-      this.landmark(az, dist, cx, cz, seed++, rng);
-    }
-
-    // --- far layers: mass and hue only, they exist to separate the ring from
-    // the sky. Low-res meshes, since at 2 km a 380 m island is 40 px tall.
-    for (const L of [
-      { dist: 1500, count: 7, r: 260, h: 120, jag: 0.9, segs: 26, rings: 8 },
-      { dist: 2400, count: 7, r: 430, h: 235, jag: 0.7, segs: 20, rings: 6 },
-    ]) {
-      for (let i = 0; i < L.count; i++) {
-        const az = (i / L.count) * Math.PI * 2 + rng() * 0.5;
-        const out = Math.max(inner + 400, L.dist * (0.82 + rng() * 0.4));
-        _p.set(cx + Math.cos(az) * out, 0, cz + Math.sin(az) * out);
-        const geo = landmassGeo(L.r * (0.6 + rng() * 0.8), L.h * (0.55 + rng() * 0.9), seed++, 0, L.jag, L.segs, L.rings);
-        this.acc.backdrop.add(geo, trs(_p.x, this.seaLevel, _p.z, rng() * 6.28), this.hazeTint(out, 0x6f7f5c));
-        this.marks.push({ x: _p.x, z: _p.z, r: L.r });
+    for (const band of BACKDROP_BANDS) {
+      const R = inner + band.offset * fit;
+      const arc = (Math.PI * 2 * R) / band.slots;
+      for (let i = 0; i < band.slots; i++) {
+        // Slots are evenly spaced but jittered in bearing AND radius: the radius
+        // jitter is what makes two neighbours overlap at different depths, which
+        // is where a ring stops reading as a ring and starts reading as layered
+        // ridges receding into haze.
+        const az = (i / band.slots) * Math.PI * 2 + (rng() - 0.5) * (Math.PI * 2) / band.slots * 0.55;
+        const dist = R * (1 + (rng() - 0.5) * band.jitter);
+        this.ridgeSlot(band, az, dist, arc, cx, cz, seed++, rng);
       }
     }
 
-    // --- coverage assertion
+    // --- coverage assertion (see the note above: this should never fire)
     let inserted = 0;
-    this.walk(0, 1, 40, (t, s) => {
-      // A hard cap: 16 ring slots plus 14 far masses already fill the horizon,
-      // and a pathological layout must not be able to turn this into a hundred
-      // islands. If the cap is ever hit the ring spacing is the thing to fix.
-      if (inserted >= 14) return;
+    this.walk(0, 1, 60, (t, s) => {
+      if (inserted >= 8) return;
       if (this.forwardCovered(s.pos, s.tangent)) return;
-      // Aim the insert down the look direction, kicked sideways a little so a
-      // run of empty samples does not stack four islands on one bearing.
-      const yaw = Math.atan2(s.tangent.x, s.tangent.z) + (rng() - 0.5) * 0.5;
-      const dirX = Math.sin(yaw);
-      const dirZ = Math.cos(yaw);
-      // Push out until it clears the circuit envelope.
-      let d = 520 + rng() * 380;
+      const yaw = Math.atan2(s.tangent.x, s.tangent.z) + (rng() - 0.5) * 0.4;
+      let d = 560 + rng() * 320;
       for (let k = 0; k < 8; k++) {
-        const px = s.pos.x + dirX * d;
-        const pz = s.pos.z + dirZ * d;
-        if (Math.hypot(px - cx, pz - cz) >= inner) break;
+        if (Math.hypot(s.pos.x + Math.sin(yaw) * d - cx, s.pos.z + Math.cos(yaw) * d - cz) >= inner) break;
         d += 220;
       }
-      const px = s.pos.x + dirX * d;
-      const pz = s.pos.z + dirZ * d;
+      const px = s.pos.x + Math.sin(yaw) * d;
+      const pz = s.pos.z + Math.cos(yaw) * d;
       const az = Math.atan2(pz - cz, px - cx);
-      this.landmark(az, Math.hypot(px - cx, pz - cz), cx, cz, seed++, rng);
+      const dist = Math.hypot(px - cx, pz - cz);
+      this.ridgeSlot(BACKDROP_BANDS[1], az, dist, 420, cx, cz, seed++, rng);
       inserted++;
     });
     void inserted;
+  }
+
+  /**
+   * One slot of one band: a ridge over land, an island over water.
+   *
+   * Orientation matters and is not arbitrary. The ridge's local +Z is aimed
+   * radially OUTWARD, which puts its short steep flank toward the circuit and
+   * its long dip slope behind — a face and a back, the way bedded rock actually
+   * sits — and puts its crest line tangentially across the view rather than
+   * end-on, so the summits and saddles are what you see.
+   */
+  private ridgeSlot(band: BackdropBand, az: number, dist: number, arc: number, cx: number, cz: number, seed: number, rng: RNG) {
+    const x = cx + Math.cos(az) * dist;
+    const z = cz + Math.sin(az) * dist;
+    const crest = this.bandTint(band.crest, band.haze);
+    const foot = this.bandTint(band.foot, band.haze * 1.2);
+    const height = lerp(band.height[0], band.height[1], rng());
+
+    if (this.seaBearing(az)) {
+      // Open water: islands with gaps between them, never a wall. A bay that is
+      // fenced off at 250 m is not a bay, and one fenced off at 2 km is a lake.
+      if (rng() > band.seaChance) return;
+      const r = arc * (0.22 + rng() * 0.24);
+      // Offshore masses are LOW relative to their band. A 700 m peak rising
+      // straight out of the water at 2 km is a volcano, not a far shore; what
+      // actually sits out there is a long low cape with a saddle in it, and its
+      // job is to give the sea a horizon to end against, not to compete with
+      // the range behind the town.
+      // ...and the comment above was policy the code did not enforce: with the
+      // old radius roll an offshore mass could come out 1.9x as tall as it was
+      // wide, which is a volcanic plug by any measure. Height is now capped
+      // against the footprint, so "low cape" is a fact about the geometry.
+      const h = Math.min(height * band.seaH * (0.5 + rng() * 0.45), r * (0.42 + rng() * 0.22));
+      const yaw = rng() * 6.28;
+      this.acc.backdrop.add(
+        islandGeo({
+          radius: r,
+          height: h,
+          seed,
+          jag: band.jag + 0.3,
+          segs: Math.max(20, band.segs >> 1),
+          rings: band.rings,
+          squash: 0.45 + rng() * 0.7,
+          crestTint: crest,
+          footTint: foot,
+          uvScale: Math.max(10, h * 0.24),
+          strata: Math.max(4, h * 0.07),
+        }),
+        trs(x, this.seaLevel, z, yaw)
+      );
+      this.marks.push({ x, z, r });
+      // One in three offshore masses gets something man-made on it. That is the
+      // only silhouette in the whole backdrop with a straight line in it, and it
+      // is what tells the eye the scale of everything around it. Only on the
+      // bands the camera can resolve: a monastery at 2 km is four sub-pixel
+      // boxes that alias, and the two far bands are silhouette work only.
+      if (!band.dress) return;
+      const k = rng();
+      if (k < 0.3) this.monastery(x, this.seaLevel + h * 0.9, z, az + Math.PI, 0.9 + rng() * 0.5 + h * 0.004, dist, rng);
+      else if (k < 0.5) {
+        const lh = lighthouseGeo(this.seaLevel + h * 0.15, this.seaLevel);
+        const base = trs(x + Math.cos(az + 1.4) * r * 0.8, this.seaLevel + h * 0.14, z + Math.sin(az + 1.4) * r * 0.8, rng() * 6.28, 2.2 + rng() * 1.8);
+        this.acc.backdrop.add(lh.stone, base, this.hazeTint(dist, 0xf0e6d4));
+        this.acc.backdrop.add(lh.trim, base, this.hazeTint(dist, 0xd8654a));
+      } else if (k < 0.8) this.ridgeSpires(x, this.seaLevel + h * 0.86, z, az + Math.PI, r * 0.55, 6, dist, rng);
+      return;
+    }
+
+    // --- land: a ridge, overlapping its neighbours
+    const yaw = Math.PI / 2 - az;
+    const length = arc * (1.28 + rng() * 0.5);
+    const depth = lerp(band.depth[0], band.depth[1], rng());
+    // HEADLANDS. `shoulder` is how much of its height a ridge keeps at its ends:
+    // high means the range continues behind its neighbour, which is right in the
+    // middle of a run of land and wrong at the coast, where it leaves a sheared
+    // vertical wall standing in the water. Where the next bearing along is open
+    // bay, the ends are dropped so the ridge dives into the sea instead — which
+    // is both what a Mediterranean coast actually does and the silhouette
+    // ART_DIRECTION §1 keeps asking for.
+    const halfArc = arc * 0.5 / Math.max(1, dist);
+    const coastal = this.seaBearing(az + halfArc * 1.6) || this.seaBearing(az - halfArc * 1.6);
+    const shoulder = coastal ? Math.min(band.shoulder, 0.05) : band.shoulder;
+    const crestLine: number[] = [];
+    // Only the two dressed bands need their surface handed back; the far two are
+    // silhouette work and the copy would be dead weight.
+    const flank: RidgeFlank | undefined = band.terraces ? { cols: 0, rings: 0, p: new Float32Array(0) } : undefined;
+    this.acc.backdrop.add(
+      ridgeGeo({
+        length,
+        depth,
+        height,
+        seed,
+        segs: band.segs,
+        rings: band.rings,
+        jag: band.jag,
+        shoulder,
+        skirt: height * 0.3 + 30,
+        crestTint: crest,
+        footTint: foot,
+        uvScale: Math.max(12, height * 0.22),
+        strata: Math.max(5, height * 0.075),
+        crestOut: crestLine,
+        flankOut: flank,
+      }),
+      trs(x, this.seaLevel, z, yaw)
+    );
+    this.marks.push({ x, z, r: length * 0.5 });
+    if (!band.dress) return;
+
+    const base = trs(x, this.seaLevel, z, yaw);
+    const roll = rng();
+    if (roll < 0.5) this.crestSpires(base, crestLine, 7 + ((rng() * 8) | 0), dist, rng);
+    if (roll > 0.34 && roll < 0.66) this.crestTown(base, crestLine, length, height, dist, rng);
+    // Cultivation reads at 200–600 m as horizontal banding on the slope, which
+    // is precisely what a terraced grove IS. It costs a handful of thin strips.
+    if (flank && flank.cols > 10) {
+      if (rng() < 0.8) this.hillTerraces(base, flank, height, dist, rng);
+      if (rng() < 0.45) this.switchbackRoad(base, flank, dist, rng);
+    }
+  }
+
+  // --- which bearings out of the circuit are open water ---------------------
+  private cx = 0;
+  private cz = 0;
+  private cr = 1;
+  /** 1 = the bay lies on this bearing out of the circuit centre. */
+  private seaAz = new Uint8Array(SEA_AZ_BINS);
+
+  /**
+   * ROOT FIX. The old test probed the terrain at `dist * 0.55` from the centre
+   * and asked whether it was below sea level. For the two near bands that is a
+   * few hundred metres out and it works; for the two FAR bands it is 700 m to
+   * 1.3 km out, which is well outside the track's heightfield. `Track` clamps
+   * heightfield lookups to its border, so past the edge the answer stops being
+   * "is there water here" and becomes "whatever the border happens to hold on
+   * this bearing" — arbitrary, and it flipped with the layout. The previous
+   * table dodged the problem by setting `probeSea: false` on both far bands,
+   * which meant they laid a CONTINUOUS RING of mountains all the way round,
+   * including straight across the open sea. A bay walled in at every bearing is
+   * a lake, and it is why the seaward half of the frame had a horizon that
+   * terminated instead of one that opened.
+   *
+   * So classify by BEARING instead of by distance, sampled at a radius where
+   * the heightfield genuinely exists (just outside the circuit, ~1.1–1.4 cr).
+   * Land or water at 400 m on a bearing is what land or water is at 2 km on the
+   * same bearing — a coastline does not change its mind — and every band can
+   * now share one cheap, reliable answer.
+   */
+  private buildSeaBearings(cx: number, cz: number, cr: number) {
+    const n = SEA_AZ_BINS;
+    const raw = new Uint8Array(n);
+    const s0 = this.ctx.track.sample(0);
+    for (let i = 0; i < n; i++) {
+      const az = ((i + 0.5) / n) * Math.PI * 2;
+      if (this.flatWorld) {
+        // No heightfield to read: fall back to the geometric rule, which is the
+        // side of the circuit the water was surveyed onto.
+        _p2.set(Math.cos(az), 0, Math.sin(az));
+        raw[i] = _p2.dot(s0.binormal) * this.seaSide(0) >= 0 ? 1 : 0;
+        continue;
+      }
+      let wet = 1;
+      for (const k of [1.08, 1.24, 1.42]) {
+        _p2.set(cx + Math.cos(az) * cr * k, 0, cz + Math.sin(az) * cr * k);
+        if (this.groundY(_p2, 0) > this.seaLevel + 2.5) { wet = 0; break; }
+      }
+      raw[i] = wet;
+    }
+    // Majority filter: one noisy probe must not punch a hole in a headland, and
+    // a single wet bin in the middle of a range must not open a gap in it.
+    for (let i = 0; i < n; i++) {
+      let acc = 0;
+      for (let k = -2; k <= 2; k++) acc += raw[(i + k + n) % n];
+      this.seaAz[i] = acc >= 3 ? 1 : 0;
+    }
+  }
+
+  /** Is the bay on this bearing out of the circuit centre? */
+  private seaBearing(az: number): boolean {
+    const n = SEA_AZ_BINS;
+    const i = Math.floor((az / (Math.PI * 2)) * n);
+    return this.seaAz[((i % n) + n) % n] === 1;
+  }
+
+  /** A band key colour, pre-faded toward the haze by the band's own amount. */
+  private bandTint(base: number, haze: number): THREE.Color {
+    return _col.set(base).lerp(_bandHaze, clamp(haze, 0, 1)).clone();
+  }
+
+  /** A line of cypress/pine spires standing ON the crest, not near it. */
+  private crestSpires(base: THREE.Matrix4, crest: number[], n: number, dist: number, rng: RNG) {
+    const cols = crest.length / 3;
+    if (cols < 4) return;
+    const col = this.hazeTint(dist, 0x3f5230);
+    for (let i = 0; i < n; i++) {
+      // Cluster toward the summits: spires on a saddle read as a hedge, spires
+      // on a skyline read as Tuscany.
+      let c = 2 + ((rng() * (cols - 4)) | 0);
+      for (let k = 0; k < 3; k++) {
+        const alt = 2 + ((rng() * (cols - 4)) | 0);
+        if (crest[alt * 3 + 1] > crest[c * 3 + 1]) c = alt;
+      }
+      const h = Math.max(9, dist * 0.022) * (0.7 + rng() * 0.7);
+      const spire = loft((t, o) => o.set(0, t * h, 0), 4, 5, (t) => Math.pow(Math.sin(Math.pow(t, 0.6) * Math.PI * 0.95), 0.7) * h * (0.11 + rng() * 0.05), 1, true, true);
+      const jitter = (rng() - 0.5) * 2;
+      const ci = clamp(c + Math.round(jitter), 0, cols - 1) | 0;
+      this.acc.backdrop.add(spire, _m4.multiplyMatrices(base, trs(crest[ci * 3] + (rng() - 0.5) * h, crest[ci * 3 + 1] - h * 0.2, crest[ci * 3 + 2] + (rng() - 0.5) * h * 1.5, 0)).clone(), col);
+    }
+  }
+
+  /** A hill town spilling down the front flank from a point on the crest. */
+  private crestTown(base: THREE.Matrix4, crest: number[], length: number, height: number, dist: number, rng: RNG) {
+    const cols = crest.length / 3;
+    if (cols < 6) return;
+    const c = 2 + ((rng() * (cols - 4)) | 0);
+    const y = crest[c * 3 + 1];
+    if (y < height * 0.25) return;
+    const spread = Math.min(length * 0.16, Math.max(24, dist * 0.055));
+    this.townStackLocal(base, crest[c * 3], y - spread * 0.55, crest[c * 3 + 2], spread, spread * 0.9, dist, rng);
+  }
+
+  /**
+   * Contour terraces: ledges cut across the front flank at four heights, each
+   * with a strip of grove colour above it. From 200 m this is what an olive
+   * terrace or a vineyard looks like, and it is the single cheapest way to say
+   * "this land is farmed" rather than "this is a rock".
+   *
+   * Built from the ridge's OWN vertices (`ridgeContour`) rather than from an
+   * analytic inverse of its cross-section. The old version ruled one straight
+   * box per row at a z bisected out of the analytic cross-section, which ignores
+   * the per-column lean, the spur displacement and the gullies: measured against
+   * the real surface it missed by 24–35 m. A straight bar floating in front of a
+   * hillside is the most conspicuous possible failure at this distance, because
+   * a horizontal line is exactly what the eye is looking for.
+   *
+   * A contour also BENDS with the land, which a box cannot, and that bend is the
+   * actual read — it is what says the ledge is cut into a slope.
+   */
+  private hillTerraces(base: THREE.Matrix4, fl: RidgeFlank, height: number, dist: number, rng: RNG) {
+    const cols = fl.cols;
+    if (cols < 12) return;
+    const wall = this.hazeTint(dist, 0xcbbb9c);
+    const grove = this.hazeTint(dist, 0x6c7b45);
+    const rows = 3 + ((rng() * 3) | 0);
+    const i0 = 2 + ((rng() * (cols - 10)) | 0);
+    const span = Math.min(cols - i0 - 2, 7 + ((rng() * 9) | 0));
+    if (span < 4) return;
+    // Wall height scales with the landform: a 1 m kerb on a 300 m hill is
+    // invisible, and a 6 m wall on a 40 m one is a dam.
+    const th = clamp(height * 0.022, 1.2, 7);
+    const bot: number[] = [];
+    const top: number[] = [];
+    for (let r = 0; r < rows; r++) {
+      const f = 0.20 + (r / rows) * 0.52 + rng() * 0.04;
+      const line = ridgeContour(fl, f, i0, span);
+      if (line.length < 12) continue;
+      // The grove band is the strip between this contour and the next one up, so
+      // it lies ON the surface by construction and can never detach from it.
+      const above = ridgeContour(fl, Math.min(0.96, f + 0.085), i0, span);
+      if (above.length !== line.length) continue;
+      bot.length = 0;
+      top.length = 0;
+      for (let i = 0; i < line.length; i += 3) {
+        // stand the face a little proud of the rock so it never z-fights
+        bot.push(line[i], line[i + 1] - th, line[i + 2] - th * 0.35);
+        top.push(line[i], line[i + 1], line[i + 2] - th * 0.35);
+        above[i + 2] -= th * 0.2;
+      }
+      const face = ribbonStrip(bot, top, Math.max(6, th * 5));
+      if (face) this.acc.backdrop.add(face, base, wall);
+      const band = ribbonStrip(top, above, Math.max(8, th * 8));
+      if (band) this.acc.backdrop.add(band, base, grove);
+    }
+  }
+
+  /**
+   * A coast road switchbacking up the headland. Five or six short legs at rising
+   * heights, alternating along the slope: at 200-600 m that zig-zag is instantly
+   * legible as a road, and a road on a distant hillside is one of the strongest
+   * scale cues available - it says "that is a mountain, and people drive on it".
+   *
+   * Each leg is a ribbon between two adjacent contours, so the carriageway lies
+   * on the slope and its width is the slope distance between them - which means
+   * it automatically narrows where the flank steepens, the way a real bench cut
+   * does.
+   */
+  private switchbackRoad(base: THREE.Matrix4, fl: RidgeFlank, dist: number, rng: RNG) {
+    const cols = fl.cols;
+    if (cols < 14) return;
+    const road = this.hazeTint(dist, 0xb9b2a6);
+    const legs = 5 + ((rng() * 3) | 0);
+    const i0 = 2 + ((rng() * Math.max(1, cols - 14)) | 0);
+    const span = Math.min(cols - i0 - 4, 7);
+    if (span < 4) return;
+    const w = 0.030 + rng() * 0.014;
+    for (let k = 0; k < legs; k++) {
+      const f = 0.14 + (k / legs) * 0.56;
+      // alternate the leg along the crest so the legs stack into a zig-zag
+      const a0 = i0 + (k & 1 ? 2 : 0);
+      const hi = ridgeContour(fl, f + w, a0, span);
+      const lo = ridgeContour(fl, Math.max(0.03, f), a0, span);
+      if (hi.length < 12 || hi.length !== lo.length) continue;
+      for (let i = 2; i < hi.length; i += 3) {
+        hi[i] -= 0.6;
+        lo[i] -= 0.6;
+      }
+      const leg = ribbonStrip(lo, hi, 16);
+      if (leg) this.acc.backdrop.add(leg, base, road);
+    }
   }
 
   /** Landmark footprints, in world XZ, used by the coverage assertion. */
@@ -2646,92 +3110,20 @@ export class Scenery implements System {
   }
 
   /**
-   * Two-stage aerial perspective: the albedo is pre-faded toward the sky before
-   * `patchAerial`'s shader haze even runs, because a 2 km headland at full
-   * saturation reads as a painted flat no matter how much fog is on top of it.
+   * Albedo pre-fade toward the haze for the small things standing ON the
+   * backdrop — spires, roofs, a lighthouse lantern.
+   *
+   * Weaker than it was (it topped out at 0.58). The scene fog now survives to
+   * do the convergence, and stacking a second full-strength fade on top of it
+   * is what made every layer land on the same cream. Starts earlier though,
+   * because these are metre-scale objects at hundreds of metres and they lose
+   * their local contrast long before a mountain does.
    */
   private hazeTint(dist: number, base: number): THREE.Color {
-    const fade = clamp((dist - 500) / 2100, 0, 1);
-    return _col.set(base).lerp(_haze, 0.18 + fade * 0.4).clone();
+    const fade = clamp((dist - 180) / 2600, 0, 1);
+    return _col.set(base).lerp(_haze, 0.08 + fade * 0.34).clone();
   }
 
-  /**
-   * One background landmark on bearing `az` at `dist` from the circuit centre.
-   * The kind is chosen from whether that bearing is water — a monastery island
-   * on a hillside or a terraced town in the middle of the bay would both be
-   * absurd, and the whole layer stops working the moment one of them shows up.
-   */
-  private landmark(az: number, dist: number, cx: number, cz: number, seed: number, rng: RNG) {
-    const x = cx + Math.cos(az) * dist;
-    const z = cz + Math.sin(az) * dist;
-    _p.set(x, this.seaLevel, z);
-    // Sea or land: probe the terrain a third of the way out. Beyond the
-    // heightfield the probe clamps, so also treat "lower than the harbour" as
-    // water, and on a flat world fall back to the derived sea side.
-    let overSea: boolean;
-    if (this.flatWorld) {
-      const c = new THREE.Vector3(cx, 0, cz);
-      _p2.set(x, 0, z).sub(c);
-      const s0 = this.ctx.track.sample(0);
-      overSea = _p2.dot(s0.binormal) * this.seaSide(0) >= 0;
-    } else {
-      _p2.set(cx + Math.cos(az) * (dist * 0.55), 0, cz + Math.sin(az) * (dist * 0.55));
-      overSea = this.groundY(_p2, 0) <= this.seaLevel + 2.5;
-    }
-    const yaw = az + Math.PI; // faces the circuit
-    const k = (rng() * 3) | 0;
-
-    if (overSea) {
-      if (k === 0) {
-        // Offshore island with a monastery on the crown — the strongest single
-        // silhouette in the set, because it is the only one that is man-made.
-        const r = 78 + rng() * 60;
-        const h = 46 + rng() * 40;
-        this.acc.backdrop.add(landmassGeo(r, h, seed, 0, 1.2, 30, 10), trs(x, this.seaLevel, z, rng() * 6.28), this.hazeTint(dist, 0x8c8a68));
-        this.monastery(x, this.seaLevel + h * 0.92, z, yaw, 1.0 + rng() * 0.5, dist, rng);
-        this.marks.push({ x, z, r });
-      } else if (k === 1) {
-        // Lighthouse on a low spit: a long flat mass with one vertical on it,
-        // which is the read that says "the bay ends there".
-        const r = 96 + rng() * 70;
-        const h = 9 + rng() * 8;
-        const geo = landmassGeo(r, h, seed, 0, 1.5, 30, 8);
-        // squash it across the bearing so it reads as a spit, not a dome
-        const m = _m4.compose(_p.set(x, this.seaLevel, z), _q.setFromEuler(_e.set(0, yaw, 0, 'YXZ')), _scl.set(1, 1, 0.34)).clone();
-        this.acc.backdrop.add(geo, m, this.hazeTint(dist, 0xa2977a));
-        const lh = lighthouseGeo(this.seaLevel + h, this.seaLevel);
-        const sc = 2.6 + rng() * 1.6;
-        const base = trs(x, this.seaLevel + h * 0.9, z, rng() * 6.28, sc);
-        this.acc.backdrop.add(lh.stone, base, this.hazeTint(dist, 0xf0e6d4));
-        this.acc.backdrop.add(lh.trim, base, this.hazeTint(dist, 0xd8654a));
-        this.marks.push({ x, z, r });
-      } else {
-        // Bare headland shouldering into the water, cypress-topped.
-        const r = 130 + rng() * 110;
-        const h = 62 + rng() * 70;
-        this.acc.backdrop.add(landmassGeo(r, h, seed, 0, 1.05, 32, 10), trs(x, this.seaLevel, z, rng() * 6.28), this.hazeTint(dist, 0x7d8a5e));
-        this.ridgeSpires(x, this.seaLevel + h * 0.9, z, yaw, r * 0.5, 7, dist, rng);
-        this.marks.push({ x, z, r });
-      }
-      return;
-    }
-
-    // Landward. The bible's hillside town has to appear at distance too, or the
-    // village stops at the horizon line the way drift.png's did.
-    if (k === 0) {
-      const r = 150 + rng() * 120;
-      const h = 90 + rng() * 90;
-      this.acc.backdrop.add(landmassGeo(r, h, seed, 0, 0.95, 32, 10), trs(x, this.seaLevel, z, rng() * 6.28), this.hazeTint(dist, 0x76855a));
-      this.ridgeSpires(x, this.seaLevel + h * 0.88, z, yaw, r * 0.55, 11, dist, rng);
-      this.marks.push({ x, z, r });
-    } else {
-      const r = 120 + rng() * 90;
-      const h = 55 + rng() * 55;
-      this.acc.backdrop.add(landmassGeo(r, h, seed, 0, 1.0, 30, 9), trs(x, this.seaLevel, z, rng() * 6.28), this.hazeTint(dist, 0x84865e));
-      this.townStack(x, this.seaLevel + h * 0.42, z, yaw, r * 0.62, h * 0.42, dist, rng);
-      this.marks.push({ x, z, r });
-    }
-  }
 
   /** A walled monastery: a block, a cloister wall, a campanile, a pitched roof. */
   private monastery(x: number, y: number, z: number, yaw: number, sc: number, dist: number, rng: RNG) {
@@ -2751,24 +3143,29 @@ export class Scenery implements System {
     put(bevelBox(bw * 1.5, 5.2, 1.4, 0.25, 0.2), trs(-bw * 0.2, 2.6, -11, 0.22), wall);
   }
 
-  /** A stepped stack of pastel blocks under one terracotta band — a hill town. */
-  private townStack(x: number, y: number, z: number, yaw: number, spread: number, rise: number, dist: number, rng: RNG) {
-    const base = trs(x, y, z, yaw);
+  /**
+   * A stepped stack of pastel blocks under one terracotta band — a hill town,
+   * placed in the LOCAL space of a ridge so it climbs the slope it is on.
+   * `spread` scales with viewing distance so a town at 4 km is not built out of
+   * sub-pixel houses (which cost triangles and read as noise).
+   */
+  private townStackLocal(base: THREE.Matrix4, x: number, y: number, z: number, spread: number, rise: number, dist: number, rng: RNG) {
     const roof = this.hazeTint(dist, 0xb5643f);
+    const unit = Math.max(4, spread * 0.14);
     const rows = 4;
     for (let r = 0; r < rows; r++) {
-      const rowY = (r / rows) * rise;
-      const rowZ = -r * spread * 0.26;
-      const n = 6 + ((rng() * 4) | 0);
+      const rowY = y + (r / rows) * rise;
+      const rowZ = z + r * spread * 0.2;
+      const n = 5 + ((rng() * 4) | 0);
       for (let i = 0; i < n; i++) {
-        const bx = (i / (n - 1) - 0.5) * spread * (1.05 - r * 0.1) + (rng() - 0.5) * 6;
-        const bw = 7 + rng() * 7;
-        const bh = 8 + rng() * 9;
+        const bx = x + (i / (n - 1) - 0.5) * spread * (1.05 - r * 0.1) + (rng() - 0.5) * unit;
+        const bw = unit * (0.9 + rng() * 0.9);
+        const bh = unit * (1.0 + rng() * 1.1);
         // Pastel walls, ONE constant roof band. That contrast is the entire
         // reason a Mediterranean hill town is legible at silhouette size (§3).
         const wall = this.hazeTint(dist, PAL.pastels[(rng() * 5) | 0]);
-        this.acc.backdrop.add(bevelBox(bw, bh, 8 + rng() * 4, 0.3, 0.12), _m4.multiplyMatrices(base, trs(bx, rowY + bh / 2, rowZ, (rng() - 0.5) * 0.3)).clone(), wall);
-        this.acc.backdrop.add(bevelBox(bw + 1.1, 1.5, 9.4, 0.25, 0.14), _m4.multiplyMatrices(base, trs(bx, rowY + bh + 0.75, rowZ, (rng() - 0.5) * 0.3)).clone(), roof);
+        this.acc.backdrop.add(bevelBox(bw, bh, unit, 0.3, 0.12), _m4.multiplyMatrices(base, trs(bx, rowY + bh / 2, rowZ, (rng() - 0.5) * 0.3)).clone(), wall);
+        this.acc.backdrop.add(bevelBox(bw + unit * 0.16, unit * 0.2, unit * 1.16, 0.25, 0.14), _m4.multiplyMatrices(base, trs(bx, rowY + bh + unit * 0.1, rowZ, (rng() - 0.5) * 0.3)).clone(), roof);
       }
     }
   }
@@ -2784,6 +3181,231 @@ export class Scenery implements System {
       const bz = (rng() - 0.5) * spread * 0.5;
       // sink the base so a spire on a curved crest never floats off it
       this.acc.backdrop.add(spire, _m4.multiplyMatrices(base, trs(bx, -h * 0.14 - Math.abs(bx) * 0.06, bz, 0)).clone(), col);
+    }
+  }
+
+  // ==========================================================================
+  // Midground — the 40 to 150 m band
+  // ==========================================================================
+
+  /**
+   * The emptiest part of every frame, and the other half of "the world stops
+   * about 80 metres from the camera".
+   *
+   * Everything before this pass is gated. `dressLandBands` fills 15–35 m and
+   * 40–90 m but only on `-seaSide(t)`, so the seaward half of the circuit gets
+   * nothing. `dressOpposingMidground` only fires where one side of the road
+   * rises 6 m or more, which on a coastal boulevard is nowhere. The result is
+   * the note the composition critic kept writing: one side is a wall, the other
+   * is a void, and past the kerb there is nothing until the horizon.
+   *
+   * This pass is UNGATED. It walks the circuit and fills the 45–150 m band on
+   * BOTH sides, every time, choosing content from what is actually there:
+   *
+   *   land  — terraced olive groves, vineyard combing, cypress windbreaks and
+   *           hillside hamlets, all following the contour;
+   *   water — a marina of masts, moored fleets, a breakwater arm and a light.
+   *
+   * Draw-call cost: ZERO. Terrace walls, breakwaters and hamlet blocks go into
+   * the merged stone/wall/roof/wood accumulators that already exist; the olives
+   * and vines ride the shrub instance set, the cypresses the cypress set, the
+   * masts the far-sail set, the boats the hull sets. Not one new mesh.
+   */
+  private dressMidground() {
+    const rng = mulberry32(0x9d1efa);
+    const density = clamp(this.ctx.settings.foliageDensity ?? 1, 0.25, 1.5);
+    this.walk(0, 1, 42 / density, (t, s, i) => {
+      // the tunnel looks at rock, not at a landscape
+      if (t > 0.495 && t < 0.625) return;
+      for (const side of [-1, 1]) {
+        const idx = i * 2 + (side > 0 ? 1 : 0);
+        const lat = side * (s.halfWidth + 46 + this.hash1(idx, 0x5c1) * 34);
+        if (this.isSea(t, lat, s)) this.seaMidground(t, s, side, idx, rng);
+        else this.landMidground(t, s, side, lat, idx, rng);
+      }
+    });
+  }
+
+  /** Is (t, lat) buildable midground — real ground, above water, off the road? */
+  private midgroundOk(t: number, lat: number, s: TrackSample, out: THREE.Vector3): boolean {
+    this.at(t, lat, out, s);
+    this.settle(out, t, _n);
+    if (out.y < this.seaLevel + 0.8) return false;
+    if (this.blocked(out, 4)) return false;
+    if (!this.flatWorld && this.surfaceAt(out, t) === Surface.Road) return false;
+    return true;
+  }
+
+  /**
+   * Cultivated hillside. Everything here follows the CONTOUR — rows run along
+   * the track, not across it — because the one thing a terraced Mediterranean
+   * slope reads as at a hundred metres is horizontal banding, and rows that
+   * ignore the contour read as a plantation on a football pitch.
+   */
+  private landMidground(t: number, s: TrackSample, side: number, lat: number, idx: number, rng: RNG) {
+    const L = this.ctx.track.length || 1;
+    const kind = this.hash1(idx, 0x77a3);
+    const yaw = Math.atan2(s.tangent.x, s.tangent.z);
+
+    if (kind < 0.40) {
+      // --- terraced olive grove: retaining wall, then the row above it
+      const rows = 3 + ((rng() * 3) | 0);
+      for (let r = 0; r < rows; r++) {
+        const rowLat = lat + side * r * (10 + rng() * 6);
+        for (let k = -2; k <= 2; k++) {
+          const tt = ((t + (k * 9) / L) % 1 + 1) % 1;
+          const ss = this.ctx.track.sampleByDistance(((t * L + k * 9) % L + L) % L);
+          if (!this.midgroundOk(tt, rowLat, ss, _p)) continue;
+          if (k > -2) {
+            const h = 1.1 + rng() * 0.9;
+            this.acc.stone.add(bevelBox(0.7, h, 9.4, 0.05, 0.6), trs(_p.x, _p.y + h * 0.4, _p.z, yaw + (rng() - 0.5) * 0.08), _col.set(0xcbbb9c).clone(), (_x, y) =>
+              lerp(0.5, 1, smoothstep(-h / 2, 0.1, y))
+            );
+          }
+          _p2.set(_p.x + (rng() - 0.5) * 4, _p.y + 0.6, _p.z + (rng() - 0.5) * 4);
+          this.settle(_p2, tt);
+          this.foliage.olive(_p2.clone(), 1.9 + rng() * 1.1, rng() * 6.28);
+        }
+      }
+      return;
+    }
+
+    if (kind < 0.60) {
+      // --- vineyard: tight rows, which is the strongest texture in the band
+      const rows = 4 + ((rng() * 4) | 0);
+      for (let r = 0; r < rows; r++) {
+        const rowLat = lat + side * r * (4.5 + rng() * 2.5);
+        for (let k = -3; k <= 3; k++) {
+          const d = ((t * L + k * 5.5) % L + L) % L;
+          const ss = this.ctx.track.sampleByDistance(d);
+          if (!this.midgroundOk(ss.t, rowLat, ss, _p)) continue;
+          this.foliage.vine(_p.clone(), 1.5 + rng() * 0.5, yaw + (rng() - 0.5) * 0.08);
+        }
+      }
+      return;
+    }
+
+    if (kind < 0.80) {
+      // --- cypress windbreak: a LINE, which is the only planting shape that
+      // reads as deliberate at this distance, plus a dry-stone wall at its foot
+      const n = 5 + ((rng() * 6) | 0);
+      for (let k = 0; k < n; k++) {
+        const d = ((t * L + (k - n / 2) * 7.5) % L + L) % L;
+        const ss = this.ctx.track.sampleByDistance(d);
+        if (!this.midgroundOk(ss.t, lat + (rng() - 0.5) * 3, ss, _p)) continue;
+        this.foliage.cypFar(_p.clone(), 1.5 + rng() * 0.7, rng() * 6.28);
+      }
+      this.stoneRun(t, s, lat - side * 5, 16 + rng() * 12, rng);
+      return;
+    }
+
+    // --- a hamlet on the slope: four to seven blocks under one roof colour
+    if (!this.midgroundOk(t, lat, s, _p)) return;
+    const inward = Math.atan2(-s.binormal.x * side, -s.binormal.z * side);
+    const roof = _col.set(0xb5643f).clone();
+    const n = 4 + ((rng() * 4) | 0);
+    const base = trs(_p.x, _p.y, _p.z, inward + (rng() - 0.5) * 0.6);
+    for (let k = 0; k < n; k++) {
+      const bw = 5 + rng() * 4;
+      const bh = 4.5 + rng() * 4;
+      const bx = (k / Math.max(1, n - 1) - 0.5) * (n * 7);
+      const bz = (rng() - 0.5) * 9;
+      const by = Math.abs(bx) * 0.09 * (rng() < 0.5 ? 1 : -1);
+      const wall = _col.set(pick(rng, PAL.pastels)).clone();
+      this.acc.wall.add(bevelBox(bw, bh, bw * 0.85, 0.07, 0.5), _m4.multiplyMatrices(base, trs(bx, by + bh / 2, bz, (rng() - 0.5) * 0.35)).clone(), wall, (_x, y) =>
+        lerp(0.55, 1, smoothstep(-bh * 0.5, -bh * 0.15, y))
+      );
+      this.acc.roof.add(bevelBox(bw + 0.9, 0.55, bw * 0.95, 0.06, 0.8), _m4.multiplyMatrices(base, trs(bx, by + bh + 0.28, bz, (rng() - 0.5) * 0.35)).clone(), roof);
+    }
+    this.claim(_p, n * 3.5);
+    for (let k = 0; k < 3; k++) {
+      _p2.set(_p.x + (rng() - 0.5) * 26, _p.y, _p.z + (rng() - 0.5) * 26);
+      this.settle(_p2, t);
+      if (_p2.y > this.seaLevel + 0.8) this.foliage.cypFar(_p2.clone(), 1.4 + rng() * 0.6, rng() * 6.28);
+    }
+  }
+
+  /**
+   * The seaward half of the same band. A harbour town's midground over water is
+   * masts — hundreds of thin verticals at 80–250 m — plus the stone arm that
+   * makes the water inside them flat. Both are strong silhouettes and neither
+   * costs a draw call.
+   */
+  private seaMidground(t: number, s: TrackSample, side: number, idx: number, rng: RNG) {
+    const kind = this.hash1(idx, 0x33b1);
+    const yaw = Math.atan2(s.tangent.x, s.tangent.z);
+
+    if (kind < 0.42) {
+      // --- marina: a raft of masts on a grid, which is what reads
+      const rows = 3 + ((rng() * 3) | 0);
+      const cols = 4 + ((rng() * 4) | 0);
+      const d0 = 60 + this.hash1(idx, 0x33b2) * 90;
+      const across = 9 + rng() * 5;
+      for (let r = 0; r < rows; r++)
+        for (let c = 0; c < cols; c++) {
+          this.at(t, side * (s.halfWidth + d0 + r * across), _p, s);
+          _p.x += s.tangent.x * (c - cols / 2) * 11;
+          _p.z += s.tangent.z * (c - cols / 2) * 11;
+          if (!this.flatWorld && this.groundY(_p, t) > this.seaLevel - 0.6) continue;
+          _p.y = this.seaLevel;
+          this.sets.farSail.add(trs(_p.x, _p.y, _p.z, yaw + (rng() - 0.5) * 0.25, 1.5 + rng() * 0.9), {
+            color: _col.setHSL(0.09, 0.04 + rng() * 0.05, 0.82 + rng() * 0.14).clone(),
+            uv: new THREE.Vector4(1, 1, 0, 0),
+            bob: new THREE.Vector4(0.1 + rng() * 0.07, rng() * 6.28, 0.02 + rng() * 0.02, 0),
+            lod: 0,
+          });
+        }
+      return;
+    }
+
+    if (kind < 0.68) {
+      // --- moored fleet at two depths
+      for (let k = 0; k < 6; k++) {
+        const d = 55 + rng() * 120;
+        this.at(t, side * (s.halfWidth + d), _p, s);
+        _p.x += (rng() - 0.5) * 40;
+        _p.z += (rng() - 0.5) * 40;
+        if (!this.flatWorld && this.groundY(_p, t) > this.seaLevel - 0.8) continue;
+        _p.y = this.seaLevel;
+        this.boatAt(trs(_p.x, _p.y, _p.z, yaw + (rng() - 0.5) * 0.7), rng, 1.4 + rng() * 0.9);
+      }
+      return;
+    }
+
+    // --- breakwater: a stone arm with a light on the head. The horizontal is
+    // what gives the open water a scale, and the light gives it a full stop.
+    const d0 = 80 + this.hash1(idx, 0x33c4) * 70;
+    const segs = 7 + ((rng() * 6) | 0);
+    const L = this.ctx.track.length || 1;
+    let ok = 0;
+    for (let k = 0; k < segs; k++) {
+      const dd = ((t * L + (k - segs / 2) * 13) % L + L) % L;
+      const ss = this.ctx.track.sampleByDistance(dd);
+      // the arm curves out as it runs, so it is not a ruled bar
+      this.at(ss.t, side * (s.halfWidth + d0 + Math.pow(k / segs, 1.6) * 26), _p, ss);
+      if (!this.flatWorld && this.groundY(_p, ss.t) > this.seaLevel - 0.5) continue;
+      const h = 3.2 + rng() * 0.9;
+      this.acc.stone.add(
+        bevelBox(6.5, h, 13.5, 0.12, 0.35),
+        trs(_p.x, this.seaLevel + h * 0.35, _p.z, Math.atan2(ss.tangent.x, ss.tangent.z) + (rng() - 0.5) * 0.12),
+        _col.set(0xb9ab92).clone(),
+        (_x, y) => lerp(0.42, 1, smoothstep(-h / 2, 0, y))
+      );
+      // armour blocks tumbled along the seaward face
+      if (k % 2 === 0)
+        this.sets.debris0.add(trs(_p.x + s.binormal.x * side * 8, this.seaLevel + 0.4, _p.z + s.binormal.z * side * 8, rng() * 6.28, 3.5 + rng() * 2.5), {
+          color: _col.set(0xa89a82).clone(),
+          uv: new THREE.Vector4(1, 1, 0, 0),
+          lod: 320,
+        });
+      ok = k;
+      _p2.copy(_p);
+    }
+    if (ok > 2) {
+      const lh = lighthouseGeo(this.seaLevel + 3.4, this.seaLevel);
+      const base = trs(_p2.x, this.seaLevel + 3.2, _p2.z, rng() * 6.28, 1.15);
+      this.acc.stone.add(lh.stone, base, _col.set(0xefe6d6).clone());
+      this.acc.trim.add(lh.trim, base, _col.set(0xd8654a).clone());
     }
   }
 

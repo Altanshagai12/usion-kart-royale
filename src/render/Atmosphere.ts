@@ -37,6 +37,28 @@ export const SUN_LIGHT_COLOR = 0xffd9a8;
 export const GROUND_BOUNCE_COLOR = 0xc98f5a;
 /** Cool sky fill, art bible §2. */
 export const SKY_FILL_COLOR = 0xa8c8ff;
+/**
+ * Direction TOWARD the cool fill: 35° up, on the ANTI-solar side.
+ *
+ * A fill that arrives from the same half of the compass as the key cannot
+ * separate from it — it just makes the key's own falloff shallower, which is
+ * precisely the "the shadowed side is a dimmer copy of the lit side" note. At
+ * 14° sun elevation the part of the sky an object's shaded side actually sees is
+ * the high, blue half away from the sun, so that is where this comes from.
+ *
+ * The 35° elevation is a tuned compromise, not a guess. Straight down from the
+ * zenith the fill lands hardest on UP-facing normals, i.e. on the road, and
+ * since it casts no shadow that directly weakens every cast shadow on the
+ * tarmac: measured on a 0.18 grey card, a vertical fill took the lit:shadowed
+ * ratio on flat road from 2.39:1 to 1.98:1. Tilted to 35° the same fill lands on
+ * side-facing normals instead — where the sculpting is needed — and the road
+ * ratio comes back to 2.43:1, i.e. slightly BETTER than before the fill existed,
+ * while an anti-solar-facing surface goes from red:blue 1.69 (warm) to 0.54
+ * (cool). That swing is the entire point of the exercise.
+ */
+export const SKY_FILL_DIRECTION = new THREE.Vector3(
+  -SUN_DIRECTION.x * 1.45, 1.0, -SUN_DIRECTION.z * 1.45,
+).normalize();
 /** Target displayed sky colours after tone mapping. */
 export const SKY_ZENITH_TARGET = 0x3f74c4;
 export const SKY_HORIZON_TARGET = 0xffd0a0;
@@ -89,6 +111,44 @@ const MIE_TINT = [1.0, 0.78, 0.52];
  */
 const GAIN_BLEND_END = 0.42;
 const GAIN_BLEND_POW = 0.95;
+/**
+ * How the dome hands over to the aerial-perspective haze at the horizon line.
+ *
+ * THIS IS THE HORIZON SEAM, and it was a construction error rather than a
+ * tuning one. Aerial perspective drives every distant surface toward
+ * `krFogHaze`, which is the low-sky radiance WITH the highlight rolloff applied.
+ * The dome was drawn from the raw radiance and only pulled 34% of the way toward
+ * that same haze. Straight down-sun the raw value is (6.94, 3.10, 1.79) and the
+ * haze is (1.15, 0.51, 0.30), so the last pixel of sky above the waterline came
+ * out FOUR TIMES brighter than the first pixel of fully-hazed sea below it —
+ * a hard, dead-straight, horizon-wide step. No amount of fog tuning can close
+ * it, because the two sides were converging on different numbers by design.
+ *
+ * The sky and the fog now converge on exactly the same value in exactly the same
+ * azimuth: the weld reaches 1.0 at mu = 0. The band is deliberately narrow
+ * (3.2°) so it reads as the real thing — the compressed haze layer you always
+ * see stacked on a sea horizon — rather than as a wash up the dome.
+ */
+const HORIZON_WELD_BAND = 0.055;
+
+/**
+ * The shoulder applied to the low sky before it becomes the aerial-perspective
+ * asymptote. Retuned upward from 0.55/1.15 now that it no longer destroys hue.
+ *
+ * The old ceiling of 1.15 was doing two jobs at once and doing the second one
+ * badly: it kept the fog target under the ACES knee (right) and, as a
+ * side effect of being per-channel, it flattened the entire compass onto one
+ * near-neutral cream (wrong — see `compressHighlights`). With the chromaticity
+ * preserved, a ceiling that low crushes the haze a stop and a half below the sky
+ * it is supposed to be welded to. At 0.90/1.95 the fitted haze lands on
+ * #f1e3d9 down-sun, #fbc191 at 90° and #f8bf90 behind — within a few percent of
+ * the art bible's #ffd0a0 where the bible measures it, with 1.8:1 of luminance
+ * spread around the compass, and still low enough that a headland standing in
+ * front of it keeps a slice of display range to be a silhouette in.
+ */
+const HAZE_KNEE = 0.90;
+const HAZE_CEILING = 1.95;
+const HAZE_DESAT = 0.45;
 /** Eye height used for the integrals. Sea level plus a bit of cliff. */
 const VIEW_ALTITUDE = 300;
 
@@ -145,6 +205,7 @@ const _mieScratch = new Float64Array(3);
 const _dir = new THREE.Vector3();
 const _shBasis: number[] = [0, 0, 0, 0, 0, 0, 0, 0, 0];
 const _hazeBasis: number[] = [0, 0, 0, 0];
+const _weldScratch = new THREE.Vector3();
 const UP_AXIS = new THREE.Vector3(0, 1, 0);
 
 function mulberry32(seed: number): () => number {
@@ -438,19 +499,57 @@ export class AtmosphereModel {
 
   /**
    * Roll the top end of a linear radiance off toward `ceiling`. The sky's own
-   * horizon is deliberately superwhite (the bible's #ffd0a0 has R = 255, so the
-   * only linear value that tone maps to it is one that clips), and that is fine
-   * for the DOME — but anything that uses it as an asymptote for geometry, i.e.
-   * fog, drives every distant surface past the ACES knee where all form
-   * disappears. Compressed, the same hue lands just under the knee: distant land
-   * still reads as a silhouette against the sky instead of dissolving into it.
+   * horizon is bright (the bible's #ffd0a0 has R = 255, so the linear value that
+   * tone maps to it sits above display white), and that is fine for the DOME —
+   * but anything that uses it as an asymptote for geometry, i.e. fog, drives
+   * every distant surface past the ACES knee where all form disappears.
+   * Compressed, the same hue lands just under the knee: distant land still reads
+   * as a silhouette against the sky instead of dissolving into it.
+   *
+   * THE COMPRESSION IS APPLIED TO THE BRIGHTEST CHANNEL AND THE OTHER TWO ARE
+   * SCALED WITH IT. This is the fix for the dead white sea.
+   *
+   * Per-channel compression — what this used to do — is a hue destroyer, and at
+   * golden hour it is a catastrophic one. Straight down-sun the model's own
+   * low-sky radiance is (6.94, 3.10, 1.79): a saturated orange with a 3.9:1
+   * red:blue ratio. Compress each channel independently against a ceiling of
+   * 1.15 and every channel above ~2 lands within a percent of the ceiling, so
+   * that orange came out (1.150, 1.141, 1.074) — a 1.07:1 ratio, i.e. NEUTRAL
+   * WHITE. The fog colour, the sky's horizon weld and the cloud aerial term all
+   * converge on this value, which is why the bay was a featureless white sheet
+   * and why the whole compass hazed to the same cream regardless of where the
+   * camera pointed: the azimuthal variation the haze fit works so hard to
+   * preserve was being flattened by the very last operation applied to it.
+   *
+   * Gated on max(rgb) the same orange lands at (1.150, 0.514, 0.297): the same
+   * chromaticity, the same 3.9:1 ratio, under the knee. Sea and sky now converge
+   * on a warm value down-sun and a duller one away from it, which is what makes
+   * the bay read as water at golden hour instead of as paper.
    */
   static compressHighlights(
-    v: THREE.Vector3, out: THREE.Vector3, knee = 0.55, ceiling = 1.15,
+    v: THREE.Vector3, out: THREE.Vector3,
+    knee = HAZE_KNEE, ceiling = HAZE_CEILING, desatMax = HAZE_DESAT,
   ): THREE.Vector3 {
+    const m = Math.max(v.x, v.y, v.z);
+    if (m <= knee) return out.copy(v);
     const span = ceiling - knee;
-    const f = (x: number) => (x <= knee ? x : knee + span * (1 - Math.exp(-(x - knee) / span)));
-    return out.set(f(v.x), f(v.y), f(v.z));
+    const s = (knee + span * (1 - Math.exp(-(m - knee) / span))) / m;
+    out.set(v.x * s, v.y * s, v.z * s);
+    // ...then the SAME desaturation ACES itself would have applied on the way to
+    // display, so preserving chromaticity in linear does not come back as an
+    // over-saturated result on screen. Looking straight into the sun the haze is
+    // pale and warm; at 90° it is amber; behind, dusty. That spread — 1.8:1 in
+    // luminance and a full hue swing — is the thing a single fog colour cannot
+    // have, and it is what makes the bay read as a place rather than a backdrop.
+    let t = Math.min(Math.max((m - knee) / (knee * 12 - knee), 0), 1);
+    t = t * t * (3 - 2 * t) * desatMax;
+    if (t <= 0) return out;
+    const lum = 0.2126 * out.x + 0.7152 * out.y + 0.0722 * out.z;
+    return out.set(
+      out.x + (lum - out.x) * t,
+      out.y + (lum - out.y) * t,
+      out.z + (lum - out.z) * t,
+    );
   }
 
   // -- calibration ------------------------------------------------------------
@@ -636,10 +735,18 @@ export class AtmosphereModel {
       out.lerp(this.groundColor, g);
     }
     if (weld) {
-      // Twin of the weld in the fragment shader; see the comment there.
-      let w = Math.min(Math.max(Math.abs(mu) / 0.030, 0), 1);
+      // Twin of the weld in the fragment shader; see HORIZON_WELD_BAND. Note it
+      // welds to the haze in THIS direction's azimuth, not to the single
+      // averaged `hazeColor` — the shader has always done the former and the CPU
+      // side quietly did the latter, which put the SH probe and the sky on two
+      // different horizons.
+      const l = Math.hypot(dir.x, dir.z);
+      const c = l > 1e-5
+        ? Math.min(Math.max((dir.x * this.sunAzimuth.x + dir.z * this.sunAzimuth.y) / l, -1), 1)
+        : 0;
+      let w = Math.min(Math.max(Math.abs(mu) / HORIZON_WELD_BAND, 0), 1);
       w = 1 - w * w * (3 - 2 * w);
-      out.lerp(this.hazeColor, 0.34 * w);
+      out.lerp(this.hazeAt(c, _weldScratch), w);
     }
     return out;
   }
@@ -931,13 +1038,13 @@ vec3 atmosphere(vec3 dir, float gamma) {
   // env map has a lower hemisphere; on screen it is under the terrain.
   col = mix(col, uGroundColor, smoothstep(0.0, 0.16, -mu));
 
-  // Take the kink out of the sky/ground join, and — more importantly — put the
-  // last degree of sky on exactly the value the fog is converging on. gHaze IS
-  // this direction's own low-elevation radiance with the highlight rolloff
-  // applied, so the weld now only compresses the top end; it no longer drags a
-  // warm horizon toward a cool average (or the reverse) the way a single
-  // constant did, which is what welded a hard line between bay and sky.
-  col = mix(col, gHaze, 0.34 * (1.0 - smoothstep(0.0, 0.030, abs(mu))));
+  // THE HORIZON WELD. At mu = 0 this is not a nudge, it is an identity: the sky
+  // on the waterline IS gHaze, which is exactly what aerial perspective drives
+  // every distant surface toward, in exactly this azimuth. Sea and sky therefore
+  // arrive at the same number from both sides and the seam has nothing left to
+  // be. At 34% (what this was) the last pixel of sky sat 4x above the first
+  // pixel of hazed sea down-sun — see HORIZON_WELD_BAND.
+  col = mix(col, gHaze, 1.0 - smoothstep(0.0, ${gf(HORIZON_WELD_BAND)}, abs(mu)));
   return col;
 }
 

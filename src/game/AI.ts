@@ -49,6 +49,49 @@ const A_BRAKE = 11.5;
  * mini-turbos per lap. Lower it and they drift the straights.
  */
 const DRIFT_MIN_CURV = 0.0098;
+/**
+ * How much road the driver insists on keeping under the outside wheels before
+ * it abandons a drift, metres inside the road edge.
+ *
+ * A drift is a slide, and a slide costs lateral room: measured over the baked
+ * line, an AI drift washes the kart a median 3.5 m and up to 4.4 m wider than
+ * where it turned in. The corridor only offers ~2.4 m outside the racing line,
+ * so the slide has to be cut short rather than ridden out. Releasing here still
+ * banks a mini-turbo — it is simply a shorter one than a 26 m road allowed.
+ */
+const DRIFT_EDGE_KEEP = 0.6;
+/**
+ * Speed multiplier applied while a drift is committed.
+ *
+ * `Kart.ts` drops the rears to DRIFT_REAR_GRIP_IN (0.58) in a drift, which puts
+ * the achievable lateral acceleration at roughly 0.78 of the four-wheel figure
+ * the speed profile is solved with; speed scales as its square root.
+ */
+const DRIFT_SPEED_FACTOR = 0.88;
+/** steer added on turn-in to load the rack before the drift hop lands */
+const DRIFT_FLICK = 0.45;
+/** metres of road on the apex side at which the flick is worth its full value */
+const DRIFT_FLICK_ROOM = 6.0;
+/**
+ * Edge repulsion. Beyond `half - EDGE_PUSH_KEEP` the driver actively steers
+ * back toward the middle, on top of whatever the racing line asked for.
+ *
+ * The racing line is clamped to `half - EDGE_MARGIN` and the lane bias to
+ * `half - 1.4`, so this dead band sits outside both and never fights either.
+ * It exists because line-following alone has no opinion about the road: a
+ * drift, a rival's shove or a kerb bounce all displace the kart faster than
+ * the cross-track term can pull it back, and the barrier is only ~2 m further.
+ */
+const EDGE_PUSH_KEEP = 1.2;
+/**
+ * Half-width the rival-avoidance shove was authored against. Below this the
+ * push is scaled down in proportion — there is simply less road to give.
+ */
+const LANE_REF_HALF = 9.5;
+/** steer per metre of excursion past the keep-out, before clamping */
+const EDGE_PUSH_GAIN = 0.55;
+/** ceiling on the edge term so it can never fully override the racing line */
+const EDGE_PUSH_MAX = 0.85;
 
 // --- module scratch ----------------------------------------------------------
 const _p0 = new THREE.Vector3();
@@ -413,6 +456,8 @@ export class AIDriver {
   /** seconds the current shield has been on the tow rope */
   private carryT = 0;
   private stuckT = 0;
+  /** counts down the forward "drive away" phase after a reverse, seconds */
+  private escapeT = 0;
 
   constructor(readonly kart: IKart, private line: RacingLine, seed: number) {
     const h0 = hash01(seed * 7 + 11);
@@ -441,6 +486,7 @@ export class AIDriver {
     this.itemDelay = 0;
     this.carryT = 0;
     this.stuckT = 0;
+    this.escapeT = 0;
     this.cmd.steer = this.cmd.throttle = this.cmd.brake = 0;
     this.cmd.drift = false;
     this.cmd.useItem = false;
@@ -525,6 +571,22 @@ export class AIDriver {
     // through long constant-radius corners; this is what removes it.
     let steer = err * 2.35 + dErr * 0.10 + this.iErr * 0.30 + cross * 0.045;
 
+    // Edge repulsion. `half` here is the road under the kart *now*, not at the
+    // lookahead: this is a reaction to where the kart actually is, which is the
+    // whole point — the lookahead is already accounted for by the line.
+    // Sign follows the cross-track term: a kart displaced toward +binormal is
+    // brought back by a positive steer, so the push is sign(lat) * excess.
+    const bi = line.index(d);
+    const halfNow = line.half[bi];
+    const outSign = lat >= 0 ? 1 : -1;
+    // Positional only, deliberately. A rate term on `lat` was tried and is
+    // wrong: the racing line itself moves across the corridor through a corner,
+    // so a kart tracking it perfectly still carries outward lateral velocity,
+    // and damping that fights the line instead of the excursion (measured: it
+    // put wall contacts back up from 25 to 31 per run).
+    const excess = Math.abs(lat) - (halfNow - EDGE_PUSH_KEEP);
+    if (excess > 0) steer += outSign * Math.min(excess * EDGE_PUSH_GAIN, EDGE_PUSH_MAX);
+
     // reversing out of a wall: invert so the correction is not fighting itself
     if (speed < -0.5) steer = -steer;
 
@@ -547,10 +609,21 @@ export class AIDriver {
     cmd.steer = clamp(this.steerSmooth, -1, 1);
 
     // ---- drift -------------------------------------------------------------
-    cmd.drift = this.updateDrift(k, d, speed, cross, dt);
+    cmd.drift = this.updateDrift(k, d, speed, cross, lat, halfNow, dt);
     if (this.driftEntry > 0 && k.driftDir === 0) {
-      // flick it in: the chassis needs a loaded rack when the hop lands
-      cmd.steer = clamp(cmd.steer + this.driftSide * 0.45, -1, 1);
+      // Flick it in: the chassis needs a loaded rack when the hop lands.
+      //
+      // Scaled by the road left on the INSIDE of the corner, because that is
+      // what the flick spends. A fixed 0.45 was tuned against a corridor with
+      // ~6 m inside the racing line; this one leaves ~2.3 m, and the same flick
+      // over-rotates the kart straight across the inside kerb into the barrier
+      // (measured: every AI wall contact on the circuit was the inside line of
+      // a left-hander, not a run-wide). Room is measured toward the apex side,
+      // which is the side the flick rotates toward.
+      const insideSign = -this.driftSide;
+      const room = halfNow - insideSign * lat;
+      const scale = clamp(room / DRIFT_FLICK_ROOM, 0.3, 1);
+      cmd.steer = clamp(cmd.steer + this.driftSide * DRIFT_FLICK * scale, -1, 1);
     }
 
     // ---- speed -------------------------------------------------------------
@@ -561,6 +634,14 @@ export class AIDriver {
     target *= band;
     // personal ceiling: even a perfect line is driven a little short of it
     target *= 0.90 + this.skill * 0.11;
+    // A committed drift is a slide, and the profile above was solved for a kart
+    // that is NOT sliding: it uses A_LAT, full grip on all four corners. Once
+    // the driver has decided to drift, the rears are down to DRIFT_REAR_GRIP_IN
+    // and the same entry speed simply cannot be turned in the same radius. The
+    // profile and the driver were disagreeing about which kart they were
+    // driving; this reconciles them, and because it feeds the ordinary braking
+    // logic the backward pass turns it into a real lift *before* turn-in.
+    if (this.driftHold || k.driftDir !== 0) target *= DRIFT_SPEED_FACTOR;
     if (this.mistake === Mistake.LateBrake) target *= 1.16;
     if (k.stunTime > 0) target = 0;
 
@@ -580,16 +661,38 @@ export class AIDriver {
     if (k.driftDir !== 0 || k.boostTime > 0) { cmd.throttle = 1; cmd.brake = 0; }
 
     // ---- unstick -----------------------------------------------------------
-    // Beached on a kerb or nose-in to a wall: reverse out rather than sitting
-    // there with the throttle pinned looking broken.
-    if (Math.abs(speed) < 1.6 && k.stunTime <= 0) this.stuckT += dt;
-    else this.stuckT = Math.max(0, this.stuckT - dt * 2);
-    if (this.stuckT > 1.4) {
-      cmd.throttle = 0;
-      cmd.brake = 1;
+    // Beached on a kerb, nose-in to a wall, or wedged against a rival: reverse
+    // out rather than sitting there with the throttle pinned looking broken.
+    //
+    // Two things here are load-bearing. First, the reverse steers off the
+    // *heading error*, not off an inverted copy of whatever the line controller
+    // last wanted: backing up with the same lock that wedged the kart simply
+    // re-presents it to the same wall. Reversing pivots about the rear, so the
+    // sign is opposite to the forward case — this is what actually rotates the
+    // nose back down the road. Second, there is an explicit forward escape
+    // phase afterwards. The previous code reset the timer to zero the moment
+    // the reverse ended, so a kart that was still against the obstacle went
+    // straight back to full throttle and re-wedged 1.4 s later, forever: two
+    // karts were measured trading the same 40 m of road for 20 s that way.
+    if (this.escapeT > 0) {
+      this.escapeT -= dt;
+      this.stuckT = 0;
       cmd.drift = false;
-      cmd.steer = -cmd.steer * 0.6;
-      if (this.stuckT > 3.0) this.stuckT = 0;
+      cmd.throttle = 1;
+      cmd.brake = 0;
+    } else {
+      if (Math.abs(speed) < 1.6 && k.stunTime <= 0) this.stuckT += dt;
+      else this.stuckT = Math.max(0, this.stuckT - dt * 2);
+      if (this.stuckT > 1.4) {
+        cmd.throttle = 0;
+        cmd.brake = 1;
+        cmd.drift = false;
+        cmd.steer = clamp(-err * 1.4, -1, 1);
+        if (this.stuckT > 3.0) {
+          this.stuckT = 0;
+          this.escapeT = 1.2;
+        }
+      }
     }
 
     // ---- items -------------------------------------------------------------
@@ -622,6 +725,14 @@ export class AIDriver {
   ) {
     let want = 0;
     const line = this.line;
+    // How much road there is decides how much of it avoidance may spend. These
+    // were absolute metres chosen against a 13 m half-width, where a 3.8 m
+    // sidestep was a quarter of the corridor; here it is most of it, and a
+    // saturated bias parks the whole field against the barrier where the next
+    // touch tips someone into it. Scale the reach and the shove with the road.
+    const half = line.half[line.index(d)];
+    const roadScale = clamp(half / LANE_REF_HALF, 0.55, 1);
+    const sideWindow = clamp(half * 0.62, 3.0, 5.5);
     // `fwd x up`, NOT `up x fwd`: this must point the same way as the track's
     // binormal (SurfaceProbe's +lateral) or every avoidance push is inverted
     // and the field steers into each other instead of around.
@@ -637,14 +748,14 @@ export class AIDriver {
       const ahead = _rel.dot(k.forward);
       if (ahead < -2 || ahead > 26) continue;
       const side = _rel.dot(_right);
-      if (Math.abs(side) > 5.5) continue;
+      if (Math.abs(side) > sideWindow) continue;
       // closer and more square-on = stronger push
       const prox = 1 - clamp(ahead / 26, 0, 1);
-      const push = (2.6 + this.aggression * 1.2) * prox * (side > 0 ? -1 : 1);
+      const push = (2.6 + this.aggression * 1.2) * roadScale * prox * (side > 0 ? -1 : 1);
       // An aggressive driver commits to one side instead of splitting the
       // difference between two rivals, which is what causes the classic
       // "AI wobbles between two karts and hits both" look.
-      want += push * (1 - Math.abs(side) / 5.5);
+      want += push * (1 - Math.abs(side) / sideWindow);
     }
 
     for (let i = 0; i < hazards.length; i++) {
@@ -667,7 +778,11 @@ export class AIDriver {
       want += Math.sign(line.curvAt(d) || 1) * 0.6 * this.aggression;
     }
 
-    this.laneTarget = clamp(want, -6, 6);
+    // The corridor, not a fixed 6 m, is the ceiling: the aim point is clamped
+    // to `half - 1.4` anyway, so anything past that is bias the driver can
+    // never spend and only serves to pin it against the clamp.
+    const laneMax = Math.max(0.8, half - 1.4);
+    this.laneTarget = clamp(want, -laneMax, laneMax);
     // Bias moves at a believable rate — a kart cannot teleport across the road.
     const rate = Math.min(1, dt * 2.6);
     this.lane += (this.laneTarget - this.lane) * rate;
@@ -680,7 +795,15 @@ export class AIDriver {
    * least a tier-1 mini-turbo. Entering one straightens the kart's line, so
    * the decision is made on the corner *ahead*, not the one under the wheels.
    */
-  private updateDrift(k: IKart, d: number, speed: number, cross: number, dt: number): boolean {
+  private updateDrift(
+    k: IKart,
+    d: number,
+    speed: number,
+    cross: number,
+    lat: number,
+    half: number,
+    dt: number,
+  ): boolean {
     if (this.mistake === Mistake.NoDrift || k.stunTime > 0 || speed < 9) {
       this.driftHold = false;
       this.driftEntry = 0;
@@ -698,7 +821,13 @@ export class AIDriver {
       const exit = Math.abs(line.peakCurv(d, 16));
       // Running wide is the signal a human reads to straighten up and stop
       // trying to be a hero; without it a missed apex compounds into the grass.
-      const wide = Math.abs(cross) > 4.5;
+      //
+      // This MUST be measured against the road edge, not as an absolute number
+      // of metres off the line. A drift washes the kart 3.5-4.5 m wide; the
+      // corridor only leaves ~2.4 m outside the line, so an absolute 4.5 m
+      // threshold does not fire until the kart is already in the barrier. The
+      // road is the thing that ran out, so the road is what the test reads.
+      const wide = Math.abs(lat) > half - DRIFT_EDGE_KEEP || Math.abs(cross) > half;
       // Hold until the corner genuinely opens up, then release to cash the
       // mini-turbo onto the exit — bailing early throws the whole charge away.
       if (exit < 0.0072 || wide || (this.driftEntry <= 0 && k.driftDir === 0)) {

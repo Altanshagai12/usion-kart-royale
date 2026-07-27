@@ -114,6 +114,23 @@ export interface FbmOpts {
   warpFreq?: number;
   /** anisotropic stretch: >1 squashes the field along Y (wood grain, water) */
   stretchY?: number;
+  /**
+   * Histogram-stretch the finished field back out to [0,1], clipping this
+   * fraction off each tail first (0.02 is a good default; 0 uses the exact
+   * extremes).
+   *
+   * **Read this before authoring another low-frequency field.** An n-octave fbm
+   * is a sum of n independent-ish signals, so by the central limit theorem its
+   * output piles up around 0.5: a 3-octave field normalised by the sum of its
+   * amplitudes spends almost all of its area inside 0.35..0.65 and essentially
+   * never reaches 0 or 1. Every "macro variation" map in this library was built
+   * that way and then consumed as `(v - 0.5) * 2`, which meant a modulation the
+   * call site *thought* was ±100% was actually delivering about ±25%. That is
+   * the arithmetic reason the metre-scale layer was invisible in shipped frames
+   * and every surface read as one grade of fine speckle. Anything whose whole
+   * job is to vary at a large scale must be normalised.
+   */
+  normalize?: number;
 }
 
 function sampleWrap(buf: Float32Array, res: number, u: number, v: number): number {
@@ -301,9 +318,326 @@ export function fbmField(size: number, o: FbmOpts = {}): Float32Array {
 
   const inv = 1 / norm;
   for (let i = 0; i < n; i++) work[i] *= inv;
+  if (o.normalize !== undefined) normalizeField(work, o.normalize);
   if (workRes === size) return work;
   const out = new Float32Array(size * size);
   upsampleWrap(work, workRes, out, size);
+  return out;
+}
+
+/**
+ * Histogram-stretch a field in place so it actually spans [0,1].
+ *
+ * `clip` is the fraction of texels sacrificed off each tail before the stretch,
+ * found with a 512-bin histogram. Clipping is what turns a smooth blob field
+ * into a field with *regions*: the tails flatten into solid plateaux and the
+ * transitions between them steepen, which is the difference between "the tarmac
+ * is very slightly lighter over there" and "that is a different patch of tarmac".
+ */
+export function normalizeField(buf: Float32Array, clip = 0.02): Float32Array {
+  const n = buf.length;
+  if (n === 0) return buf;
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const v = buf[i];
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
+  if (!(hi > lo)) return buf;
+  if (clip > 0) {
+    const BINS = 512;
+    const hist = new Int32Array(BINS);
+    const k = (BINS - 1) / (hi - lo);
+    for (let i = 0; i < n; i++) hist[((buf[i] - lo) * k) | 0]++;
+    const want = Math.max(1, Math.round(n * clip));
+    let acc = 0;
+    let b0 = 0;
+    while (b0 < BINS - 1 && acc + hist[b0] < want) acc += hist[b0++];
+    acc = 0;
+    let b1 = BINS - 1;
+    while (b1 > b0 && acc + hist[b1] < want) acc += hist[b1--];
+    const nlo = lo + b0 / k;
+    const nhi = lo + b1 / k;
+    if (nhi - nlo > 1e-6) {
+      lo = nlo;
+      hi = nhi;
+    }
+  }
+  const s = 1 / (hi - lo);
+  for (let i = 0; i < n; i++) buf[i] = clamp01((buf[i] - lo) * s);
+  return buf;
+}
+
+/** Push a 0..1 field away from (k>0) or toward (k<0) its midpoint. */
+export function contrastField(buf: Float32Array, k: number): Float32Array {
+  if (k === 0) return buf;
+  const e = k > 0 ? 1 / (1 + k) : 1 - k;
+  for (let i = 0; i < buf.length; i++) {
+    const v = buf[i];
+    buf[i] = v < 0.5 ? 0.5 * Math.pow(clamp01(v * 2), e) : 1 - 0.5 * Math.pow(clamp01((1 - v) * 2), e);
+  }
+  return buf;
+}
+
+// ---------------------------------------------------------------------------
+// The macro layer
+// ---------------------------------------------------------------------------
+
+export interface MacroOpts extends FbmOpts {
+  /**
+   * Working resolution. A macro map is low frequency *by definition* — its whole
+   * content is a handful of lattice cells — so building it at the material's
+   * texture size is pure waste. 128² stretched over 30 m of world is a sample
+   * every 23 cm, which is finer than anything this layer is allowed to contain.
+   */
+  res?: number;
+  /** clip fraction for the histogram stretch (see `normalizeField`) */
+  clip?: number;
+}
+
+/**
+ * A **metre-scale** variation field: low frequency, heavily domain-warped and
+ * contrast-normalised, built small and magnified.
+ *
+ * This is the layer the whole library was missing. `fbmField` produces a good
+ * detail octave, but a detail octave is all it produces: at any frequency high
+ * enough to look like grain it also averages to a constant over a metre, and a
+ * surface whose only spatial frequency is grain reads as flat noise no matter
+ * how good the grain is. Use this for everything above ~1 m, and consume it for
+ * BOTH albedo and roughness — a large-scale albedo blotch with constant
+ * roughness under it still lights like a flat sheet.
+ */
+export function macroField(size: number, o: MacroOpts = {}): Float32Array {
+  const res = Math.min(size, o.res ?? 128);
+  const buf = fbmField(res, {
+    freq: 2,
+    octaves: 3,
+    warp: 0.12,
+    warpFreq: 2,
+    ...o,
+    normalize: undefined,
+  });
+  normalizeField(buf, o.clip ?? 0.02);
+  if (res === size) return buf;
+  const out = new Float32Array(size * size);
+  upsampleWrap(buf, res, out, size);
+  return out;
+}
+
+export interface PatchOpts {
+  /** patch cells across the tile — 3..6 for road repairs at a ~30 m macro period */
+  cells?: number;
+  jitter?: number;
+  /** domain-warp amplitude in cell units; this is what makes the boundary ragged */
+  warp?: number;
+  warpFreq?: number;
+  /** fraction of cells that are actually a patch, 0..1 */
+  coverage?: number;
+  /** boundary feather, in cell units. Small = a cut edge, large = a smear. */
+  softness?: number;
+  seed?: number;
+  res?: number;
+}
+
+export interface PatchFieldResult {
+  /** 1 inside a patch, 0 outside, feathered across `softness` */
+  mask: Float32Array;
+  /** owning cell id, so each patch can take its own tone/roughness */
+  id: Int32Array;
+}
+
+/**
+ * Irregular regions with **soft but definite** boundaries: asphalt repairs,
+ * resurfaced sections, worn-through turf, damp ground.
+ *
+ * A thresholded fbm gives regions with mushy edges that read as a stain; a raw
+ * Voronoi gives regions with straight edges that read as a mosaic. This is a
+ * Voronoi *sampled through a domain warp*, which is the one construction that
+ * gives a region a definite edge you can point at and an outline nothing
+ * recognises as a cell. Built at `res` and magnified — a patch boundary is a
+ * metre-scale feature and does not need texel-accurate placement.
+ */
+export function patchField(size: number, o: PatchOpts = {}): PatchFieldResult {
+  const res = Math.min(size, o.res ?? 192);
+  const cells = Math.max(2, Math.round(o.cells ?? 4));
+  const seed = o.seed ?? 1;
+  const softness = o.softness ?? 0.16;
+  const coverage = o.coverage ?? 0.34;
+  const warp = o.warp ?? 0.35;
+  const v = voronoiField(res, cells, cells, o.jitter ?? 0.95, seed, 1);
+  const wx = fbmField(res, { freq: Math.max(2, o.warpFreq ?? 3), octaves: 3, seed: seed + 611 });
+  const wy = fbmField(res, { freq: Math.max(2, o.warpFreq ?? 3), octaves: 3, seed: seed + 907 });
+
+  const mask = new Float32Array(res * res);
+  const id = new Int32Array(res * res);
+  // Warping the *lookup* rather than the sites keeps the field cheap: one extra
+  // bilinear fetch per texel instead of a re-solve of the cell neighbourhood.
+  for (let y = 0; y < res; y++) {
+    const v0 = y / res;
+    const row = y * res;
+    for (let x = 0; x < res; x++) {
+      const u0 = x / res;
+      const du = (wx[row + x] - 0.5) * 2 * warp / cells;
+      const dv = (wy[row + x] - 0.5) * 2 * warp / cells;
+      const f1 = sampleWrap(v.f1, res, u0 + du, v0 + dv);
+      const f2 = sampleWrap(v.f2, res, u0 + du, v0 + dv);
+      let sx = Math.floor((u0 + du - Math.floor(u0 + du)) * res);
+      let sy = Math.floor((v0 + dv - Math.floor(v0 + dv)) * res);
+      if (sx >= res) sx = res - 1;
+      if (sy >= res) sy = res - 1;
+      const cid = v.id[sy * res + sx];
+      id[row + x] = cid;
+      const keep = hash2(cid, 71, seed) < coverage ? 1 : 0;
+      mask[row + x] = keep * smoothstep(0, softness, f2 - f1);
+    }
+  }
+  if (res === size) return { mask, id };
+  const outMask = new Float32Array(size * size);
+  upsampleWrap(mask, res, outMask, size);
+  const outId = new Int32Array(size * size);
+  const k = res / size;
+  for (let y = 0; y < size; y++) {
+    const r = (((y * k) | 0) % res) * res;
+    const row = y * size;
+    for (let x = 0; x < size; x++) outId[row + x] = id[r + (((x * k) | 0) % res)];
+  }
+  return { mask: outMask, id: outId };
+}
+
+export interface StrataOpts {
+  /** beds across the tile height */
+  bands?: number;
+  /** per-bed thickness variation, 0..1 */
+  thicknessJitter?: number;
+  /** how far the bedding planes wander, in band heights */
+  warp?: number;
+  warpFreq?: number;
+  seed?: number;
+  res?: number;
+}
+
+export interface StrataFieldResult {
+  /** position inside the bed, 0 at its base, 1 at its top */
+  t: Float32Array;
+  /** bed index — hash it for per-bed tone, roughness and hardness */
+  id: Int32Array;
+  /** 1 on a bedding plane, falling to 0 in the middle of a bed */
+  plane: Float32Array;
+}
+
+/**
+ * Sedimentary bedding: horizontal bands of varying thickness whose boundaries
+ * wander, with a stable per-bed identity.
+ *
+ * Rock is not pebble noise. What makes a cliff read as *geology* from 40 m is
+ * layering — bands that differ in tone, in hardness and therefore in how far
+ * they weather back — and no isotropic noise field, at any frequency, produces
+ * it. Beds stack along V (the field varies with y), so on a triplanar
+ * surface the caller should let the shader do the world-space banding and use
+ * this for the tile-scale layering underneath it.
+ */
+export function strataField(size: number, o: StrataOpts = {}): StrataFieldResult {
+  const res = Math.min(size, o.res ?? 256);
+  const bands = Math.max(2, Math.round(o.bands ?? 7));
+  const seed = o.seed ?? 1;
+  const jit = o.thicknessJitter ?? 0.45;
+  const warpAmt = o.warp ?? 0.55;
+
+  // Bed boundaries in 0..1, closing exactly on 1 so the field tiles vertically.
+  const edges = new Float32Array(bands + 1);
+  const rnd = mulberry32(seed * 7919 + 13);
+  const w = new Float32Array(bands);
+  let total = 0;
+  for (let b = 0; b < bands; b++) {
+    w[b] = 1 + (rnd() - 0.5) * 2 * jit;
+    total += w[b];
+  }
+  let acc = 0;
+  for (let b = 0; b < bands; b++) {
+    edges[b] = acc;
+    acc += w[b] / total;
+  }
+  edges[bands] = 1;
+
+  const warp = fbmField(res, { freq: 3, octaves: 3, seed: seed + 331, stretchY: 0.35 });
+  const t = new Float32Array(res * res);
+  const id = new Int32Array(res * res);
+  const plane = new Float32Array(res * res);
+
+  for (let y = 0; y < res; y++) {
+    const row = y * res;
+    const v0 = (y + 0.5) / res;
+    for (let x = 0; x < res; x++) {
+      // the bedding plane wanders, but slowly and mostly horizontally — that
+      // slight non-flatness is the whole difference between strata and stripes
+      let v = v0 + (warp[row + x] - 0.5) * 2 * (warpAmt / bands);
+      v -= Math.floor(v);
+      let b = 0;
+      while (b < bands - 1 && v >= edges[b + 1]) b++;
+      const lo = edges[b];
+      const hi = edges[b + 1];
+      const h = Math.max(1e-4, hi - lo);
+      const f = (v - lo) / h;
+      t[row + x] = f;
+      id[row + x] = b;
+      // thin beds have proportionally thicker bedding planes, same as real rock
+      plane[row + x] = Math.max(smoothstep(0.13, 0.0, f), smoothstep(0.87, 1.0, f));
+    }
+  }
+  if (res === size) return { t, id, plane };
+  const upT = new Float32Array(size * size);
+  const upP = new Float32Array(size * size);
+  upsampleWrap(t, res, upT, size);
+  upsampleWrap(plane, res, upP, size);
+  const outId = new Int32Array(size * size);
+  const k = res / size;
+  for (let y = 0; y < size; y++) {
+    const r = (((y * k) | 0) % res) * res;
+    const row = y * size;
+    for (let x = 0; x < size; x++) outId[row + x] = id[r + (((x * k) | 0) % res)];
+  }
+  return { t: upT, id: outId, plane: upP };
+}
+
+/**
+ * Smear a field along a direction — the isotropy breaker for fields that are
+ * not fbm and so cannot be stretched at generation time (Voronoi aggregate,
+ * a patch mask, a scatter).
+ *
+ * Road aggregate is dragged along the direction of travel by every tyre that
+ * ever crossed it; rock spalls along its bedding; brushed metal runs one way.
+ * A field with no direction in it is the second half of "uniform isotropic
+ * speckle" and no amount of extra octaves fixes it.
+ */
+export function directionalBlur(
+  src: Float32Array,
+  size: number,
+  dx: number,
+  dy: number,
+  radius: number,
+): Float32Array {
+  const out = new Float32Array(size * size);
+  const r = Math.max(1, Math.round(radius));
+  const inv = 1 / Math.hypot(dx, dy || 1e-6);
+  const sx = dx * inv;
+  const sy = dy * inv;
+  const n = r * 2 + 1;
+  const norm = 1 / n;
+  for (let y = 0; y < size; y++) {
+    const row = y * size;
+    for (let x = 0; x < size; x++) {
+      let acc = 0;
+      for (let k = -r; k <= r; k++) {
+        let px = Math.round(x + sx * k);
+        let py = Math.round(y + sy * k);
+        px = ((px % size) + size) % size;
+        py = ((py % size) + size) % size;
+        acc += src[py * size + px];
+      }
+      out[row + x] = acc * norm;
+    }
+  }
   return out;
 }
 

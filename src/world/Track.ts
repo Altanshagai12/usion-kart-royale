@@ -16,8 +16,9 @@ import * as THREE from 'three';
 import type { Ctx, ITrack, SurfaceProbe, TrackSample } from '../types';
 import { Surface } from '../types';
 import {
-  buildCenterline, terrainDetail, smoothstep as ss, BOOST_PADS, CHECKPOINTS,
-  CROWN, KERB_CROWN0, KERB_CROWN1, KERB_END, KERB_HS, KERB_QS, KERB_W, SEA_Y,
+  buildCenterline, terrainDetail, smoothstep as ss, gridSlot, BOOST_PADS, CHECKPOINTS,
+  CROWN, GRID_LAT, KERB_CROWN0, KERB_CROWN1, KERB_END, KERB_HS, KERB_QS,
+  KERB_RIPPLE_A, KERB_RIPPLE_K, KERB_W, SEA_Y,
   SKIRT_W, WALL_HEIGHT, WALL_NONE, ZONES,
   type Centerline,
 } from './TrackLayout';
@@ -224,13 +225,16 @@ export class Track implements ITrack {
     while (k < KERB_QS.length - 1 && q > KERB_QS[k]) k++;
     const a = KERB_QS[k - 1], bq = KERB_QS[k];
     const h = KERB_HS[k - 1] + (KERB_HS[k] - KERB_HS[k - 1]) * ((q - a) / (bq - a));
-    // 3.2 m period: long enough that the 1.5 m kerb rings resolve it cleanly.
     // Confined to the crown so it never disturbs the face or the bevel angle —
     // those two facets are the whole point of the profile. Bounded by the named
     // crown constants, not by positions in the breakpoint table: the table gains
     // and loses chamfers, and the ripple must not move when it does.
+    //
+    // Amplitude and wavelength both live in TrackLayout now, because the mesh
+    // has to sample this at better than half the wavelength and the two numbers
+    // cannot be allowed to drift apart. See KERB_RIPPLE_A.
     const crown = ss(KERB_CROWN0 - 0.10, KERB_CROWN0, q) * (1 - ss(KERB_CROWN1, KERB_CROWN1 + 0.14, q));
-    return h + 0.016 * Math.sin(i * this.cl.ds * 1.963) * crown;
+    return h + KERB_RIPPLE_A * Math.sin(i * this.cl.ds * KERB_RIPPLE_K) * crown;
   }
 
   /** Ground height beyond the kerb, relative to the shoulder edge. */
@@ -635,18 +639,37 @@ export class Track implements ITrack {
   //  Start grid + bounds
   // =======================================================================
 
+  /**
+   * Two abreast with the outside car of each row set back — the classic
+   * staggered arcade grid. Pole sits on the inside of turn one (a left).
+   *
+   * The slot geometry comes from `gridSlot()` rather than being written out
+   * here, because `buildMarkings` paints the boxes these karts stand in and the
+   * start-line checker scrubs its paint thin in the corridors they launch down.
+   * Three copies of `11 + row * 8.5 + col * 4.2` is how round 3 ended up with
+   * karts standing beside their boxes rather than on them.
+   *
+   * The lateral offset is now a fixed 3.2 m instead of `min(5.4, half * 0.46)`.
+   * Scaling it with the road width was the wrong instinct twice over: it made
+   * the grid as wide as whatever the road happened to be — 5.4 m apart on the
+   * old 26 m road, which is why the field never read as a pack — and it meant
+   * the painted boxes (which used a hard-coded 5.0) and the karts drifted apart
+   * the moment the width schedule moved. A grid slot is a fixed physical thing.
+   * All we owe the road is a check that it fits.
+   */
   private buildStartGrid() {
     const cl = this.cl;
     const tmp = makeSample();
     for (let k = 0; k < 8; k++) {
-      const row = k >> 1, col = k & 1;
-      // two abreast with the outside car of each row set back — the classic
-      // staggered arcade grid. Pole sits on the inside of turn one (a left).
-      const back = 11 + row * 8.5 + col * 4.2;
+      const { back, lat: rawLat } = gridSlot(k);
       const d = ((-back % cl.length) + cl.length) % cl.length;
       const s = this.sampleByDistance(d, tmp);
       const i = Math.round((d / cl.length) * cl.count) % cl.count;
-      const lat = (col === 0 ? -1 : 1) * Math.min(5.4, cl.half[i] * 0.46);
+      // 1.6 m of kart half-width plus a metre of margin has to fit inside the
+      // road proper; the start straight carries 8.8 m so this never bites, but
+      // it is the guard that stops a future width edit clipping karts into kerbs
+      const room = Math.max(1.2, cl.half[i] - 2.6);
+      const lat = Math.sign(rawLat) * Math.min(GRID_LAT, room);
       const pos = new THREE.Vector3();
       this.crossPoint(i, lat, pos);
       pos.y += 0.45;
