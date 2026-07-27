@@ -389,16 +389,12 @@ html[data-touch] .kr-speed {
   right: 47vmin;
   transform: scale(.82);   /* transform-origin is already 100% 100% */
 }
-/* The standings plate is right-centre on desktop. On a phone in landscape the
-   BRAKE and LOOK buttons reach up into the lower half of that column, so the
-   board rides a little high and a little small; it is already trimmed to six
-   rows under 620 px of height by ui.css. Measured clear of every button rect
-   at 844x390, 1024x600 and 1280x720. */
-html[data-touch] .kr-board {
-  top: 41%;
-  transform: translateY(-50%) scale(.88);
-  transform-origin: 100% 50%;
-}
+/* DEAD RULE REMOVED (round 10). This block repositioned `.kr-board`, the
+   eight-row standings tower that used to sit right-centre. Round 8 deleted
+   that element — the in-race order is now one rival row inside the position
+   plate at LEFT-centre — so this selector had matched nothing since. The
+   right half of a touch frame is now the action cluster and the speedometer
+   and nothing else, which is what the reflow below assumes. */
 /* The AUTO / PAUSE chips start at 17vmin, which is inside the lap plate on a
    short landscape phone. Push them clear; the minimap sits at frame centre and
    is nowhere near them. */

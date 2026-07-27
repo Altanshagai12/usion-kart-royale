@@ -10,7 +10,13 @@ export const meta = {
 }
 
 const ROOT = '/Users/ryan/dev/personal/kart-game'
-const ROUND = (args && args.round) || 1
+// `args` can arrive as a JSON string rather than a parsed object depending on
+// how the run was launched. Reading `.round` off a string yields undefined, so
+// every round silently defaulted to 1 — captures all landed in shots/r1 and,
+// far worse, `.seed` was undefined so every seeded finding was dropped without
+// a word. Normalise once, here.
+const ARGS = typeof args === 'string' ? JSON.parse(args) : (args || {})
+const ROUND = ARGS.round || 1
 const OUT = `shots/r${ROUND}`
 
 phase('Capture')
@@ -191,7 +197,7 @@ const ok = reviews.filter(Boolean)
 // Seeded findings come from the orchestrator's own read of the previous round —
 // blockers confirmed by eye, and anything whose fix agent died before applying.
 // They are merged in as if a critic had raised them.
-const SEED = (args && args.seed) || []
+const SEED = ARGS.seed || []
 const all = ok
   .flatMap((r, i) => (r.findings || []).map((f) => ({ ...f, critic: CRITICS[i].key })))
   .concat(SEED.map((f) => ({ ...f, critic: 'seeded' })))

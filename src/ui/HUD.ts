@@ -887,13 +887,13 @@ export class HUD implements System {
     g.beginPath();
     g.arc(cx, cy, r, A0, A1);
     g.lineWidth = chanW;
-    g.strokeStyle = 'rgba(3, 6, 15, 0.62)';
+    g.strokeStyle = 'rgba(18, 10, 4, 0.64)';
     g.stroke();
 
     g.beginPath();
     g.arc(cx, cy, r, A0, A1);
     g.lineWidth = chanW * 0.78;
-    g.strokeStyle = 'rgba(206, 222, 255, 0.16)';
+    g.strokeStyle = 'rgba(255, 232, 202, 0.15)';
     g.stroke();
 
     // --- value fill --------------------------------------------------------
@@ -954,7 +954,7 @@ export class HUD implements System {
     }
     g.lineCap = 'round';
     g.lineWidth = Math.max(1.2, W * 0.007);
-    g.strokeStyle = 'rgba(3, 6, 15, 0.75)';
+    g.strokeStyle = 'rgba(18, 10, 4, 0.78)';
     g.stroke();
     g.lineWidth = Math.max(1, W * 0.0035);
     g.strokeStyle = 'rgba(255, 244, 226, 0.42)';
@@ -968,7 +968,7 @@ export class HUD implements System {
       g.lineTo(cx + c * tMaj, cy + s * tMaj);
     }
     g.lineWidth = Math.max(1.8, W * 0.013);
-    g.strokeStyle = 'rgba(3, 6, 15, 0.85)';
+    g.strokeStyle = 'rgba(18, 10, 4, 0.86)';
     g.stroke();
     g.lineWidth = Math.max(1.2, W * 0.0075);
     g.strokeStyle = 'rgba(255, 244, 226, 0.72)';
@@ -980,12 +980,16 @@ export class HUD implements System {
     // rather than information, so they are simply not drawn.
     if (W >= 200) {
       const lr = tMaj + r * 0.16;
-      g.font = `700 ${Math.round(W * 0.072)}px ui-rounded, "SF Pro Rounded", ` +
-        '"Arial Rounded MT Bold", system-ui, sans-serif';
+      // ROUND 10: the same condensed display stack --fd resolves to in ui.css.
+      // Two dial labels in a different family from every other numeral in the
+      // frame is exactly the "separately-invented widget" fault, one canvas
+      // removed from the DOM where it is harder to notice.
+      g.font = `700 ${Math.round(W * 0.072)}px "Avenir Next Condensed", ` +
+        '"Roboto Condensed", "PT Sans Narrow", "Arial Narrow", sans-serif';
       g.textAlign = 'center';
       g.textBaseline = 'middle';
       g.fillStyle = 'rgba(255, 244, 226, 0.5)';
-      g.strokeStyle = 'rgba(3, 6, 15, 0.85)';
+      g.strokeStyle = 'rgba(18, 10, 4, 0.86)';
       g.lineWidth = Math.max(1.6, W * 0.012);
       g.lineJoin = 'round';
       for (let i = 0; i <= 1; i++) {
@@ -1010,7 +1014,7 @@ export class HUD implements System {
       g.beginPath();
       g.arc(cx, cy, cr, A0, A1);
       g.lineWidth = chanW * 0.34;
-      g.strokeStyle = 'rgba(3, 6, 15, 0.55)';
+      g.strokeStyle = 'rgba(18, 10, 4, 0.58)';
       g.stroke();
       const ca = A0 + sweep * clamp(Math.max(charge, this.tierFlash * 0.2), 0.02, 1);
       g.save();
@@ -1044,7 +1048,7 @@ export class HUD implements System {
     g.lineTo(0, r * 0.078);
     g.closePath();
     g.save();
-    g.shadowColor = 'rgba(3, 6, 15, 0.65)';
+    g.shadowColor = 'rgba(18, 10, 4, 0.68)';
     g.shadowBlur = W * 0.022;
     g.shadowOffsetX = W * 0.005;
     g.shadowOffsetY = W * 0.010;
@@ -1053,26 +1057,26 @@ export class HUD implements System {
     g.restore();
     g.lineJoin = 'round';
     g.lineWidth = Math.max(1.5, W * 0.009);
-    g.strokeStyle = 'rgba(3, 6, 15, 0.9)';
+    g.strokeStyle = 'rgba(18, 10, 4, 0.92)';
     g.stroke();
     g.restore();
 
     // hub cap — chrome, §4's metalness 1.0 read as a two-stop vertical ramp
     const hr = r * 0.135;
     const hub = g.createLinearGradient(cx, cy - hr, cx, cy + hr);
-    hub.addColorStop(0, '#f2f6ff');
-    hub.addColorStop(0.5, '#8d9cb4');
-    hub.addColorStop(1, '#39445c');
+    hub.addColorStop(0, '#fff7ec');
+    hub.addColorStop(0.5, '#b29a80');
+    hub.addColorStop(1, '#443426');
     g.beginPath();
     g.arc(cx, cy, hr, 0, Math.PI * 2);
     g.fillStyle = hub;
     g.fill();
     g.lineWidth = Math.max(1.4, W * 0.009);
-    g.strokeStyle = 'rgba(3, 6, 15, 0.9)';
+    g.strokeStyle = 'rgba(18, 10, 4, 0.92)';
     g.stroke();
     g.beginPath();
     g.arc(cx, cy, hr * 0.4, 0, Math.PI * 2);
-    g.fillStyle = 'rgba(3, 6, 15, 0.75)';
+    g.fillStyle = 'rgba(18, 10, 4, 0.78)';
     g.fill();
   }
 

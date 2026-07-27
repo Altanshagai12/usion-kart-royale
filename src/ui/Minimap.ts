@@ -57,10 +57,17 @@ const REF_H = 132;
 const TRACK_W = 3.4;      // the bright core
 const TRACK_CASE = 5.2;   // the dark casing the core sits inside
 const TRACK_COL = '#f6f0e2';           // §3 kerb white, lifted — never #ffffff
-const CASE_COL = '#04070d';
-/** the well's own ground — a deep teal, NOT near-black. See `bake`. */
-const WELL_A = '#123047';
-const WELL_B = '#081726';
+/** ROUND 10: the casing ink is WARM (hue 22°), like every other ink in the
+ *  HUD now — a 220° near-black hairline was the last cool edge on the panel. */
+const CASE_COL = '#0e0803';
+/**
+ * The well's own ground. It is the one place in the HUD that is allowed to
+ * stay cool, and it is cool because it is WATER: §3's sea-deep `#0d5a7a`
+ * taken two stops down, inside a warm plate. Read as the bay from above, not
+ * as a product-UI panel — which is exactly the distinction the review drew.
+ */
+const WELL_A = '#0f4257';
+const WELL_B = '#06202e';
 
 /**
  * SECTION TINT — ART_DIRECTION §1's lap table, as value.
@@ -322,7 +329,7 @@ export class Minimap {
       g.moveTo(ax + nx * a0, ay + ny * a0);
       g.lineTo(ax + nx * a1, ay + ny * a1);
       g.lineWidth = 6.4 * d;
-      g.strokeStyle = i % 2 ? '#0a0f18' : '#fff6e4';
+      g.strokeStyle = i % 2 ? '#140c05' : '#fff6e4';
       g.stroke();
     }
     g.lineCap = 'round';
@@ -480,7 +487,7 @@ export class Minimap {
     // which is exactly where the player always is
     g.beginPath();
     g.arc(x, y, r * 1.62, 0, Math.PI * 2);
-    g.fillStyle = 'rgba(4, 8, 14, 0.55)';
+    g.fillStyle = 'rgba(18, 10, 4, 0.55)';
     g.fill();
 
     g.beginPath();
@@ -507,7 +514,7 @@ export class Minimap {
     g.lineTo(-r * 0.34, r * 0.5);
     g.closePath();
     g.lineJoin = 'round';
-    g.fillStyle = 'rgba(6, 12, 20, 0.86)';
+    g.fillStyle = 'rgba(22, 12, 5, 0.86)';
     g.fill();
     g.restore();
   }

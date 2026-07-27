@@ -2,6 +2,40 @@
    Kart Royale — UI layer.
    Everything is scoped under .kr so nothing here can leak into the canvas host.
 
+   ROUND 10 — THE HUD JOINS THE WORLD IT IS DRAWN OVER.
+
+   Round 8 removed the timing tower (verified gone: the eight-row board is on
+   the pause and results screens, and in race the position plate carries one
+   rival row). What it did NOT fix is the other half of the same note — "a
+   well-systematised web-app HUD … on dark navy iOS cards that have nothing to
+   do with Sunset Bay's warm coastal palette". Sampled off the shipped frame:
+
+     lap plate body    #464c52   hue 210°
+     timer plate body  #2c3742   hue 210°
+     position plate    #122638   hue 208°
+     minimap plate     #102b41   hue 207°
+     ---- the world it sits on ----
+     road              #38302b   hue  23°
+     kerb stone        #914141   hue   0°
+
+   Two hundred degrees of hue between the panel and the ground it floats over
+   is not a taste disagreement, it is a measurement. Round 10 changes exactly
+   two things and touches no layout:
+
+     1. EVERY INK IS WARM. Plate body, contour ring, cast shadow, well,
+        die-cut edge, dial channel, minimap casing — all moved to hue 20–28°,
+        keyed off §3's stone `#a8927a` and sand `#e3c893` in shadow. Never
+        #000: the darkest stop in the system is #170e0a. The only cool things
+        left are (a) the full-screen speed vignette, because §2 asks for
+        teal-leaning shadows in the GRADE, and (b) the minimap's well, because
+        it is the sea.
+     2. THE TYPE IS A REAL DISPLAY FACE. `--fd` led with `ui-rounded` — the
+        OS's own rounded UI font — at a 0.594em digit advance. It is now a
+        heavy CONDENSED display stack with drawn 900 and 700 masters. Every
+        fixed digit cell moved from `em` to `ch` so the lockups are pinned to
+        whatever face actually resolves.
+
+   ---------------------------------------------------------------------------
    ROUND 8 — THE HUD GETS A VOICE, AND LOSES THE TIMING TOWER.
 
    Round 7 answered "six separately-invented widgets" by making every widget
@@ -50,12 +84,19 @@
   overflow: hidden;
   isolation: isolate;
 
-  /* --- ink & paper: never pure black, never pure white --- */
-  --ink-2: #0a0d18;
+  /* --- ink & paper: never pure black, never pure white ------------------
+     ROUND 10. Every ink in this file was a COOL ink — #0a0d18, rgba(7,14,24),
+     rgba(4,9,18) — i.e. hue ≈ 220°. Sampled off the shipped frame, the plate
+     bodies measured hue 207–215° while the road under them measured hue 23°
+     and the cliffs 25°. That 190° of hue separation is the whole "iOS card
+     over a coastal sunset" complaint, stated as a number. Every ink below is
+     now on the warm side of neutral (hue 20–28°), keyed off §3's stone
+     `#a8927a` and sand `#e3c893` taken down into shadow. Still never #000. */
+  --ink-2: #17100b;
   --ink-warm: #1a1208;          /* §3: countdown casing, never #000 */
-  --ink-c: rgba(7, 14, 24, 0.92);  /* the ONE contour ink, for the type ring */
+  --ink-c: rgba(28, 15, 7, 0.93);  /* the ONE contour ink, for the type ring */
   --paper: #fff4e2;
-  --dim: rgba(226, 216, 200, 0.62);
+  --dim: rgba(240, 220, 190, 0.66);
   --gold: #ffcf6b;
   /* §3 palette, the only hues the HUD is allowed to key an accent from */
   --sky-warm: #ffd0a0;
@@ -90,11 +131,14 @@
   --map-h: clamp(72px, 11.1vmin, 162px);
 
   /* --- ONE plate recipe -------------------------------------------------
-     A WARM dark body. #1b2340 was a cool product-UI navy that shared nothing
-     with the world; this is a deep teal-navy sitting between §3's sea-deep
-     and its tarmac, so the plates read as objects lit by the same 14° sun as
-     everything behind them. Opaque, three stops, top-lit per §2. */
-  --plate-bg: linear-gradient(179deg, #1e3d59 0%, #143047 30%, #0d2134 66%, #08192a 100%);
+     ROUND 10. Round 8 replaced a cool product navy (#1b2340) with a slightly
+     less cool one (#1e3d59 -> #08192a, measured hue 207–215°). Same fault,
+     one step smaller. The body is now DEEP WARM INK: §3's cliff stone
+     `#a8927a` and sand `#e3c893` carried down four stops into shadow, so the
+     ramp runs hue 22–27° — the same hue family the tarmac, the cliffs and the
+     kerb stone measure at in every captured frame. Opaque, four stops,
+     top-lit per §2, and the darkest stop is #170e0a, not black. */
+  --plate-bg: linear-gradient(179deg, #54402f 0%, #3d2b1e 30%, #281a12 66%, #170e0a 100%);
   /* THE rim. Painted as the plate element's own background with the body
      inset over it, so it is a true 1.5 px edge that is WARM along the top
      (accent-tinted rim light, §2's key) and dark along the bottom (the
@@ -102,14 +146,16 @@
   --plate-rim: linear-gradient(
       177deg,
       color-mix(in srgb, var(--accent) 72%, #fff6e6) 0%,
-      color-mix(in srgb, var(--accent) 34%, rgba(255, 226, 186, 0.30)) 16%,
-      rgba(120, 96, 70, 0.34) 46%,
-      rgba(4, 10, 18, 0.86) 100%);
+      color-mix(in srgb, var(--accent) 34%, rgba(255, 226, 186, 0.34)) 16%,
+      rgba(150, 112, 74, 0.40) 46%,
+      rgba(24, 12, 5, 0.88) 100%);
   /* One shadow recipe. `filter` rather than `box-shadow` because the plates
-     are chamfered and a box-shadow would be squared off by the clip. */
+     are chamfered and a box-shadow would be squared off by the clip. The
+     cast shadow is warm-black too: a cool shadow under a warm plate on warm
+     tarmac was the second thing reading as "pasted on". */
   --plate-shadow:
-    drop-shadow(0 0.16vmin 0.28vmin rgba(3, 8, 16, 0.55))
-    drop-shadow(0 1.0vmin 2.0vmin rgba(3, 8, 16, 0.46));
+    drop-shadow(0 0.16vmin 0.28vmin rgba(20, 10, 4, 0.58))
+    drop-shadow(0 1.0vmin 2.0vmin rgba(24, 12, 5, 0.48));
 
   /* --- ONE type scale, ratio ~1.42 -------------------------------------- */
   --t1: clamp(9px, 1.28vmin, 16px);    /* labels, units */
@@ -124,22 +170,36 @@
   --gold-glow: drop-shadow(0 0 0 rgba(0, 0, 0, 0));
 
   /* --- TYPE -------------------------------------------------------------
-     `--f` was "SF Pro Display", i.e. the operating system's own UI font, used
-     at three weights for every number in the game. It is a product grotesque
-     and it is why the HUD read as a browser overlay.
+     ROUND 10. `--fd` led with `ui-rounded`, which resolves to SF Pro Rounded
+     — still the operating system's own face, just the rounded cut of it, and
+     it rendered every numeral in the game at a measured 0.594em digit
+     advance: a wide, soft, friendly product face. That is the "OS system
+     font" the review named.
 
-     `--fd` is the DISPLAY face and it carries every numeral and every label.
-     It leads with the rounded geometric grotesques that actually ship on the
-     target platforms — `ui-rounded` resolves to SF Pro Rounded on Apple, and
-     SF Pro Rounded / Arial Rounded MT Bold have real heavy weights, generous
-     counters and no product-UI connotation — with the system stack as a
-     FALLBACK only, per §7's "strong system stack with explicit weights".
+     `--fd` is now a HEAVY CONDENSED DISPLAY face. Avenir Next Condensed ships
+     on macOS with six REAL weights — Ultra Light through Heavy — so 900 and
+     600 both hit a drawn master and nothing is synthetically emboldened or
+     synthetically narrowed. Condensed is also the correct idiom: race
+     numerals want vertical stress and tight sidebearings so a three-digit
+     speed occupies the same optical block as a two-digit one. Digit advance
+     drops to ~0.46em, which is where the width slack for the position plate
+     and the timer lockup comes from.
+
+     The fallbacks are real condensed faces too, in platform order: Roboto
+     Condensed (Android/CrOS), PT Sans Narrow, Arial Narrow (Windows+Office,
+     macOS), then the old rounded stack so nothing can land on Times.
      Nothing here is an external file: §4's no-external-assets rule applies to
-     the HUD as much as to the materials. */
+     the HUD as much as to the materials.
+
+     THE HARD RULE THIS BUYS: every fixed cell that used to be sized in `em`
+     against SF Pro Rounded's advance is now sized in `ch` — the advance of
+     "0" in whatever face actually resolved — so the lockups cannot break the
+     next time this stack changes. */
   --f: "Avenir Next", "SF Pro Display", "Segoe UI Variable Display", "Segoe UI",
        system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
-  --fd: ui-rounded, "SF Pro Rounded", "Arial Rounded MT Bold", "Nunito",
-        "Varela Round", "Avenir Next Rounded", "Trebuchet MS", var(--f);
+  --fd: "Avenir Next Condensed", "Roboto Condensed", "PT Sans Narrow",
+        "Arial Narrow", "Helvetica Neue Condensed", ui-rounded,
+        "SF Pro Rounded", "Arial Rounded MT Bold", var(--f);
 
   /* THE contour ring. Eight zero-blur offsets, so there is no mitre to spike
      on a diagonal (which is what killed `-webkit-text-stroke` in round 6) and
@@ -151,7 +211,7 @@
     0 0.055em 0 var(--ink-c), 0 -0.055em 0 var(--ink-c),
     0.039em 0.039em 0 var(--ink-c), -0.039em 0.039em 0 var(--ink-c),
     0.039em -0.039em 0 var(--ink-c), -0.039em -0.039em 0 var(--ink-c),
-    0 0.07em 0.14em rgba(3, 6, 15, 0.6);
+    0 0.07em 0.14em rgba(22, 11, 4, 0.62);
   --ring-s:
     0.07em 0 0 var(--ink-c), -0.07em 0 0 var(--ink-c),
     0 0.07em 0 var(--ink-c), 0 -0.07em 0 var(--ink-c),
@@ -220,8 +280,8 @@
   border-radius: inherit;
   background: var(--plate-bg);
   /* §2's warm sand bounce from below, so the plate is lit by the same rig as
-     the world behind it rather than being a flat navy fill. */
-  box-shadow: inset 0 -0.55vmin 1.3vmin rgba(255, 168, 96, 0.11);
+     the world behind it rather than being a flat fill. */
+  box-shadow: inset 0 -0.55vmin 1.3vmin rgba(255, 172, 98, 0.16);
   clip-path: var(--clip, none);
   pointer-events: none;
   /* Behind the plate's own content but in front of the rim. Every plate has a
@@ -249,16 +309,24 @@
 .kr-item-frame::after {
   border-radius: calc(var(--r) * 0.6);
   clip-path: var(--clip, none);
-  background: rgba(3, 8, 16, 0.5);
+  background: rgba(18, 10, 5, 0.52);
   box-shadow:
-    inset 0 0.35vmin 0.9vmin rgba(2, 5, 12, 0.66),
-    inset 0 -0.12vmin 0 rgba(255, 226, 186, 0.12);
+    inset 0 0.35vmin 0.9vmin rgba(14, 7, 3, 0.68),
+    inset 0 -0.12vmin 0 rgba(255, 226, 186, 0.14);
 }
 
 /* ==========================================================================
    THE ONE NUMERAL / THE ONE LABEL
    ==========================================================================
-   Weight 900 on the rounded display face, with the permanent contour ring.
+   TWO deliberate treatments off ONE family, and no third.
+
+     NUMERALS  --fd at 900 (Avenir Next Condensed Heavy — a drawn master, not
+               a synthetic bold), tabular lining figures, tracking ~0, with
+               the permanent contour ring.
+     LABELS    --fd at 700 (Bold — also a drawn master), uppercase, 0.22em
+               tracking with a matching text-indent so the trailing letter
+               space does not push the word off its own left edge.
+
    Round 7 removed all outlines on the argument that the plate made them
    unnecessary — which held right up until the countdown state faded the
    plates and the whole HUD turned to mush over sunlit grass (grid.png). The
@@ -269,7 +337,7 @@
 .kr-item-count {
   font-family: var(--fd);
   font-weight: 900;
-  letter-spacing: 0.005em;
+  letter-spacing: 0.01em;
   color: var(--paper);
   font-variant-numeric: tabular-nums lining-nums;
   font-feature-settings: "tnum" 1, "lnum" 1;
@@ -284,8 +352,11 @@
 .kr-label {
   font-family: var(--fd);
   font-size: var(--t1);
-  font-weight: 800;
-  letter-spacing: 0.2em;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  /* Tracking adds a trailing space after the last cap. Left-aligned labels
+     (LAP) are unaffected; the CENTRED one (TIME) would sit 0.11em left of
+     centre, so it gets a matching indent below. */
   text-transform: uppercase;
   /* The label is where the widget's accent lives, at a weight low enough that
      six accents across the frame read as one warm family rather than as a
@@ -486,7 +557,7 @@
 }
 .kr-line-k {
   font-family: var(--fd);
-  font-weight: 800;
+  font-weight: 700;
   letter-spacing: 0.2em;
   text-transform: uppercase;
   color: var(--dim);
@@ -507,7 +578,12 @@
    that quadrant is now a pill under the plate, mirroring the lap split — so
    the plate's height is constant and the top rail cannot step. */
 .kr-timer {
-  --accent: var(--boost-blue);
+  /* ROUND 10. This accent was --boost-blue: a 210° cool note on the plate the
+     player's eye returns to most, in a frame whose every other hue is 20–40°.
+     §3's boost blue still owns the drift/boost feedback, where it means
+     something; the race clock takes the gold, which the best-lap pill under
+     it already carried — so the top-right column is now ONE accent, not two. */
+  --accent: var(--gold);
   --clip: var(--clip-bl);
   height: var(--rail-top);
   box-sizing: border-box;
@@ -519,11 +595,17 @@
   gap: 0.3em;
 }
 
-/* JITTER FIX — the digits are tabular AND the clock block has a hard `width`
-   in em and packs to its right edge, so no advance-width difference, no
-   subpixel rounding and no font fallback can change the box. */
+/* JITTER FIX — the digits are tabular AND every field has a hard width, so no
+   advance-width difference, no subpixel rounding and no font fallback can
+   move anything: the fields consume reserved space.
+   ROUND 10: those widths are in `ch`, not `em`. `1ch` IS the advance of "0"
+   in whatever face resolved, and with tabular figures every digit equals it,
+   so the cells stay exactly one/two digits wide across the whole fallback
+   chain. In `em` they were calibrated to SF Pro Rounded's 0.594em digit and
+   would have opened 0.13em gaps between "2", ":" and "48" the moment the
+   family changed. The parent no longer needs a width at all — four fixed
+   children sum to a constant. */
 .kr-timer-v {
-  width: 4.62em;
   justify-content: center;
   font-size: var(--t5);
   font-weight: 900;
@@ -531,15 +613,15 @@
   letter-spacing: 0;
 }
 .kr-timer-v > span { flex: 0 0 auto; }
-.kr-t-m { width: 0.66em; text-align: right; }
-.kr-t-sep { width: 0.30em; text-align: center; color: var(--dim); }
-.kr-t-s { width: 1.30em; text-align: left; }
+.kr-t-m { width: 1.06ch; text-align: right; }
+.kr-t-sep { width: 0.52ch; text-align: center; color: var(--dim); }
+.kr-t-s { width: 2.06ch; text-align: left; }
 /* Subordinate the fraction so the eye locks on minutes:seconds. */
 .kr-t-f {
-  width: 1.62em;
+  width: 2.6ch;   /* "." + two digits, in its OWN (smaller) ch */
   text-align: left;
   font-size: 0.64em;
-  color: rgba(255, 244, 226, 0.75);
+  color: rgba(255, 244, 226, 0.78);
   align-self: baseline;
 }
 
@@ -653,7 +735,7 @@
   height: 0.62em;
   border-radius: 50%;
   background: var(--c, #8fa0bb);
-  box-shadow: 0 0 0 1.5px rgba(4, 9, 18, 0.85), 0 0 0.7vmin color-mix(in srgb, var(--c, #8fa0bb) 55%, transparent);
+  box-shadow: 0 0 0 1.5px rgba(24, 13, 6, 0.88), 0 0 0.7vmin color-mix(in srgb, var(--c, #8fa0bb) 55%, transparent);
 }
 .kr-rel-n {
   font-family: var(--fd);
@@ -673,7 +755,11 @@
 }
 .kr-rel-v {
   font-size: calc(var(--t3) * 0.8);
-  width: 4.0em;
+  /* Widest real value is formatDelta's over-a-minute form, "+1:39.00":
+     sign + 6 tabular digits + colon + point. In `ch` that is ~7.4; at 4.0em
+     against the old face it was 6.7ch and the >60 s case overprinted the
+     rival's name. Fixed, so the plate cannot resize as the gap moves. */
+  width: 7.6ch;
   flex: none;
   text-align: right;
   transition: color 0.3s var(--e-out);
@@ -789,7 +875,7 @@
   color: var(--ink-warm);
   text-shadow: none;   /* the ring is for cream on dark, not for ink on gold */
   background: linear-gradient(180deg, #fff0c0, var(--gold));
-  box-shadow: 0 0 0 1.5px rgba(40, 22, 6, 0.75), 0 0.35vmin 1vmin rgba(3, 6, 15, 0.6);
+  box-shadow: 0 0 0 1.5px rgba(40, 22, 6, 0.75), 0 0.35vmin 1vmin rgba(22, 11, 4, 0.62);
   opacity: 0;
   transform: scale(0.5);
   transition: opacity 0.24s var(--e-out), transform 0.34s var(--e-spring);
@@ -829,8 +915,10 @@
 .kr-speed-n {
   font-size: var(--t4);
   font-weight: 900;
-  letter-spacing: -0.015em;
-  width: 2.35em;
+  letter-spacing: -0.01em;
+  /* Exactly three tabular digits, so the number+unit cluster's optical centre
+     does not walk sideways between 99 and 100 km/h. */
+  width: 3.05ch;
 }
 .kr-speed-n .kr-lock-l { justify-content: center; }
 .kr-speed-u {
@@ -927,8 +1015,8 @@
   width: 66vmin;
   height: 52vmin;
   border-radius: 50%;
-  background: radial-gradient(closest-side, rgba(4, 9, 20, 0.55) 0%,
-              rgba(4, 9, 20, 0.26) 46%, rgba(4, 9, 20, 0) 76%);
+  background: radial-gradient(closest-side, rgba(22, 12, 5, 0.58) 0%,
+              rgba(22, 12, 5, 0.28) 46%, rgba(22, 12, 5, 0) 76%);
   pointer-events: none;
 }
 .kr-count-vig {
@@ -961,26 +1049,26 @@
   font-size: clamp(18px, 4.2vmin, 58px);
   padding: 0.42em 0.62em;
   border-radius: 999px;
-  background: linear-gradient(180deg, rgba(28, 22, 14, 0.72), rgba(6, 10, 18, 0.86));
-  box-shadow: 0 0 0 1.5px rgba(255, 214, 170, 0.30), 0 0.5vmin 1.6vmin rgba(3, 7, 14, 0.6);
+  background: linear-gradient(180deg, rgba(60, 44, 30, 0.78), rgba(20, 11, 5, 0.9));
+  box-shadow: 0 0 0 1.5px rgba(255, 214, 170, 0.30), 0 0.5vmin 1.6vmin rgba(20, 10, 4, 0.62);
 }
 .kr-count-lamp {
   width: 1em;
   height: 1em;
   border-radius: 50%;
-  background: radial-gradient(circle at 38% 32%, #3a3a44, #14161f 70%);
-  box-shadow: inset 0 0 0 1.5px rgba(6, 10, 18, 0.9), inset 0 0.1em 0.16em rgba(255, 255, 255, 0.10);
+  background: radial-gradient(circle at 38% 32%, #4a4038, #1c1510 70%);
+  box-shadow: inset 0 0 0 1.5px rgba(20, 11, 5, 0.9), inset 0 0.1em 0.16em rgba(255, 255, 255, 0.10);
   transition: background 0.18s var(--e-out), box-shadow 0.18s var(--e-out);
 }
 .kr-count-lights.l1 .kr-count-lamp:nth-child(1),
 .kr-count-lights.l2 .kr-count-lamp:nth-child(-n + 2),
 .kr-count-lights.l3 .kr-count-lamp {
   background: radial-gradient(circle at 38% 32%, #ff9a80, var(--kerb-red) 62%, #8c1c18 100%);
-  box-shadow: inset 0 0 0 1.5px rgba(6, 10, 18, 0.9), 0 0 0.9em rgba(224, 69, 63, 0.75);
+  box-shadow: inset 0 0 0 1.5px rgba(20, 11, 5, 0.9), 0 0 0.9em rgba(224, 69, 63, 0.75);
 }
 .kr-count-lights.go .kr-count-lamp {
   background: radial-gradient(circle at 38% 32%, #d6ffd0, #4fd45e 60%, #17742e 100%);
-  box-shadow: inset 0 0 0 1.5px rgba(6, 10, 18, 0.9), 0 0 1.1em rgba(90, 230, 110, 0.85);
+  box-shadow: inset 0 0 0 1.5px rgba(20, 11, 5, 0.9), 0 0 1.1em rgba(90, 230, 110, 0.85);
 }
 .kr-count-lights.run { animation: kr-lamps 0.5s var(--e-spring) both; }
 @keyframes kr-lamps {
@@ -1090,8 +1178,8 @@
   position: absolute;
   inset: 0;
   background:
-    radial-gradient(ellipse 90% 80% at 50% 42%, rgba(8, 12, 26, 0.30), rgba(4, 6, 16, 0.80) 82%),
-    linear-gradient(200deg, rgba(30, 22, 48, 0.42), rgba(6, 10, 22, 0.62));
+    radial-gradient(ellipse 90% 80% at 50% 42%, rgba(26, 15, 9, 0.30), rgba(18, 10, 5, 0.80) 82%),
+    linear-gradient(200deg, rgba(58, 34, 22, 0.42), rgba(20, 11, 6, 0.62));
   backdrop-filter: blur(14px) saturate(1.25) brightness(0.82);
   -webkit-backdrop-filter: blur(14px) saturate(1.25) brightness(0.82);
 }
@@ -1129,7 +1217,7 @@
   text-indent: 0.52em;
   text-transform: uppercase;
   color: rgba(255, 226, 174, 0.86);
-  text-shadow: 0 0.1em 0.4em rgba(4, 7, 16, 0.9);
+  text-shadow: 0 0.1em 0.4em rgba(20, 10, 4, 0.9);
 }
 
 .kr-prompt {
@@ -1141,7 +1229,7 @@
   text-transform: uppercase;
   color: var(--paper);
   animation: kr-breathe 2.4s var(--e-soft) infinite;
-  text-shadow: 0 0.1em 0.35em rgba(4, 7, 16, 0.9);
+  text-shadow: 0 0.1em 0.35em rgba(20, 10, 4, 0.9);
 }
 @keyframes kr-breathe {
   0%, 100% { opacity: 0.42; transform: scale(0.99); }
@@ -1194,9 +1282,9 @@
   cursor: pointer;
   padding: clamp(8px, 1.5vmin, 20px);
   border-radius: calc(var(--r) * 1.2);
-  background: linear-gradient(180deg, rgba(24, 31, 56, 0.66), rgba(7, 11, 24, 0.84));
+  background: linear-gradient(180deg, rgba(56, 40, 28, 0.66), rgba(24, 14, 8, 0.84));
   border: 1px solid rgba(255, 240, 214, 0.16);
-  box-shadow: 0 0.8vmin 2.4vmin rgba(4, 7, 16, 0.5), inset 0 0.12vmin 0 rgba(255, 246, 228, 0.2);
+  box-shadow: 0 0.8vmin 2.4vmin rgba(20, 10, 4, 0.5), inset 0 0.12vmin 0 rgba(255, 246, 228, 0.2);
   transform-origin: 50% 100%;
   transition: transform 0.42s var(--e-spring), box-shadow 0.34s var(--e-out),
               border-color 0.34s var(--e-out), filter 0.34s var(--e-out);
@@ -1209,7 +1297,7 @@
   transform: translateY(-1.4vmin) scale(1.045);
   border-color: color-mix(in srgb, var(--c) 70%, rgba(255, 240, 214, 0.4));
   box-shadow: 0 0 3vmin color-mix(in srgb, var(--c) 45%, transparent),
-              0 1.4vmin 3.4vmin rgba(4, 7, 16, 0.6),
+              0 1.4vmin 3.4vmin rgba(20, 10, 4, 0.6),
               inset 0 0.12vmin 0 rgba(255, 246, 228, 0.3);
 }
 .kr-card-chip {
@@ -1220,7 +1308,7 @@
     linear-gradient(120deg, rgba(255, 255, 255, 0.34), rgba(255, 255, 255, 0) 46%),
     repeating-linear-gradient(118deg, rgba(255, 255, 255, 0.11) 0 6%, rgba(0, 0, 0, 0) 6% 13%),
     linear-gradient(170deg, color-mix(in srgb, var(--c) 88%, #ffffff),
-                    var(--c) 46%, color-mix(in srgb, var(--c) 62%, #0a0e1c));
+                    var(--c) 46%, color-mix(in srgb, var(--c) 62%, #1c1209));
   box-shadow: inset 0 0 2vmin rgba(0, 0, 0, 0.35), inset 0 0.12vmin 0 rgba(255, 255, 255, 0.45);
   overflow: hidden;
 }
@@ -1229,7 +1317,7 @@
   content: "";
   position: absolute;
   inset: 30% 0 0 0;
-  background: linear-gradient(180deg, rgba(6, 9, 20, 0), rgba(6, 9, 20, 0.34));
+  background: linear-gradient(180deg, rgba(22, 12, 6, 0), rgba(22, 12, 6, 0.34));
 }
 .kr-card-init {
   position: absolute;
@@ -1240,7 +1328,7 @@
   font-weight: 900;
   letter-spacing: 0.02em;
   color: rgba(255, 252, 244, 0.34);
-  text-shadow: 0 0.05em 0.12em rgba(6, 9, 20, 0.45);
+  text-shadow: 0 0.05em 0.12em rgba(22, 12, 6, 0.45);
   mix-blend-mode: overlay;
   z-index: 1;
 }
@@ -1309,9 +1397,9 @@
   text-transform: uppercase;
   text-align: center;
   color: rgba(248, 242, 230, 0.82);
-  background: linear-gradient(180deg, rgba(28, 36, 66, 0.7), rgba(8, 12, 26, 0.88));
+  background: linear-gradient(180deg, rgba(64, 46, 32, 0.7), rgba(26, 15, 9, 0.88));
   border: 1px solid rgba(255, 240, 214, 0.2);
-  box-shadow: 0 0.6vmin 1.8vmin rgba(4, 7, 16, 0.5), inset 0 0.12vmin 0 rgba(255, 246, 228, 0.22);
+  box-shadow: 0 0.6vmin 1.8vmin rgba(20, 10, 4, 0.5), inset 0 0.12vmin 0 rgba(255, 246, 228, 0.22);
   transition: transform 0.3s var(--e-spring), color 0.24s var(--e-out),
               background 0.24s var(--e-out), box-shadow 0.24s var(--e-out), border-color 0.24s var(--e-out);
   overflow: hidden;
@@ -1320,7 +1408,7 @@
   color: var(--ink-2);
   background: linear-gradient(180deg, #fff3cc, #ffc84e 58%, #f09a1c);
   border-color: rgba(255, 236, 190, 0.9);
-  box-shadow: 0 0 2.6vmin rgba(255, 196, 90, 0.5), 0 0.8vmin 2vmin rgba(4, 7, 16, 0.5),
+  box-shadow: 0 0 2.6vmin rgba(255, 196, 90, 0.5), 0 0.8vmin 2vmin rgba(20, 10, 4, 0.5),
               inset 0 0.14vmin 0 rgba(255, 255, 255, 0.7);
   transform: scale(1.035);
 }
@@ -1346,7 +1434,7 @@
   gap: 0.9em;
   padding: 0.5em 1em 0.55em;
   border-radius: calc(var(--r) * 0.7);
-  background: linear-gradient(180deg, rgba(24, 31, 56, 0.55), rgba(7, 11, 24, 0.72));
+  background: linear-gradient(180deg, rgba(56, 40, 28, 0.55), rgba(24, 14, 8, 0.72));
   border: 1px solid rgba(255, 240, 214, 0.12);
   opacity: 0;
 }
@@ -1393,7 +1481,7 @@
   align-items: baseline;
   padding: 0.5em 0.9em 0.55em;
   border-radius: calc(var(--r) * 0.8);
-  background: linear-gradient(180deg, rgba(24, 31, 56, 0.5), rgba(7, 11, 24, 0.68));
+  background: linear-gradient(180deg, rgba(56, 40, 28, 0.5), rgba(24, 14, 8, 0.68));
   border: 1px solid rgba(255, 240, 214, 0.1);
 }
 .kr-lapline b { font-size: clamp(9px, 1.35vmin, 18px); font-weight: 800; letter-spacing: 0.2em;
@@ -1404,7 +1492,7 @@
 .kr-lapline.best em { color: var(--gold); }
 .kr-lapline-total {
   margin-top: 0.6vmin;
-  background: linear-gradient(180deg, rgba(34, 44, 78, 0.62), rgba(10, 15, 30, 0.8));
+  background: linear-gradient(180deg, rgba(76, 55, 38, 0.62), rgba(30, 18, 11, 0.8));
   border-color: rgba(255, 240, 214, 0.24);
 }
 .kr-lapline-total b { color: rgba(255, 226, 174, 0.8); }
@@ -1424,7 +1512,7 @@
 .kr-best em { display: block; margin-top: 0.18em; font-style: normal;
               font-size: clamp(22px, 4.4vmin, 58px); font-weight: 900; letter-spacing: -0.01em;
               font-variant-numeric: tabular-nums; color: #fff3d0;
-              text-shadow: 0 0 1.6vmin rgba(255, 190, 90, 0.6), 0 0.06em 0.2em rgba(4, 7, 16, 0.7); }
+              text-shadow: 0 0 1.6vmin rgba(255, 190, 90, 0.6), 0 0.06em 0.2em rgba(20, 10, 4, 0.7); }
 
 /* --- pause ---------------------------------------------------------------- */
 

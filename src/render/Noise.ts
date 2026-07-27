@@ -381,6 +381,284 @@ export function contrastField(buf: Float32Array, k: number): Float32Array {
 }
 
 // ---------------------------------------------------------------------------
+// The micro layer — one surface response per material FAMILY
+// ---------------------------------------------------------------------------
+
+/**
+ * ===========================================================================
+ *  Why this exists, with the measurement that produced it.
+ * ===========================================================================
+ *  Every generator in the library used to reach for the same two lines for its
+ *  sub-millimetre detail:
+ *
+ *      const fine = fbmField(size, { freq: size / 10, octaves: 2, seed });
+ *      ...
+ *      rough = base + (fine[i] - 0.5) * 0.14;
+ *
+ *  Those two lines are the entire "single-octave noise doing duty on every
+ *  surface" complaint, and they are worse than they look, for three reasons
+ *  that only show up once you measure the shipped maps rather than read the
+ *  source:
+ *
+ *   1. `freq: size / N` makes the frequency a property of the TEXTURE, not of
+ *      the material. A 512² tile over 3 m and a 1024² tile over 1.2 m came out
+ *      with detail at 47 mm and at 9 mm from *identical* parameters, and two
+ *      surfaces that are supposed to be the same stuff came out different while
+ *      two that are supposed to differ came out the same. Feature size belongs
+ *      in MILLIMETRES OF WORLD, which is what `MicroSpec.mm` is.
+ *   2. Two octaves at the default lacunarity 2 and gain 0.5 is one shape. Every
+ *      material got that shape. Measured as a radial energy profile over the
+ *      shipped roughness maps, `dirt`, `concrete`, `palm-bark` and the crowd's
+ *      cloth were within 0.26 of each other on a scale where 0 is "identical
+ *      surface response" — i.e. four materials the eye has no way to tell apart
+ *      by how they answer a light, whatever their albedo says.
+ *   3. `(fine - 0.5) * 0.14` against an un-normalised 2-octave fbm delivers a
+ *      standard deviation around 0.02. Seventeen of the twenty-four materials
+ *      shipped a roughness map with sd < 0.05, which is a constant to within
+ *      the 8-bit quantisation of the channel it travels in.
+ *
+ *  So a family here fixes FOUR independent things at once, and it has to be all
+ *  four or it does not read:
+ *
+ *   • characteristic frequency, in mm of world (`mm`, `mm2`);
+ *   • octave structure — how many, how fast they fall off, and at what ratio
+ *     (`octaves`, `gain`, `lacunarity`) — plus which `mode`, because ridged,
+ *     turbulent and plain fbm have visibly different *histograms* and the
+ *     histogram is what a low sun reads;
+ *   • direction (`stretchY`, and `cross` for anything woven), because an
+ *     isotropic surface is one the eye files under "noise";
+ *   • and the RESPONSE — `gamma`, which decides whether a surface sits mostly
+ *     at its rough end with rare polished spots (crushed stone) or mostly at
+ *     its smooth end with rare rough ones (a paint film, a glaze). Two
+ *     materials with the same roughness mean and the same swing but opposite
+ *     gammas look nothing like each other under a 14° key, and no amount of
+ *     albedo work substitutes for it.
+ * ===========================================================================
+ */
+export type MicroFamily =
+  | 'asphalt'
+  | 'granular'
+  | 'soil'
+  | 'stone-rough'
+  | 'stone-cut'
+  | 'stone-bored'
+  | 'stone-polished'
+  | 'stucco'
+  | 'concrete'
+  | 'ceramic'
+  | 'wood'
+  | 'metal-rolled'
+  | 'metal-polished'
+  | 'paint'
+  | 'fabric'
+  | 'rubber'
+  | 'glass'
+  | 'bark';
+
+export interface MicroSpec {
+  /** characteristic feature size, in MILLIMETRES of world */
+  mm: number;
+  /** the family's second decade, also in mm — its "macro of the micro" */
+  mm2: number;
+  octaves: number;
+  lacunarity: number;
+  gain: number;
+  /**
+   * Anisotropy. `stretchY` is passed straight to `fbmField`, where it scales
+   * the Y lattice frequency: **< 1 elongates the features along V**, > 1
+   * elongates them along U. V is down the track on the road, up the wall on
+   * architecture, along the board on a plank and around the arc on a rail, so
+   * one number covers every case the library has.
+   */
+  stretchY: number;
+  mode: FbmMode;
+  warp: number;
+  /** share of the roughness swing taken from `mm2` rather than from `mm` */
+  coarse: number;
+  /** peak-to-peak roughness swing the family carries inside its tile */
+  swing: number;
+  /**
+   * Response shape, applied as `v ** gamma` before the swing.
+   *
+   *  · **< 1** — the surface spends most of its area at its ROUGH end, with
+   *    rare polished excursions. Crushed stone, raw concrete, bark: the worn
+   *    crowns are the exception.
+   *  · **> 1** — most of the area sits at the SMOOTH end with rare rough
+   *    excursions. A paint film with a few chalked patches, a fired glaze with
+   *    a few blisters, polished marble with a scuff.
+   *  · **1** — symmetric.
+   */
+  gamma: number;
+  /** histogram clip: small = plateaux you can point at, large = a soft gradient */
+  clip: number;
+  /**
+   * Woven. The second field is built at the SAME frequency as the first with a
+   * reciprocal stretch, giving warp and weft, and the two are combined as a
+   * weave rather than blended. One fbm cannot be anisotropic in two orthogonal
+   * directions at once, and a fabric that is anisotropic in only one is a
+   * brushed metal.
+   */
+  cross?: boolean;
+}
+
+/**
+ * The table. Every row is a different answer to "what does a light do when it
+ * lands on this?", and the columns are deliberately uncorrelated — a family
+ * that differed only in `mm` would still share a histogram, and one that
+ * differed only in `gamma` would still share a frequency.
+ */
+export const MICRO: Record<MicroFamily, MicroSpec> = {
+  // Bitumen-bound crushed stone. Chip-scale, dragged down the direction of
+  // travel, mostly rough with the traffic-polished crowns as the exception.
+  asphalt: { mm: 9, mm2: 420, octaves: 3, lacunarity: 2.0, gain: 0.55, stretchY: 0.45, mode: 'fbm', warp: 0.03, coarse: 0.42, swing: 0.30, gamma: 0.75, clip: 0.03 },
+  // Dry sand: grains far below a texel, so what actually varies is the ripple
+  // field the wind and the tide leave, which runs along the shore.
+  granular: { mm: 2.2, mm2: 260, octaves: 2, lacunarity: 2.9, gain: 0.42, stretchY: 0.30, mode: 'fbm', warp: 0.05, coarse: 0.62, swing: 0.18, gamma: 1.25, clip: 0.05 },
+  soil: { mm: 7, mm2: 340, octaves: 4, lacunarity: 1.85, gain: 0.60, stretchY: 1.0, mode: 'fbm', warp: 0.07, coarse: 0.44, swing: 0.24, gamma: 0.90, clip: 0.03 },
+  // Ashlar and sea wall: pitted, isotropic within a block, turbulent histogram
+  // (all the energy on one side of zero) which is what pitting looks like.
+  'stone-rough': { mm: 6, mm2: 260, octaves: 4, lacunarity: 2.1, gain: 0.52, stretchY: 1.0, mode: 'turbulence', warp: 0.05, coarse: 0.45, swing: 0.26, gamma: 0.70, clip: 0.02 },
+  // A bedded limestone face: spalls ALONG its bedding, so the detail is drawn
+  // out horizontally, and ridged because rock parts along planes.
+  'stone-cut': { mm: 14, mm2: 900, octaves: 4, lacunarity: 2.35, gain: 0.48, stretchY: 4.0, mode: 'ridged', warp: 0.06, coarse: 0.50, swing: 0.28, gamma: 0.80, clip: 0.02 },
+  // A bored tunnel is a fresh mechanical cut: finer, arced around the bore
+  // rather than bedded, and much less weathered — so a tighter swing.
+  'stone-bored': { mm: 5, mm2: 480, octaves: 3, lacunarity: 2.7, gain: 0.45, stretchY: 0.30, mode: 'ridged', warp: 0.03, coarse: 0.38, swing: 0.22, gamma: 0.95, clip: 0.04 },
+  'stone-polished': { mm: 40, mm2: 1400, octaves: 2, lacunarity: 2.0, gain: 0.40, stretchY: 0.55, mode: 'fbm', warp: 0.10, coarse: 0.60, swing: 0.17, gamma: 1.9, clip: 0.06 },
+  // Lime render: sand grains at 3 mm inside float sweeps at 40 cm, and the
+  // sweeps run across the wall because that is how a trowel is held.
+  stucco: { mm: 3, mm2: 380, octaves: 3, lacunarity: 1.75, gain: 0.62, stretchY: 1.45, mode: 'turbulence', warp: 0.11, coarse: 0.38, swing: 0.23, gamma: 0.85, clip: 0.03 },
+  // Cast concrete: fine sand-cement skin over the shutter marks the form boards
+  // left, and form boards are laid horizontally — hence a strong stretch the
+  // other way from every stone in the table.
+  concrete: { mm: 5, mm2: 300, octaves: 4, lacunarity: 1.9, gain: 0.58, stretchY: 3.2, mode: 'turbulence', warp: 0.04, coarse: 0.48, swing: 0.29, gamma: 0.65, clip: 0.02 },
+  // Fired clay under a glaze: the glaze is the surface, so it is mostly smooth
+  // with the chalked and crazed patches as rare excursions.
+  ceramic: { mm: 22, mm2: 520, octaves: 2, lacunarity: 2.6, gain: 0.42, stretchY: 0.75, mode: 'fbm', warp: 0.04, coarse: 0.55, swing: 0.25, gamma: 1.70, clip: 0.05 },
+  // Sawn timber. Ridged, because growth rings are ridges, at a 3× lacunarity so
+  // the figure is coarse-to-fine rather than a smooth blur, and stretched hard
+  // along V because the grain runs the length of the board.
+  wood: { mm: 2, mm2: 240, octaves: 3, lacunarity: 3.0, gain: 0.50, stretchY: 0.09, mode: 'ridged', warp: 0.02, coarse: 0.35, swing: 0.33, gamma: 1.0, clip: 0.03 },
+  'metal-rolled': { mm: 1.5, mm2: 190, octaves: 2, lacunarity: 2.8, gain: 0.45, stretchY: 0.10, mode: 'fbm', warp: 0.02, coarse: 0.50, swing: 0.23, gamma: 1.5, clip: 0.05 },
+  'metal-polished': { mm: 0.6, mm2: 90, octaves: 2, lacunarity: 3.4, gain: 0.38, stretchY: 0.035, mode: 'fbm', warp: 0.01, coarse: 0.45, swing: 0.15, gamma: 2.2, clip: 0.06 },
+  // A sprayed film. Almost featureless, which is the point — what varies is
+  // orange peel at half a millimetre and where the film has chalked.
+  paint: { mm: 1.2, mm2: 320, octaves: 2, lacunarity: 2.2, gain: 0.40, stretchY: 1.0, mode: 'fbm', warp: 0.06, coarse: 0.62, swing: 0.16, gamma: 2.4, clip: 0.07 },
+  fabric: { mm: 1.1, mm2: 55, octaves: 2, lacunarity: 4.0, gain: 0.55, stretchY: 0.16, mode: 'turbulence', warp: 0.01, coarse: 0.45, swing: 0.28, gamma: 1.0, clip: 0.04, cross: true },
+  rubber: { mm: 0.8, mm2: 45, octaves: 3, lacunarity: 2.2, gain: 0.60, stretchY: 1.0, mode: 'turbulence', warp: 0.02, coarse: 0.30, swing: 0.21, gamma: 0.75, clip: 0.03 },
+  glass: { mm: 60, mm2: 900, octaves: 2, lacunarity: 2.0, gain: 0.35, stretchY: 0.80, mode: 'fbm', warp: 0.08, coarse: 0.70, swing: 0.08, gamma: 3.0, clip: 0.08 },
+  bark: { mm: 4, mm2: 170, octaves: 4, lacunarity: 2.15, gain: 0.55, stretchY: 0.26, mode: 'turbulence', warp: 0.03, coarse: 0.40, swing: 0.25, gamma: 0.70, clip: 0.03 },
+};
+
+export interface MicroField {
+  /** the family's characteristic field, normalised to [0,1] */
+  a: Float32Array;
+  /** its second decade — or the weft, on a woven family */
+  b: Float32Array;
+  spec: MicroSpec;
+  /** `0.5 ** gamma`, hoisted so the per-texel path has no `pow` on a constant */
+  centre: number;
+}
+
+/**
+ * Build one material family's micro surface at a given world scale.
+ *
+ * `worldScaleM` is the metres of world one tile covers — the same number the
+ * material publishes in `WORLD_SCALE` — and it is what turns the family's
+ * feature size in millimetres into a lattice frequency. Frequencies are clamped
+ * to `size / 4`: a feature four texels across is the finest thing a mip chain
+ * can carry without turning into specular crawl, and asking for 0.6 mm chrome
+ * brush lines on a 1 m tile would otherwise request 1666 cycles.
+ */
+export function microSurface(
+  size: number,
+  worldScaleM: number,
+  family: MicroFamily,
+  seed: number,
+): MicroField {
+  const s = MICRO[family];
+  const mmPerTile = Math.max(1, worldScaleM) * 1000;
+  const top = Math.max(4, size >> 2);
+  const fA = clamp(Math.round(mmPerTile / s.mm), 2, top);
+  const a = fbmField(size, {
+    freq: fA,
+    octaves: s.octaves,
+    gain: s.gain,
+    lacunarity: s.lacunarity,
+    stretchY: s.stretchY,
+    mode: s.mode,
+    warp: s.warp,
+    seed,
+    normalize: s.clip,
+  });
+  const b = s.cross
+    ? // the weft: same thread pitch, laid across the warp
+      fbmField(size, {
+        freq: fA,
+        octaves: s.octaves,
+        gain: s.gain,
+        lacunarity: s.lacunarity,
+        stretchY: 1 / s.stretchY,
+        mode: s.mode,
+        warp: s.warp,
+        seed: seed + 1013,
+        normalize: s.clip,
+      })
+    : fbmField(size, {
+        freq: clamp(Math.round(mmPerTile / s.mm2), 1, Math.max(2, fA - 1)),
+        octaves: Math.max(2, s.octaves - 1),
+        gain: s.gain,
+        lacunarity: s.lacunarity,
+        // the coarse decade keeps the family's direction but only half as hard —
+        // a surface whose every scale is stretched identically reads as a smear
+        stretchY: s.stretchY > 1 ? 1 + (s.stretchY - 1) * 0.5 : 1 - (1 - s.stretchY) * 0.5,
+        mode: 'fbm',
+        warp: s.warp * 1.6,
+        seed: seed + 1013,
+        normalize: Math.min(0.12, s.clip * 1.8),
+      });
+  return { a, b, spec: s, centre: Math.pow(0.5, s.gamma) };
+}
+
+/** The family's combined field at texel `i`, in [0,1] before the response curve. */
+export function microValue(m: MicroField, i: number): number {
+  const s = m.spec;
+  if (s.cross) {
+    // A weave is not a blend. A tow crown is where one thread passes OVER the
+    // other, i.e. where one field is high and the other is low, and the fabric
+    // dips into the interstice where both are low — so `max` gives the crowns
+    // and the product gives the interstices, and the difference between them is
+    // the cross-hatch that makes cloth read as cloth at a centimetre.
+    const hi = m.a[i] > m.b[i] ? m.a[i] : m.b[i];
+    return hi * 0.72 + m.a[i] * m.b[i] * 0.28;
+  }
+  return m.a[i] * (1 - s.coarse) + m.b[i] * s.coarse;
+}
+
+/**
+ * Roughness at texel `i`, as this family responds.
+ *
+ * `base` is the family's centre value — the number the material already knew —
+ * and everything this adds is the *variation*, shaped by `gamma`, so retro-
+ * fitting a builder never moves its mean.
+ */
+export function microRough(m: MicroField, i: number, base: number): number {
+  const v = microValue(m, i);
+  return base + (Math.pow(v, m.spec.gamma) - m.centre) * m.spec.swing;
+}
+
+/**
+ * The same field as a signed detail term for height and albedo, in ±0.5.
+ *
+ * Relief has to come from the same generator as roughness or the two disagree
+ * about where the surface is: a chip crown that is smooth in the roughness map
+ * and flat in the height map is two materials pretending to be one.
+ */
+export function microDetail(m: MicroField, i: number): number {
+  return microValue(m, i) - 0.5;
+}
+
+// ---------------------------------------------------------------------------
 // The macro layer
 // ---------------------------------------------------------------------------
 

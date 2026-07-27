@@ -55,9 +55,10 @@ import { Quality, type Ctx } from '../types';
 const GRADE_FRAGMENT = /* glsl */ `
 uniform mat4 prevViewProj;
 uniform mat4 invViewProj;
-uniform vec4 grade;   // x exposure, y S-curve amount, z saturation, w vignette
+uniform vec4 grade;   // x exposure, y S-curve amount, z saturation, w vignette (authored base)
 uniform vec4 lens;    // x aberration, y grain, z speed-line gain, w shutter
 uniform vec3 rush;    // x radial blur amount, y gated speed intensity, z boost kick (0..1)
+uniform vec2 vig;     // x vignette amount (speed-driven), y inner edge (closes in with speed)
 uniform vec3 subject; // world-space centre of the player's kart
 uniform vec2 hold;    // hold-out radii about the subject: x fully sharp, y fully blurred (metres)
 uniform vec3 coolTint;
@@ -211,7 +212,20 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, const in float depth,
   float camTravel = length(velocity);
   velocity *= min(camTravel, 0.016) / max(camTravel, 1e-5);
 
-  velocity += fromCentre * rush.x;              // arcade zoom-blur under boost
+  // --- arcade zoom-blur -----------------------------------------------------
+  // The world streak, and the only motion cue the capture path has (the camera
+  // reprojection term above is dropped on a one-tap build, and the hero kart is
+  // masked out of everything below).
+  //
+  // WEIGHTED TOWARD THE FRAME EDGE, on top of the |fromCentre| the term already
+  // carries. A plain radial blur is linear in radius, so at rad 0.5 it is
+  // already half as long as at the corner — which puts real smear on the road
+  // surface and the vanishing point while the corners, where trackside geometry
+  // rushes past, are still not moving enough to read. The extra (0.30 + 0.70*r)
+  // makes the profile quadratic: 15% of the corner length at mid-radius, full
+  // length only in the outer quarter. That is what lets the magnitude go up by
+  // 2x without any of it landing where the reviewers said it was mush.
+  velocity += fromCentre * (rush.x * (0.30 + 0.70 * rad));
 
   // --- hero hold-out --------------------------------------------------------
   // The player's kart is rigidly bolted to the camera, so a camera-only
@@ -261,7 +275,7 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, const in float depth,
   // the rush term is RADIAL: it is exactly zero in the middle of the frame and
   // only reaches full length out at the corners, so a long streak there costs
   // the subject and the racing line nothing.
-  float travelCap = 0.011 + 0.011 * rush.z;
+  float travelCap = 0.0125 + 0.0105 * rush.z;
   velocity *= min(travel, travelCap) / max(travel, 1e-5);
   travel = min(travel, travelCap);
 
@@ -406,7 +420,16 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, const in float depth,
     float kick = rush.z;
     float n = krValueNoise(ang * 26.0 + time * 1.6) * 0.62
             + krValueNoise(ang * 63.0 - time * 2.4) * 0.38;
-    float streak = smoothstep(0.60, 0.97, n);
+    // Threshold widened from (0.60, 0.97). `n` is the sum of two value-noise
+    // octaves, so it is roughly normal about 0.5 with sd ~0.18: a 0.97 upper
+    // edge means the comb only ever reached full strength on ~0.5% of angles
+    // and sat under a third of it on almost all of the rest. Whatever gain was
+    // dialled in on top of that, the frame got a handful of faint hairs. At
+    // (0.55, 0.93) about a third of the angular domain carries a ray and the
+    // brightest decile actually reaches the authored gain — which is the
+    // difference between "there are speed lines if you look for them" and a
+    // comb you read at a glance.
+    float streak = smoothstep(0.55, 0.93, n);
     // Banded so they live in the outer third: they frame, they don't obscure.
     // Under boost the band reaches a little further in and the outer rolloff
     // moves out, so the lines read as converging on the kart rather than as a
@@ -445,14 +468,30 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, const in float depth,
     // an already-bright sky compresses instead of punching a hole of pure white
     // in the corner of the frame. Art bible §6: three stacked effects must not
     // white the frame out.
-    c += (lines / (1.0 + lines * 0.9)) * vec3(1.0, 0.972, 0.918);
+    //
+    // Plus a HEADROOM term, which is what makes the gain safe to double. The
+    // shoulder alone is scene-independent: it caps what the comb ADDS, not what
+    // the sum arrives at, so the same ray that reads as a bright hair over the
+    // road at display 0.45 lands at 1.0+ over the golden-hour sky at 0.85 and
+    // punches a white notch out of the corner. Rolling the comb off through the
+    // top third of the range costs nothing where there is room (the tunnel, the
+    // tarmac, the cliff face) and keeps the brightest content — which is where
+    // a clipped ray is most obvious and least useful — under the ceiling.
+    float head = 1.0 - 0.50 * smoothstep(0.60, 1.00, lum);
+    c += (lines / (1.0 + lines * 1.2)) * head * vec3(1.0, 0.972, 0.918);
   }
 
   // Vignette AFTER the display transform, deliberately. Applied in linear it
   // would be a light-loss term that the shoulder then has to re-expand, which
   // is a second way to lose the top end; here it is what it is supposed to be,
   // a print-down of the finished image.
-  c *= 1.0 - grade.w * smoothstep(0.30, 1.02, rad);
+  //
+  // It CLOSES IN with speed now (`vig`, driven on the CPU side): the amount
+  // rises from the authored 0.22 to 0.36 and the inner edge walks from rad 0.30
+  // to rad 0.16, so flat out the frame is being squeezed from a third of the
+  // way out instead of only at the corners. This is the cheapest of all the
+  // speed cues and the one that survives at thumbnail size.
+  c *= 1.0 - vig.x * smoothstep(vig.y, 1.02, rad);
 
   // Grain last, and monochrome — the same scalar is added to all three
   // channels, so it can only ever be luma noise. (The coloured speckle in the
@@ -493,13 +532,31 @@ export class GradeEffect extends Effect {
         // block in GRADE_FRAGMENT: past about a texel the fringe stops being a
         // fringe and starts decorrelating the channels of whatever specular
         // aliasing is already on screen.
-        ['CA_MAX_TEXELS', '1.25'],
+        // Raised from 1.25. The reasoning below (under about a texel the
+        // bilinear fetch is its own low-pass, so the channels stay correlated
+        // and the fringe reads as a fringe) is what sets the FLOOR, not the
+        // ceiling — and at 1.25 the cap was biting at 78% of top speed, so the
+        // aberration was pinned from three-quarter pace all the way to a boost
+        // and carried none of the ramp §2 asks for. 2.0 texels is where the
+        // authored corner offset (CA_BOOST at |fromCentre| = 0.707, i.e.
+        // 0.00134 uv, against the bible's 0.0012) actually lands at 1080p, so
+        // the cap is now a safety net for small render scales rather than the
+        // thing that decides the look.
+        ['CA_MAX_TEXELS', '2.0'],
         // Tap budget for the SMEAR loop, which is entered only when there is
         // more than ~0.4 px of travel. Never below six, whatever the
         // reprojection budget is: the radial boost rush has to integrate
         // properly even on the one-tap software/capture build, and that build
         // is what every reviewed frame is rendered with.
-        ['SMEAR_SAMPLES', String(Math.max(6, Math.round(opts.samples)))],
+        // Nine, up from six, because the streak it has to integrate got longer:
+        // the boost corner now travels ~0.0175 uv (27 px at 1080p) against
+        // ~0.011 (17 px) before. Six taps over that is 4.5 px between samples,
+        // which the per-pixel jitter turns into visible noise rather than into a
+        // gradient; nine keeps the spacing at 3.4 px, i.e. the same sample
+        // density the old boost frame had. It is only ever paid on frames with
+        // more than ~0.4 px of travel, and the half-budget branch below still
+        // covers most of the screen area because the rush is edge-weighted.
+        ['SMEAR_SAMPLES', String(Math.max(9, Math.round(opts.samples)))],
       ]),
       uniforms: new Map<string, THREE.Uniform>([
         ['prevViewProj', new THREE.Uniform(new THREE.Matrix4())],
@@ -508,6 +565,9 @@ export class GradeEffect extends Effect {
           new THREE.Vector4(opts.exposure, opts.contrast, opts.saturation, opts.vignette))],
         ['lens', new THREE.Uniform(new THREE.Vector4(CA_REST, opts.grain, STREAK_REST, 0.0))],
         ['rush', new THREE.Uniform(new THREE.Vector3(0, 0, 0))],
+        // Seeded with the authored vignette so a frame rendered before the
+        // first `sync` looks exactly like the old constant-vignette build.
+        ['vig', new THREE.Uniform(new THREE.Vector2(opts.vignette, VIGNETTE_INNER_REST))],
         ['subject', new THREE.Uniform(new THREE.Vector3())],
         // Released until `sync` finds a player kart: with a negative outer
         // radius the smoothstep returns 1 everywhere and nothing is held.
@@ -586,6 +646,7 @@ export class GradeEffect extends Effect {
   get grade(): THREE.Vector4 { return this.uniforms.get('grade')!.value; }
   get lens(): THREE.Vector4 { return this.uniforms.get('lens')!.value; }
   get rush(): THREE.Vector3 { return this.uniforms.get('rush')!.value; }
+  get vig(): THREE.Vector2 { return this.uniforms.get('vig')!.value; }
   get subject(): THREE.Vector3 { return this.uniforms.get('subject')!.value; }
   get hold(): THREE.Vector2 { return this.uniforms.get('hold')!.value; }
   get prevViewProj(): THREE.Matrix4 { return this.uniforms.get('prevViewProj')!.value; }
@@ -612,7 +673,19 @@ const _dofTarget = new THREE.Vector3();
  * speckle over the boost road.
  */
 const CA_REST = 0.00045;
-const CA_BOOST = 0.0016;
+const CA_BOOST = 0.0019;
+
+/**
+ * Vignette, at rest and flat out, plus where the print-down starts.
+ *
+ * The bible authors 0.22 (§2) and that is what a still frame gets. The extra
+ * 0.14 and the inner edge walking from 0.30 to 0.16 is the speed term: at
+ * 101 km/h the frame is being closed in on from a third of the way out, which
+ * is a cue that survives being looked at for a tenth of a second.
+ */
+const VIGNETTE_SPEED = 0.14;
+const VIGNETTE_INNER_REST = 0.30;
+const VIGNETTE_INNER_FAST = 0.16;
 
 /**
  * Speed-line gain, at rest and flat out on a boost. This is `lens.z`, and the
@@ -632,8 +705,25 @@ const CA_BOOST = 0.0016;
 // STREAK_BOOST is now the ceiling for *either* driver — a flat-out lap reaches
 // it too. What still separates a boost is the second, whiter, faster comb the
 // shader adds on top of it (gated on `rush.z`), not the gain of the first one.
-const STREAK_REST = 0.095;
-const STREAK_BOOST = 0.25;
+//
+// STREAK_REST IS ZERO NOW, and that is a correctness fix, not a taste call.
+// §6 says speed lines exist "only above ~70% top speed"; a non-zero rest gain
+// meant the term was always armed and the *gate* had to do all the work, so the
+// two were multiplying each other down (0.095 of gain behind a part-open gate is
+// nothing, however the gate is tuned) and the ramp between "calm" and "flat out"
+// was a factor of 2.6 instead of a switch. With the rest at zero the gain IS the
+// ramp: exactly zero below the bible's gate, and everything above it.
+//
+// The ceiling is up from 0.25 to 0.38, which is where 0.20/0.44 was aiming
+// before the tunnel starburst forced it down. Three things make it safe now that
+// were not all present then: the band lives in the outer third (0.55, 0.44 under
+// boost), the comb is scaled by what is actually under it (`sceneLit`), and the
+// sum is rolled off against the remaining display headroom (`head`). Worked
+// through on the two ends — a boost under the tunnel exit (scene ~0.08 display)
+// peaks at +43 counts, a boost against the golden sky (~0.85) at +51, and
+// neither reaches the ceiling.
+const STREAK_REST = 0.0;
+const STREAK_BOOST = 0.38;
 
 /**
  * The value `ctx.speedIntensity` takes at 100% of top speed with no boost.
@@ -676,8 +766,15 @@ const SPEED_FLATOUT = 0.30;
  * a threshold between them separates "boosting" from "merely fast" cleanly and
  * arrives already eased.
  */
-const KICK_LO = 3.4;
-const KICK_HI = 8.0;
+// Moved up with the sustained-speed FOV term in Effects.updateSignals, which
+// went from 3.2 to 4.2 degrees flat out so the lens itself carries some of the
+// speed read. The separation contract is unchanged: the most a NON-boost frame
+// can publish is 4.2 (flat out, or flat out on a tier-3 drift — the drift branch
+// takes a max, not a sum), and a boost publishes 8.5 before any speed term is
+// added on top, so KICK_LO sits in the 0.7-degree gap and a boost taken from a
+// standstill still reaches a full kick of 1.0 at KICK_HI.
+const KICK_LO = 4.9;
+const KICK_HI = 8.5;
 
 /**
  * Radius around the player kart's centre of mass, in metres, inside which the
@@ -1026,6 +1123,13 @@ export class PostFX {
     lens.z = STREAK_REST + (STREAK_BOOST - STREAK_REST) * drive;
     lens.w = shutter;
 
+    // Vignette closes in with the same signal. Nothing here moves at all below
+    // the bible's 70%-of-top gate, so a cruising frame prints down exactly as
+    // the authored 0.22 / 0.30 it always did.
+    const vig = grade.vig;
+    vig.x = grade.grade.w + VIGNETTE_SPEED * drive;
+    vig.y = VIGNETTE_INNER_REST + (VIGNETTE_INNER_FAST - VIGNETTE_INNER_REST) * drive;
+
     const rush = grade.rush;
     // Radial zoom-blur, and the second half of the "no speed cue at speed" fix.
     //
@@ -1043,8 +1147,22 @@ export class PostFX {
     // tuned to (0.0145, ~17 px at the corner) rather than gaining the sustained
     // term on top of it. The reviewers are already unhappy about how much of
     // boost.png is smeared; this must not make that worse.
+    //
+    // RETUNED, and the numbers are the point. The old sustained term was
+    // 0.0095 * fast^2 with a flat radial profile: at the 101 km/h frame the
+    // reviewers were shown (fast = 0.80) that is 0.0061, i.e. 6.7 px of travel
+    // at the extreme corner and 3.4 px halfway out — measurable and invisible.
+    // Measured on the shipped frames, the radial-to-tangential gradient ratio in
+    // the outer annulus is 0.952 at 55 km/h and 0.915 at 101: a four percent
+    // difference, which is exactly the "visually indistinguishable" note.
+    //
+    // 0.0165 * fast^1.5 with the edge weighting in the shader puts the same
+    // frame at 13 px at the corner and still under 2 px at mid-radius, and a
+    // boost at 27 px. The exponent came down from 2 to 1.5 because the whole
+    // range that matters is fast 0.5..1 (85% of top speed and up) and a square
+    // spends most of that range doing nothing.
     rush.x = shutter > 0
-      ? Math.max(0.0095 * fast * fast, 0.0065 * speed * speed + 0.0105 * kick * speed)
+      ? Math.max(0.0165 * Math.pow(fast, 1.5), 0.0125 * speed * speed + 0.0150 * kick * speed)
       : 0;
     // The gate on the speed-line comb, now driven by the renormalised ramp: it
     // cracks open just above the art bible's ~70% of top speed and is fully open
@@ -1054,7 +1172,11 @@ export class PostFX {
     // signal while the gain used the ramp was how the two ended up multiplying
     // each other down to nothing: 0.216 of gain behind a gate of 0.31 is 0.067,
     // which is invisible however the gain is tuned.
-    rush.y = Math.max(THREE.MathUtils.smoothstep(fast, 0.03, 0.55), kick * 0.9);
+    // Ramp tightened to (0, 0.42): `fast` is already zero at the bible's ~70% of
+    // top speed, so this opens from nothing at 70% to fully open by ~82% and the
+    // transition is a decision rather than a fade. `kick` pins it wide open on
+    // its own — a boost IS the event the lines exist to announce.
+    rush.y = Math.max(THREE.MathUtils.smoothstep(fast, 0.0, 0.42), kick);
     rush.z = kick;
 
     // Keep `time` in a range where fract() still has bits left for the grain.

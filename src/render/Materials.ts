@@ -68,11 +68,17 @@ import {
   hash2,
   lerp,
   macroField,
+  microDetail,
+  microRough,
+  microSurface,
+  microValue,
   mulberry32,
   patchField,
   smoothstep,
   strataField,
   voronoiField,
+  type MicroFamily,
+  type MicroField,
 } from './Noise';
 import {
   Fields,
@@ -1899,6 +1905,24 @@ export class Materials implements System {
   }
 
   /**
+   * This material's own micro-surface basis — see `MICRO` in `Noise.ts`.
+   *
+   * Every generator in this file used to build its sub-millimetre detail from
+   * the same `fbmField(freq: size / 10, octaves: 2)` and consume it as
+   * `base + (fine - 0.5) * 0.14`. Measured over the shipped roughness maps that
+   * gave seventeen of twenty-four materials a standard deviation below 0.05 —
+   * a constant to within the channel's own quantisation — and it made `dirt`,
+   * `concrete`, `palm-bark` and the crowd's cloth statistically the same
+   * surface. Going through here means the frequency is stated in millimetres of
+   * world rather than in texels, and the octave count, the lacunarity, the
+   * direction and the roughness *response curve* all come from the family
+   * rather than from whichever builder was copied last.
+   */
+  private micro(name: MaterialName, size: number, family: MicroFamily, seed: number): MicroField {
+    return microSurface(size, WORLD_SCALE[name] ?? 1, family, seed);
+  }
+
+  /**
    * Build one material's macro layer.
    *
    * Everything above roughly a metre lives here and NOWHERE ELSE. That
@@ -3260,7 +3284,10 @@ export class Materials implements System {
     const f = new Fields(size);
     const bf = brickField(size, 5, 8, 0.37, 0.24, 0.014, 101);
     const face = fbmField(size, { freq: 24, octaves: 4, seed: 102, warp: 0.03 });
-    const pit = fbmField(size, { freq: Math.round(size / 9), octaves: 2, seed: 103 });
+    // Turbulent 6 mm pitting — all crests, no troughs, which is what a pitched
+    // ashlar face is. Four octaves at lacunarity 2.1 rather than the shared
+    // two-at-2.0, so the pitting has a size distribution instead of one grade.
+    const mic = this.micro('stone-wall', size, 'stone-rough', 103);
     // the vertical weathering run — normalised so it reaches the gate below
     const streak = fbmField(size, { freq: 14, octaves: 3, seed: 104, stretchY: 0.16, normalize: 0.03 });
     const grain = grainField(size, 106);
@@ -3290,9 +3317,13 @@ export class Materials implements System {
         (0.9 + bias * 0.16 + (face[i] - 0.5) * 0.18 + (grain[i] - 0.5) * 0.05) * (1 - dirty * 0.14) * (0.9 + chamfer * 0.1);
       f.set(i, _a.r * tone, _a.g * tone, _a.b * tone);
 
-      const h = chamfer * 0.65 + face[i] * 0.14 * joint + pit[i] * 0.06 - (1 - joint) * 0.25;
+      const h = chamfer * 0.65 + face[i] * 0.14 * joint + microValue(mic, i) * 0.06 - (1 - joint) * 0.25;
+      // Per-BLOCK roughness, not just per-block tone. A wall is a set of stones
+      // that were quarried, dressed and weathered separately; the old ±0.03
+      // from `bias` was a tenth of what that is worth, and it is the cheapest
+      // material variety in the file — one hash already being computed.
       const rough = clamp(
-        0.84 + (face[i] - 0.5) * 0.18 + (1 - joint) * 0.12 + dirty * 0.06 - bias * 0.06,
+        microRough(mic, i, 0.84) + (1 - joint) * 0.12 + dirty * 0.06 + (bias - 0.5) * 0.26,
         0.5,
         0.99,
       );
@@ -3348,7 +3379,12 @@ export class Materials implements System {
   private buildStucco(size: number): Entry {
     const f = new Fields(size);
     const trowel = fbmField(size, { freq: 7, octaves: 4, seed: 111, warp: 0.09, warpFreq: 4 });
-    const fine = fbmField(size, { freq: Math.round(size / 12), octaves: 3, seed: 112 });
+    // Lime render's own micro basis: 3 mm sand grains inside 38 cm float
+    // sweeps, turbulent (a rendered wall's texture is all crests and no
+    // troughs), and stretched ACROSS the wall because that is the direction a
+    // trowel is drawn. Replaces the shared `fbmField(size / 12, 2 octaves)`
+    // that made stucco's roughness map indistinguishable from concrete's.
+    const mic = this.micro('stucco', size, 'stucco', 112);
     const cracks = voronoiField(size, 8, 8, 0.95, 113, 2);
     const stain = fbmField(size, { freq: 4, octaves: 4, seed: 114, warp: 0.07 });
     const grain = grainField(size, 116);
@@ -3378,14 +3414,17 @@ export class Materials implements System {
       const grime = smoothstep(0.5, 0.85, stain[i]) * 0.55;
       mixRGB(base, dirty, grime, _a);
       mixRGB(_a, crackC, crack * 0.45, _b);
+      const md = microDetail(mic, i);
       // ±0.12 luminance of panel-scale mottle, the range the review asked for.
       const tone =
-        0.94 + trowel[i] * 0.12 + (fine[i] - 0.5) * 0.06 + (grain[i] - 0.5) * 0.04 +
+        0.94 + trowel[i] * 0.12 + md * 0.06 + (grain[i] - 0.5) * 0.04 +
         (patchM[i] - 0.5) * 0.24;
       f.set(i, _b.r * tone, _b.g * tone, _b.b * tone);
 
-      const h = trowel[i] * 0.3 + fine[i] * 0.18 - crack * 0.28;
-      const rough = clamp(0.9 + (fine[i] - 0.5) * 0.14 + (trowel[i] - 0.5) * 0.1 + crack * 0.06, 0.62, 0.99);
+      const h = trowel[i] * 0.3 + (md + 0.5) * 0.18 - crack * 0.28;
+      // gamma 0.85: limewash is matte nearly everywhere, and where it is NOT is
+      // where the float has burnished it — a few percent of the wall, not half.
+      const rough = clamp(microRough(mic, i, 0.90) + (trowel[i] - 0.5) * 0.1 + crack * 0.06, 0.62, 0.99);
       const ao = 1 - crack * 0.22 - (1 - trowel[i]) * 0.08;
       f.surf(i, h, ao, rough);
     }
@@ -3429,7 +3468,11 @@ export class Materials implements System {
   private buildRoofTile(size: number): Entry {
     const f = new Fields(size);
     const bf = brickField(size, 5, 2, 0.0, 0.05, 0.008, 121);
-    const fine = fbmField(size, { freq: Math.round(size / 10), octaves: 2, seed: 122 });
+    // Fired clay under a glaze, gamma 1.70: the glaze IS the surface, so the
+    // tile is smooth over most of its area and what varies is the minority that
+    // has crazed or chalked back. Same nominal roughness centre as before, an
+    // entirely different distribution around it.
+    const mic = this.micro('roof-tile', size, 'ceramic', 122);
     const moss = fbmField(size, { freq: 7, octaves: 4, seed: 123, warp: 0.07 });
     const chalk = fbmField(size, { freq: 12, octaves: 3, seed: 124 });
     const grain = grainField(size, 126);
@@ -3461,13 +3504,21 @@ export class Materials implements System {
       const mossM = smoothstep(0.62, 0.86, moss[i]) * (1 - barrel * 0.55);
       const chalkM = smoothstep(0.68, 0.92, chalk[i]) * barrel;
 
+      const mv = microValue(mic, i);
       mixRGB(tileC, chalkC, chalkM * 0.25, _a);
       mixRGB(_a, mossC, mossM * 0.55, _b);
-      const tone = 0.86 + bias * 0.2 + barrel * 0.14 + (fine[i] - 0.5) * 0.1 + (grain[i] - 0.5) * 0.05;
+      const tone = 0.86 + bias * 0.2 + barrel * 0.14 + (mv - 0.5) * 0.1 + (grain[i] - 0.5) * 0.05;
       f.set(i, _b.r * tone, _b.g * tone, _b.b * tone);
 
-      const h = barrel * 0.72 + overlap * 0.16 + lip * 0.2 + fine[i] * 0.07 - seam * 0.22;
-      const rough = clamp(0.78 - chalkM * 0.06 + mossM * 0.14 + (fine[i] - 0.5) * 0.14 - barrel * 0.1, 0.42, 0.98);
+      const h = barrel * 0.72 + overlap * 0.16 + lip * 0.2 + mv * 0.07 - seam * 0.22;
+      // ...plus a per-PAN firing identity. Pantiles come out of the kiln in
+      // batches and no two courses took the glaze the same; ±0.09 per tile is
+      // what makes a roof read as a patchwork rather than as corduroy.
+      const rough = clamp(
+        microRough(mic, i, 0.78) - chalkM * 0.06 + mossM * 0.14 - barrel * 0.1 + (bias - 0.5) * 0.18,
+        0.42,
+        0.98,
+      );
       const ao = 1 - (1 - barrel) * 0.42 - (1 - overlap) * 0.35 - mossM * 0.1;
       f.surf(i, h, ao, rough);
     }
@@ -3521,7 +3572,14 @@ export class Materials implements System {
     });
     const rings = fbmField(size, { freq: 18, octaves: 3, seed: seed + 2, stretchY: 0.2, mode: 'ridged' });
     const split = fbmField(size, { freq: 30, octaves: 3, seed: seed + 3, stretchY: 0.08, mode: 'ridged' });
-    const fine = fbmField(size, { freq: Math.round(size / 8), octaves: 2, seed: seed + 4 });
+    // Timber's own basis: 2 mm rings, RIDGED (a growth ring is a ridge), at a
+    // 3.0 lacunarity so the figure steps coarse-to-fine instead of blurring,
+    // and stretchY 0.09 so the roughness runs the length of the board. The
+    // material's albedo was already directional; its roughness map measured
+    // aniso 1.74/2.62 only because the grain leaked in through albedo, and the
+    // roughness the light actually answers was the same isotropic field the
+    // concrete used.
+    const mic = this.micro(weathered ? 'wood-weathered' : 'wood-plank', size, 'wood', seed + 4);
     const grain = grainField(size, seed + 6);
     // Decking silvers where the sun reaches it and stays dark and damp under the
     // rail; boards get replaced one at a time. Both are metres, not millimetres.
@@ -3575,12 +3633,18 @@ export class Materials implements System {
         // the gap between planks goes almost black — that dark line is most of
         // what makes decking read as boards rather than a printed pattern
         const gapShade = 0.32 + joint * 0.68;
-        const tone = (0.9 + bias * 0.16 + (fine[i] - 0.5) * 0.08 + (grain[i] - 0.5) * 0.05) * (1 - splitM * 0.2) * gapShade;
+        const mv = microValue(mic, i);
+        const tone = (0.9 + bias * 0.16 + (mv - 0.5) * 0.08 + (grain[i] - 0.5) * 0.05) * (1 - splitM * 0.2) * gapShade;
         f.set(i, _b.r * tone, _b.g * tone, _b.b * tone);
 
         const h = joint * 0.5 + g * 0.2 + knot * 0.12 - splitM * 0.35 - (1 - joint) * 0.3;
+        // The grain drives roughness twice: once through `g`, which is the
+        // earlywood/latewood value, and once through the family basis, which is
+        // the ring RELIEF. Latewood is denser and takes a shine; earlywood is
+        // open and drinks it. That is the whole reason a plank looks like wood
+        // and not like a brown rectangle when the sun rakes along it.
         const rough = clamp(
-          (weathered ? 0.88 : 0.66) + (g - 0.5) * 0.16 + splitM * 0.1 - knot * 0.12 + (fine[i] - 0.5) * 0.1,
+          microRough(mic, i, weathered ? 0.88 : 0.66) + (g - 0.5) * 0.16 + splitM * 0.1 - knot * 0.12,
           0.35,
           0.98,
         );
@@ -3666,6 +3730,12 @@ export class Materials implements System {
     // freq 8 rather than 60: 19 cm of waviness, not a 2.5 cm crease, and plain
     // fbm rather than ridged so it has no hard valleys to facet on.
     const roll = fbmField(size, { freq: 8, octaves: 3, seed: 142, stretchY: 0.16, normalize: 0.03 });
+    // Rolled steel's own basis: 1.5 mm structure drawn out 10:1 along the
+    // direction of rolling, gamma 1.5 so the sheet is mostly at its smoother
+    // end with the chalked and abraded runs as the exception. This is the
+    // family that must NOT share a response with `concrete` — a galvanised rail
+    // and a cast parapet stand next to each other in half the frames.
+    const mic = this.micro('metal-painted', size, 'metal-rolled', 150);
     // Longitudinal scuffs from whatever last slid along it. Fine, but shallow
     // and directional, and they reach ROUGHNESS far more than they reach height.
     const scuffL = fbmField(size, { freq: 26, octaves: 2, seed: 152, stretchY: 0.07 });
@@ -3732,7 +3802,7 @@ export class Materials implements System {
       // of the barrier rather than a dotted line of pinpoints — and it is the
       // sheen, not the pinpoints, that the note was actually asking for.
       const rough = clamp(
-        0.34 + bare * 0.22 + scr * 0.18 + rst * 0.30 + dust[i] * 0.14 +
+        microRough(mic, i, 0.34) + bare * 0.22 + scr * 0.18 + rst * 0.30 + dust[i] * 0.14 +
           (peel[i] - 0.5) * 0.14 - spg * 0.10,
         0.34,
         0.92,
@@ -3970,7 +4040,13 @@ export class Materials implements System {
     const bubble = voronoiField(size, 60, 60, 1.0, 192);
     const stain = fbmField(size, { freq: 5, octaves: 4, seed: 193, warp: 0.07 });
     const streak = fbmField(size, { freq: 10, octaves: 3, seed: 194, stretchY: 0.14 });
-    const fine = fbmField(size, { freq: Math.round(size / 8), octaves: 2, seed: 195 });
+    // Cast concrete's own basis. The critical column is `stretchY: 3.2` — a
+    // shuttered pour carries the horizontal grain of the form boards it was
+    // cast against, and that is the one structure that distinguishes concrete
+    // from every stone in the game at a glance. With the old shared
+    // `fbmField(size / 8, 2 octaves)` this material measured aniso 1.00 and its
+    // roughness spectrum was within 0.19 of `dirt`'s.
+    const mic = this.micro('concrete', size, 'concrete', 195);
     const grain = grainField(size, 197);
     // Concrete is poured in bays, and each bay cures its own colour. The join
     // between two pours is a 3-6 m event, so it can only live out here.
@@ -3989,13 +4065,16 @@ export class Materials implements System {
       const pit = smoothstep(0.1, 0.03, bubble.f1[i]) * (hash2(bubble.id[i], 31, 15) > 0.78 ? 1 : 0);
       const grime = smoothstep(0.55, 0.9, stain[i]) * 0.34 + smoothstep(0.7, 0.95, streak[i]) * 0.16;
 
-      mixRGB(base, pale, speck * 0.5 + fine[i] * 0.2, _a);
+      const mv = microValue(mic, i);
+      mixRGB(base, pale, speck * 0.5 + mv * 0.2, _a);
       mixRGB(_a, dirty, clamp01(grime), _b);
-      const tone = 0.93 + (fine[i] - 0.5) * 0.1 + (grain[i] - 0.5) * 0.05 - pit * 0.35;
+      const tone = 0.93 + (mv - 0.5) * 0.1 + (grain[i] - 0.5) * 0.05 - pit * 0.35;
       f.set(i, _b.r * tone, _b.g * tone, _b.b * tone);
 
-      const h = fine[i] * 0.15 + speck * 0.1 - pit * 0.6;
-      const rough = clamp(0.82 + (fine[i] - 0.5) * 0.16 + pit * 0.12 + grime * 0.06 - speck * 0.06, 0.5, 0.98);
+      const h = mv * 0.15 + speck * 0.1 - pit * 0.6;
+      // gamma 0.65: raw concrete is rough almost everywhere. The exceptions are
+      // the trowelled/formed faces that took a skin, and they are a minority.
+      const rough = clamp(microRough(mic, i, 0.82) + pit * 0.12 + grime * 0.06 - speck * 0.06, 0.5, 0.98);
       const ao = 1 - pit * 0.55 - grime * 0.1;
       f.surf(i, h, ao, rough);
     }
@@ -4043,7 +4122,12 @@ export class Materials implements System {
     const vein = fbmField(size, { freq: 3, octaves: 5, seed: 201, mode: 'ridged', warp: 0.16, warpFreq: 2 });
     const vein2 = fbmField(size, { freq: 6, octaves: 4, seed: 202, mode: 'ridged', warp: 0.12, warpFreq: 3 });
     const cloud = fbmField(size, { freq: 4, octaves: 4, seed: 203, warp: 0.08 });
-    const polish = fbmField(size, { freq: 7, octaves: 3, seed: 204, warp: 0.05 });
+    // gamma 1.9: a polished stone is polished nearly everywhere. What the eye
+    // reads is the small minority that ISN'T — buffing arcs, a scuff, a patch
+    // the mop never reaches — so the response has to be one-sided or the floor
+    // reads as satin plastic. This is the opposite response curve from
+    // `stone-rough` on the same nominal material class, which is the point.
+    const mic = this.micro('marble', size, 'stone-polished', 204);
     const grain = grainField(size, 205);
     const macroTex = this.macroMaps({
       r: macroField(MACRO_RES, { freq: 2, octaves: 3, warp: 0.14, warpFreq: 2, seed: 206, clip: 0.04 }),
@@ -4067,7 +4151,7 @@ export class Materials implements System {
       // veins are slightly softer stone, so they polish differently — that
       // roughness break is what sells marble over "grey noise"
       const h = v1 * 0.1 + v2 * 0.06 + cloud[i] * 0.04;
-      const rough = clamp(0.16 + v1 * 0.14 + v2 * 0.1 + (polish[i] - 0.5) * 0.14, 0.06, 0.55);
+      const rough = clamp(microRough(mic, i, 0.16) + v1 * 0.14 + v2 * 0.1, 0.06, 0.55);
       f.surf(i, h, 1 - v1 * 0.08, rough);
     }
 

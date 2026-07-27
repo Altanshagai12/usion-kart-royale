@@ -1726,7 +1726,19 @@ export class Effects implements System {
     // no boost flag of its own and recovers one from this number (see KICK_LO /
     // KICK_HI there), so the boost band has to sit clear of the most a drift
     // or a flat-out lap can produce — 3.3 and 3.2 respectively.
-    let fovTarget = boost * 8.5 + want * 3.2;
+    // The sustained term is up from 3.2 to 4.2 degrees. A widening lens is one
+    // of the five cues that has to separate a 101 km/h frame from a 55 km/h one
+    // and it was contributing 1.8 degrees at 101 — under three percent of the
+    // 62-degree base, which is below the threshold of noticing. At 4.2 flat out
+    // the chase rig opens by 3.3 (it takes 0.78 of this) and pulls the arm in to
+    // match, so the kart holds its size while the world stretches past it.
+    //
+    // The ceiling on a NON-boost frame is still a single number, deliberately:
+    // PostFX has no boost flag of its own and recovers one from this signal (see
+    // KICK_LO / KICK_HI there). The drift branch below takes a max rather than
+    // adding, so nothing without a boost can publish more than 4.2, against 8.5
+    // for a boost taken from a standstill.
+    let fovTarget = boost * 8.5 + want * 4.2;
     if (k.driftTier > 0 && !boost) fovTarget = Math.max(fovTarget, 1.1 * k.driftTier);
     if (k.stunTime > 0) fovTarget = -3;
     const rate = fovTarget > this.signalFov ? 12 : 4.5;
@@ -2040,13 +2052,21 @@ export class Effects implements System {
     // what makes them frame rather than cover.
     // Not gated on `grounded`: a jump at speed is the last moment you want the
     // sense of speed to blink out, and the ramp already fades it in and out.
-    if (k.isPlayer && this.signalSpeed > 0.05) {
-      const ramp = THREE.MathUtils.clamp((this.signalSpeed - 0.05) / 0.55, 0, 1);
+    if (k.isPlayer && this.signalSpeed > 0.045) {
+      // RENORMALISED. `signalSpeed` is not a fraction of top speed — the 70%
+      // gate is already applied above, so the whole no-boost range of this
+      // signal is 0..0.42 and a boost floors it at 0.52. Dividing by 0.55 was
+      // reading it as if it were 0..1: the 101 km/h frame the reviewers were
+      // shown sat at signalSpeed 0.24, i.e. ramp 0.345, so it got a third of the
+      // authored density at a third of the authored size — which is why there is
+      // not one streak in that image. Against 0.255 the same frame lands at 0.77
+      // and flat out is 1.0, which is what the curve was always tuned for.
+      const ramp = THREE.MathUtils.clamp((this.signalSpeed - 0.045) / 0.255, 0, 1);
       // Density is applied to the RATE, not left to Particles.emit(): that
       // clamps a single-particle emit up to one so the readability cue survives
       // a low setting, which is right for a drift spark and wrong for a
       // decorative rush line the player is meant to get fewer of.
-      fx.rushAcc += dt * (26 + 90 * ramp) * (boosting ? 2.0 : 1) * this.particles.density;
+      fx.rushAcc += dt * (18 + 130 * ramp) * (boosting ? 1.8 : 1) * this.particles.density;
       const n = Math.floor(fx.rushAcc);
       if (n > 0) { fx.rushAcc -= n; this.slipstream(k, n, ramp, boosting); }
     } else {
@@ -2542,18 +2562,28 @@ export class Effects implements System {
     // the half that has real perspective and real occlusion behind the kart,
     // so it is what makes the screen-space comb in PostFX read as air moving
     // rather than as a filter laid over the picture.
-    p.stretch = boosting ? 5.4 : 3.6;
+    p.stretch = boosting ? 5.6 : 4.2;
     // Shorter, and seeded further out (see `ahead` below), so a streak dies of
     // old age at roughly the distance the chase camera sits rather than sailing
     // through the lens as a frame-wide bar.
     p.life = 0.30; p.lifeJitter = 0.28;
-    p.size0 = (0.062 + 0.024 * ramp) * (boosting ? 1.5 : 1); p.size1 = 0.02; p.sizeJitter = 0.5;
+    // SCALES HARD WITH THE RAMP, and almost nothing sits under it. The old
+    // 0.062 + 0.024 * ramp was a 40% span: at three-quarter pace a streak was
+    // 0.07 m across, which at the 12-27 m it is seeded at is four pixels before
+    // the stretch and vanishes into the tarmac's own aliasing. The span is 0.055
+    // to 0.130 now, so the difference between "fast" and "flat out" is a factor
+    // of two and a bit in every dimension of the cue at once — length, width,
+    // count and opacity — which is what makes it read as the world moving
+    // rather than as a particle setting.
+    p.size0 = (0.055 + 0.075 * ramp) * (boosting ? 1.45 : 1); p.size1 = 0.02; p.sizeJitter = 0.5;
     p.gravity = 0; p.drag = 0.05; p.spin = 0;
     p.fadeIn = 0.16; p.count = 1;
-    // Low, and scaled by the ramp on top of the global additive gain: three of
-    // these overlapping must not add up to a wipe across the road.
-    const rushI = (0.85 + 0.55 * ramp) * (boosting ? 1.5 : 1);
-    this.particles.colorA(_col, rushI, (0.10 + 0.24 * ramp) * (boosting ? 1.45 : 1));
+    // Still low in absolute terms and still scaled by the shared additive gain:
+    // three of these overlapping must not add up to a wipe across the road. What
+    // changed is the SPAN — at ramp 0 they are fainter than before, at ramp 1
+    // they are about 1.6x, so the cue has a bottom as well as a top.
+    const rushI = (0.75 + 0.85 * ramp) * (boosting ? 1.4 : 1);
+    this.particles.colorA(_col, rushI, (0.06 + 0.42 * ramp) * (boosting ? 1.35 : 1));
     this.particles.colorB(_col, 0.20, 0);
     // A generous camera-ward bias and a real soft fade against the road plane.
     // Without them a streak that grazes the tarmac is depth-tested against it
@@ -2940,8 +2970,39 @@ export class Effects implements System {
     // of how long it is, so length can go back to doing its job. 2.32 m peak is
     // ~1.2x kart length and still three and a half metres clear of the chase
     // eye, so nothing sweeps the lens.
-    const len = (1.45 + 0.72 * burn) * (1 + 0.28 * ignite);
-    const rad = 0.29 + 0.12 * burn + 0.05 * ignite;
+    let len = (1.45 + 0.72 * burn) * (1 + 0.28 * ignite);
+    let rad = 0.29 + 0.12 * burn + 0.05 * ignite;
+
+    // --- SCREEN-SPACE CLAMP ---------------------------------------------------
+    //
+    // Everything above is authored in metres, and metres are the wrong unit for
+    // a silhouette rule. The chase rig surges IN under boost — to about 4.5 m —
+    // and the shader deliberately widens the tongue as it turns to face the eye
+    // (`W *= 1 + 0.70 * align`), so the two effects that make the flame readable
+    // from behind are also the two that make it enormous exactly when it is
+    // brightest. Measured against r1/boost.png with a 62-degree vertical field
+    // at 4.5 m: the tongue subtends 0.29 of frame height across and 0.43 along,
+    // i.e. a 313 x 464 px cream mass on a 1080p frame, which is the flame the
+    // review says blows out and eats the kart. It is not over-bright — nothing
+    // in that shot exceeds display 249 — it is over-LARGE, and 40 000 pixels of
+    // near-white with no structure in them reads as blown whatever the peak is.
+    //
+    // So the flame is budgeted as a fraction of the frame instead. `ppm` is the
+    // fraction of frame height one metre at the kart subtends; the plume is
+    // scaled down (never up) until it fits inside 18% of frame height across and
+    // 40% along. At the reviewed distance that is a 0.61 scale — a 194 x 421 px
+    // flame against a kart that fills about 400 px of the same frame, so the
+    // flame is smaller than its subject, which §6's "nothing this file emits may
+    // be bigger than the kart" has been asking for since round three. Beyond
+    // ~8 m the clamp is inactive and the metre-authored size is what ships.
+    const fovRad = THREE.MathUtils.degToRad(ctx.camera.fov);
+    const ppm = 1 / (2 * Math.tan(fovRad * 0.5) * Math.max(dist, 1.2));
+    // 1.7 is the shader's own worst-case widening, so the budget is measured
+    // against the widest the tongue can get rather than its authored radius.
+    const wantW = rad * 2 * 1.7 * ppm;
+    const wantL = len * ppm;
+    const fit = Math.min(1, 0.18 / Math.max(wantW, 1e-4), 0.40 / Math.max(wantL, 1e-4));
+    if (fit < 1) { len *= fit; rad *= fit; }
     // Down from 5.2 + 2.4 with a 1.9x ignition kick, i.e. from a peak of 14.4.
     // Fourteen units of additive radiance through a Reinhard shoulder is still
     // five units on the framebuffer, which after ACES is white whatever colour
@@ -2960,15 +3021,25 @@ export class Effects implements System {
     // Fade out with distance rather than popping off at the LOD boundary.
     const alpha = 0.80 * THREE.MathUtils.clamp(1.25 - dist / 90, 0.15, 1);
 
-    // 25 degrees, per the review. cos/sin precomputed.
-    const COS_MAX = 0.9063, SIN_MAX = 0.4226;
+    // 18 degrees, tightened from 25. The cone is what decides whether the plume
+    // is BEHIND the car or across it: at 25 degrees a 2.3 m tongue ends up a
+    // metre outboard of the axis, which from the three-quarter chase angle the
+    // boost shot is taken at projects straight over the rear bodywork, the
+    // spoiler and the roll bar. 18 degrees keeps the tip within 0.7 m of the
+    // centreline, so the kart's own silhouette occludes the root (the plume is
+    // depth-tested) and the tongue trails out of the back of it. cos/sin
+    // precomputed.
+    const COS_MAX = 0.9511, SIN_MAX = 0.3090;
 
     for (let s = 0; s < 2; s++) {
       // Origin comes from the model's own exhaust anchor so the flame is welded
       // to the pipe through body roll and pitch, then biased 12 cm further back
       // so its root starts behind the bodywork rather than inside it.
       this.stackMouth(k, s, _p, _q);
-      _p.addScaledVector(_fwd, -0.12);
+      // 20 cm back, up from 12. The root is the brightest part of the flame and
+      // it is the part that has to be hidden by the bodywork rather than laid
+      // over it; a tenth of a metre is inside the rear bumper's own thickness.
+      _p.addScaledVector(_fwd, -0.20);
 
       // CONSTRAIN THE CONE ABOUT -forward.
       //
@@ -2978,10 +3049,10 @@ export class Effects implements System {
       // bodywork instead of trailing behind it. Splay outboard, allow a little
       // buoyancy, then clamp the whole thing into a 25-degree half-angle about
       // straight-back — exactly the constraint the review specified.
-      _q.multiplyScalar(0.35)
-        .addScaledVector(_fwd, -0.65)
-        .addScaledVector(UP, 0.12)
-        .addScaledVector(_side, s === 0 ? -0.10 : 0.10)
+      _q.multiplyScalar(0.30)
+        .addScaledVector(_fwd, -0.70)
+        .addScaledVector(UP, 0.07)
+        .addScaledVector(_side, s === 0 ? -0.07 : 0.07)
         .normalize();
       _n.copy(_fwd).multiplyScalar(-1);
       const c = _q.dot(_n);
