@@ -26,7 +26,8 @@ import {
   BOOST_PADS, BRIDGE_T0, BRIDGE_T1, CROWN, FASCIA_OFF, GRID_BOX_HL, GRID_BOX_HW,
   GRID_LAT, KERB_HS, KERB_QS, KERB_W, PARAPET_OFF, SEA_Y,
   SKIRT_W, TUNNEL_CLEAR, TUNNEL_H, TUNNEL_T0, TUNNEL_T1, WALL_GUARDRAIL,
-  Z_BEACH, gridSlot, smoothstep as ss,
+  WALL_PARAPET, WALL_ROCK,
+  Z_BEACH, Z_TUNNEL, gridSlot, smoothstep as ss, type Corner,
 } from './TrackLayout';
 import { createNoise2D } from 'simplex-noise';
 import { getMaterials } from '../render/Materials';
@@ -399,6 +400,164 @@ function cobbleMaterial(lib: MatLib): THREE.Material {
 }
 
 /**
+ * Metres of world one cobble tile covers.
+ *
+ * The library declares 2.4 m — twelve setts across, so 200 mm, which is what a
+ * sett physically is and is the right number for a walking camera. It is the
+ * wrong number for a chase camera at 90 km/h: at 25 m a 200 mm sett is four
+ * pixels of a 1080p frame and the *joint* between two of them is one, so the
+ * whole village street resolves into a field of one-pixel highlights that
+ * crawls with every frame of camera motion. That is exactly what the drift and
+ * wide frames show.
+ *
+ * 2.85 m is 238 mm setts — still a real sett, a third of an octave further from
+ * the point where the joint goes sub-pixel, and chunkier, which is the arcade
+ * read anyway. It is deliberately not a round multiple of anything: the
+ * library's world-space macro breakup runs at 13.9 m and 4.4 m, and a tile size
+ * that divided either of those would put the two patterns back in phase.
+ */
+function cobbleUvScale(lib: MatLib): number {
+  return lib.scale('cobblestone', 2.4) * 1.19;
+}
+
+/**
+ * The cobble as the *track* uses it: vertex colours, plus the two things the
+ * shared material does not carry and cannot be asked to, because it is also on
+ * the village squares and the quay where neither applies.
+ *
+ * **1. Geometric specular anti-aliasing.** The library's own `std()` takes a
+ * `specAA` flag and the tarmac sets it; `buildCobble` does not. A sett map is
+ * ~180 dome edges per tile at full normal strength, which is a far harsher
+ * normal-curvature signal than 36 mm chippings, so the surface that most needs
+ * the term is the one shipping without it. This is a Toksvig-style widening:
+ * measure how fast the shaded normal is changing across the pixel footprint and
+ * fold that variance into roughness, so a normal that swings a long way inside
+ * one pixel is shaded as a rougher surface rather than as a mirror pointed in
+ * an arbitrary direction. It is the only thing that actually kills edge crawl —
+ * mip filtering cannot, because the aliasing is in the *lighting response*, not
+ * in the texture fetch.
+ *
+ * **2. A second detail octave at 1/2.37.** Straight off the note. The library's
+ * breakup layer works in world space at 13.9 m and 4.4 m, which is macro tone;
+ * what is missing is a decade between that and the 238 mm sett, and without it
+ * every sett in a 2.85 m tile has an identical twin 2.85 m away in both axes.
+ * Re-reading the albedo and roughness maps at 1/2.37 of the rate — irrational
+ * against the tile, so it never comes back into phase — lands a *different*
+ * sett's tone and gloss on top of each one. Two extra fetches, on the one
+ * material group that needs them.
+ *
+ * Both ride on the clone. Nothing here touches the shared material, which is
+ * still exactly what the village walls and squares asked the library for.
+ */
+function injectCobbleDetail(mat: THREE.Material) {
+  // x: second-octave UV rate, y: its albedo weight, z: its roughness weight
+  const uD = { value: new THREE.Vector3(1 / 2.37, 0.34, 0.30) };
+  // x: variance gain, y: the most roughness² the AA term may add
+  const uAA = { value: new THREE.Vector2(0.62, 0.16) };
+  const prev = mat.onBeforeCompile;
+  const prevKey = mat.customProgramCacheKey;
+  mat.onBeforeCompile = (shader, renderer) => {
+    if (prev && prev !== THREE.Material.prototype.onBeforeCompile) prev.call(mat, shader, renderer);
+    shader.uniforms.uCobDetail = uD;
+    shader.uniforms.uCobAA = uAA;
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying float vCobDist;')
+      .replace('#include <project_vertex>', '#include <project_vertex>\nvCobDist = -mvPosition.z;');
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        '#include <common>\nuniform vec3 uCobDetail;\nuniform vec2 uCobAA;\n' +
+          'varying float vCobDist;\nfloat gCobD = 0.0;\n',
+      )
+      // `color_fragment` survives the library's own injection (which consumes
+      // map_fragment, roughnessmap_fragment and normal_fragment_maps), and at
+      // this point diffuseColor is albedo × vertex colour with nothing else
+      // applied — the right place for a detail octave.
+      .replace(
+        '#include <color_fragment>',
+        /* glsl */ `#include <color_fragment>
+        #ifdef USE_MAP
+        {
+          // rotated as well as rescaled: an axis-aligned second octave still
+          // shares the first one's row and column directions, and two lattices
+          // in the same orientation read as one moiré rather than as breakup
+          vec2 ruv = mat2( 0.857, -0.515, 0.515, 0.857 ) * vMapUv * uCobDetail.x + 0.317;
+          const vec3 kLum = vec3( 0.299, 0.587, 0.114 );
+          float dtl = dot( texture2D( map, ruv ).rgb, kLum );
+          // Referenced against the map's *own* mean — a high mip of the same
+          // fetch — rather than against a hand-typed constant, so the octave is
+          // a true ±0 modulation whatever albedo the shared library hands over
+          // and cannot quietly turn into a global tint when that map changes.
+          float ref = dot( textureLod( map, ruv, 7.0 ).rgb, kLum ) + 1e-4;
+          gCobD = clamp( dtl / ref - 1.0, -0.85, 0.85 );
+          // ...and faded out with distance, because past the point where the
+          // second octave is itself sub-pixel it is no longer breaking up a
+          // pattern, it is just adding noise to a mip that had settled
+          gCobD *= 1.0 - smoothstep( 45.0, 120.0, vCobDist );
+          diffuseColor.rgb *= 1.0 + gCobD * uCobDetail.y;
+        }
+        #endif`,
+      )
+      // roughnessFactor is declared by the roughness block and is still live
+      // here; metalnessmap_fragment is untouched by every injection upstream
+      .replace(
+        '#include <metalnessmap_fragment>',
+        '#include <metalnessmap_fragment>\n' +
+          'roughnessFactor = clamp( roughnessFactor * ( 1.0 + gCobD * uCobDetail.z ), 0.06, 1.0 );',
+      )
+      // last stop before the BRDF, where `normal` is final and roughnessFactor
+      // has not yet been copied into `material`
+      .replace(
+        '#include <lights_physical_fragment>',
+        /* glsl */ `{
+          vec3 dnx = dFdx( normal );
+          vec3 dny = dFdy( normal );
+          float variance = uCobAA.x * ( dot( dnx, dnx ) + dot( dny, dny ) );
+          float kernel = min( variance, uCobAA.y );
+          roughnessFactor = min( 1.0, sqrt( roughnessFactor * roughnessFactor + kernel ) );
+        }
+        #include <lights_physical_fragment>`,
+      );
+  };
+  mat.customProgramCacheKey = () => (prevKey ? prevKey.call(mat) : '') + '|cobdtl';
+}
+
+/**
+ * Sett-course domain warp, in metres of lateral / arc length.
+ *
+ * Setts are laid in courses that arc and wander; a rectilinear UV grid lays them
+ * in dead-straight ranks parallel to the kerb and square to the direction of
+ * travel, which is precisely the "identical stones marching to the horizon"
+ * read the critique names. Two decorrelated ~50 m octaves push the
+ * parameterisation around by up to ±0.6 m, so the tile lattice never lands on a
+ * screen-space grid and the courses bend the way a paviour would have laid them.
+ * Smooth and C1 at the 1 m and 1.5 m ring spacings the two callers use, so it
+ * deforms the courses without shearing a single sett.
+ *
+ * Lives here because the road ribbon and the flush apron both emit cobble and
+ * they weld to each other: a warp on one and not the other is a 0.6 m step in
+ * the sett courses down the whole village kerb line.
+ */
+const _warp = { u: 0, v: 0 };
+function cobbleWarp(dist: number, lat: number) {
+  _warp.u = lat + tn2(dist * 0.021 + 3.1, lat * 0.021) * 0.60;
+  _warp.v = dist + tn2(dist * 0.017 + 41, lat * 0.026 + 7) * 0.55;
+  return _warp;
+}
+
+/** The road/apron cobble material: shared map, track-owned detail and spec AA. */
+function cobbleVc(lib: MatLib): THREE.Material {
+  return lib.vc('cobblestone', () => cobbleMaterial(lib), (m) => {
+    // The relief that survives to 40 m is macro form, not 4 mm of dome. Trimming
+    // it here is the cheap half of the crawl fix and it costs no instructions;
+    // the spec-AA term is the half that handles what is left.
+    const sm = m as THREE.MeshStandardMaterial;
+    if (sm.normalScale) sm.normalScale.multiplyScalar(0.78);
+    injectCobbleDetail(m);
+  });
+}
+
+/**
  * Fallback kerb. The red/white banding is baked into the map along V at four
  * bands per tile, matching the shared library's pitch — the mesh's vertex
  * colours now carry joint dirt and rubber wear instead of the stripe, so if the
@@ -759,6 +918,7 @@ export function buildTrackGeometry(track: Track, ctx: Ctx) {
   buildKerbs(track, lib, g);
   buildMarkings(track, lib, g);
   buildBoostPads(track, lib, g);
+  buildCornerBoards(track, lib, g);
   buildSkirt(track, lib, g);
   buildTerrain(track, lib, g);
   buildSea(track, lib, g);
@@ -795,13 +955,29 @@ export function buildTrackGeometry(track: Track, ctx: Ctx) {
  * lands where the two albedos already agree — so it shows up as a hotter,
  * narrower highlight inside a soft dark band, and not as a seam.
  */
-const ROAD_NL = 17;
-const LINE_K0 = 4;   // first column pinned to the racing line
-const RACE_A = 6;    // first vertex of the polished core
-const RACE_B = 10;   // last vertex of the polished core
+const ROAD_NL = 19;
+const LINE_K0 = 5;   // first column pinned to the racing line
+const RACE_A = 7;    // first vertex of the polished core
+const RACE_B = 11;   // last vertex of the polished core
 /** offsets from the ideal line for columns LINE_K0 … LINE_K0+8 */
 const LINE_OFFS = [-2.6, -1.9, -1.15, -0.55, 0, 0.55, 1.15, 1.9, 2.6];
 const LINE_SPAN = 2.6;
+
+/**
+ * Lateral width of the contact band pinned against the kerb junction.
+ *
+ * Two extra columns (one per side) exist purely so the road can carry an
+ * ambient-occlusion and dirt gradient in the last third of a metre before the
+ * kerb. Without them the outermost quad row is 0.9–1.4 m wide and the narrowest
+ * gradient the mesh can express at the junction is that same 1.4 m, which is a
+ * soft wash and not a contact — so the setts butted into the kerb on a razor
+ * with nothing bedding one into the other. The kerb has had a 60 mm contact-AO
+ * gradient at its own foot since round 1 (`kerbWear`); this is the other half of
+ * that joint, and a joint with AO on one side only reads worse than one with
+ * none, because the step in value lands exactly on the seam.
+ */
+const EDGE_AO_W = 0.34;
+
 const roadLats = new Float64Array(ROAD_NL);
 const roadMask = new Float64Array(ROAD_NL);
 
@@ -824,14 +1000,21 @@ function planRoadLats(hw: number, race: number) {
   }
   const lo = roadLats[LINE_K0], hi = roadLats[LINE_K0 + LINE_OFFS.length - 1];
   const kHi = LINE_K0 + LINE_OFFS.length - 1;
-  for (let k = 0; k < LINE_K0; k++) {
-    roadLats[k] = -hw + (lo + hw) * (k / LINE_K0);
-    roadMask[k] = 0;
+  // The contact column can never cross the line block on the 5.4 m cliff ledge,
+  // so it is pulled in from the edge but never past whatever room is left.
+  const ao = Math.min(EDGE_AO_W, Math.max(0.05, (hw + lo) * 0.5), Math.max(0.05, (hw - hi) * 0.5));
+  roadLats[0] = -hw;
+  roadLats[1] = -hw + ao;
+  for (let k = 2; k < LINE_K0; k++) {
+    roadLats[k] = roadLats[1] + (lo - roadLats[1]) * ((k - 1) / (LINE_K0 - 1));
   }
-  for (let k = kHi + 1; k < ROAD_NL; k++) {
-    roadLats[k] = hi + (hw - hi) * ((k - kHi) / (ROAD_NL - 1 - kHi));
-    roadMask[k] = 0;
+  for (let k = 0; k < LINE_K0; k++) roadMask[k] = 0;
+  roadLats[ROAD_NL - 1] = hw;
+  roadLats[ROAD_NL - 2] = hw - ao;
+  for (let k = kHi + 1; k < ROAD_NL - 2; k++) {
+    roadLats[k] = hi + (roadLats[ROAD_NL - 2] - hi) * ((k - kHi) / (ROAD_NL - 2 - kHi));
   }
+  for (let k = kHi + 1; k < ROAD_NL; k++) roadMask[k] = 0;
 }
 
 /** In-place circular box blur over a per-station signal. */
@@ -878,10 +1061,10 @@ function buildRoad(track: Track, lib: MatLib, root: THREE.Group) {
   const dP = new THREE.Vector3(), T = new THREE.Vector3(), N = new THREE.Vector3();
 
   const sTar = lib.scale('tarmac', 3.5);
-  const sCob = lib.scale('cobblestone', 2.4);
+  const sCob = cobbleUvScale(lib);
   const wear = raceWear(cl);
 
-  const emitRing = (si: number, dist: number, uvScale: number) => {
+  const emitRing = (si: number, dist: number, uvScale: number, cobble = false) => {
     const hw = cl.half[si];
     planRoadLats(hw, cl.race[si]);
     const base = b.pos.length / 3;
@@ -917,7 +1100,22 @@ function buildRoad(track: Track, lib: MatLib, root: THREE.Group) {
       // metre-scale patch variation, at a scale the tiling breakup cannot reach
       _c.multiplyScalar(1 + tn2(_p.x * 0.021, _p.z * 0.021) * 0.07
         + tn2(_p.x * 0.0067 + 31, _p.z * 0.0067 + 31) * 0.05);
-      pushV(b, _p.x, _p.y, _p.z, N.x, N.y, N.z, L / uvScale, dist / uvScale, _c);
+      // --- contact AO + dirt in the last 340 mm before the kerb junction -----
+      // A hard, narrow term, deliberately much tighter than the `edge` wash
+      // above: the wash says "this end of the road is dirtier", this says "the
+      // road and the kerb are the same object where they touch". Value drop is
+      // 0.30, which is the same order as the kerb's own foot AO on the other
+      // side of the seam, so the two meet at roughly one value instead of
+      // stepping across it.
+      const contact = 1 - ss(0, EDGE_AO_W, hw - Math.abs(L));
+      _c.lerp(C_JOINT_MUL, contact * 0.42);
+      _c.multiplyScalar(1 - contact * 0.16);
+      let u = L, v = dist;
+      if (cobble) {
+        const w = cobbleWarp(dist, L);
+        u = w.u; v = w.v;
+      }
+      pushV(b, _p.x, _p.y, _p.z, N.x, N.y, N.z, u / uvScale, v / uvScale, _c);
       b.tan!.push(dP.x, dP.y, dP.z, 1);
     }
     return base;
@@ -950,7 +1148,7 @@ function buildRoad(track: Track, lib: MatLib, root: THREE.Group) {
     const prevSi = r > 0 ? Math.round(((r - 1) * cl.count) / rings) % cl.count : si;
     const needs = cl.cobble[si] >= 0.5 || (r > 0 && cl.cobble[prevSi] >= 0.5);
     if (!needs) { prev = -1; continue; }
-    const ring = emitRing(si, raw * cl.ds, sCob);
+    const ring = emitRing(si, raw * cl.ds, sCob, true);
     if (prev >= 0 && cl.cobble[prevSi] >= 0.5) stitch(prev, ring, 0, ROAD_NL - 1, idxC);
     prev = ring;
   }
@@ -970,7 +1168,7 @@ function buildRoad(track: Track, lib: MatLib, root: THREE.Group) {
   const mesh = new THREE.Mesh(geo, [
     lib.vc('tarmac', () => tarmacMaterial(lib)),
     lib.vc('tarmac-racing-line', () => tarmacMaterial(lib, true)),
-    lib.vc('cobblestone', () => cobbleMaterial(lib)),
+    cobbleVc(lib),
   ]);
   mesh.name = 'road';
   mesh.receiveShadow = true;
@@ -998,9 +1196,15 @@ function kerbWear(q: number, dist: number, hot: number, out: THREE.Color) {
   // note — and AO in every contact point is not optional (bible §2).
   out.lerp(C_JOINT_MUL, (1 - ss(0.0, 0.14, q)) * 0.72);
   out.multiplyScalar(1 - (1 - ss(0.0, 0.06, q)) * 0.34);
-  // grime gradient up the outer face — the bottom 15% is where it collects, and
-  // the gutter silts up worse on a straight than on a corner nobody misses
-  out.lerp(C_GRIME, ss(1.40, KERB_W, q) * (0.48 + (1 - hot) * 0.26));
+  // Grime gradient up the outer face — the bottom 15% is where it collects, and
+  // the gutter silts up worse on a straight than on a corner nobody misses.
+  //
+  // The `(1 - hot)` weight was 0.26, and `hot` is *inside*-of-corner curvature,
+  // so the term was dirtying the outside kerb hardest — i.e. it was dimming
+  // precisely the ribbon that draws the shape of the corner for a driver on the
+  // entry. Still true to life, still there, but at 0.10 it grades the kerb
+  // without taking the read-ahead cue out with it.
+  out.lerp(C_GRIME, ss(1.40, KERB_W, q) * (0.44 + (1 - hot) * 0.10));
   // the bevel and the crown edge get scuffed pale by wheels riding over
   const polish = ss(0.20, 0.30, q) * (1 - ss(0.34, 0.44, q));
   out.multiplyScalar(1 + polish * 0.10 * (0.4 + hot));
@@ -1134,6 +1338,8 @@ function buildKerbs(track: Track, lib: MatLib, root: THREE.Group) {
     owns: (si: number) => boolean;
     uvS: number;
     edgeU: boolean;
+    /** setts: carry the road ribbon's course warp across the junction */
+    warp?: boolean;
     wear: (q: number, dist: number, hot: number, out: THREE.Color) => void;
     idx: number[];
   }
@@ -1151,8 +1357,10 @@ function buildKerbs(track: Track, lib: MatLib, root: THREE.Group) {
         const q = KERB_QS[k + e];
         track.crossPoint(si, side * (hw + q), _p);
         p.wear(q, dist, hot, _c);
-        const u = (p.edgeU ? side * (hw + q) : q) / p.uvS;
-        pushV(b, _p.x, _p.y, _p.z, N.x, N.y, N.z, u, dist / p.uvS, _c);
+        const lat = p.edgeU ? side * (hw + q) : q;
+        const w = p.warp ? cobbleWarp(dist, lat) : null;
+        pushV(b, _p.x, _p.y, _p.z, N.x, N.y, N.z,
+          (w ? w.u : lat) / p.uvS, (w ? w.v : dist) / p.uvS, _c);
       }
     }
     return ring;
@@ -1192,10 +1400,20 @@ function buildKerbs(track: Track, lib: MatLib, root: THREE.Group) {
       // third of an octave further from Nyquist at the distances that alias.
       p: { owns: hasKerb, uvS: lib.scale('kerb', 2.0) * 1.3, edgeU: false, wear: kerbWear, idx: [] },
       mat: () => lib.vc('kerb', () => kerbMaterial(lib), (m) => {
-        // tile mean: half red, half white, knocked back by the grime and chip
-        // the map averages in. This is the value a distant kerb resolves to.
-        _c2.copy(C_KERB_R).lerp(C_KERB_W, 0.5).multiplyScalar(0.72);
-        injectDistanceFlatten(m, 26, 105, _c2);
+        // Tile mean: half red, half white, knocked back by the grime and chip the
+        // map averages in — the value a distant kerb resolves to.
+        //
+        // The band was 26 → 105 m at 0.72 of the mean, which killed the stripe
+        // crawl and then kept going: the kerb is the *only* full-contrast line
+        // in the frame that draws the shape of the corner, and starting to erase
+        // it 26 m ahead of the kart is a direct cause of "no kerb curvature
+        // telegraphed through the haze". 34 → 125 m keeps a legible saw-tooth
+        // right through the mid-ground where the corner is actually read, and
+        // 0.86 leaves the far kerb a bright band against dark tarmac rather than
+        // a grey smear that the aerial perspective then finishes off. 34 m is
+        // still comfortably before a 650 mm stripe approaches Nyquist.
+        _c2.copy(C_KERB_R).lerp(C_KERB_W, 0.5).multiplyScalar(0.86);
+        injectDistanceFlatten(m, 34, 125, _c2);
       }),
     },
     {
@@ -1208,9 +1426,9 @@ function buildKerbs(track: Track, lib: MatLib, root: THREE.Group) {
     {
       p: {
         owns: (si) => !hasKerb(si) && cl.cobble[si] >= 0.5,
-        uvS: lib.scale('cobblestone', 2.4), edgeU: true, wear: apronWear, idx: [],
+        uvS: cobbleUvScale(lib), edgeU: true, warp: true, wear: apronWear, idx: [],
       },
-      mat: () => lib.vc('cobblestone', () => cobbleMaterial(lib)),
+      mat: () => cobbleVc(lib),
     },
   ];
   for (const { p } of passes) run(p);
@@ -1254,6 +1472,28 @@ function buildKerbs(track: Track, lib: MatLib, root: THREE.Group) {
 //  vertex alpha (how thick the paint is), plus a per-family lift so coplanar
 //  families resolve in a fixed order instead of z-fighting.
 // ---------------------------------------------------------------------------
+
+/**
+ * Distance from a corner's mark point back to its first (3-bar) marker.
+ *
+ * Shared by the painted braking ladder and the upright count boards, because
+ * the whole point of the two families is that they agree: a driver reads "three
+ * bars" once and gets it from the road and from the roadside at the same
+ * station. Two copies of `c.d - 100` is exactly how they would stop agreeing.
+ *
+ * Adaptive rather than fixed at 100 m, because the corners on this circuit are
+ * 77–249 m apart — a fixed ladder would have the three village esses writing
+ * their braking boards over each other's exits.
+ */
+function cornerLadder(corners: readonly Corner[], ci: number, len: number): number {
+  return Math.max(26, Math.min(112, cornerGap(corners, ci, len) - 30));
+}
+
+/** Clean run of road behind corner `ci`, i.e. distance back to the previous one. */
+function cornerGap(corners: readonly Corner[], ci: number, len: number): number {
+  const raw = corners[ci].d - corners[(ci - 1 + corners.length) % corners.length].d;
+  return raw > 0 ? raw : raw + len;
+}
 
 /** paint-thickness ordering, metres above the road; larger wins */
 const LIFT_PATCH = 0.008;
@@ -1586,6 +1826,22 @@ function buildRoadDecals(track: Track, strip: StripFn, softPatch: PatchFn, setLi
     const si = Math.floor(dd / cl.ds) % cl.count;
     return cl.cobble[si] < 0.5 && cl.kerb[si] > 0.5;
   };
+  /**
+   * As `clear`, but setts are allowed.
+   *
+   * `clear` refuses cobble because a tar seam or a saw-cut binder patch in a
+   * village street is nonsense. A corner marking is not: a painted chevron on
+   * setts is a thing that exists, and three of this circuit's nine corners are
+   * the village esses, which is where a driver most needs telling — the terraces
+   * press in on both sides and there is no sightline at all. Refusing cobble for
+   * the telegraph was silently removing a third of it.
+   */
+  const clearMark = (d: number) => {
+    const dd = ((d % len) + len) % len;
+    if (dd < 34 || dd > len - 34) return false;
+    const si = Math.floor(dd / cl.ds) % cl.count;
+    return cl.kerb[si] > 0.5;
+  };
   const halfAt = (d: number) => cl.half[Math.floor((((d % len) + len) % len) / cl.ds) % cl.count];
 
   // --- transverse construction joints, one every ~31 m ---------------------
@@ -1676,29 +1932,30 @@ function buildRoadDecals(track: Track, strip: StripFn, softPatch: PatchFn, setLi
   //  are man-made hard shapes on an organic surface, they read at a grazing
   //  angle where an upright board is edge-on, and they are the last thing still
   //  visible when the road is cresting away from you.
+  //
+  //  ROUND-1 NOTE. None of this shipped. The detector was
+  //  `Math.abs(cl.curv[i]) > 0.0125`, and on this layout that gate is above
+  //  every corner on the circuit except the banked coastal 180 — see the block
+  //  comment on `findCorners` in TrackLayout for the measured numbers. Eight of
+  //  nine corners got no boards, no rumbles, no chevron, which is the whole of
+  //  the "the player cannot anticipate" finding. `track.corners` is now a real
+  //  segmentation of the curvature schedule and gives nine marks a lap.
   setLift(LIFT_ARROW);
-  const curvy: { d: number; sign: number; k: number }[] = [];
-  for (let i = 0; i < cl.count; i += 8) {
-    if (Math.abs(cl.curv[i]) > 0.0125) {
-      curvy.push({ d: i * cl.ds, sign: Math.sign(cl.curv[i]), k: Math.abs(cl.curv[i]) });
-    }
-  }
-  let lastD = -1e9;
-  for (const c of curvy) {
-    if (c.d - lastD < 150) continue;
-    if (!clear(c.d - 46)) continue;
-    lastD = c.d;
+  const corners = track.corners;
+  for (let ci = 0; ci < corners.length; ci++) {
+    const c = corners[ci];
+    if (!clearMark(c.d - 40)) continue;
     // Outside of the turn: `curv < 0` is a left-hander, whose outside is the
     // right-hand side, which is also where a kart on the ideal line is pointed.
     const outSign = -c.sign;
+    const gap = cornerGap(corners, ci, len);
+    const b0 = cornerLadder(corners, ci, len);
 
-    // --- tiered braking boards: 3 / 2 / 1 bars, 100 / 70 / 40 m out ---------
-    const marks = [
-      [100, 3], [70, 2], [40, 1],
-    ] as const;
+    // --- tiered braking boards: 3 / 2 / 1 bars -----------------------------
+    const marks: [number, number][] = [[b0, 3], [b0 * 0.66, 2], [b0 * 0.36, 1]];
     for (const [back, bars] of marks) {
       const dm = c.d - back;
-      if (!clear(dm)) continue;
+      if (!clearMark(dm)) continue;
       const hwm = halfAt(dm);
       // hugs the outside kerb, clear of the edge line
       const inner = hwm - 1.15;
@@ -1718,10 +1975,12 @@ function buildRoadDecals(track: Track, strip: StripFn, softPatch: PatchFn, setLi
     //  camera is now close enough for that to land. Two bars, palette colours,
     //  laid at a slight skew so they read as painted on rather than composited.
     //  Laid at −142 … −131 m so it clears the rumble strips at −121 … −114 and
-    //  the first braking board at −100. Corners are gated 150 m apart, so it
-    //  also cannot reach back into the previous corner's chevron.
+    //  the first braking board at −100. Gated on `gap` rather than on a global
+    //  150 m corner spacing, because corners are now detected properly and the
+    //  village esses are 77–89 m apart: on those the ladder is boards + chevron
+    //  only, and the long approaches keep the full run-up.
     setLift(LIFT_SPONSOR);
-    {
+    if (gap >= 172) {
       const ds = c.d - 142;
       if (clear(ds) && clear(ds + 15)) {
         const hws = halfAt(ds);
@@ -1758,7 +2017,7 @@ function buildRoadDecals(track: Track, strip: StripFn, softPatch: PatchFn, setLi
     //  thing in the frame. Pitched at 1.1 m falling to 0.7 — under a metre is
     //  where a rib stops resolving at speed and starts shimmering.
     setLift(LIFT_ARROW);
-    {
+    if (gap >= 148) {
       const NR = 9;
       let sr = c.d - 122;
       for (let k = 0; k < NR; k++) {
@@ -1779,7 +2038,8 @@ function buildRoadDecals(track: Track, strip: StripFn, softPatch: PatchFn, setLi
 
     // --- direction chevron at the braking board -----------------------------
     setLift(LIFT_ARROW);
-    const d = c.d - 46;
+    const d = c.d - Math.min(46, b0 * 0.42);
+    if (!clearMark(d) || !clearMark(d + 6)) continue;
     const lat = outSign * (halfAt(d) - 3.6);
     // brighter and bigger than round 1's 0.30 — at 0.30 over a dark road under a
     // 14° key it was inside the tarmac's own noise floor and simply did not read
@@ -1828,6 +2088,245 @@ function buildBoostPads(track: Track, lib: MatLib, root: THREE.Group) {
   const mesh = new THREE.Mesh(finish(b), lib.get('boost-pad', () => boostMaterial()));
   mesh.name = 'boost-pads';
   mesh.renderOrder = 2;
+  root.add(mesh);
+}
+
+// ---------------------------------------------------------------------------
+//  Corner marker boards — the vertical half of the read-ahead answer
+// ---------------------------------------------------------------------------
+//
+//  Every round-1 chase frame runs the road to a vanishing point and loses it:
+//  no vertical landmark on the sightline, no banking in profile, nothing above
+//  the horizon that says which way the next corner goes. The painted telegraph
+//  above is the half of the answer that lives on the tarmac, and it has a hard
+//  limit — paint is *in the road plane*, so the moment the road crests away
+//  from you (the beach descent, the cliff, the run to the bridge) it is gone
+//  exactly when you need it most.
+//
+//  These are the other half, and they are the part a driver actually reads at
+//  120 m: upright boards on posts on the outside shoulder. Two families:
+//
+//   • **Count boards** on the approach — three bars, then two, then one, at the
+//     same stations as the painted braking ladder so the two agree. A driver
+//     learns the rhythm in one lap and then knows how far the corner is without
+//     looking at anything else.
+//   • **Chevron boards** through the corner itself, spaced along the *outside*
+//     shoulder from the mark point to the exit. Because they follow the
+//     shoulder, the line they draw in the air IS the shape of the corner — that
+//     is the read-ahead cue, not the individual board. They are also what
+//     remains visible when the road surface has crested out of view.
+//
+//  Sized off the sightline, not off taste: a 1.35 m board whose top sits 3.4 m
+//  above the road subtends about 0.6° at 120 m, i.e. 12 px of a 1080p 60° frame,
+//  and sits clear above the horizon for a chase camera at ~2.6 m. Cream face
+//  against the palette's kerb red, which is the highest-contrast pair the bible
+//  allows and survives the aerial perspective on the way in.
+//
+//  Cost: one merged mesh, one material, ~2.5 k triangles for the whole circuit.
+//  The shadow they throw across the road under a 14° key is a bonus — it lands
+//  ahead of the driver and telegraphs the corner a second time.
+// ---------------------------------------------------------------------------
+
+/** cream sign face; never `#ffffff` (bible §3) */
+const C_BOARD_FACE = new THREE.Color('#f2ece0');
+const C_BOARD_BAR = new THREE.Color('#e0453f');
+/** galvanised post, well off black so it keeps form shading in the shadows */
+const C_BOARD_POST = new THREE.Color('#8d8f93');
+/** board top above the shoulder, and the face's own height */
+const BOARD_TOP = 3.4;
+const BOARD_H = 1.35;
+
+/**
+ * Enamelled sign plate. Its own bake rather than `metal-painted`, because a
+ * sign is a flat baked-enamel panel with a fine orange-peel and a chalked, dusty
+ * lower half, and the library's painted metal is a rolled, scuffed guardrail
+ * skin at a 1.5 m tile — on a 2.4 m board that reads as corrugated iron.
+ *
+ * Roughness lands around 0.38 against the tarmac's 0.72 and the kerb's grime, so
+ * the boards are a genuinely distinct surface response in frame (bible §9.3) and
+ * catch a hard rim off the low key rather than sitting flat.
+ */
+function boardMaterial(lib: MatLib): THREE.Material {
+  const s = bakeTexSet(256,
+    (u, v) => fbm(u * 26, v * 26, 3) * 0.28 + tn2(u * 150, v * 150) * 0.1,
+    (u, v, h, out) => {
+      out.setRGB(1, 1, 1).multiplyScalar(0.94 + h * 0.12);
+      // road film and chalking, heaviest along the bottom edge of a panel
+      out.multiplyScalar(1 - Math.max(0, fbm(u * 5 + 12, v * 5 + 12, 3)) * 0.16
+        - (1 - ss(0.0, 0.34, v)) * 0.13);
+    },
+    (u, v, h) => 0.38 + h * 0.16 + Math.max(0, fbm(u * 8 + 5, v * 8 + 5, 2)) * 0.14,
+    12,
+  );
+  lib.tune(s, 1);
+  return new THREE.MeshStandardMaterial({
+    ...s, color: 0xffffff, roughness: 1, metalness: 0.15,
+    vertexColors: true, side: THREE.DoubleSide,
+    normalScale: new THREE.Vector2(0.45, 0.45),
+  });
+}
+
+function buildCornerBoards(track: Track, lib: MatLib, root: THREE.Group) {
+  const cl = track.cl;
+  const b = newBuf();
+  const R = new THREE.Vector3();   // board "right", along the plate
+  const F = new THREE.Vector3();   // board normal, facing oncoming traffic
+  const base = new THREE.Vector3();
+
+  const stationAt = (d: number) =>
+    Math.floor((((d % cl.length) + cl.length) % cl.length) / cl.ds) % cl.count;
+
+  /**
+   * Footing for a board `off` metres outside the kerb at arc length `d`.
+   *
+   * Returns false where there is nothing to stand on, and there are three ways
+   * for that to be true:
+   *
+   *  • the tunnel bore, where the shoulder is rock;
+   *  • a rock wall or a bridge parapet, which owns that ground already — a
+   *    marker board bolted to a cliff face is not a thing;
+   *  • ground that has fallen more than 1.6 m below the shoulder, i.e. the
+   *    seaward side of the cliff ledge and the beach drop. A post standing in
+   *    mid-air over the bay is the "nothing floats" note (§2) at its purest, and
+   *    it is exactly the mistake a naïve `hw + constant` placement makes.
+   *
+   * Behind an Armco it steps out past the rail rather than through it.
+   * `groundAt` is the function the terrain mesh itself is built from, so if it
+   * says the ground is there, the rendered ground is there.
+   */
+  const footing = (d: number, side: number, off: number): boolean => {
+    const dd = ((d % cl.length) + cl.length) % cl.length;
+    // the start straight is the banner arch's and the grandstand's; a corner
+    // board in among that furniture is clutter, not navigation
+    if (dd < 26 || dd > cl.length - 26) return false;
+    const si = stationAt(d);
+    if (cl.zone[si] === Z_TUNNEL) return false;
+    const wall = side < 0 ? cl.wallL[si] : cl.wallR[si];
+    if (wall === WALL_ROCK || wall === WALL_PARAPET) return false;
+    let q = KERB_W + off;
+    if (wall === WALL_GUARDRAIL) {
+      const wo = side < 0 ? cl.wallOffL[si] : cl.wallOffR[si];
+      q = Math.max(q, wo + 0.85);
+    }
+    // Reference height is the *kerb edge*, not the board's own footing.
+    // `crossPoint` already carries the shoulder profile down the cliff, so
+    // testing a shoulder point against itself is a tautology that never fires
+    // and would have planted posts thirty metres out over the bay.
+    track.crossPoint(si, side * (cl.half[si] + KERB_W), _p2);
+    track.crossPoint(si, side * (cl.half[si] + q), _p);
+    const gy = track.groundAt(_p.x, _p.z);
+    if (gy < _p2.y - 1.6) return false;
+    base.set(_p.x, Math.min(_p.y, gy) - 0.08, _p.z);
+    // face back down the road, canted 12° toward the centreline so an
+    // approaching driver sees the plate rather than its edge
+    const ca = Math.cos(0.21) * -1, sa = Math.sin(0.21) * -side;
+    F.set(cl.tx[si] * ca + cl.hx[si] * sa, 0, cl.tz[si] * ca + cl.hz[si] * sa).normalize();
+    // `up × F`, so the CCW winding below has its geometric normal along F and a
+    // double-sided plate is not lit from behind, and so that increasing `fx` is
+    // the *approaching driver's* right — which is what the chevron's asymmetry
+    // is defined against.
+    R.set(F.z, 0, -F.x);
+    return true;
+  };
+
+  /** First offset in `offs` that has ground under it; false if none does. */
+  const footingAny = (d: number, side: number, offs: number[]): boolean => {
+    for (const o of offs) if (footing(d, side, o)) return true;
+    return false;
+  };
+
+  /** One board plate of `cols` cells, `paint(i)` choosing each cell's colour. */
+  const plate = (w: number, h: number, top: number, cols: number,
+    paint: (i: number) => THREE.Color) => {
+    const y0 = base.y + top - h, y1 = base.y + top;
+    // stood off the post's front face rather than run through its axis
+    const fx0 = F.x * 0.085, fz0 = F.z * 0.085;
+    for (let i = 0; i < cols; i++) {
+      const f0 = -w * 0.5 + (w * i) / cols, f1 = -w * 0.5 + (w * (i + 1)) / cols;
+      const col = paint(i);
+      const v = b.pos.length / 3;
+      for (const [fx, y] of [[f0, y0], [f1, y0], [f1, y1], [f0, y1]] as const) {
+        pushV(b, base.x + R.x * fx + fx0, y, base.z + R.z * fx + fz0, F.x, F.y, F.z,
+          (fx + w * 0.5) / 0.9, (y - y0) / 0.9, col);
+      }
+      quad(b, v, v + 1, v + 2, v + 3);
+    }
+  };
+
+  /** Hexagonal post; six facets, so no 90° edge goes black under the low key. */
+  const post = (top: number, rad: number) => {
+    const ring0 = b.pos.length / 3;
+    for (let s = 0; s < 2; s++) {
+      const y = base.y + (s ? top : 0);
+      for (let k = 0; k < 6; k++) {
+        const a = (k / 6) * Math.PI * 2 + 0.26;
+        const cx = Math.cos(a) * rad, cz = Math.sin(a) * rad;
+        const nx = R.x * cx + F.x * cz, nz = R.z * cx + F.z * cz;
+        _c.copy(C_BOARD_POST).multiplyScalar(0.82 + 0.24 * (s ? 1 : 0.72));
+        pushV(b, base.x + nx, y, base.z + nz, nx / rad, 0, nz / rad, k / 6, y * 0.6, _c);
+      }
+    }
+    for (let k = 0; k < 6; k++) {
+      const k2 = (k + 1) % 6;
+      quad(b, ring0 + k, ring0 + k2, ring0 + 6 + k2, ring0 + 6 + k);
+    }
+  };
+
+  const boards: { d: number; side: number; kind: number; bars: number }[] = [];
+  const corners = track.corners;
+  for (let ci = 0; ci < corners.length; ci++) {
+    const c: Corner = corners[ci];
+    const side = -c.sign;   // outside of the turn
+    const b0 = cornerLadder(corners, ci, cl.length);
+    // count boards, on the same ladder as the painted braking marks
+    boards.push({ d: c.d - b0, side, kind: 0, bars: 3 });
+    boards.push({ d: c.d - b0 * 0.66, side, kind: 0, bars: 2 });
+    boards.push({ d: c.d - b0 * 0.36, side, kind: 0, bars: 1 });
+    // chevrons through the bend, from the mark point out to the exit: five of
+    // them, so the run of boards traces the arc rather than marking a point
+    const runEnd = c.d1 > c.d ? c.d1 : c.d1 + cl.length;
+    const span = Math.max(24, Math.min(120, runEnd - c.d + 26));
+    for (let k = 0; k < 5; k++) boards.push({ d: c.d + (span * k) / 4, side, kind: 1, bars: 0 });
+  }
+
+  for (const bd of boards) {
+    // Chevrons sit tighter to the kerb than the count boards: through the corner
+    // the outside shoulder is the one piece of ground most likely to be there,
+    // and a close board reads its own arc more strongly. The tight fallbacks are
+    // for the cliff ledge, where the shoulder is 1.5 m wide and everything past
+    // it is a 30 m drop to the sea — the bible asks for "kerb + posts" there and
+    // this is the one placement that fits. Both fallbacks are half the plate's
+    // own width plus 0.2 m, so even the tightest board still hangs clear of the
+    // kerb's outer lip instead of over the corridor.
+    const offs = bd.kind === 0 ? [2.6, 1.45] : [1.9, 1.05];
+    if (!footingAny(bd.d, bd.side, offs)) continue;
+    if (bd.kind === 0) {
+      post(BOARD_TOP - BOARD_H * 0.5, 0.075);
+      // 3 / 2 / 1 red bars on cream, centred — the same count the painted
+      // braking boards on the road show at this station
+      const cols = 7;
+      const bars = bd.bars;
+      const lit = bars === 3 ? [1, 3, 5] : bars === 2 ? [2, 4] : [3];
+      plate(2.4, BOARD_H, BOARD_TOP, cols, (i) => (lit.indexOf(i) >= 0 ? C_BOARD_BAR : C_BOARD_FACE));
+    } else {
+      post(2.55 - 0.5, 0.062);
+      // A hard asymmetric silhouette: the plate is split into six cells and the
+      // red runs from one end and stops short, so the board is visibly "heavier"
+      // on the side the corner turns toward. Direction reads at a distance where
+      // an arrow glyph has already collapsed into one pixel of nothing.
+      const dirRight = bd.side < 0;   // outside is left ⇒ the corner turns right
+      plate(1.6, 0.86, 2.55, 6, (i) => {
+        const k = dirRight ? 5 - i : i;
+        return k < 4 ? C_BOARD_BAR : C_BOARD_FACE;
+      });
+    }
+  }
+
+  if (!b.idx.length) return;
+  const mesh = new THREE.Mesh(finish(b), lib.own('corner-board', () => boardMaterial(lib)));
+  mesh.name = 'corner-boards';
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
   root.add(mesh);
 }
 

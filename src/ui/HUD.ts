@@ -1,6 +1,18 @@
 /**
- * HUD — lap, timer, position, item box, speedometer, minimap, countdown,
- * drift feedback, speed vignette and toasts.
+ * HUD — lap, timer, position, rival board, item box, speedometer, minimap,
+ * countdown, drift feedback, speed vignette and toasts.
+ *
+ * LAYOUT (round 2). Five zones off one safe-area token, not a stack:
+ *
+ *      LAP  top-left                                   top-right  TIME
+ *      POSITION + GAP  left-centre        right-centre  RIVAL BOARD
+ *      bottom rail:  [ITEM]      [--- MINIMAP ---]      [SPEEDO]
+ *
+ * Round 1 put LAP, POSITION, GAP, MINIMAP and ITEM all inside x<300 and left
+ * the whole right-centre and bottom-centre empty, which is what made every
+ * frame read left-heavy. The minimap is now bottom-centre as ART_DIRECTION §7
+ * requires, the three bottom panels share one height and one bottom edge, and
+ * the right-centre carries the standings.
  *
  * Layout and typography live in ui.css; this file owns state and the two
  * canvases (speedometer dial, minimap) where a canvas beats DOM. Every DOM
@@ -8,37 +20,42 @@
  * nothing, and no per-frame object is allocated once the tree is built.
  */
 import './ui.css';
-import { BASE_TOP_SPEED, ItemKind, RaceState, type Ctx, type System } from '../types';
+import { BASE_TOP_SPEED, ItemKind, RaceState, type Ctx, type IKart, type System } from '../types';
 import { Minimap } from './Minimap';
 import { Menus } from './Menus';
 import { ItemIconAtlas, ITEM_NAMES, ITEM_TINT, ROULETTE_ORDER } from './ItemIcons';
 import {
-  Spring, TIER_COLORS, clamp, damp, el, formatClock, formatDelta,
+  Spring, TIER_COLORS, clamp, cssColor, damp, el, formatClock, formatDelta,
   ordinalSuffix, retrigger, setNum, setStyle, setText,
 } from './uiUtil';
 
 // --- speedometer dial geometry ---------------------------------------------
-// All fractions are of the canvas *width*; the element's 1:0.88 aspect ratio
-// then guarantees the 252° sweep and its housing fit inside the plate rect with
-// margin to spare, and leaves the wedge between the arc ends (which the needle
-// never enters) free for the digital readout.
+// Fractions of the canvas: CX/CY/R are keyed to HEIGHT (except cx), because
+// what has to fit is the vertical stack — dial, charge rail, readout — and the
+// panel is very close to square.
 //
-// The furthest thing this draws is the outer tick tip at 1.175 * DIAL_R, so
-// DIAL_CY - 1.175 * DIAL_R must stay positive with room for the corner radius.
-const DIAL_CX = 0.5;
-const DIAL_CY = 0.47;
-const DIAL_R = 0.365;
+// The dial sweeps 252° with its opening at the bottom. Everything below
+// DIAL_CY + 0.588 * (tick tip radius) is free, and that strip carries the
+// mini-turbo charge rail and the digital readout. Round 1 put the readout
+// under the hub, INSIDE the arc, and the needle swept straight through the
+// digits at both ends of the range.
+const DIAL_CX = 0.5;    // of width
+const DIAL_CY = 0.40;   // of height
+const DIAL_R = 0.30;    // of height
 const A0 = Math.PI * 0.80;   // 144°
 const A1 = Math.PI * 2.20;   // 396°
-const REDLINE = 0.90;        // fraction of the sweep where the digit goes hot
+const REDLINE = 0.88;        // fraction of the sweep where the scale goes hot
 const DIVS = 20;             // 20 steps across the sweep
 const MAJOR_EVERY = 4;       // five majors, four minors between each pair
 
+/** Charge rail, in the open wedge directly under the dial. */
+const RAIL_Y = 0.650;   // of height
+const RAIL_HW = 0.255;  // half-width, of width
+const RAIL_T = 0.030;   // thickness, of height
+
 /**
  * The strongest sustained boost multiplier a kart can hold (tier-3 mini-turbo,
- * `DRIFT_BOOST_STRENGTH[3]` in Kart.ts) plus a little headroom. A dial whose
- * top third the needle can never reach carries no information, so the end of
- * the sweep is derived from what the player can actually do.
+ * `DRIFT_BOOST_STRENGTH[3]` in Kart.ts) plus a little headroom.
  */
 const BOOST_PEAK = 1.30;
 const HEADROOM = 1.05;
@@ -51,6 +68,19 @@ function dialMax(kmh: number) {
 }
 
 const ROULETTE_TIME = 1.15;
+/** how many standings rows the board shows */
+const BOARD_ROWS = 8;
+
+const PAD2 = ['00', '01', '02', '03', '04', '05', '06', '07', '08', '09'];
+function p2(n: number) { return n < 10 ? PAD2[n] : String(n); }
+
+/**
+ * A live text slot in a two-layer cased lockup: [ink layer node, top layer
+ * node]. Both carry the same string; the ink layer draws the outline with a
+ * real font stroke and the top layer draws the gradient over it.
+ */
+type Pair = [HTMLElement, HTMLElement];
+function setPair(p: Pair, v: string) { setText(p[0], v); setText(p[1], v); }
 
 export class HUD implements System {
   private root!: HTMLDivElement;
@@ -67,30 +97,50 @@ export class HUD implements System {
   // lap
   private lapWrap!: HTMLDivElement;
   private lapIn!: HTMLDivElement;
-  private lapCur!: HTMLSpanElement;
-  private lapTot!: HTMLSpanElement;
+  private lapCur!: Pair;
+  private lapTot!: Pair;
   private split!: HTMLDivElement;
   private splitKey!: HTMLSpanElement;
   private splitVal!: HTMLSpanElement;
 
-  // timer / position
+  // timer — three fixed-width slots, never one string
   private timerWrap!: HTMLDivElement;
-  private timerVal!: HTMLDivElement;
+  private tM!: Pair;
+  private tS!: Pair;
+  private tF!: Pair;
   private bestWrap!: HTMLDivElement;
   private bestVal!: HTMLSpanElement;
+
+  // position / gap
   private gapKey!: HTMLSpanElement;
   private gapVal!: HTMLSpanElement;
   /** throttle on the gap recompute — 10 Hz is well past the eye's read rate */
   private gapT = 0;
   private posWrap!: HTMLDivElement;
   private posIn!: HTMLDivElement;
-  private posNum!: HTMLSpanElement;
-  private posSuf!: HTMLSpanElement;
+  private posNum!: Pair;
+  private posSuf!: Pair;
   private posArrow!: HTMLSpanElement;
-  /** seconds left on the gain/loss tint; 0 = no direction shown */
+  /** seconds left on the gain/loss chevron; 0 = no direction shown */
   private posDirT = 0;
   /** cooldown on the "took the lead" banner */
   private leadToastT = 0;
+  private shownRank = -1;
+
+  // rival board
+  private board!: HTMLDivElement;
+  private rows: HTMLDivElement[] = [];
+  private rowPlace: HTMLSpanElement[] = [];
+  private rowSuf: HTMLElement[] = [];
+  private rowChip: HTMLSpanElement[] = [];
+  private rowName: HTMLSpanElement[] = [];
+  /** scratch: kart occupying each board slot. Allocated once. */
+  private slot: (IKart | null)[] = [];
+  /** livery colour per kart index, resolved once — cssColor() builds a string */
+  private liveries: string[] = [];
+  /** kart index occupying each board slot, parallel to `slot` */
+  private slotIdx: number[] = [];
+  private boardT = 0;
 
   // item
   private itemWrap!: HTMLDivElement;
@@ -108,7 +158,7 @@ export class HUD implements System {
   private speedWrap!: HTMLDivElement;
   private speedCanvas!: HTMLCanvasElement;
   private speedG!: CanvasRenderingContext2D;
-  private speedNum!: HTMLSpanElement;
+  private speedNum!: Pair;
   private needle = new Spring(190, 15.5);
   private dialW = 0;
   private dialH = 0;
@@ -120,7 +170,9 @@ export class HUD implements System {
   private countWrap!: HTMLDivElement;
   private countVig!: HTMLDivElement;
   private countNum!: HTMLDivElement;
+  private countText!: Pair;
   private countRing!: HTMLDivElement;
+  private countTicks!: HTMLDivElement;
   private countShown = -99;
 
   // toast: a single slot, plus at most one outgoing node mid-crossfade
@@ -136,6 +188,7 @@ export class HUD implements System {
   private lapsSeen = -1;
   private driftGlow = 0;
   private tierFlash = 0;
+  private wasCounting = true;
 
   // ---------------------------------------------------------------- lifecycle
 
@@ -151,19 +204,19 @@ export class HUD implements System {
     this.buildLap();
     this.buildTimer();
     this.buildPosition();
+    this.buildBoard(ctx);
     this.buildItem();
     this.buildSpeedo();
 
-    // The toast slot keeps the bottom-centre column: it is small, transient,
-    // and empty most of the time, so it can share that space with the kart.
+    // Transient slot only, and it sits ABOVE the minimap so the two never
+    // share pixels.
     const bottom = el('div', 'kr-bottom', this.hud);
     this.toasts = el('div', 'kr-toasts', bottom);
 
-    // The minimap does not get the centre column at either end. Bottom-centre
-    // is where the chase camera parks the player's kart; top-centre is the
-    // vanishing point the player is driving toward, which is why the panel kept
-    // landing on the horizon, the tunnel exit, the sun and the village. It is
-    // now a bottom-left plate stacked on the item box — see .kr-map.
+    // §7: "Minimap: bottom-centre or top-centre". Bottom-centre, centred on
+    // the frame axis and locked to the same bottom line as the item box and
+    // the speedometer, so the foot of the frame is one rail of three panels at
+    // one height rather than a left-hand column of stacked widgets.
     this.minimap = new Minimap(this.hud);
 
     this.buildCountdown();
@@ -179,9 +232,6 @@ export class HUD implements System {
     this.prevPlace = player ? player.place : 1;
     // starting on pole is not "taking the lead"
     this.leadToastT = this.prevPlace === 1 ? 6 : 0;
-    // The dial's top end is the player's own achievable top speed, not a
-    // hardcoded round number: BASE_TOP_SPEED x their stat x the strongest
-    // mini-turbo, in km/h, rounded up to five clean majors.
     const topMul = player?.stats?.topSpeedMul || 1;
     this.speedMax = dialMax(BASE_TOP_SPEED * topMul * BOOST_PEAK * HEADROOM * 3.6);
     this.needle.snap(0);
@@ -191,70 +241,146 @@ export class HUD implements System {
 
   // ------------------------------------------------------------------- build
 
+  /**
+   * Build a two-layer cased lockup: an ink layer carrying a real font stroke,
+   * and a gradient-clipped layer on top of it. `build` is called once per
+   * layer and returns the nodes that carry live text, in the same order both
+   * times; the two are zipped into Pairs so one setPair writes both.
+   *
+   * This replaces round 1's chained-drop-shadow outline, which compounded
+   * (each shadow filters the previous one's output) and hit Chromium's
+   * filter-region clip — the stair-stepped diagonals and mitre spikes the
+   * review measured. One stroke, no filter chain, and it costs less per frame.
+   */
+  private cased(
+    parent: HTMLElement, cls: string, topCls: string,
+    build?: (layer: HTMLElement) => HTMLElement[],
+  ): { wrap: HTMLDivElement; parts: Pair[] } {
+    const wrap = el('div', 'kr-cased ' + cls, parent);
+    const mk = (extra: string) => {
+      const l = el('div', 'kr-cased-l ' + extra, wrap);
+      return build ? build(l) : [l];
+    };
+    const ink = mk('kr-cased-ink');
+    const top = mk('kr-cased-top ' + topCls);
+    const parts: Pair[] = [];
+    for (let i = 0; i < ink.length; i++) parts.push([ink[i], top[i]]);
+    return { wrap, parts };
+  }
+
   private buildLap() {
-    this.lapWrap = el('div', 'kr-lap', this.hud);
+    // kr-scrim: a shaped darken so the lockup survives whatever the world puts
+    // behind it — in the round-1 hero frame a grandstand roof and its post sat
+    // directly under this cluster.
+    this.lapWrap = el('div', 'kr-lap kr-scrim', this.hud);
     this.lapIn = el('div', 'kr-lap-in', this.lapWrap);
     el('div', 'kr-label', this.lapIn, 'Lap');
-    // One gold-clipped word. The casing lives on the container (see ui.css) so
-    // the whole "1/3" takes a single fill and a single outline.
-    const nums = el('div', 'kr-lap-nums kr-gold kr-gold-q', this.lapIn);
-    this.lapCur = el('span', 'kr-lap-cur', nums, '1');
-    el('span', 'kr-lap-sep', nums, '/');
-    this.lapTot = el('span', 'kr-lap-tot', nums, '3');
+    // One gold-clipped word: the ramp lives on the lockup, so "1" and "/3"
+    // ride one continuous gradient instead of each re-ramping over its own box.
+    const lap = this.cased(this.lapIn, 'kr-lap-nums', 'kr-gold kr-gold-q', (l) => {
+      const cur = el('span', 'kr-lap-cur', l, '1');
+      el('span', 'kr-lap-sep', l, '/');
+      const tot = el('span', 'kr-lap-tot', l, '3');
+      return [cur, tot];
+    });
+    this.lapCur = lap.parts[0];
+    this.lapTot = lap.parts[1];
 
     this.split = el('div', 'kr-split', this.hud);
-    const pill = el('div', 'kr-split-pill', this.split);
-    this.splitKey = el('span', 'kr-split-k', pill, 'Lap 1');
-    this.splitVal = el('span', 'kr-split-v', pill, '0:00.000');
+    const pill = el('div', 'kr-pill', this.split);
+    this.splitKey = el('span', 'kr-pill-k', pill, 'Lap 1');
+    this.splitVal = el('span', 'kr-pill-v', pill, '0:00.000');
   }
 
   private buildTimer() {
     this.timerWrap = el('div', 'kr-timer', this.hud);
     el('div', 'kr-label', this.timerWrap, 'Time');
-    this.timerVal = el('div', 'kr-timer-v kr-gold kr-gold-q', this.timerWrap, '0:00.00');
-    // Persistent best lap. Total elapsed is the least useful number in a
-    // three-lap race; this is the one the player is racing against.
+    // Fixed-width slots. The hundredths roll every frame; any advance-width
+    // difference at all — and a right-anchored string has nowhere to put it —
+    // pumps the head of the clock sideways sixty times a second. Each field is
+    // its own fixed-em inline-block, so the block width is a constant.
+    const t = this.cased(this.timerWrap, 'kr-timer-v', 'kr-gold kr-gold-q', (l) => {
+      const m = el('span', 'kr-t-m', l, '0');
+      el('span', 'kr-t-sep', l, ':');
+      const sec = el('span', 'kr-t-s', l, '00');
+      const f = el('span', 'kr-t-f', l, '.00');
+      return [m, sec, f];
+    });
+    this.tM = t.parts[0];
+    this.tS = t.parts[1];
+    this.tF = t.parts[2];
+
     this.bestWrap = el('div', 'kr-best-line', this.timerWrap);
-    const bp = el('div', 'kr-split-pill', this.bestWrap);
-    el('span', 'kr-split-k', bp, 'Best');
-    this.bestVal = el('span', 'kr-split-v', bp, '0:00.000');
+    const bp = el('div', 'kr-pill', this.bestWrap);
+    el('span', 'kr-pill-k', bp, 'Best');
+    this.bestVal = el('span', 'kr-pill-v', bp, '0:00.000');
   }
 
   private buildPosition() {
-    this.posWrap = el('div', 'kr-pos', this.hud);
-    this.posIn = el('div', 'kr-pos-in', this.posWrap);
-    // numeral and suffix are one word, so they share one fill and one outline
-    this.posNum = el('span', 'kr-pos-n kr-gold', this.posIn, '1');
-    this.posSuf = el('span', 'kr-pos-s kr-gold', this.posIn, 'st');
-    // absolutely positioned so it cannot shift the lockup when it appears
+    this.posWrap = el('div', 'kr-pos kr-scrim', this.hud);
+    // The gold clip lives on the LOCKUP, not on the glyphs: numeral and
+    // ordinal share one ramp and one outline, so the suffix stops reading as a
+    // foreign object stuck onto the numeral.
+    const pos = this.cased(this.posWrap, 'kr-pos-in', 'kr-gold', (l) => {
+      const n = el('span', 'kr-pos-n', l, '1');
+      const suf = el('span', 'kr-pos-s', l, 'st');
+      return [n, suf];
+    });
+    this.posIn = pos.wrap;
+    this.posNum = pos.parts[0];
+    this.posSuf = pos.parts[1];
+    // A sibling of the two cased layers, not a child of either: inside the
+    // gradient layer it would be clipped to the ramp and painted transparent,
+    // and hung off .kr-pos it would anchor to the gap pill's width instead of
+    // the numeral's.
     this.posArrow = el('span', 'kr-pos-arrow', this.posIn, '▲');
 
-    // Interval to the kart being raced — ahead of the player, or behind when
-    // the player leads. Hangs off the position lockup, on the split pill's
-    // plate, so the two read as one readout rather than a new invention.
     const gap = el('div', 'kr-gap', this.posWrap);
-    const gp = el('div', 'kr-split-pill', gap);
-    this.gapKey = el('span', 'kr-split-k', gp, 'Gap');
-    this.gapVal = el('span', 'kr-split-v', gp, '+0.00');
+    const gp = el('div', 'kr-pill', gap);
+    this.gapKey = el('span', 'kr-pill-k', gp, 'Grid');
+    this.gapVal = el('span', 'kr-pill-v', gp, '+0.00');
+  }
+
+  /**
+   * Standings, right-centre. This is the element the round-1 frame was
+   * missing: the right side carried only the timer and the dial, so the
+   * composition was weighted hard to the left in every shot. It is also the
+   * one thing a player in a pack actually wants to know.
+   */
+  private buildBoard(ctx: Ctx) {
+    this.board = el('div', 'kr-board', this.hud);
+    const n = Math.min(BOARD_ROWS, ctx.race?.karts?.length || BOARD_ROWS);
+    for (let i = 0; i < n; i++) {
+      const row = el('div', 'kr-brow', this.board);
+      const p = el('span', 'kr-brow-p', row, String(i + 1));
+      const suf = el('i', undefined, p, ordinalSuffix(i + 1));
+      this.rowSuf.push(suf);
+      this.rowPlace.push(p);
+      this.rowChip.push(el('span', 'kr-brow-c', row));
+      this.rowName.push(el('span', 'kr-brow-n', row, ''));
+      row.classList.add('r' + Math.min(4, i + 1));
+      this.rows.push(row);
+      this.slot.push(null);
+    }
   }
 
   private buildItem() {
     this.itemWrap = el('div', 'kr-item', this.hud);
     el('div', 'kr-item-frame', this.itemWrap);
-    // Embossed empty-slot motif — the item-box diamond struck into the well
-    // floor. Replaces the dashed "?" placeholder: this reads as an empty slot,
-    // not as a component nobody has designed yet.
+    // The empty state is a deliberate, shaped, breathing item-box diamond
+    // struck into the well floor — not a dim placeholder glyph. The plate's
+    // own chrome (border, well, sheen) is identical whether or not an item is
+    // held; only the contents swap.
     const motif = el('div', 'kr-item-motif', this.itemWrap);
     motif.innerHTML =
       '<svg viewBox="0 0 100 100" aria-hidden="true">' +
-      // warm, not the cool #9fb0cc it was: bottom-left was the only corner of
-      // the HUD with no colour in it at all
       '<defs><linearGradient id="krMotif" x1="0" y1="0" x2="0" y2="1">' +
-      '<stop offset="0" stop-color="#fffdf6"/><stop offset="1" stop-color="#e0a63c"/>' +
+      '<stop offset="0" stop-color="#fffdf6"/><stop offset="0.55" stop-color="#ffd36a"/>' +
+      '<stop offset="1" stop-color="#e07c14"/>' +
       '</linearGradient></defs>' +
-      '<path d="M50 6 94 50 50 94 6 50Z" fill="none" stroke="url(#krMotif)" stroke-width="6" ' +
+      '<path d="M50 4 96 50 50 96 4 50Z" fill="none" stroke="url(#krMotif)" stroke-width="7" ' +
       'stroke-linejoin="round"/>' +
-      '<path d="M50 26 74 50 50 74 26 50Z" fill="url(#krMotif)" opacity="0.5"/>' +
+      '<path d="M50 25 75 50 50 75 25 50Z" fill="url(#krMotif)" opacity="0.42"/>' +
       '</svg>';
     this.itemIcon = el('div', 'kr-item-icon', this.itemWrap);
     this.itemCanvas = el('canvas', undefined, this.itemIcon);
@@ -264,13 +390,14 @@ export class HUD implements System {
 
   private buildSpeedo() {
     this.speedWrap = el('div', 'kr-speed', this.hud);
-    // The canvas lives in a clipped face box, not directly on the plate: the
-    // two rects used to differ and dial geometry escaped the rounded card.
     const face = el('div', 'kr-speed-face', this.speedWrap);
     this.speedCanvas = el('canvas', undefined, face);
     this.speedG = this.speedCanvas.getContext('2d')!;
+    // Below the dial's open bottom wedge, outside the needle's reach, with a
+    // real unit. "101" on its own is a number, not a speed.
     const read = el('div', 'kr-speed-read', this.speedWrap);
-    this.speedNum = el('span', 'kr-speed-n kr-gold kr-gold-q', read, '0');
+    this.speedNum = this.cased(read, 'kr-speed-n', 'kr-gold kr-gold-q').parts[0];
+    el('span', 'kr-speed-u', read, 'km/h');
   }
 
   private buildCountdown() {
@@ -278,7 +405,21 @@ export class HUD implements System {
     this.countVig = el('div', 'kr-count-vig', this.countWrap);
     const stage = el('div', 'kr-count-stage', this.countWrap);
     this.countRing = el('div', 'kr-count-ring', stage);
-    this.countNum = el('div', 'kr-count-n kr-gold', stage, '3');
+    // Three radial chevron ticks in the mini-turbo blue (§3), on the ring's
+    // easing. A designed start motif in place of the round-1 tan haze.
+    this.countTicks = el('div', 'kr-count-ticks', stage);
+    let ticks = '<svg viewBox="0 0 200 200" aria-hidden="true">';
+    for (let i = 0; i < 3; i++) {
+      const a = -90 + i * 120;
+      ticks += `<g transform="rotate(${a} 100 100)">` +
+        '<path d="M100 6 L112 26 L100 20 L88 26 Z" fill="#4fc3ff" opacity="0.92"/>' +
+        '</g>';
+    }
+    this.countTicks.innerHTML = ticks + '</svg>';
+    const c = this.cased(stage, 'kr-count-n', 'kr-gold');
+    this.countNum = c.wrap;
+    this.countText = c.parts[0];
+    setPair(this.countText, '3');
   }
 
   // ------------------------------------------------------------------ events
@@ -322,7 +463,6 @@ export class HUD implements System {
     setText(this.splitVal, formatClock(t, 3));
     this.split.classList.toggle('best', isBest);
     this.bestWrap.classList.toggle('best-new', isBest);
-    // once there is a benchmark, the delta is the more interesting number
     if (!isBest && Number.isFinite(prevBest)) {
       setText(this.splitKey, `Lap ${n}  ${formatDelta(t - prevBest)}`);
     }
@@ -336,31 +476,23 @@ export class HUD implements System {
     if (n > 3) return;
     retrigger(this.countNum, 'run');
     retrigger(this.countRing, 'run');
+    retrigger(this.countTicks, 'run');
     retrigger(this.countVig, 'run');
     if (n <= 0) {
-      setText(this.countNum, 'GO!');
+      setPair(this.countText, 'GO!');
       this.countNum.classList.add('go');
-      // white full-screen flash, GO only
       this.flash.classList.remove('tick');
       retrigger(this.flash, 'on');
     } else {
-      setText(this.countNum, String(n));
+      setPair(this.countText, String(n));
       this.countNum.classList.remove('go');
-      // short warm flash on every tick, so the grid is not a static wallpaper
       this.flash.classList.remove('on');
       retrigger(this.flash, 'tick');
     }
   }
 
   /**
-   * One slot, one message. Reserved for genuinely transient events — an item
-   * hit, taking the lead, finishing. Anything the HUD already shows permanently
-   * must never be echoed here: two readouts of the same datum can disagree, and
-   * a stack of them reads as a rendering fault.
-   *
-   * An incoming toast crossfades the outgoing one out *in place* (same grid
-   * cell), and any node still leaving from an earlier event is dropped on the
-   * spot, so at most two nodes exist and they never stack.
+   * One slot, one message. Reserved for genuinely transient events.
    */
   private toast(label: string, glyph: string, tint: string) {
     this.toastOut?.remove();
@@ -407,7 +539,6 @@ export class HUD implements System {
       this.rouletteT += dt;
       if (this.rouletteT >= this.rouletteNext) {
         this.rouletteIdx = (this.rouletteIdx + 1) % ROULETTE_ORDER.length;
-        // interval opens up cubically — a fast blur that decelerates into place
         const f = clamp(this.rouletteT / ROULETTE_TIME, 0, 1);
         this.rouletteNext = this.rouletteT + 0.040 + 0.215 * f * f * f;
       }
@@ -429,8 +560,8 @@ export class HUD implements System {
       this.shownKind = show;
       const s = this.itemCanvas.width;
       this.itemG.clearRect(0, 0, s, s);
-      // ItemKind.None draws nothing: the empty state is the recessed well and
-      // the embossed motif behind this canvas, not a placeholder glyph on it.
+      // ItemKind.None draws nothing: the empty state is the well and the
+      // embossed diamond behind this canvas, not a placeholder glyph on it.
       if (show !== ItemKind.None) this.itemG.drawImage(this.atlas.get(show), 0, 0, s, s);
     }
   }
@@ -463,22 +594,18 @@ export class HUD implements System {
 
   private buildDialGradient() {
     const g = this.speedG;
-    const W = this.dialW;
-    const cx = DIAL_CX * W;
-    const cy = DIAL_CY * W;
-    const r = DIAL_R * W;
-    // One warm ramp off --gold-ramp, ending on ART_DIRECTION §3 kerb red.
-    // The old cyan -> green -> amber -> red diagnostic ramp was Grafana visual
-    // language in a Mediterranean golden-hour racer, and it shared no colour
-    // with the cased gold numerals 400 px to its left. #4fc3ff survives in this
-    // instrument in exactly one place, where the palette assigns it: the
-    // mini-turbo tier-1 charge ring.
+    const cx = DIAL_CX * this.dialW;
+    const cy = DIAL_CY * this.dialH;
+    const r = DIAL_R * this.dialH;
+    // One warm ramp off --gold-ramp. This is the VALUE fill only; the unfilled
+    // scale is a single flat low value (see drawDial) — round 1 painted the
+    // whole ramp at low alpha behind the fill, which came out grey on the left
+    // half and brown on the right and read as a rendering fault.
     const grd = g.createLinearGradient(cx - r, cy + r * 0.35, cx + r, cy - r * 0.55);
     grd.addColorStop(0.00, '#fffdf6');
-    grd.addColorStop(0.30, '#ffe7ae');
-    grd.addColorStop(0.64, '#f7ae3c');
-    grd.addColorStop(0.87, '#e07c14');
-    grd.addColorStop(1.00, '#e0453f');
+    grd.addColorStop(0.34, '#ffe7ae');
+    grd.addColorStop(0.70, '#f7ae3c');
+    grd.addColorStop(1.00, '#e07c14');
     this.arcGrad = grd;
   }
 
@@ -493,25 +620,29 @@ export class HUD implements System {
     const dimmed = !blocked && this.menus.screen === 'pause';
     this.root.classList.toggle('is-blocked', blocked);
     this.root.classList.toggle('is-dimmed', dimmed);
-    // The countdown owns the grid: one large numeral on screen, not two.
-    this.root.classList.toggle('is-counting', race.state === RaceState.Countdown);
-    // the countdown belongs to the race, not to the menus
+    const counting = race.state === RaceState.Countdown;
+    // The HUD stays MOUNTED through the countdown and comes forward as one
+    // eased group on GO. Nothing is allowed to pop into a previously empty
+    // zone the instant the lights go out.
+    this.root.classList.toggle('is-counting', counting);
+    this.posWrap.classList.toggle('grid', counting);
+    if (counting !== this.wasCounting) {
+      this.wasCounting = counting;
+      setText(this.gapKey, counting ? 'Grid' : 'Gap');
+    }
     setNum(this.countWrap, 'opacity', blocked ? 0 : 1, 1);
 
     if (!player) return;
 
     // --- lap ---------------------------------------------------------------
     const lapNow = clamp(player.lap + 1, 1, race.totalLaps);
-    setText(this.lapCur, String(lapNow));
-    setText(this.lapTot, String(race.totalLaps));
+    setPair(this.lapCur, String(lapNow));
+    setPair(this.lapTot, String(race.totalLaps));
     this.lapWrap.classList.toggle('final', lapNow === race.totalLaps && race.totalLaps > 1);
     if (player.lap !== this.prevLap) this.prevLap = player.lap;
 
-    // --- timer + best lap --------------------------------------------------
-    setText(this.timerVal, formatClock(race.raceTime));
-    // Derived from the race's own lap list rather than from the 'lap' event
-    // alone, so the benchmark is right even if the HUD is built mid-race or the
-    // event is missed. Only recomputed when a lap actually lands.
+    // --- timer, into three fixed-width slots -------------------------------
+    this.writeClock(race.raceTime);
     const laps = race.lapTimes;
     if (laps.length !== this.lapsSeen) {
       this.lapsSeen = laps.length;
@@ -527,9 +658,11 @@ export class HUD implements System {
     }
 
     // --- position ----------------------------------------------------------
-    // One position readout, in one typographic convention. The direction of
-    // the change rides on this element (retinted ramp + chevron) instead of
-    // spawning a second, contradictory copy of the same number elsewhere.
+    // Colour means RANK and nothing else — gold / silver / bronze / cream, one
+    // outline weight across all four. Round 1 retinted the ramp by the
+    // DIRECTION of the last change, which put an alarm red on a hard-won 2nd
+    // and left a steady 5th in trophy gold. Direction now rides entirely on
+    // the chevron and the punch.
     const place = player.place || 1;
     if (this.leadToastT > 0) this.leadToastT -= dt;
     if (place !== this.prevPlace) {
@@ -540,9 +673,7 @@ export class HUD implements System {
       this.posWrap.classList.toggle('gain', gained);
       this.posWrap.classList.toggle('loss', !gained);
       retrigger(this.posArrow, 'run');
-      this.posDirT = 0.70; // covers the full chevron animation
-      // The toast channel is spent on the one moment that deserves it. Rate
-      // limited so a flip-flopping battle for first does not machine-gun it.
+      this.posDirT = 0.70;
       if (place === 1 && this.leadToastT <= 0) {
         this.leadToastT = 6;
         this.toast('Took the lead', '★', '#ffd36b');
@@ -551,36 +682,39 @@ export class HUD implements System {
       this.posDirT -= dt;
       if (this.posDirT <= 0) this.posWrap.classList.remove('gain', 'loss');
     }
-    setText(this.posNum, String(place));
-    setText(this.posSuf, ordinalSuffix(place));
-    this.posWrap.classList.toggle('lead', place === 1);
+    setPair(this.posNum, String(place));
+    setPair(this.posSuf, ordinalSuffix(place));
+    const rank = Math.min(4, place);
+    if (rank !== this.shownRank) {
+      this.posWrap.classList.remove('p1', 'p2', 'p3');
+      if (rank <= 3) this.posWrap.classList.add('p' + rank);
+      this.shownRank = rank;
+    }
 
     // --- interval to the kart being raced ----------------------------------
-    // Distance along the race converted to a time by the closing speed the
-    // player can actually make up, which is what "one and a half seconds back"
-    // means to a driver. Recomputed at 10 Hz: any faster and the last digit is
-    // noise, and the string churn is not free.
     this.gapT -= dt;
     if (this.gapT <= 0) {
       this.gapT = 0.1;
-      // when leading, the interesting number is the cushion over 2nd instead.
-      // Found by place rather than by index so this does not depend on how the
-      // race director happens to order `standings`.
       const want = place === 1 ? 2 : place - 1;
       const karts = race.karts;
-      let other: typeof player | null = null;
+      let other: IKart | null = null;
       for (let i = 0; i < karts.length; i++) {
         if (karts[i] !== player && karts[i].place === want) { other = karts[i]; break; }
       }
-      const has = !!other && !player.finished;
-      this.posWrap.classList.toggle('has-gap', has);
-      if (other && has) {
+      if (other && !player.finished) {
         const metres = Math.abs(other.raceDistance - player.raceDistance);
         const closing = Math.max(6, Math.abs(player.forwardSpeed));
         const secs = Math.min(99, metres / closing);
-        setText(this.gapKey, place === 1 ? 'Lead' : 'Gap');
+        if (!counting) setText(this.gapKey, place === 1 ? 'Lead' : 'Gap');
         setText(this.gapVal, (place === 1 ? '' : '+') + secs.toFixed(2));
       }
+    }
+
+    // --- rival board -------------------------------------------------------
+    this.boardT -= dt;
+    if (this.boardT <= 0) {
+      this.boardT = 0.2;
+      this.updateBoard(ctx);
     }
 
     // --- item --------------------------------------------------------------
@@ -592,7 +726,7 @@ export class HUD implements System {
     this.needle.target = frac;
     this.needle.step(dt);
     const boosting = player.boostTime > 0;
-    setText(this.speedNum, String(Math.round(kmh)));
+    setPair(this.speedNum, String(Math.round(kmh)));
     this.speedWrap.classList.toggle('red', frac > REDLINE);
     this.speedWrap.classList.toggle('boosting', boosting);
 
@@ -602,7 +736,7 @@ export class HUD implements System {
     this.tierFlash = Math.max(0, this.tierFlash - dt * 2.6);
     if (tier > this.lastTier) {
       this.tierFlash = 1;
-      retrigger(this.speedWrap, 'tier'); // spring pop on the whole instrument
+      retrigger(this.speedWrap, 'tier');
     }
     this.lastTier = player.driftDir !== 0 ? tier : 0;
     this.drawDial(frac, charge, tier, boosting, ctx.time);
@@ -623,6 +757,64 @@ export class HUD implements System {
 
   private lastTier = 0;
 
+  /** m : ss . hh, one field per fixed-width slot. */
+  private writeClock(seconds: number) {
+    const s = seconds < 0 ? 0 : seconds;
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s - m * 60);
+    const f = Math.floor((s - m * 60 - sec) * 100);
+    setPair(this.tM, String(m));
+    setPair(this.tS, p2(sec));
+    setPair(this.tF, '.' + p2(f));
+  }
+
+  /**
+   * Standings rows. Written at 5 Hz through the cached setters, so a frame in
+   * which nothing changed places costs zero DOM work.
+   */
+  private updateBoard(ctx: Ctx) {
+    const karts = ctx.race.karts;
+    const player = ctx.race.player;
+    const n = this.rows.length;
+    if (this.liveries.length !== karts.length) {
+      this.liveries.length = 0;
+      for (let i = 0; i < karts.length; i++) this.liveries.push(cssColor(karts[i].stats.color));
+    }
+    for (let i = 0; i < n; i++) this.slot[i] = null;
+    for (let i = 0; i < karts.length; i++) {
+      const p = (karts[i].place | 0) - 1;
+      if (p >= 0 && p < n && !this.slot[p]) { this.slot[p] = karts[i]; this.slotIdx[p] = i; }
+    }
+    for (let i = 0; i < n; i++) {
+      const k = this.slot[i];
+      const row = this.rows[i];
+      if (!k) {
+        // an unfilled slot must go blank, not keep a stale name at low alpha
+        row.classList.add('out');
+        setText(this.rowName[i], '');
+        continue;
+      }
+      row.classList.remove('out');
+      this.setPlaceText(i, i + 1);
+      setStyle(this.rowChip[i], '--c', this.liveries[this.slotIdx[i]] || '#888888');
+      setText(this.rowName[i], k.stats.name);
+      row.classList.toggle('you', k === player);
+    }
+  }
+
+  /** Writes "5" + <i>th</i> without rebuilding the row. */
+  private setPlaceText(i: number, place: number) {
+    const p = this.rowPlace[i];
+    const first = p.firstChild;
+    const s = String(place);
+    if (first && first.nodeType === 3) {
+      if (first.nodeValue !== s) first.nodeValue = s;
+    } else {
+      p.insertBefore(document.createTextNode(s), p.firstChild);
+    }
+    setText(this.rowSuf[i], ordinalSuffix(place));
+  }
+
   // --------------------------------------------------------------- dial draw
 
   private drawDial(frac: number, charge: number, tier: number, boosting: boolean, time: number) {
@@ -634,57 +826,48 @@ export class HUD implements System {
     g.clearRect(0, 0, W, H);
 
     const cx = DIAL_CX * W;
-    const cy = DIAL_CY * W;
-    const r = DIAL_R * W;
-    const band = r * 0.155;
+    const cy = DIAL_CY * H;
+    const r = DIAL_R * H;
+    const band = r * 0.165;
     const sweep = A1 - A0;
+    const chanW = band * 0.86;
+    const backW = chanW + band * 0.5;
 
     g.lineCap = 'butt';
-
-    // Three concentric zones, and nothing crosses between them: the scale ring
-    // sits outside the channel, the channel holds the value fill, and the
-    // numerals + drift ring live inside it. That separation is the whole
-    // reason the gauge reads as an instrument rather than as stacked strokes.
-    const chanW = band * 0.86;
 
     // --- channel -----------------------------------------------------------
     g.beginPath();
     g.arc(cx, cy, r, A0, A1);
-    g.lineWidth = chanW + band * 0.5;
-    g.strokeStyle = 'rgba(5, 8, 18, 0.72)';
+    g.lineWidth = backW;
+    g.strokeStyle = 'rgba(6, 10, 22, 0.7)';
     g.stroke();
 
+    // The unfilled scale: ONE flat low value at ONE opacity, all the way
+    // round. Round 1 drew the whole warm ramp here at 24% alpha, which read as
+    // grey from 7 to 12 o'clock and brown from 12 to 5 with no legend and no
+    // semantics — the review called it a bug, correctly.
     g.beginPath();
     g.arc(cx, cy, r, A0, A1);
     g.lineWidth = chanW;
-    const housing = g.createLinearGradient(cx, cy - r, cx, cy + r);
-    housing.addColorStop(0, 'rgba(30, 39, 66, 0.94)');
-    housing.addColorStop(0.6, 'rgba(13, 18, 34, 0.96)');
-    housing.addColorStop(1, 'rgba(7, 10, 21, 0.97)');
-    g.strokeStyle = housing;
+    g.strokeStyle = 'rgba(232, 226, 208, 0.28)';
     g.stroke();
 
-    // The unfilled scale, always present at low alpha. Without it a stationary
-    // dial is a bare grey groove and a boosting one is a full warm wash — the
-    // same widget reading as two different components between states. The ramp
-    // is visible at rest; the value fill adds intensity on top of it, and that
-    // is the only thing that changes.
-    g.save();
-    g.globalAlpha = 0.24;
+    // ...and a REAL redline: a saturated §3 kerb-red segment over the top 12%
+    // of the range, so the one coloured thing on the unfilled scale means
+    // something.
+    const ra = A0 + sweep * REDLINE;
     g.beginPath();
-    g.arc(cx, cy, r, A0, A1);
+    g.arc(cx, cy, r, ra, A1);
     g.lineWidth = chanW;
-    g.strokeStyle = this.arcGrad || '#ffd66b';
+    g.strokeStyle = 'rgba(224, 69, 63, 0.85)';
     g.stroke();
-    g.restore();
 
     // --- value fill --------------------------------------------------------
     const va = A0 + sweep * clamp(this.needle.value, 0, 1);
     if (va > A0 + 0.004) {
       g.save();
-      // one hue, two intensities — boost is a bloom, not a retint
-      g.shadowColor = boosting ? 'rgba(255, 158, 62, 0.95)' : 'rgba(255, 190, 110, 0.45)';
-      g.shadowBlur = W * (boosting ? 0.055 : 0.026);
+      g.shadowColor = boosting ? 'rgba(255, 158, 62, 0.95)' : 'rgba(255, 190, 110, 0.42)';
+      g.shadowBlur = W * (boosting ? 0.05 : 0.024);
       g.beginPath();
       g.arc(cx, cy, r, A0, va);
       g.lineWidth = chanW;
@@ -692,18 +875,16 @@ export class HUD implements System {
       g.stroke();
       g.restore();
       g.beginPath();
-      g.arc(cx, cy, r, Math.max(A0, va - 0.075), va);
+      g.arc(cx, cy, r, Math.max(A0, va - 0.07), va);
       g.lineWidth = chanW;
-      g.strokeStyle = 'rgba(255, 252, 236, 0.55)';
+      g.strokeStyle = 'rgba(255, 252, 236, 0.5)';
       g.stroke();
       if (boosting) {
         const p = (time * 1.5) % 1.35 - 0.175;
         const sa = A0 + sweep * clamp(p, 0, 1);
-        // These two are NOT ordered by construction: once the sweep head runs
-        // past the value fill, `start` exceeds `end` and canvas arc() takes the
-        // long way round — it painted a translucent warm band across the whole
-        // bottom of the dial, through the empty wedge and out past the plate
-        // corners. That was the "unmasked render layer" in the boost frames.
+        // These two are NOT ordered by construction: if start exceeds end,
+        // canvas arc() takes the long way round and paints a band across the
+        // whole open wedge.
         const s0 = Math.max(A0, sa - 0.16);
         const s1 = Math.min(va, sa + 0.16);
         if (s1 > s0) {
@@ -712,7 +893,7 @@ export class HUD implements System {
           g.beginPath();
           g.arc(cx, cy, r, s0, s1);
           g.lineWidth = chanW;
-          g.strokeStyle = 'rgba(255, 226, 170, 0.30)';
+          g.strokeStyle = 'rgba(255, 226, 170, 0.28)';
           g.stroke();
           g.restore();
         }
@@ -722,24 +903,27 @@ export class HUD implements System {
     // chamfer hairlines at both channel lips
     g.lineWidth = Math.max(1, W * 0.0035);
     g.beginPath(); g.arc(cx, cy, r + chanW * 0.5, A0, A1);
-    g.strokeStyle = 'rgba(255, 244, 220, 0.28)'; g.stroke();
+    g.strokeStyle = 'rgba(255, 244, 220, 0.24)'; g.stroke();
     g.beginPath(); g.arc(cx, cy, r - chanW * 0.5, A0, A1);
-    g.strokeStyle = 'rgba(4, 7, 16, 0.55)'; g.stroke();
+    g.strokeStyle = 'rgba(4, 7, 16, 0.5)'; g.stroke();
 
     // --- scale ring, entirely outside the channel --------------------------
-    // Batched: one casing path and one fill path per weight, so the whole scale
-    // costs four strokes rather than two per tick.
-    const t0 = r + chanW * 0.5 + band * 0.22;
+    // t0 clears the CASING radius, not the channel radius. Round 1 measured
+    // from the channel, so the backing arc reached past the tick roots and the
+    // end ticks appeared to cross the arc terminus.
+    const t0 = r + backW * 0.5 + band * 0.20;
     const majorW = W * 0.0105;
     const minorW = W * 0.005;
     const casing = W * 0.0075;
+    const redIdx = REDLINE * DIVS;
 
-    const tickPath = (major: boolean) => {
+    const tickPath = (major: boolean, hot: boolean) => {
       g.beginPath();
       for (let i = 0; i <= DIVS; i++) {
         if ((i % MAJOR_EVERY === 0) !== major) continue;
+        if ((i >= redIdx) !== hot) continue;
         const a = A0 + sweep * (i / DIVS);
-        const t1 = t0 + band * (major ? 0.48 : 0.25);
+        const t1 = t0 + band * (major ? 0.46 : 0.24);
         const c = Math.cos(a), s = Math.sin(a);
         g.moveTo(cx + c * t0, cy + s * t0);
         g.lineTo(cx + c * t1, cy + s * t1);
@@ -748,79 +932,82 @@ export class HUD implements System {
 
     g.lineCap = 'round';
     g.strokeStyle = 'rgba(4, 7, 16, 0.85)';
-    tickPath(true);  g.lineWidth = majorW + casing; g.stroke();
-    tickPath(false); g.lineWidth = minorW + casing; g.stroke();
+    tickPath(true, false);  g.lineWidth = majorW + casing; g.stroke();
+    tickPath(true, true);   g.stroke();
+    tickPath(false, false); g.lineWidth = minorW + casing; g.stroke();
+    tickPath(false, true);  g.stroke();
+    // cool ticks
     g.strokeStyle = 'rgba(255, 244, 214, 0.95)';
-    tickPath(true);  g.lineWidth = majorW; g.stroke();
+    tickPath(true, false);  g.lineWidth = majorW; g.stroke();
     g.strokeStyle = 'rgba(255, 238, 206, 0.5)';
-    tickPath(false); g.lineWidth = minorW; g.stroke();
+    tickPath(false, false); g.lineWidth = minorW; g.stroke();
+    // ticks inside the redline match the redline
+    g.strokeStyle = '#e0453f';
+    tickPath(true, true);  g.lineWidth = majorW; g.stroke();
+    tickPath(false, true); g.lineWidth = minorW; g.stroke();
     g.lineCap = 'butt';
 
-    // No numerals on the scale. They sat on the needle's own ring — the needle
-    // swept straight through them and erased a digit at exactly the speeds the
-    // player drives at ("120" reading ".20", "90" reading "00"). A scale you
-    // cannot read is worse than no scale, and at this size they would have been
-    // 9 px anyway. The digital readout carries the value; the arc carries the
-    // proportion. That is what §7 asks for.
-
-    // --- mini-turbo charge ring --------------------------------------------
-    // The FILL is the bright element and the track is a dark groove; the old
-    // arrangement had a pale full-sweep track reading as the value and the
-    // actual charge as a dim nub. At zero charge the ring is not drawn at all,
-    // so an idle dial has no unlabelled circle floating in it.
-    // moved outward from band*1.55 now that the numeral ring is gone
-    const ir = r - chanW * 0.5 - band * 1.0;
-    const driftOn = charge > 0.001 || this.tierFlash > 0;
+    // --- mini-turbo charge rail, in the open wedge under the dial ----------
+    // §6 asks for an unmistakable read on the drift charge. Round 1 hid it as
+    // a thin ring inside the dial where the needle and the digits were already
+    // competing; a frame at tier 2 gave the player no idea what tier they were
+    // on. It is now its own instrument, directly under the gauge, in the tier
+    // colour, with a full-width flash on promotion.
+    const ry = RAIL_Y * H;
+    const rhw = RAIL_HW * W;
+    const rt = RAIL_T * H;
+    const driftOn = charge > 0.001 || this.tierFlash > 0.001;
+    g.lineCap = 'round';
+    g.lineWidth = rt;
+    g.beginPath();
+    g.moveTo(cx - rhw, ry);
+    g.lineTo(cx + rhw, ry);
+    g.strokeStyle = 'rgba(6, 10, 22, 0.72)';
+    g.stroke();
+    g.lineWidth = rt * 0.6;
+    g.strokeStyle = 'rgba(238, 232, 214, 0.10)';
+    g.stroke();
     if (driftOn) {
-      const trackW = band * 0.24;
-      g.beginPath();
-      g.arc(cx, cy, ir, A0, A1);
-      g.lineWidth = trackW;
-      g.strokeStyle = 'rgba(6, 10, 22, 0.55)';
-      g.stroke();
-
       const col = TIER_COLORS[clamp(tier, 0, 3)];
-      const ca = A0 + sweep * Math.max(0.02, clamp(charge, 0, 1));
+      const w = rhw * 2 * clamp(Math.max(charge, this.tierFlash * 0.25), 0.03, 1);
       g.save();
-      g.lineCap = 'round';
+      g.lineWidth = rt * 0.72;
       g.shadowColor = col;
-      g.shadowBlur = W * (0.024 + this.tierFlash * 0.05);
+      g.shadowBlur = W * (0.02 + this.tierFlash * 0.05);
       g.beginPath();
-      g.arc(cx, cy, ir, A0, ca);
-      g.lineWidth = trackW * 2.2;
+      g.moveTo(cx - rhw, ry);
+      g.lineTo(cx - rhw + w, ry);
       g.strokeStyle = col;
       g.stroke();
-      // additive bloom on the leading edge — the charge front, not the track
-      g.globalCompositeOperation = 'lighter';
-      g.beginPath();
-      g.arc(cx, cy, ir, Math.max(A0, ca - 0.10), ca);
-      g.lineWidth = trackW * 2.2;
-      g.strokeStyle = 'rgba(255, 253, 244, 0.55)';
-      g.stroke();
-      g.restore();
       if (this.tierFlash > 0) {
-        g.save();
         g.globalCompositeOperation = 'lighter';
         g.beginPath();
-        g.arc(cx, cy, ir, A0, A1);
-        g.lineWidth = trackW * 2.2;
-        g.strokeStyle = `rgba(255,255,255,${(this.tierFlash * 0.6).toFixed(3)})`;
+        g.moveTo(cx - rhw, ry);
+        g.lineTo(cx + rhw, ry);
+        g.lineWidth = rt * 0.72;
+        g.strokeStyle = `rgba(255,255,255,${(this.tierFlash * 0.7).toFixed(3)})`;
         g.stroke();
-        g.restore();
+      }
+      g.restore();
+      // tier pips: three notches so the rail says WHICH tier, not just "some"
+      for (let i = 1; i <= 3; i++) {
+        const x = cx - rhw + (rhw * 2) * (i / 3);
+        g.beginPath();
+        g.moveTo(x, ry - rt * 0.42);
+        g.lineTo(x, ry + rt * 0.42);
+        g.lineWidth = Math.max(1, W * 0.006);
+        g.strokeStyle = i <= tier ? 'rgba(255,255,255,0.9)' : 'rgba(6,10,22,0.7)';
+        g.stroke();
       }
     }
+    g.lineCap = 'butt';
 
     // --- needle ------------------------------------------------------------
-    // A blade, not a hairline: same warm ramp and same heavy ink casing as the
-    // cased type elsewhere in the HUD, so the instrument shares a line weight
-    // and a fill idiom with the numerals instead of importing a second one.
     const na = A0 + sweep * clamp(this.needle.value, -0.02, 1.02);
     const tip = r - chanW * 0.5 - band * 0.10;
     g.save();
     g.translate(cx, cy);
     g.rotate(na);
-    // The tail stops inside the hub radius: anything longer pokes out the back
-    // of the hub and reads as a glitch, not as a counterweight.
     g.beginPath();
     g.moveTo(tip, 0);
     g.lineTo(tip * 0.84, -r * 0.042);
@@ -849,8 +1036,7 @@ export class HUD implements System {
     g.stroke();
     g.restore();
 
-    // hub — a cased gold cap, not a machined chrome boss. The old radial read
-    // as a photoreal metal part next to flat 2D iconography.
+    // hub — a cased gold cap, the same idiom as the cased type elsewhere
     const hr = r * 0.145;
     g.beginPath();
     g.arc(cx, cy, hr, 0, Math.PI * 2);

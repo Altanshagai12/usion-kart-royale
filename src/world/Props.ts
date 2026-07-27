@@ -287,14 +287,38 @@ function vnoise(u: number, v: number, px: number, py: number, seed: number): num
   return (a + (b - a) * sx) * (1 - sy) + (c + (d - c) * sx) * sy;
 }
 
-/** fbm in [-1,1]; periods double each octave so the wrap survives. */
-function fbm(seed: number, u: number, v: number, px: number, py: number, oct: number, gain = 0.5): number {
+/**
+ * fbm in [-1,1]; periods double each octave so the wrap survives.
+ *
+ * ---------------------------------------------------------------------------
+ *  ROUND 2: THE NYQUIST GUARD, AND WHY IT IS THE FIX FOR "NOISE-MOTTLED"
+ * ---------------------------------------------------------------------------
+ *  `ridgeGeo` already refuses to ask for a feature its column spacing cannot
+ *  carry, and says so at length. The texture generator never got the same rule,
+ *  and it is asked for sub-pixel detail constantly: the sponsor board's vinyl
+ *  ran `fbm(..., 192, 192, 3)` into a 512² map, so its three octaves land at
+ *  2.7, 1.3 and 0.7 PIXELS per cycle. Only the first is drawable. The other two
+ *  are per-texel white noise, and because this feeds `normalFromHeight` they
+ *  arrive as a field of random normals — which under a 14° key is a scintillating
+ *  dither up close and, once the mip chain has averaged it, a grey mush at range.
+ *  That is exactly the critique's "noise-mottled panel... reads as texture
+ *  compression artefacts rather than as weathered paint", and it is why the
+ *  lettering appeared to dissolve INTO the board: the board was fizzing.
+ *
+ *  So: stop at the last octave the map can actually resolve. Four texels per
+ *  cycle is the floor — below that a value-noise lattice is aliasing by
+ *  construction. Callers working at 512² pass `res` so the cap follows them.
+ *  Nothing that was drawable is lost; everything that was never drawable goes.
+ */
+function fbm(seed: number, u: number, v: number, px: number, py: number, oct: number, gain = 0.5, res = 1024): number {
   let amp = 1,
     sum = 0,
     norm = 0,
     a = px,
     b = py;
+  const lim = res / 4;
   for (let o = 0; o < oct; o++) {
+    if (o > 0 && (a > lim || b > lim)) break;
     sum += amp * vnoise(u, v, a | 0, b | 0, seed + o * 131);
     norm += amp;
     amp *= gain;
@@ -458,22 +482,49 @@ export class TexLib {
           const col = Math.floor(colF) % cols;
           const ct = colF - Math.floor(colF);
           // Barrel profile: half-round ridge, so height peaks mid-tile.
-          const barrel = Math.sin(ct * Math.PI);
-          const lap = smoothstep(0.0, 0.10, rowT); // shadowed lap line at the top
-          const gap = smoothstep(0.5, 0.0, Math.abs(ct - 0.5) * 2) * 0.0 + Math.pow(barrel, 0.6);
           const ji = (row % rows) * cols * 3 + col * 3;
           const j0 = jitter[ji],
             j1 = jitter[ji + 1],
             j2 = jitter[ji + 2];
+          // ------------------------------------------------------------------
+          // "CORRUGATED CARDBOARD": WHAT A REAL BARREL ROOF HAS THAT THIS DIDN'T
+          // ------------------------------------------------------------------
+          // The profile and the per-tile hue drift were already here, and they
+          // are not what was missing. What was missing is that every pan ran the
+          // full height of the map as one unbroken stripe: the lap shadow was
+          // only the top 10% of a course, the tile ENDS all landed on the same
+          // ten lines, and no individual tile ever sat proud, slipped or broken.
+          // A ribbed prism is exactly what that describes.
+          //
+          //  · `slip` drops a course's leading edge by up to a quarter of its
+          //    own lap, per tile, so the courses stop being ruled lines;
+          //  · the lap shadow is three times deeper and follows the slip;
+          //  · `broken` takes one tile in ~forty down to the underlay;
+          //  · `proud` lifts a scattered few so they catch the low sun on their
+          //    upslope edge, which is the tell that a roof is made of objects.
+          const slip = (j1 - 0.5) * 0.16;
+          const rowS = clamp(rowT - slip, 0, 1);
+          const barrel = Math.sin(ct * Math.PI);
+          const lap = smoothstep(0.0, 0.30, rowS); // shadowed lap line at the top
+          const proud = j2 > 0.86 ? 0.16 : 0;
+          const broken = j0 > 0.975 ? 1 : 0;
+          const gap = Math.pow(barrel, 0.6) * (1 - broken * 0.72);
           const i = y * size + x;
-          h[i] = gap * 0.9 + lap * 0.35 - (1 - lap) * 0.5 + fbm(41, fu, fv, 256, 256, 3) * 0.09;
-          const shade = (0.55 + 0.45 * gap) * (0.72 + 0.28 * lap);
-          // terracotta with per-tile hue drift + moss in the valleys
+          h[i] = gap * 0.9 + lap * 0.35 - (1 - lap) * 0.5 + proud + fbm(41, fu, fv, 96, 96, 2, 0.5, size) * 0.09;
+          const shade = (0.55 + 0.45 * gap) * (0.62 + 0.38 * lap) * (1 - broken * 0.28);
+          // Per-pan hue AND value drift. §3's roof key is #b5643f; ±0.03 of hue
+          // and ±0.15 of value around it is what stops eight pans reading as one
+          // extruded ribbon, and it is free because it rides the jitter table
+          // that was already indexed per tile.
           const hueT = j0 * 0.5 + j1 * 0.2;
-          let rr = lerp(0.62, 0.80, hueT) * shade;
-          let gg = lerp(0.30, 0.42, hueT) * shade;
-          let bb = lerp(0.21, 0.28, hueT * 0.8) * shade;
-          const moss = clamp((1 - barrel) * 1.4 - 0.55, 0, 1) * (0.25 + j2 * 0.5) * smoothstep(0.15, 0.6, fbm(53, fu, fv, 8, 8, 2) + 0.5);
+          const val = 1 + (j2 - 0.5) * 0.30;
+          let rr = lerp(0.62, 0.80, hueT) * shade * val;
+          let gg = lerp(0.30, 0.42, hueT + (j1 - 0.5) * 0.12) * shade * val;
+          let bb = lerp(0.21, 0.28, hueT * 0.8) * shade * val;
+          // Moss lives in the valleys AND in the lap shadow, which is where the
+          // water actually sits.
+          const moss =
+            clamp((1 - barrel) * 1.4 - 0.55 + (1 - lap) * 0.35, 0, 1) * (0.25 + j2 * 0.5) * smoothstep(0.15, 0.6, fbm(53, fu, fv, 8, 8, 2, 0.5, size) + 0.5);
           rr = lerp(rr, 0.34, moss * 0.55);
           gg = lerp(gg, 0.38, moss * 0.55);
           bb = lerp(bb, 0.24, moss * 0.55);
@@ -779,15 +830,23 @@ export class TexLib {
       const [c, g] = cv(size);
       const w = size / 2,
         h0 = size / 4;
+      // SHORT WORDS. This is the largest single lever on sign legibility and it
+      // is not a rendering setting: a 4 m board at 40 m is ~40 screen pixels
+      // wide, so 'KART ROYALE' gets 3.6 px per character and there is no font,
+      // resolution or filter that recovers a letterform from that. Six glyphs
+      // maximum, so each one gets 6-7 px and the WORD SHAPE survives even after
+      // the letterforms have gone. Every pair is also picked for luminance
+      // contrast, not just hue contrast — hue is the first thing a mip average
+      // throws away.
       const boards: [string, string, string][] = [
-        ['#e0453f', '#f2ece0', 'SUNSET BAY'],
+        ['#e0453f', '#f9f4ea', 'SUNSET'],
         ['#2f6ba0', '#f5e2b0', 'TURBO'],
-        ['#f5e2b0', '#b5643f', 'AMALFI OIL'],
+        ['#f5e2b0', '#8f3f22', 'AMALFI'],
         ['#2f5d43', '#f2ece0', 'MARINA'],
-        ['#ff9d2e', '#3f3f4a', 'NITRO'],
-        ['#3f3f4a', '#4fc3ff', 'KART ROYALE'],
-        ['#dcb8d8', '#3f3f4a', 'GOLDEN HR'],
-        ['#4fc3ff', '#f2ece0', 'BOOST CO.'],
+        ['#ff9d2e', '#2b2b34', 'NITRO'],
+        ['#2b2f3a', '#4fc3ff', 'ROYALE'],
+        ['#c78ec2', '#2b2430', 'GOLD'],
+        ['#4fc3ff', '#20303c', 'BOOST'],
       ];
       for (let i = 0; i < 8; i++) {
         const cx = (i % 2) * w,
@@ -819,16 +878,25 @@ export class TexLib {
         // 1024 x 512 for a 4 m x 1 m panel ≈ 4 mm/texel), and a hard contrast
         // ring around every glyph so what the mip chain averages toward is still
         // a light-on-dark edge rather than mud.
-        g.font = `800 ${h0 * 0.42}px "Helvetica Neue", Helvetica, Arial, sans-serif`;
+        g.font = `900 ${h0 * 0.52}px "Helvetica Neue", Helvetica, Arial, sans-serif`;
         g.textAlign = 'center';
         g.textBaseline = 'middle';
-        g.letterSpacing = `${Math.round(h0 * 0.012)}px`;
+        // Generous tracking. Tight letterforms merge into one blob at the first
+        // mip drop; a gap between glyphs is what survives, because the gap is
+        // what the average has to fill in before the word closes up.
+        g.letterSpacing = `${Math.round(h0 * 0.035)}px`;
         g.lineJoin = 'round';
-        g.strokeStyle = 'rgba(20,16,14,0.55)';
-        g.lineWidth = h0 * 0.055;
-        g.strokeText(text, cx + w / 2, cy + h0 / 2, w * 0.86);
+        // Drop shadow first, offset DOWN-RIGHT so it reads as depth rather than
+        // as a fat outline, then the keyline, then the fill. Three layers means
+        // the glyph edge is still a hard light-dark transition two mip levels
+        // down, which is the level a 40 m board is actually sampled at.
+        g.fillStyle = 'rgba(18,12,10,0.34)';
+        g.fillText(text, cx + w / 2 + h0 * 0.018, cy + h0 / 2 + h0 * 0.022, w * 0.9);
+        g.strokeStyle = 'rgba(20,16,14,0.62)';
+        g.lineWidth = h0 * 0.07;
+        g.strokeText(text, cx + w / 2, cy + h0 / 2, w * 0.9);
         g.fillStyle = fg;
-        g.fillText(text, cx + w / 2, cy + h0 / 2, w * 0.86);
+        g.fillText(text, cx + w / 2, cy + h0 / 2, w * 0.9);
         // frame: a dark keyline plus a light inner line, so the board's own
         // outline survives to the distance the lettering does not
         g.strokeStyle = 'rgba(0,0,0,0.4)';
@@ -839,21 +907,46 @@ export class TexLib {
         g.strokeRect(cx + h0 * 0.055, cy + h0 * 0.055, w - h0 * 0.11, h0 - h0 * 0.11);
         g.restore();
       }
-      // Only the lettering needs the texel density; the vinyl's surface noise is
-      // low frequency and stays at 512 so the atlas costs one big map, not three.
+      // ------------------------------------------------------------------
+      // THE BOARD WEATHERS, THE PAINT CHIPS — AND THEY ARE NOT THE SAME NOISE
+      // ------------------------------------------------------------------
+      // Round 1's surface noise ran at 192 cycles into a 512² map, three
+      // octaves deep: 2.7, 1.3 and 0.7 pixels per cycle. See the note on `fbm`.
+      // In a normal map that is not weathering, it is a dither, and it is what
+      // made every sign in the game read as compression mush with the type
+      // dissolving into it.
+      //
+      // Weathering is LOW frequency: a board fades in patches the size of a
+      // hand, streaks where the rain runs off it, and lifts at the corners. All
+      // three are here, all at wavelengths the map can carry, and the amplitude
+      // is a third of what it was so the glyph edges — which are the thing the
+      // player is actually meant to read — stay the highest-contrast feature on
+      // the panel rather than competing with the substrate.
       const ns = 512;
       const hf = new Float32Array(ns * ns);
       const rf = new Float32Array(ns * ns);
       for (let y = 0; y < ns; y++)
         for (let x = 0; x < ns; x++) {
           const i = y * ns + x;
-          const n = fbm(109, x / ns, y / ns, 192, 192, 3);
-          hf[i] = n;
-          rf[i] = 0.34 + n * 0.16 + (Math.sin(y * 0.08) * 0.5 + 0.5) * 0.06;
+          const u = x / ns,
+            v = y / ns;
+          // patchy fade (hand-sized), plus vertical rain streaking
+          const patch = fbm(109, u, v, 14, 14, 2, 0.5, ns);
+          const streak = fbm(113, u, v, 26, 3, 2, 0.5, ns);
+          // the vinyl's own weave, right at the resolution limit and no finer
+          const weave = fbm(127, u, v, 96, 96, 1, 0.5, ns);
+          hf[i] = patch * 0.55 + streak * 0.3 + weave * 0.15;
+          // Roughness carries most of the weathering read: a scuffed board is a
+          // ROUGHNESS story, not a bump story, and roughness does not alias into
+          // sparkle the way a normal does.
+          rf[i] = clamp(0.36 + patch * 0.22 + streak * 0.12 + weave * 0.05, 0.1, 0.95);
         }
       return {
         map: finish(c, true, this.aniso, false),
-        normalMap: normalFromHeight(hf, ns, 5, this.aniso),
+        // 5 -> 2.2: the panel is flat printed vinyl on a flat board. Relief on
+        // it is a lie, and at 40 m a lie with a high-frequency component is a
+        // shimmer.
+        normalMap: normalFromHeight(hf, ns, 2.2, this.aniso),
         roughnessMap: greyFromField(rf, ns, this.aniso),
       };
     });
@@ -875,13 +968,31 @@ export class TexLib {
           const i = y * size + x;
           let hh: number, tone: number;
           if (palm) {
-            // diamond leaf scars: two interleaved ring families
-            const ring = Math.abs(((v * 22 + Math.sin(u * 6.283 * 2) * 0.18) % 1) - 0.5) * 2;
-            const stagger = Math.abs(((u * 11 + Math.floor(v * 22) * 0.5) % 1) - 0.5) * 2;
-            const scar = smoothstep(0.75, 0.22, ring) * smoothstep(0.85, 0.3, stagger);
-            const fibre = fbm(113, u, v, 192, 48, 3);
-            hh = scar * 0.9 - 0.4 + fibre * 0.3;
-            tone = 0.52 + scar * 0.3 + fibre * 0.2;
+            // ------------------------------------------------------------
+            // THE BARCODE. Round 1's trunk read as a high-contrast black/tan
+            // stripe pattern that moiréd down its own length, and there were
+            // two separate causes:
+            //
+            //  · `fibre` ran at 192 cycles across a 512 map — 2.7 px per cycle,
+            //    three octaves deep. See the note on `fbm`. In a normal map at
+            //    strength 30 that is a per-texel scintillation, and it is what
+            //    turned a scar pattern into a barcode.
+            //  · the ring family was a single INTEGER-period sawtooth, so every
+            //    scar course lined up perfectly with every other one. §4 asks
+            //    for a second octave at a non-integer scale precisely to stop
+            //    that; the ring here now carries a 7.3-per-tile drift and a
+            //    per-course phase wobble, so no two courses register.
+            //
+            // Contrast is also down (scar 0.9 -> 0.55 in height, 0.3 -> 0.18 in
+            // tone): a palm's leaf scars are a soft relief, not an engraving,
+            // and the old amplitude is what made the pattern shout at range.
+            const drift = Math.sin(v * 6.283 * 7.3 + 1.1) * 0.09 + Math.sin(u * 6.283 * 3.0) * 0.14;
+            const ring = Math.abs(((v * 22 + drift) % 1) - 0.5) * 2;
+            const stagger = Math.abs(((u * 11 + Math.floor(v * 22) * 0.5 + Math.sin(v * 17.0) * 0.16) % 1) - 0.5) * 2;
+            const scar = smoothstep(0.75, 0.26, ring) * smoothstep(0.85, 0.32, stagger);
+            const fibre = fbm(113, u, v, 34, 96, 2, 0.5, size);
+            hh = scar * 0.55 - 0.24 + fibre * 0.24;
+            tone = 0.56 + scar * 0.18 + fibre * 0.14;
           } else {
             // pine: irregular plates with deep fissures
             const plate = fbm(127, u, v, 14, 20, 3);
@@ -903,7 +1014,10 @@ export class TexLib {
       g.putImageData(img, 0, 0);
       return {
         map: finish(c, true, this.aniso),
-        normalMap: normalFromHeight(h, size, palm ? 30 : 38, this.aniso),
+        // Palm 30 -> 18: the scar relief is now half the amplitude it was, and
+        // a normal strength tuned against the old height field turned what is
+        // left into contrast the geometry does not have.
+        normalMap: normalFromHeight(h, size, palm ? 18 : 38, this.aniso),
         roughnessMap: greyFromField(r, size, this.aniso),
       };
     });
@@ -1160,9 +1274,12 @@ export class TexLib {
           const u = x / size,
             v = y / size;
           const i = y * size + x;
-          // sprays: fine vertical streaks broken by clumps
-          const spray = fbm(211, u, v, 128, 26, 4);
-          const clump = fbm(223, u, v, 14, 10, 3);
+          // Sprays: fine vertical streaks broken by clumps. `res` is passed so
+          // the Nyquist guard measures against THIS map's 512, not the 1024
+          // default — grid.png's cypresses sparkled, and a needle texture whose
+          // top octave runs at two texels per cycle is what sparkling is.
+          const spray = fbm(211, u, v, 96, 22, 4, 0.5, size);
+          const clump = fbm(223, u, v, 14, 10, 3, 0.5, size);
           const shade = 0.5 + spray * 0.32 + clump * 0.28;
           h[i] = spray * 0.75 + clump * 0.4;
           const dark = clamp(shade, 0, 1);
@@ -1177,7 +1294,10 @@ export class TexLib {
       g.putImageData(img, 0, 0);
       return {
         map: finish(c, true, this.aniso),
-        normalMap: normalFromHeight(h, size, 26, this.aniso),
+        // 26 -> 15: a cypress is a mass of needles, not a rock face, and a
+        // normal this strong on a spindle whose whole job is silhouette is a
+        // specular crawl generator at any distance past 20 m.
+        normalMap: normalFromHeight(h, size, 15, this.aniso),
         roughnessMap: greyFromField(r, size, this.aniso),
       };
     });
@@ -1721,6 +1841,19 @@ export interface RidgeOpts {
   crestTint?: THREE.Color;
   footTint?: THREE.Color;
   /**
+   * Yaw the sun sits at, in the ridge's LOCAL frame (0 = local +Z, the front
+   * flank). Columns whose local slope faces it get a warm rim along the crest —
+   * "a rim of warm sun-catch along the sun-facing ridge". Omit to disable.
+   */
+  sunLocal?: number;
+  /**
+   * Vegetation/scrub key, mixed into the flank at 40–120 m feature size. This
+   * is the cheap answer to "an untextured orange silhouette with no vegetation
+   * stippling and no rock": low-frequency albedo patchwork only, no normal, and
+   * it costs nothing because it rides the vertex colour that is already there.
+   */
+  scrubTint?: THREE.Color;
+  /**
    * Filled with the crest line as local x,y,z triples, one per column. Anything
    * standing ON the ridge — a cypress line, a hill town, a switchback road —
    * has to know where the crest actually is, or it floats above a saddle and
@@ -1955,6 +2088,39 @@ export function ridgeGeo(o: RidgeOpts): THREE.BufferGeometry {
     prof.set(sm);
   }
 
+  // --- 1e. the break: a low-frequency, ASYMMETRIC step in the skyline --------
+  //
+  // ROUND 2 NOTE. Everything above — the dilation envelope, the subtractive
+  // cols, then two to six [1 2 1] passes — is a chain of SMOOTHING operators,
+  // and it showed: the horizon came out as a run of smooth, near-symmetric
+  // domes. "The current profiles are too smooth and too symmetric" is a fair
+  // description of an erosion model with no tectonics in it.
+  //
+  // Real ranges are not smooth at the top; they have benches, scarps and
+  // hanging shoulders where one block stands proud of the next. This is that,
+  // done as cheaply as it can be: a two-octave signal at a quarter and an
+  // eighth of the run — well inside the wavelength floor, so it cannot alias —
+  // rectified so it only ever CUTS a bench in on one side of a summit, then
+  // weighted by the local height so it never touches the toe. The result is a
+  // skyline with a long side and a stepped side instead of two matching curves,
+  // which is the single strongest cue that a shape is a landform and not a
+  // triangle someone drew.
+  {
+    const lamStep = Math.max(lamMin * 2.2, o.length * 0.24);
+    for (let i = 0; i <= segs; i++) {
+      const x = (i / segs) * o.length;
+      const a = fbm1(n, x / lamStep, sy + 131.7, 2);
+      const b = fbm1(n, x / (lamStep * 0.46) + 5.1, sy + 177.3, 1);
+      // rectify against the landform's own dip direction: the bench forms on
+      // the face side, never on the dip slope
+      const bench = Math.max(0, chDir > 0 ? a : -a) * (0.55 + 0.45 * Math.max(0, b));
+      prof[i] *= 1 - 0.30 * jag * bench * clamp(prof[i] * 1.4, 0, 1);
+    }
+    // one gentle pass so the bench edge is a scarp, not a sawtooth
+    for (let i = 0; i <= segs; i++) sm[i] = (prof[Math.max(0, i - 1)] + 2 * prof[i] + prof[Math.min(segs, i + 1)]) * 0.25;
+    prof.set(sm);
+  }
+
   // Ends fall away. `shoulder` decides whether this is a headland running into
   // the water or a slab of a range continuing behind its neighbour.
   //
@@ -2096,7 +2262,32 @@ export function ridgeGeo(o: RidgeOpts): THREE.BufferGeometry {
       // --- vertex colour: strata + aerial gradient + toe darkening
       const hRel = clamp(y / Math.max(1, o.height), 0, 1);
       _lc.copy(footC).lerp(crestC, Math.pow(hRel, 0.62));
+      // SCRUB / ROCK PATCHWORK. Two octaves at 40–120 m of feature size, which
+      // is the size a Mediterranean hillside's maquis actually patches at, so
+      // one landform carries three or four distinct values across its face
+      // instead of a single ramp from foot to crest. Low frequency only and no
+      // normal: at 950 m and 1.75 km high-frequency detail is aliasing, and the
+      // whole point of finding #3 is that the crest EDGE is what resolves.
+      if (o.scrubTint) {
+        const s0 = n(x * 0.0125 + 91.4, z * 0.0125 - 12.6) * 0.62 + n(x * 0.031 - 4.2, z * 0.031 + 55.9) * 0.38;
+        // scrub grows on the shoulders and in the gullies, not on the bare
+        // steeps or the crest — hence the shape and height weighting
+        const veg = clamp(s0 * 0.9 + 0.42, 0, 1) * lerp(1.0, 0.35, Math.pow(hRel, 1.5)) * lerp(0.45, 1.0, clamp(shape * 1.4, 0, 1));
+        _lc.lerp(o.scrubTint, veg * 0.55);
+      }
       let m = 1;
+      // SUN-CATCH RIM. A ridge lit by a 14° key has a burning edge along the
+      // crest columns whose slope turns toward the sun and nothing along the
+      // ones that turn away. Baked per vertex because the backdrop's normals
+      // are far too coarse to give the real light anything to work with at this
+      // triangle density, and because a rim that is only on the SUN-FACING
+      // ridges is what separates two overlapping layers from each other.
+      if (o.sunLocal !== undefined) {
+        // local surface bearing: front flank faces +Z, dip slope faces -Z
+        const face = v <= VC ? 1 : -1;
+        const facing = Math.cos(o.sunLocal) * face;
+        m *= 1 + clamp(facing, 0, 1) * Math.pow(hRel, 3.2) * 0.30;
+      }
       if (strata > 0) {
         // Bands wander with the rock rather than ruling straight lines round
         // the landform: a second, non-integer octave plus a lateral warp.
@@ -2436,6 +2627,26 @@ export class InstSet {
     return this.mats.length;
   }
 
+  /**
+   * True when nothing about this set moves after build: no wind sway, no bob.
+   * Those two are the only patches that read the instance transform at runtime
+   * (`patchWind` needs the instance scale, `patchBob` rotates about the
+   * instance origin), so they are the only two that stop a set from being
+   * baked flat by `mergeStaticSets`.
+   */
+  get isStatic(): boolean {
+    return !this.useWind && !this.useBob;
+  }
+
+  /** Raw per-instance data, for `mergeStaticSets`. */
+  snapshot() {
+    return {
+      geo: this.geo, mat: this.mat, name: this.name,
+      mats: this.mats, cols: this.cols, uvs: this.uvs, lods: this.lods,
+      useCol: this.useCol, useUv: this.useUv, useLod: this.useLod,
+    };
+  }
+
   add(m: THREE.Matrix4, o?: InstOpts) {
     this.mats.push(m.clone());
     if (o?.color) {
@@ -2480,6 +2691,189 @@ export class InstSet {
     this.cols = this.uvs = this.winds = this.lods = this.bobs = [];
     return mesh;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Static batching
+// ---------------------------------------------------------------------------
+
+/**
+ * ============================================================================
+ *  mergeStaticSets — collapses many static InstancedMeshes into few meshes.
+ * ============================================================================
+ *  An InstancedMesh is one draw call however many instances it holds, so the
+ *  scenery's draw cost is not the instance count — it is the number of *sets*.
+ *  Measured at the `scenery` vantage point (tools/perf.mjs), the near shadow
+ *  cascade alone was submitting 52 sets every single frame, and about 25 of
+ *  those were small static props: crates, barrels, deckchairs, market stalls,
+ *  A-frames, sign panels.
+ *
+ *  Worse, almost none of them could ever be culled. An InstancedMesh's bounding
+ *  sphere has to enclose every instance, and these sets scatter their instances
+ *  around all 1600 m of circuit — so `scenery/crate` has a track-sized bounding
+ *  sphere and is submitted in full, all 42 crates and 9.2 k triangles, into a
+ *  55 m shadow box that usually contains no crates at all. One draw call and a
+ *  full geometry upload for a guaranteed-empty result.
+ *
+ *  This fixes both at once. Sets that never move are baked flat — instance
+ *  transform folded into the vertices — and re-bucketed by (material, world
+ *  grid cell). So twelve painted-timber sets spanning the whole circuit become
+ *  a handful of per-cell meshes with tight bounding spheres: far fewer draws,
+ *  and the ones that remain are cullable for the first time.
+ *
+ *  Nothing is removed. Every instance of every set survives, at the same
+ *  transform, with the same material and the same per-instance tint — the tint,
+ *  the atlas cell and the LOD distance simply become per-VERTEX attributes
+ *  carrying a constant across each baked instance, which is exactly what the
+ *  vertex shader read out of the per-instance attribute before.
+ *
+ *  Two patches are deliberately not supported, and `InstSet.isStatic` refuses
+ *  any set that uses them: `patchWind` reads the instance scale out of
+ *  `instanceMatrix`, and `patchBob` rotates about the instance origin. Neither
+ *  survives being baked flat, so foliage, cloth, crowd and boats stay instanced.
+ *  `patchLod` is guarded by `#ifdef USE_INSTANCING` and simply stops applying,
+ *  which is the intended trade: these props are now cullable by cell instead.
+ * ============================================================================
+ */
+
+const _mm = new THREE.Matrix3();
+const _mv = new THREE.Vector3();
+
+/**
+ * Edge of the world-space bucketing grid, metres.
+ *
+ * This is a straight trade between draw calls and culling. One cell for the
+ * whole circuit is the fewest possible draws but nothing can ever be rejected;
+ * 40 m cells cull beautifully and hand back all the draw calls that were just
+ * saved. 150 m is a little over the length of circuit the chase camera can see
+ * at once, so a typical frame touches two or three cells per material while the
+ * 55 m shadow box usually touches one.
+ */
+const STATIC_CELL = 400;
+
+interface StaticBucket {
+  mat: THREE.Material;
+  cast: boolean;
+  vc: boolean;
+  pos: number[]; nrm: number[]; uv: number[]; col: number[];
+  tint: number[]; iuv: number[]; lod: number[]; org: number[];
+  idx: number[]; base: number;
+  names: Set<string>;
+}
+
+/**
+ * Bakes every static set in `sets` into merged meshes, one per material per
+ * grid cell. Sets that fail `isStatic` are returned in `kept` for the caller to
+ * build as InstancedMeshes exactly as before.
+ *
+ * `castOf` decides shadow casting per set; sets that disagree are bucketed
+ * apart, because `castShadow` is a property of the mesh and cannot be mixed.
+ */
+export function mergeStaticSets(
+  sets: InstSet[],
+  castOf: (name: string) => boolean,
+  cell = STATIC_CELL,
+): { merged: THREE.Mesh[]; kept: InstSet[] } {
+  const merged: THREE.Mesh[] = [];
+  const kept: InstSet[] = [];
+  const buckets = new Map<string, StaticBucket>();
+  const matKey = new Map<THREE.Material, number>();
+
+  for (const set of sets) {
+    if (!set.isStatic || set.count === 0) { kept.push(set); continue; }
+    const s = set.snapshot();
+    const g = s.geo;
+    const p = g.attributes.position;
+    if (!p) { kept.push(set); continue; }
+
+    const n = g.attributes.normal;
+    const u = g.attributes.uv;
+    const c0 = g.attributes.color;
+    const index = g.index;
+    const vc = (s.mat as { vertexColors?: boolean }).vertexColors === true;
+    const cast = castOf(s.name);
+    if (!matKey.has(s.mat)) matKey.set(s.mat, matKey.size);
+    const mk = matKey.get(s.mat)!;
+
+    for (let inst = 0; inst < s.mats.length; inst++) {
+      const m = s.mats[inst];
+      // Bucket on the instance origin. Props are small next to the cell, so the
+      // origin is a good enough proxy for where the geometry lands.
+      const cx = Math.floor(m.elements[12] / cell);
+      const cz = Math.floor(m.elements[14] / cell);
+      const key = mk + '|' + (cast ? 1 : 0) + '|' + cx + '|' + cz;
+      let b = buckets.get(key);
+      if (!b) {
+        b = {
+          mat: s.mat, cast, vc,
+          pos: [], nrm: [], uv: [], col: [], tint: [], iuv: [], lod: [], org: [],
+          idx: [], base: 0, names: new Set(),
+        };
+        buckets.set(key, b);
+      }
+      b.names.add(s.name);
+      _mm.getNormalMatrix(m);
+
+      const tr = s.useCol ? s.cols[inst * 3] : 1;
+      const tg = s.useCol ? s.cols[inst * 3 + 1] : 1;
+      const tb = s.useCol ? s.cols[inst * 3 + 2] : 1;
+      const ux = s.useUv ? s.uvs[inst * 4] : 1;
+      const uy = s.useUv ? s.uvs[inst * 4 + 1] : 1;
+      const uz = s.useUv ? s.uvs[inst * 4 + 2] : 0;
+      const uw = s.useUv ? s.uvs[inst * 4 + 3] : 0;
+      const lod = s.useLod ? s.lods[inst] : 0;
+      // The instance origin, in the merged geometry's (object) space, so the
+      // baked-flat LOD collapse in `patchLod` has something to scale about.
+      const ox = m.elements[12], oy = m.elements[13], oz = m.elements[14];
+
+      for (let i = 0; i < p.count; i++) {
+        _mv.fromBufferAttribute(p, i).applyMatrix4(m);
+        b.pos.push(_mv.x, _mv.y, _mv.z);
+        if (n) {
+          _mv.fromBufferAttribute(n, i).applyMatrix3(_mm).normalize();
+          b.nrm.push(_mv.x, _mv.y, _mv.z);
+        } else b.nrm.push(0, 1, 0);
+        if (u) b.uv.push(u.getX(i), u.getY(i));
+        else b.uv.push(0, 0);
+        if (vc) {
+          if (c0) b.col.push(c0.getX(i), c0.getY(i), c0.getZ(i));
+          else b.col.push(1, 1, 1);
+        }
+        // The three per-instance channels, flattened to per-vertex constants.
+        // `aUv` in particular must always be written: it is a multiply-add on
+        // the map UVs, and an absent attribute reads (0,0,0,1) in GL, which
+        // would collapse every texture in the batch onto one texel.
+        b.tint.push(tr, tg, tb);
+        b.iuv.push(ux, uy, uz, uw);
+        b.lod.push(lod);
+        b.org.push(ox, oy, oz);
+      }
+      if (index) for (let i = 0; i < index.count; i++) b.idx.push(b.base + index.getX(i));
+      else for (let i = 0; i < p.count; i++) b.idx.push(b.base + i);
+      b.base += p.count;
+    }
+  }
+
+  for (const b of buckets.values()) {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(b.pos, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(b.nrm, 3));
+    g.setAttribute('uv', new THREE.Float32BufferAttribute(b.uv, 2));
+    if (b.vc) g.setAttribute('color', new THREE.Float32BufferAttribute(b.col, 3));
+    g.setAttribute('aTint', new THREE.Float32BufferAttribute(b.tint, 3));
+    g.setAttribute('aUv', new THREE.Float32BufferAttribute(b.iuv, 4));
+    g.setAttribute('aLod', new THREE.Float32BufferAttribute(b.lod, 1));
+    g.setAttribute('aOrigin', new THREE.Float32BufferAttribute(b.org, 3));
+    g.setIndex(b.idx);
+    g.computeBoundingSphere();
+    const mesh = new THREE.Mesh(g, b.mat);
+    mesh.name = 'static-' + [...b.names].sort().join('+');
+    mesh.castShadow = b.cast;
+    mesh.receiveShadow = true;
+    mesh.matrixAutoUpdate = false;
+    merged.push(mesh);
+  }
+  return { merged, kept };
 }
 
 // ---------------------------------------------------------------------------
@@ -2619,7 +3013,7 @@ export function patchInstAlpha(mat: THREE.Material) {
 export function patchLod(mat: THREE.Material, u: Shared) {
   patch(mat, 'lod', (sh) => {
     sh.uniforms.uCam = u.uCam;
-    sh.vertexShader = 'attribute float aLod;\nuniform vec3 uCam;\n' + sh.vertexShader.replace(
+    sh.vertexShader = 'attribute float aLod;\nattribute vec3 aOrigin;\nuniform vec3 uCam;\n' + sh.vertexShader.replace(
       '#include <begin_vertex>',
       `#include <begin_vertex>
        #ifdef USE_INSTANCING
@@ -2628,6 +3022,18 @@ export function patchLod(mat: THREE.Material, u: Shared) {
            float dCam = distance(iOrigin, uCam);
            // fade the last 15% of the range by shrinking, then collapse
            transformed *= 1.0 - smoothstep(aLod * 0.86, aLod, dCam);
+         }
+       #else
+         // Same collapse for a set that mergeStaticSets has baked flat. There
+         // is no instanceMatrix to read the origin out of any more, so the
+         // merger writes each baked instance's own origin into aOrigin and the
+         // scale happens about that instead of about the merged geometry's
+         // origin -- which is somewhere out in the middle of a 400 m cell, and
+         // would send every prop in the batch sliding towards it.
+         if (aLod > 0.0) {
+           float dCam = distance((modelMatrix * vec4(aOrigin, 1.0)).xyz, uCam);
+           transformed = aOrigin +
+             (transformed - aOrigin) * (1.0 - smoothstep(aLod * 0.86, aLod, dCam));
          }
        #endif`
     );
@@ -2945,10 +3351,26 @@ export function patchAerial(mat: THREE.Material, u: Shared, near = 220, far = 44
            vec3 fwd = vWorldA - uCam; fwd.y = 0.0;
            vec3 sunXZ = vec3(uSunW.x, 0.0, uSunW.z);
            float az = dot(normalize(fwd + vec3(1e-4, 0.0, 1e-4)), normalize(sunXZ + vec3(1e-4, 0.0, 1e-4)));
-           vec3 haze = mix(uHazeCool, uHazeWarm, smoothstep(-0.45, 0.9, az));
+           // ROUND 2. The azimuth ramp used to open at az = -0.45, i.e. 117
+           // degrees off the sun, so five sixths of the horizon was being
+           // painted with the WARM haze key. Combined with the desaturation
+           // below that is a machine for turning any authored colour into the
+           // same orange, and it is the direct cause of "four separate ranges
+           // at four different distances all render as the same solid orange".
+           // Golden hour genuinely is warm looking INTO the sun and violet-blue
+           // looking away from it, and that contrast across the sky is most of
+           // what makes the hour look like the hour. Narrowed to the near-sun
+           // sector so the ladder gets both ends of it.
+           vec3 haze = mix(uHazeCool, uHazeWarm, smoothstep(0.15, 0.92, az));
            float l = dot(gl_FragColor.rgb, vec3(0.2126, 0.7152, 0.0722));
-           gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(l), h * 0.82);
-           gl_FragColor.rgb = mix(gl_FragColor.rgb, haze, h * 0.40);
+           // 0.82 -> 0.42. Aerial perspective does desaturate, but 82% at the
+           // far band destroyed the band keys BEFORE the haze tint ran, so the
+           // ladder's hue separation never survived to be seen — every layer
+           // arrived as neutral grey and left painted with the same haze. The
+           // band table's own pre-fade (see BACKDROP_BANDS) now carries the
+           // convergence, and it can do it per band, which this cannot.
+           gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(l), h * 0.42);
+           gl_FragColor.rgb = mix(gl_FragColor.rgb, haze, h * 0.34);
          }
          #include <fog_fragment>`
       );
@@ -3272,10 +3694,14 @@ export class MatLib {
   private variantSeq = 0;
 
   /** Foliage materials are built on demand because Foliage owns their textures. */
-  foliage(map: THREE.Texture, opts: { alphaTest?: number; trans?: number; wind?: boolean; lod?: boolean; color?: number } = {}): THREE.MeshStandardMaterial {
+  foliage(map: THREE.Texture, opts: { alphaTest?: number; trans?: number; wind?: boolean; lod?: boolean; color?: number; vcol?: boolean } = {}): THREE.MeshStandardMaterial {
     const m = new THREE.MeshStandardMaterial({
       map,
       color: opts.color ?? 0xffffff,
+      // `vcol` is opt-in: only geometry that actually carries a `color`
+      // attribute may ask for it, and only the palm frond does (its junction
+      // AO). Turning it on globally would render every other foliage set black.
+      vertexColors: opts.vcol === true,
       alphaTest: opts.alphaTest ?? 0.42,
       side: THREE.DoubleSide,
       roughness: 0.72,

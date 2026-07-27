@@ -305,6 +305,27 @@ export class Decals {
     );
   }
 
+  /**
+   * A scorch keyed to an *emissive* effect colour — a drift tier, a boost pad.
+   *
+   * ART_DIRECTION §6 asks for a ground-scorch decal under the drift sparks in
+   * the tier colour, but this layer multiplies: it can only ever darken what it
+   * lands on, and a saturated `#ff9d2e` used directly as a multiplier would
+   * strip the blue out of the tarmac and leave a flat orange stain rather than
+   * a burn. So the emissive colour is converted into a *tint of the darkening*:
+   * a common dark floor plus a hue lift normalised by the colour's strongest
+   * channel, which keeps every tier equally dark and lets the hue live in the
+   * ratio between the channels. Tier 2 leaves a warm brown scorch, tier 1 a
+   * cool one, tier 3 a violet one, and all three read as burnt road.
+   */
+  scorch(p: THREE.Vector3, n: THREE.Vector3, radius: number, col: THREE.Color,
+         now: number, life: number, strength: number, tile: DecalTile = DecalTile.Scorch) {
+    const mx = Math.max(col.r, col.g, col.b) || 1;
+    const k = 0.34 / mx;
+    this.blot(p, n, radius, tile, now, life, strength,
+      0.070 + col.r * k, 0.065 + col.g * k, 0.060 + col.b * k);
+  }
+
   update(time: number) {
     this.material.uniforms.uTime.value = time;
     this.geo.setDrawRange(0, this.used * 6);

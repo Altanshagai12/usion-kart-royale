@@ -82,6 +82,28 @@ const TRICK_MIN_AIR = 0.3;
 const WALL_RESTITUTION = 0.28;
 const KART_RESTITUTION = 0.42;
 
+/**
+ * How far the bodywork may sink below its resting low point while leaning, in
+ * metres, before the lean itself gets scaled back. Whatever is left inside this
+ * budget is taken out by floating the shell, which at three centimetres reads
+ * as suspension travel rather than as a kart on stilts. See `buildLeanHull`.
+ */
+const BODY_SINK_MAX = 0.03;
+/** vertices above this height can never be the lowest point — skip them in the scan */
+const LEAN_SCAN_Y = 0.45;
+/**
+ * Bodywork closer than this to the road at rest is interior detail, not shell.
+ * KartModel's chrome group dips 36 mm *below* the contact plane on the left side
+ * alone (a floor tray, inboard of the sills and hidden by the kart in every
+ * frame). Letting a part that already lives inside the road set the lean limit
+ * costs about three quarters of the lean and, because it is asymmetric, does it
+ * only in left-hand drifts — a far worse artefact than the one being fixed.
+ */
+const LEAN_IGNORE_Y = 0.05;
+const LEAN_SCAN_ROLL = 0.42;
+const LEAN_SCAN_PITCH = 0.28;
+const EMPTY_HULL = new Float32Array(0);
+
 // --- module scratch — zero allocation in the hot path -------------------------
 const _fwdFlat = new THREE.Vector3();
 const _basisR = new THREE.Vector3();
@@ -162,6 +184,14 @@ export class Kart implements IKart {
   tyreSlip = 0;
   /** lateral acceleration in body space, m/s^2 (+ = pushed right) */
   lateralAccel = 0;
+  /**
+   * 0..1 share of the kart's weight currently carried on something other than
+   * tarmac. VFX should scale off-track dust with this rather than treating the
+   * kart as wholly on or wholly off the road: two wheels on a verge is the
+   * common case and it is worth half a dust plume, not none. See
+   * `Suspension.worstSurface` for why the boolean version lies.
+   */
+  offRoadLoad = 0;
 
   readonly suspension = new Suspension(DEFAULT_SUSPENSION);
 
@@ -221,6 +251,33 @@ export class Kart implements IKart {
   /** DriverRig from the model, duck-typed so Driver.ts can churn freely. */
   private driverRig: DriverPoseRig | null = null;
 
+  // --- bodywork ground clearance ---------------------------------------------
+  /**
+   * The bodywork leans about the chassis origin, and that origin sits exactly on
+   * the contact plane: the hardpoint is `restLength + wheelRadius -
+   * restCompression` up the body axis and the spring holds it `restLength +
+   * wheelRadius` above the ground, so at rest `position.y` IS the ground. Which
+   * means every radian of body lean drives the outboard sill straight down into
+   * the road. Measured against this model: 0.30 rad of roll costs 11 mm, but the
+   * 0.36 rad of a drift plus the 0.22 rad of a dive costs 176 mm — most of a
+   * wheel radius of bodywork buried in the surface. Round 1's drift shot is that
+   * exactly, the rear valance sliced off flat by the verge.
+   *
+   * Rather than pick a smaller magic number and hope, the lean is bounded by the
+   * model's own ground clearance. `leanHull` holds the handful of vertices that
+   * can ever be the lowest point of the shell anywhere in the usable roll/pitch
+   * envelope — in practice the floor pan, the two sill corners and the bumper
+   * corners — so the per-frame test is a dozen multiplies rather than a scan of
+   * five thousand vertices. Give the model more clearance and the lean widens on
+   * its own; take clearance away and it tightens. Nothing to re-tune.
+   */
+  private leanHull = EMPTY_HULL;
+  /** the contact plane expressed in the bodywork node's own frame */
+  private leanFloor = 0;
+  private bodyRestY = 0;
+  /** true when the model gave us no separate bodywork group to float */
+  private bodyIsRoot = false;
+
   // fallback rig, for a model that exposes plain named nodes instead
   private driver: THREE.Object3D | null = null;
   private driverHead: THREE.Object3D | null = null;
@@ -258,6 +315,9 @@ export class Kart implements IKart {
     }
 
     this.findDriverRig(built.root);
+    this.bodyIsRoot = this.bodyNode === built.root || this.bodyNode === this.visual;
+    this.bodyRestY = this.bodyNode.position.y;
+    this.buildLeanHull();
 
     this.mass = BASE_MASS * (stats.weightMul || 1);
     this.yawInertia = this.mass * 0.51;
@@ -329,6 +389,99 @@ export class Kart implements IKart {
     if (this.steeringWheel) this.wheelRestZ = this.steeringWheel.rotation.z;
   }
 
+  /**
+   * Reduce the bodywork to the few vertices that can ever be its lowest point
+   * under lean. Runs once per kart at build time; allocation here is fine, the
+   * per-frame path it feeds allocates nothing.
+   *
+   * The reduction is a support-function argument: for a fixed roll and pitch the
+   * height of a vertex is a linear function of it, so the lowest vertex is a
+   * corner of the convex hull and the set of winners over a bounded envelope of
+   * angles is tiny. Sampling the envelope on a grid and keeping every winner
+   * captures that set without having to build a hull.
+   */
+  private buildLeanHull() {
+    const node = this.bodyNode;
+    // The shell rotates about its own origin, which sits `bodyRestY` above the
+    // chassis origin — and the chassis origin is the contact plane by
+    // construction (see the field comment). So in this node's frame the road is
+    // at -bodyRestY, and that, not the shell's resting low point, is what the
+    // bodywork must not go under.
+    this.leanFloor = -this.bodyRestY;
+    node.updateMatrixWorld(true);
+    const inv = new THREE.Matrix4().copy(node.matrixWorld).invert();
+    const local = new THREE.Matrix4();
+    const v = new THREE.Vector3();
+    const pts: number[] = [];
+
+    node.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      if (!(mesh as unknown as { isMesh?: boolean }).isMesh) return;
+      const attr = mesh.geometry?.getAttribute?.('position') as THREE.BufferAttribute | undefined;
+      if (!attr) return;
+      local.multiplyMatrices(inv, mesh.matrixWorld);
+      for (let i = 0; i < attr.count; i++) {
+        v.fromBufferAttribute(attr, i).applyMatrix4(local);
+        if (v.y > LEAN_SCAN_Y) continue; // above the hubs: never the low point
+        if (v.y < this.leanFloor + LEAN_IGNORE_Y) continue; // interior, see above
+        pts.push(v.x, v.y, v.z);
+      }
+    });
+
+    if (pts.length === 0) {
+      this.leanHull = EMPTY_HULL;
+      return;
+    }
+
+    const keep = new Set<number>();
+    const N = 9;
+    for (let a = 0; a < N; a++) {
+      const roll = LEAN_SCAN_ROLL * (-1 + (2 * a) / (N - 1));
+      const sr = Math.sin(roll), cr = Math.cos(roll);
+      for (let b = 0; b < N; b++) {
+        const pitch = LEAN_SCAN_PITCH * (-1 + (2 * b) / (N - 1));
+        const sp = Math.sin(pitch), cp = Math.cos(pitch);
+        let lo = Infinity;
+        let at = 0;
+        for (let i = 0; i < pts.length; i += 3) {
+          const y = -pts[i] * sr + (pts[i + 1] * cp - pts[i + 2] * sp) * cr;
+          if (y < lo) { lo = y; at = i; }
+        }
+        keep.add(at);
+      }
+    }
+
+    const hull = new Float32Array(keep.size * 3);
+    let j = 0;
+    for (const i of keep) {
+      hull[j++] = pts[i];
+      hull[j++] = pts[i + 1];
+      hull[j++] = pts[i + 2];
+    }
+    this.leanHull = hull;
+  }
+
+  /**
+   * Height of the lowest point of the bodywork for a given lean, in chassis
+   * space — where y = 0 is the contact plane.
+   *
+   * `updateVisuals` poses the shell with Euler order ZYX as (pitch, 0, -roll),
+   * whose second row with no yaw is exactly the expression below. Kept in sync
+   * with that call by hand; there is no cheaper way to ask three.js for one row.
+   */
+  private lowestBody(roll: number, pitch: number): number {
+    const h = this.leanHull;
+    if (h.length === 0) return 0;
+    const sr = Math.sin(roll), cr = Math.cos(roll);
+    const sp = Math.sin(pitch), cp = Math.cos(pitch);
+    let lo = Infinity;
+    for (let i = 0; i < h.length; i += 3) {
+      const y = -h[i] * sr + (h[i + 1] * cp - h[i + 2] * sp) * cr;
+      if (y < lo) lo = y;
+    }
+    return lo;
+  }
+
   // ---------------------------------------------------------------------------
   // placement
   // ---------------------------------------------------------------------------
@@ -361,6 +514,7 @@ export class Kart implements IKart {
     this.squashTime = 0;
     this.trickPhase = 0;
     this.trickArmed = false;
+    this.offRoadLoad = 0;
     this.badSurfaceTime = 0;
     this.suspension.reset();
     this.updateBasis(1);
@@ -464,13 +618,27 @@ export class Kart implements IKart {
     }
 
     // --- surface / progress / respawn watchdogs ------------------------------
-    this.surface = grounded ? this.suspension.dominantSurface : centreSurface;
-    if (this.surface === Surface.Boost && grounded) this.applyBoostPad(ctx);
+    // Two different questions, and round 1 answered both with one number.
+    //
+    // `holding` is what is bearing the kart's weight: the right input for the
+    // out-of-bounds watchdog, which must not fire because one wheel dangled over
+    // a line. `surface` is what the kart is visibly interacting with, which is
+    // what VFX, audio and the AI actually want — and the two diverge precisely
+    // when the kart drops a pair of wheels off the kerb, because it then rolls
+    // onto the pair still on tarmac and the heaviest-loaded wheel reports Road
+    // while half the kart ploughs grass. That silence is the missing off-track
+    // dust in the drift shot.
+    const holding = grounded ? this.suspension.dominantSurface : centreSurface;
+    this.surface = grounded ? this.suspension.worstSurface : centreSurface;
+    this.offRoadLoad = grounded ? this.suspension.offRoadLoad : 0;
+    // One wheel on the strip is a hit. The pad is 1-2 m wide and asking the
+    // player to centre the most heavily loaded corner on it is not a skill test.
+    if (grounded && this.suspension.boostContact) this.applyBoostPad(ctx);
 
-    if (grounded && probe.edgeRatio < 1.25 && this.surface !== Surface.Water && this.surface !== Surface.OffTrack) {
+    if (grounded && probe.edgeRatio < 1.25 && holding !== Surface.Water && holding !== Surface.OffTrack) {
       this.lastGoodT = this.t;
       this.badSurfaceTime = 0;
-    } else if (this.surface === Surface.Water || this.surface === Surface.OffTrack) {
+    } else if (holding === Surface.Water || holding === Surface.OffTrack) {
       this.badSurfaceTime += dt;
     }
     this.watchdog(ctx);
@@ -990,9 +1158,30 @@ export class Kart implements IKart {
     // Exaggerate, then clamp — an unclamped 2.3x on a fully rolled chassis
     // would put a wheel through the bodywork.
     let roll = clamp(sus.roll * 2.3, -0.3, 0.3);
-    const pitch = clamp(sus.pitch * 1.7, -0.22, 0.22);
+    let pitch = clamp(sus.pitch * 1.7, -0.22, 0.22);
     // Reinforce the physical outward lean of a slide rather than fighting it.
     if (this.driftDir !== 0) roll = clamp(roll - this.driftDir * 0.07, -0.36, 0.36);
+
+    // --- keep the shell out of the road -------------------------------------
+    // Measured on this model, the lean asked for above costs 145 mm of the
+    // 145 mm of clearance the shell has: at full drift roll it eats 92 mm, and
+    // combined with a full dive it is 176 mm — the rear valance and the front
+    // bumper corner both end up under the surface. Both channels are contracted
+    // by the same factor rather than clamped apart, so a kart braking hard
+    // mid-drift keeps the *shape* of its pose and only loses the excess.
+    let sink = this.leanFloor - this.lowestBody(roll, pitch);
+    if (sink > BODY_SINK_MAX) {
+      let lo = 0;
+      let hi = 1;
+      for (let it = 0; it < 5; it++) {
+        const k = (lo + hi) * 0.5;
+        if (this.leanFloor - this.lowestBody(roll * k, pitch * k) <= BODY_SINK_MAX) lo = k;
+        else hi = k;
+      }
+      roll *= lo;
+      pitch *= lo;
+      sink = this.leanFloor - this.lowestBody(roll, pitch);
+    }
 
     // Trick: a full rotation over the airtime, eased so it lands flat.
     let trickRoll = 0;
@@ -1013,6 +1202,11 @@ export class Kart implements IKart {
 
     _euler.set(pitch + (sameNode ? trickPitch : 0), 0, -roll + (sameNode ? trickRoll : 0), 'ZYX');
     this.bodyNode.rotation.copy(_euler);
+    // Float off whatever penetration survived the contraction. Skipped when the
+    // model never separated its bodywork, because there the "body" carries the
+    // wheels too and lifting it would take them off the road to fix a shell that
+    // is on it.
+    if (!this.bodyIsRoot) this.bodyNode.position.y = this.bodyRestY + (sink > 0 ? sink : 0);
 
     // Squash & stretch: flatten on a hard landing, stretch under boost.
     const sq = this.squashTime > 0 ? this.squashTime / Math.max(0.01, this.squashLen) : 0;
@@ -1159,6 +1353,8 @@ export class Kart implements IKart {
     this.groundTime = 1;
     // Brief grace so you are not immediately re-hit at the drop point.
     this.invulnTime = 1.8;
+    this.offRoadLoad = 0;
+    this.surface = Surface.Road;
     this.suspension.reset();
     this.updateBasis(1);
   }

@@ -462,19 +462,16 @@ export class Race implements IRace {
     // numeral on screen to explain it.
     if (now !== prev && now >= 0 && now <= 3) {
       ctx.bus.emit({ type: 'countdown', n: now });
-      // On the last beat the field chirps its tyres. `hop` is the ground-puff
-      // channel the effects layer already owns, and a puff at each kart's
-      // contact patch on "1" is the one bit of pre-start energy the director
-      // can raise without reaching into anyone else's system. Limited to the
-      // karts near the player so the grid does not fire eight of everything at
-      // a camera that can only see three of them.
-      if (now === 1) {
-        const p = this.player.position;
-        for (const k of this.karts) {
-          if (k !== this.player && k.position.distanceToSquared(p) > 42 * 42) continue;
-          ctx.bus.emit({ type: 'hop', kart: k });
-        }
-      }
+      // The field blips its throttle on every light, not just the last one.
+      //
+      // `hop` is the ground-puff channel the effects layer already owns, and a
+      // puff at each kart's contact patch is the one bit of pre-start energy
+      // this system can raise without reaching into anyone else's. Firing it
+      // only on "1" meant the grid sat dead through "3" and "2" — three quarters
+      // of the countdown, and the exact window the establishing shot is taken
+      // in. Three staggered rev blips read as eight running engines waiting for
+      // the lights; one puff at the end reads as a car park.
+      if (now >= 1) this.revBlip(ctx);
     }
     // Published clamped: the lead-in beat is an implementation detail, and a
     // readout of "5" on the lights would be nonsense.
@@ -484,18 +481,16 @@ export class Race implements IRace {
     this.countdownT = 0;
     this.state = RaceState.Racing;
     this.raceTime = 0;
-    const near = this.player.position;
+    // Every kart breaks traction leaving the line, whatever it did with the
+    // throttle, so the whole field launches inside a wall of its own dust
+    // rather than pulling away off clean tarmac. Twice, a frame apart in
+    // intent: the GO burst is the loudest thing the grid does.
+    this.revBlip(ctx);
+    this.revBlip(ctx);
     for (let i = 0; i < this.karts.length; i++) {
       const k = this.karts[i];
       const p = this.prog[i];
       p.lapStart = 0;
-      // Every kart breaks traction leaving the line, whatever it did with the
-      // throttle. Same ground-puff channel as the chirp on "1", gated to the
-      // karts the camera can actually see, so the field launches inside a wall
-      // of its own dust instead of pulling away off clean tarmac.
-      if (k === this.player || k.position.distanceToSquared(near) < 42 * 42) {
-        ctx.bus.emit({ type: 'hop', kart: k });
-      }
       const hold = k.isPlayer ? p.hold : this.aiRocketHold(k);
       if (hold > 0.02 && hold < ROCKET_WINDOW) {
         // perfect launch
@@ -507,6 +502,21 @@ export class Race implements IRace {
         ctx.bus.emit({ type: 'ui', name: 'burnout' });
       }
       p.hold = 0;
+    }
+  }
+
+  /**
+   * A puff at every visible kart's contact patch — a throttle blip on the grid.
+   *
+   * Gated to the karts near the player so a grid of eight does not fire eight
+   * of everything at a camera that can see three of them, and the player is
+   * always included because the chase camera is always looking at them.
+   */
+  private revBlip(ctx: Ctx) {
+    const p = this.player.position;
+    for (const k of this.karts) {
+      if (k !== this.player && k.position.distanceToSquared(p) > 42 * 42) continue;
+      ctx.bus.emit({ type: 'hop', kart: k });
     }
   }
 

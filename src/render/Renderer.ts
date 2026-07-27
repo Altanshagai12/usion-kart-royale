@@ -169,6 +169,16 @@ export class RenderPipeline implements System {
       this.composer.removeAllPasses();
     }
 
+    // The composer's input buffer is the only place the scene is rasterised,
+    // so it is the only place multisampling can do anything.
+    //
+    // This used to read `ssao ? 0 : msaa`, on the belief that N8AOPostPass
+    // re-renders the scene into a private target and discards the composer's
+    // colour buffer. That is true of `N8AOPass`; `N8AOPostPass` reads the
+    // composer's `inputBuffer` as its scene colour and composites onto it. So
+    // zeroing this dropped MSAA on exactly the tier that asks for it — and the
+    // line in PostFX that was supposed to take over threw on a missing field
+    // and killed the whole effect chain with it (see PostFX.build).
     this.composer.multisampling = this.msaaSamples();
 
     try {

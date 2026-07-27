@@ -545,13 +545,21 @@ void main() {
 
 #ifdef ADDITIVE
   // Hot core. The sprite mask doubles as "how deep into the spark are we", so
-  // squaring it gives a tight centre and a wide fringe. Pulling the weak
-  // channels up to the strongest one desaturates the core toward white without
-  // touching its energy: the middle blows out and blooms neutral, the falloff
-  // keeps the whole of the tier hue. Off for every tile except the spark core
-  // and the streak (vHot), so glow halos still carry flat tier colour.
+  // cubing it gives a tight centre and a wide fringe. Pulling the weak channels
+  // up to the strongest one desaturates the core toward white without touching
+  // its energy. Off for every tile except the spark core and the streak (vHot),
+  // so glow halos still carry flat tier colour.
+  //
+  // Round 5: cubed, not squared, and 0.45 rather than 0.85. Squared-times-0.85
+  // reached 0.6 desaturation by 40% of the sprite radius, and because the
+  // stretched streak tile holds a high mask value all the way down its spine,
+  // an *entire tier-2 spark* arrived at the tone mapper as neutral white. The
+  // drift review is unambiguous: the sparks read as fireflies with no hue in
+  // them at all. A cubed mask confines the whitening to the genuine pinpoint
+  // and leaves the streak body carrying #ff9d2e.
   float mx = max(max(rgb.r, rgb.g), rgb.b);
-  rgb = mix(rgb, vec3(mx), vHot * tex.a * tex.a * 0.85);
+  float hotMask = tex.a * tex.a * tex.a;
+  rgb = mix(rgb, vec3(mx), vHot * hotMask * 0.45);
 #endif
 
 #ifdef LIT
@@ -578,10 +586,25 @@ void main() {
   // passes through the least vapour, so it is where backlight leaks through.
   float rim = pow(clamp(dot(vSprite, vSprite), 0.0, 1.0), 1.6) * clamp(0.35 - ndl, 0.0, 1.0);
   vec3 amb = mix(uBounceColor, uSkyColor, N.y * 0.5 + 0.5);
-  // Ambient pulled down and the key pushed up: with the two at parity every
-  // puff landed on the same flat mid-grey no matter which way the sun was, and
-  // smoke with no warm/cool split has no volume.
-  rgb *= amb * 0.62 + uSunColor * (wrapD * 1.05 + fwd * 1.15 + rim * 1.4);
+  // KEY AND FILL, NOT KEY PLUS AMBIENT.
+  //
+  // The previous form was amb * 0.62 + sun * (...), i.e. a constant ambient
+  // floor with the key added on top. Two things follow from that and both of
+  // them are visible in the pack/wide review frames: the sum on the lit side
+  // lands above 1.0 for a puff whose base colour is already near 0.8, so the
+  // sun side clips and loses all its internal form; and the shadow side never
+  // falls below the flat achromatic floor, so there is no cool lobe for the
+  // warm one to read against. A puff with no value ratio across it is a
+  // cotton-wool decal, which is exactly the note.
+  //
+  // Fill is now *complementary* to the key: it is strongest where the key is
+  // absent. That gives a genuine two-lobe split — roughly 2.5x brighter and
+  // distinctly warm on the sun side, cool sky-blue in the shadow — with the lit
+  // side landing just under clip so the billow keeps its density variation.
+  // ART_DIRECTION §6: the smoke must catch the sun; §2: shadows lean cool.
+  vec3 key = uSunColor * (wrapD * 0.95 + fwd * 1.05 + rim * 1.25);
+  vec3 fill = amb * (0.30 + 0.34 * (1.0 - wrapD));
+  rgb *= key + fill;
 #endif
 
   float soft = 1.0;

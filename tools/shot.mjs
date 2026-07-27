@@ -67,8 +67,20 @@ const SHOTS = [
 
 /** seconds of pinned running after the mark is reached, before the shutter */
 const HOLD = 0.62;
-/** how long to wait for a kart to drive onto its mark before giving up, seconds */
-const APPROACH_TIMEOUT = 30;
+/**
+ * How long to wait for a kart to drive onto its mark before giving up, seconds.
+ *
+ * A mark arrives once per lap, so this only has to cover a lap — but "a lap"
+ * is not the lap time on the timing screen. The AI's pace through the slow,
+ * congested sections runs as low as 10 m/s, and a kart that has been shuffled
+ * off the racing line by the field placed behind it can take upwards of sixty
+ * seconds to get round. Thirty covered a clean lap and nothing else, which
+ * meant a single bad approach failed the shot outright rather than costing it
+ * one more lap. This is a ceiling, not a cost: every shot that lands on its
+ * mark first time (all of them, now that arrival is detected by crossing)
+ * spends about five seconds here regardless.
+ */
+const APPROACH_TIMEOUT = 75;
 /**
  * The drift shot gets its own, longer budget. It is not waiting on an approach
  * — a mark arrives once per lap and thirty seconds always covers one — it is
@@ -122,7 +134,7 @@ const AI_CRUISE = 36;
  * If the art direction ever goes genuinely night-dark this threshold has to move
  * — that is what the recorded `darkFrac` in the report is for.
  */
-const CAPTURE_ATTEMPTS = 6;
+const CAPTURE_ATTEMPTS = 12;
 /** Fraction of the frame below `DARK_LEVEL` that marks a capture as torn. */
 const TORN_DARK_FRAC = 0.05;
 /** Brightness (0-255 mean of RGB) at or below which a pixel reads as unwritten. */
@@ -179,9 +191,31 @@ async function captureAttempts(page, file) {
       writeFileSync(file, buf);
       return { ...m, torn: false, attempts: attempt };
     }
-    // Let the compositor produce a fresh frame before trying again.
-    await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
-    await new Promise((r) => setTimeout(r, 120));
+    // Let the compositor produce a fresh frame before trying again — and make
+    // sure it is genuinely fresh.
+    //
+    // Two frozen rAFs were not enough on their own: `corner` and `boost` each
+    // came back torn after all six attempts in consecutive runs, the same
+    // horizontal seam at the same place every time, which is not what an
+    // independent one-in-five artefact looks like. Measured directly, a frozen
+    // page tears far *less* than a running one (10 clean captures out of 10
+    // frozen, against 2 torn out of 10 running), so the freeze is not the
+    // cause — but it does mean every retry is compositing an identical scene,
+    // and a wedged surface has no reason to resolve itself.
+    //
+    // Letting one real frame through between attempts gives the compositor new
+    // content to push. It costs a single frame of simulation, about a metre of
+    // road, which is inside the tolerance the mark is held to anyway — as
+    // against the whole point of the freeze, which was to stop retries walking
+    // the kart seconds down the circuit.
+    await page.evaluate(() => new Promise((r) => {
+      window.__freeze = false;
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        window.__freeze = true;
+        requestAnimationFrame(r);
+      }));
+    }));
+    await new Promise((r) => setTimeout(r, 150));
   }
   writeFileSync(file, best.buf);
   return { ...best, torn: true, attempts: CAPTURE_ATTEMPTS };
@@ -293,6 +327,48 @@ const main = async () => {
         k.velocity.copy(k.forward).multiplyScalar(s.speed);
       });
 
+      /**
+       * Is this kart actually on the circuit, with its wheels on it?
+       *
+       * Shared deliberately: the drift override uses it to decide a slide is
+       * worth holding, and the accept gate uses it to decide a slide is worth
+       * photographing. When those two disagreed, the override kept a slide
+       * alive that the gate would never accept.
+       *
+       * The contact count is not belt-and-braces, it is the whole test.
+       * `Suspension.update` assigns `dominantSurface = Surface.Road` as its
+       * per-frame default and only overwrites it from a wheel that is actually
+       * touching something, so a kart with no wheels on the ground reports
+       * Road — the surface meaning "on the circuit". An airborne kart is
+       * therefore indistinguishable from one on the racing line if you ask
+       * `dominantSurface` alone, and this stretch of the circuit runs along a
+       * seafront: a slide that ran wide there launched off the edge, reported
+       * Road all the way out, kept its drift held and its tier-2 charge, and
+       * was accepted. The shot came back as a kart flying over open sea with
+       * the island skyline behind it and no road anywhere in frame — a frame
+       * the report described as a tier-2 slide on the circuit.
+       */
+      window.__onCircuit = (k) => {
+        const sus = k.suspension;
+        if (!sus || !(sus.contacts > 0)) return false;
+        const surf = sus.dominantSurface;
+        return surf === 0 /* Road */ || surf === 4 /* Boost */;
+      };
+
+      /**
+       * Signed distance from the centreline, in units of the road's half-width.
+       * 0 is the middle, ±1 the road edge, ±1.3 out on the kerbs.
+       */
+      const _laneSmp = track.sample(0);
+      window.__laneOffset = (k) => {
+        track.sample(k.t, _laneSmp);
+        const c =
+          (k.position.x - _laneSmp.pos.x) * _laneSmp.binormal.x +
+          (k.position.y - _laneSmp.pos.y) * _laneSmp.binormal.y +
+          (k.position.z - _laneSmp.pos.z) * _laneSmp.binormal.z;
+        return c / Math.max(1, _laneSmp.halfWidth);
+      };
+
       // A drift cannot be set from out here: `updateDriftState` releases any
       // slide whose button is no longer held, and releasing a charged one fires
       // the mini-turbo — which is why writing `driftDir` produced a boost flame
@@ -339,27 +415,51 @@ const main = async () => {
       // the drive input is screen-right), so closing a +binormal offset here is
       // a negative steer, the opposite of the AI's own cross-track term.
       if (s.drift) {
-        const smp = track.sample(0);
-        // signed offset from the centreline, in units of the road's half-width
-        const offset = () => {
-          track.sample(player.t, smp);
-          const c =
-            (player.position.x - smp.pos.x) * smp.binormal.x +
-            (player.position.y - smp.pos.y) * smp.binormal.y +
-            (player.position.z - smp.pos.z) * smp.binormal.z;
-          return c / Math.max(1, smp.halfWidth);
-        };
+        const offset = () => window.__laneOffset(player);
+        // How long a live slide may sit off the circuit before the override
+        // gives up on it, ms. Long enough that clipping a kerb — which the
+        // racing line does on purpose — is not treated as leaving the road.
+        const OFF_ROAD_GRACE = 350;
+        let offSince = 0;
+
         race.driveOverride = (cmd) => {
-          if (player.driftDir === 0) return;
-          // Never voluntarily let go. Releasing is what cashes the mini-turbo,
-          // and handing the button back the instant tier 2 landed did exactly
-          // that: the AI dropped it, `releaseDrift` fired, and the shutter — a
-          // round-trip later — opened on a boost flame behind a kart pointing
-          // dead straight. Hold it until the frame is in the bag.
+          if (player.driftDir === 0) { offSince = 0; return; }
+
+          // Abandon a slide that has left the circuit, rather than holding it
+          // there.
+          //
+          // "Never let go" was right about the mini-turbo and wrong about the
+          // barrier. The override held the button unconditionally, so a slide
+          // that ran wide into the outside wall kept drifting *against* the
+          // wall: the hunt logged the kart pinned at u = -1.37 half-widths on
+          // grass, charging to tier 3, for forty seconds at a stretch, while
+          // the accept gate correctly refused every frame of it. The steering
+          // correction cannot recover that — the kart is held by a collision,
+          // and a slide halves its steering authority anyway — so the hunt just
+          // burned its whole budget on one dead slide. That is how the shot
+          // failed with "10 slides, best tier 3, 57 rejected off-road": ten
+          // entries, and the good ones never came round because the bad ones
+          // never ended.
+          //
+          // Letting go does cash the mini-turbo, which is the thing the comment
+          // below rightly refuses to do — but only for a slide that was never
+          // going to be the shot. The AI recovers to the racing line within a
+          // second or two and re-enters at the next corner, which turns one
+          // 40-second dead end into several fresh attempts. Measured over the
+          // same hunt, tier-2 frames went from 196-of-305 rejected for surface
+          // to the first tier-2 slide being accepted outright.
+          const now = performance.now();
+          if (window.__onCircuit(player)) offSince = 0;
+          else if (!offSince) offSince = now;
+          if (offSince && now - offSince > OFF_ROAD_GRACE) { cmd.drift = false; return; }
+
+          // Never voluntarily let go of a slide that is still on the road.
+          // Releasing is what cashes the mini-turbo, and handing the button back
+          // the instant tier 2 landed did exactly that: the AI dropped it,
+          // `releaseDrift` fired, and the shutter — a round-trip later — opened
+          // on a boost flame behind a kart pointing dead straight. Hold it until
+          // the frame is in the bag.
           cmd.drift = true;
-          // Steering it is only needed while the charge is building; past tier
-          // 2 the shot is banked and the lock would just start the circles.
-          if (player.driftTier >= 2) return;
 
           // Lock in only until the slide is as sideways as charging actually
           // rewards. `driftCharge` saturates at 0.39 rad of slip and the drift
@@ -371,9 +471,49 @@ const main = async () => {
           // frame and then out of it. That is the shot that came back as an
           // empty road with the kart behind the speedo.
           const beta = Math.abs(player.driftBeta || 0);
-          const lock = Math.max(0, Math.min(1, (0.38 - beta) / 0.15)) * 0.5;
-
           const u = offset();
+
+          // The lock is subordinate to the road, and fades out before the road
+          // does.
+          //
+          // Held at full strength it does not merely risk running wide, it
+          // *settles* wide: the lock (up to 0.5 of steer toward driftDir) and
+          // the road-edge correction below (gain 1.5 on the overshoot past one
+          // half-width) are opposed linear terms, so they balance, and they
+          // balance at |u| = 1 + 0.5/1.5 = 1.33 half-widths — which is past the
+          // kerb and onto the grass. That equilibrium is the whole of the drift
+          // shot's flakiness: the hunt logged the kart pinned at u = -1.37 on
+          // surface Grass for seconds at a stretch, charging happily to tier 3
+          // while `onCircuit()` refused every frame of it. 196 of 305 tier-2
+          // frames in one hunt were rejected for surface, all of them from that
+          // one parked position. It is not a slide that ran wide and would come
+          // back; it is a slide the override was actively holding off the road.
+          //
+          // Fading the lock out leaves the correction unopposed before the kerb
+          // is reached, so the only stable place for the kart is on the road.
+          //
+          // It is tempting to pull the balance point further in — the kerb is
+          // not the prettiest place to photograph a slide — but the drift is
+          // not a free variable. Moving the fade to 0.6-1.0 and the correction's
+          // deadband to 0.85 to centre the kart on the asphalt destabilised the
+          // slide instead of relocating it: the correction now opposes the lock
+          // over most of its range, the two fight, and the tyre model answers
+          // with slip running to 0.93 rad — a spin, not a drift. Measured, that
+          // version produced 44 tier-2 frames in a 120-second hunt against 305,
+          // and one usable frame against eighty. The kerb is where a two-second
+          // charge on this circuit ends up; the gate's job is to catch the ones
+          // that are still on the road and framed, not to relocate the physics.
+          const road = Math.max(0, Math.min(1, (1.3 - Math.abs(u)) / 0.4));
+          // Past tier 2 the shot is banked and the lock would only start the
+          // circles, so it goes to zero there regardless. The road correction
+          // does NOT: dropping the whole override at tier 2 is what let a slide
+          // that reached tier 2 already off-road stay there, with nothing
+          // steering it back and the accept gate refusing it until the AI gave
+          // up the slide entirely.
+          const lock = player.driftTier >= 2
+            ? 0
+            : Math.max(0, Math.min(1, (0.38 - beta) / 0.15)) * 0.5 * road;
+
           const wide = Math.max(0, Math.abs(u) - 1) * Math.sign(u);
           cmd.steer = Math.max(-1, Math.min(1,
             cmd.steer + player.driftDir * lock - Math.max(-1, Math.min(1, wide)) * 1.5));
@@ -421,10 +561,13 @@ const main = async () => {
       // handling model itself uses to decide the kart has left the road, which
       // makes it the same question the frame is really asking.
       //   0 Road, 4 Boost = on the circuit; Dirt/Grass/Sand/OffTrack/Water are not.
-      const onCircuit = () => {
-        const s = k.suspension?.dominantSurface;
-        return s === 0 || s === 4;
-      };
+      //
+      // ...but ask it about a kart that is actually touching the ground, which
+      // is why this shares `__onCircuit` with the drift override rather than
+      // reading `dominantSurface` itself. See the note on that helper: the
+      // surface field's per-frame default is Road, so an airborne kart answers
+      // this question "yes" no matter where it is flying.
+      const onCircuit = () => window.__onCircuit(k);
 
       // ...and on the kart being somewhere worth pointing a camera at. A slide
       // is a composition as much as a state: the rig deliberately throws the
@@ -435,10 +578,29 @@ const main = async () => {
       // that reads is the one where the kart is still in the frame's business,
       // so hold out for it: the hunt gets several corners, and the ones that
       // throw the kart the other way frame it properly.
+      //
+      // The original bounds (±0.5 in x, -0.72 in y) only kept the kart on
+      // screen, and "on screen" is not the same as "in shot": they still admit
+      // the subject wedged into a bottom corner, which is precisely the frame
+      // that came back — the kart tucked into the bottom-left behind the
+      // barrier and the MARINA sign, three quarters of the image an empty
+      // street. Pulling them in to ±0.42 and -0.62 asks for a slide the rig has
+      // actually composed, and there is no shortage to choose from: the same
+      // hunt logged eighty-odd frames that were on the circuit and framed, so
+      // the budget can afford to be choosy about which one it takes.
+      //
+      // ±0.42 / -0.62 was still not choosy enough. It bought a slide that was
+      // on the road and inside the frame and *behind the scenery*: down at the
+      // road edge in the town section, with the verge grass and the kerb
+      // between the lens and the kart, which is the "camera inside geometry"
+      // failure by another route. The subject of a hero shot belongs in the
+      // middle third, so that is what this asks for now — the tighter the
+      // window, the further the hunt walks to find a corner that delivers it,
+      // and the budget is there to be spent.
       const framed = () => {
         const n = k.position.clone().project(ctx.camera);
         if (!(n.z < 1)) return false;                 // behind the camera
-        if (Math.abs(n.x) > 0.5 || n.y < -0.72) return false;
+        if (Math.abs(n.x) > 0.3 || n.y < -0.5) return false;
         // the speedo's corner, in NDC
         return !(n.x > 0.3 && n.y < -0.45);
       };
@@ -448,13 +610,74 @@ const main = async () => {
       const mark = ((s.t - (s.speed * hold) / len) % 1 + 1) % 1;
       const gap = (a, b) => Math.abs(((a - b + 0.5) % 1 + 1) % 1 - 0.5);
 
+      // Arrival is a *crossing*, not a proximity.
+      //
+      // This used to be `gap(k.t, mark) < 0.004` — a 6.4 m window on this
+      // circuit, tested once per animation frame. That is a race between the
+      // window and the frame time, and the frame time wins often enough to
+      // matter: the capture runs at ~30 fps on SwiftShader, which is 1 m of
+      // road per frame at racing pace and perfectly safe, but single frames of
+      // 170-250 ms are routine in the scenery-dense sections, and at 28 m/s
+      // such a frame steps 5-7 m — straight over the window without ever
+      // landing in it. That is exactly how `scenery` failed while the kart drove
+      // right through its mark: the shot then chased the mark for the rest of
+      // the lap, timed out, and fired the shutter wherever the kart happened to
+      // be. It came back a duplicate of `wide`, two shots of the same town
+      // corner in a set of ten, and nothing in the report said so beyond one
+      // warning line.
+      //
+      // Testing whether the mark lies in the arc travelled since the previous
+      // frame cannot miss it however long the frame took, and it fires within
+      // one frame of the mark rather than up to 6.4 m early. The proximity test
+      // is kept only as an OR for the degenerate case: a kart barely moving, or
+      // one that spawned already inside the window, produces no arc to cross.
+      //
+      // A crossing is *travel*, though, and travel is bounded by how fast a
+      // kart can move in one frame. `k.t` is not continuous: it comes from
+      // `Track.probe`, whose hinted ±45 m search falls back to a global nearest
+      // station when the kart strays far enough from the hint, and a kart that
+      // ends up in the bay gets re-stationed somewhere else on the circuit
+      // entirely. Instrumenting the tunnel section caught one directly —
+      // t 0.7869 -> 0.9688 in a single frame, speed 0, surface Water — and an
+      // unbounded crossing test counts that 0.18-lap teleport as travel, so any
+      // mark inside the jump "arrives". That is what produced a `corner` shot
+      // reported on-mark at t=0.788: the kart drowned, its station snapped
+      // forward across the mark, and the shutter fired on a drowned kart with
+      // the camera under the water. Sixty metres is about twice what the
+      // fastest boost lap covers in the longest frame observed, and six times
+      // under the smallest snap.
+      const MAX_ARC = 60 / len;
+      let prevT = k.t;
+      const crossedMark = () => {
+        const arc = ((k.t - prevT) % 1 + 1) % 1;
+        // 0 is stationary; anything past MAX_ARC is a discontinuity, not a
+        // crossing — which covers the backwards wrap of a respawn rewinding
+        // `t` to `lastGoodT` as well as a forward re-station.
+        if (arc === 0 || arc > MAX_ARC) return false;
+        return ((mark - prevT) % 1 + 1) % 1 <= arc;
+      };
+
       // A failed hunt used to report only where it gave up, which says nothing
       // about why. Track what the kart actually managed so the warning can.
-      const seen = { slides: 0, maxTier: 0, offRoadRejects: 0 };
+      const seen = { slides: 0, maxTier: 0, offRoadRejects: 0, markPassesOffRoad: 0 };
       let sliding = false;
+      let closest = 1;
+
+      // Every shot wants a kart that is on the circuit, not only the drift one.
+      // A kart in the bay or halfway up a bank crosses its mark exactly like a
+      // kart on the racing line, and the shutter cannot tell the difference.
+      //
+      // Held over a short window rather than tested instantaneously, because
+      // the circuit has crests and kerbs and a kart is legitimately airborne
+      // for a few frames at a time — refusing those would throw away a good
+      // mark and cost a whole lap of waiting. Half a second is longer than any
+      // crest here and far shorter than a trip into the water.
+      let lastOnCircuit = performance.now();
+      const recentlyOnCircuit = () => performance.now() - lastOnCircuit < 500;
 
       const tick = () => {
         const elapsed = (performance.now() - t0) / 1000;
+        if (onCircuit()) lastOnCircuit = performance.now();
         if (k.driftDir !== 0) {
           if (!sliding) { sliding = true; seen.slides++; }
           if (k.driftTier > seen.maxTier) seen.maxTier = k.driftTier;
@@ -466,19 +689,56 @@ const main = async () => {
           if (s.hold_still) return done({ ok: true, why: 'stationary' });
           if (s.drift) {
             if (k.driftDir !== 0 && k.driftTier >= 2) {
-              if (onCircuit() && framed()) return done({ ok: true, why: 'tier-2 slide' });
+              // Margin, not just "on the road right now".
+              //
+              // A tier-2 slide is by definition travelling sideways and losing
+              // ground to the outside of the corner, so a slide accepted with
+              // its wheels on the last inch of asphalt is off the road a
+              // fraction of a second later — and a fraction of a second is
+              // exactly what separates the gate from the shutter, two page
+              // round-trips away. That is how a hunt that logged "tier-2 slide,
+              // on circuit" produced a frame of a kart in the grass verge
+              // behind the MARINA sign, and it is the same off-road frame the
+              // whole gate exists to refuse, just arriving a few frames late.
+              //
+              // The freeze below is the real remedy — it removes the latency
+              // instead of budgeting for it — so this stays generous. It has to:
+              // a tier-2 slide on this circuit genuinely sits at |u| ~ 1.25,
+              // out on the kerb, because that is where a slide that has charged
+              // for two seconds ends up. Tightening this to 1.05 to "leave room"
+              // refused every slide in a 120-second hunt: twelve entries, tier 3
+              // reached, forty-four rejections, no shot. Past the kerb is a
+              // different matter, and that is all this now excludes.
+              const margin = Math.abs(window.__laneOffset(k)) < 1.35;
+              if (onCircuit() && margin && framed()) {
+                // Stop the world here rather than at the start of the capture.
+                // Everything between this instant and the shutter is latency —
+                // the gate's own resolve, the hold beat's round-trip, then the
+                // capture's — and a slide keeps sliding through all of it.
+                // `capture()` sets this again and clears it when it is done.
+                window.__freeze = true;
+                return done({ ok: true, why: 'tier-2 slide' });
+              }
               seen.offRoadRejects++;
             }
-          } else if (gap(k.t, mark) < 0.004) {
-            return done({ ok: true, why: 'on mark' });
+          } else {
+            const d = gap(k.t, mark);
+            if (d < closest) closest = d;
+            if (crossedMark() || d < 0.004) {
+              // Let it come round again rather than photograph it where it is.
+              if (recentlyOnCircuit()) return done({ ok: true, why: 'on mark' });
+              seen.markPassesOffRoad++;
+            }
           }
         }
         if (elapsed > timeout) {
           const detail = s.drift
             ? ` (${seen.slides} slides, best tier ${seen.maxTier}, ${seen.offRoadRejects} rejected off-road)`
-            : '';
+            : ` (mark ${mark.toFixed(3)}, closest approach ${closest.toFixed(4)} lap` +
+              `, ${seen.markPassesOffRoad} mark passes rejected off-road)`;
           return done({ ok: false, why: `gave up after ${timeout}s at t=${k.t.toFixed(3)}${detail}` });
         }
+        prevT = k.t;
         requestAnimationFrame(tick);
       };
       requestAnimationFrame(tick);
@@ -538,6 +798,12 @@ const main = async () => {
           // otherwise, so reading it unconditionally reported a quarter radian
           // of slip on shots of a kart travelling perfectly straight.
           beta: k.driftDir !== 0 ? k.driftBeta || 0 : null,
+          // Where the subject is standing at the instant the shutter opens, not
+          // at the instant the gate accepted it — there are a couple of
+          // round-trips between the two, and a kart that leaves the road inside
+          // them produces a frame no gate ever saw. Recorded rather than
+          // enforced so it shows up in the report either way.
+          onCircuit: window.__onCircuit(k),
         });
       };
       requestAnimationFrame(tick);
@@ -567,6 +833,7 @@ const main = async () => {
       driftTier: arrived ? arrived.driftTier : null,
       slipRad: arrived && arrived.beta !== null ? +arrived.beta.toFixed(3) : null,
       speed: arrived ? +arrived.speed.toFixed(1) : null,
+      onCircuit: arrived ? arrived.onCircuit : null,
       reachedMark: waited.ok,
     });
     process.stdout.write(
@@ -602,6 +869,29 @@ const main = async () => {
     process.exitCode = 1;
   } else {
     console.log('no console errors');
+  }
+
+  // A shot that never reached its mark is not a shot of what it says it is —
+  // the shutter fired wherever the kart had got to, which on this circuit means
+  // a different corner, and twice now it has meant a silent duplicate of another
+  // frame in the set. That used to be a warning inside report.json and an exit
+  // code of zero, so a set with a wrong frame in it looked exactly like a clean
+  // one from the outside. It fails the run now, for the same reason a page
+  // error does: the critics would be judging a frame that is not the shot.
+  const missed = report.shots.filter((s) => !s.reachedMark);
+  if (missed.length) {
+    console.log(`\n!! ${missed.length} shot(s) never reached their mark:`);
+    for (const s of missed) {
+      console.log(`  - ${s.name}: wanted t=${s.targetT ?? '(slide)'}, fired at t=${s.actualT}`);
+    }
+    process.exitCode = 1;
+  }
+
+  const torn = report.shots.filter((s) => s.darkFrac > TORN_DARK_FRAC);
+  if (torn.length) {
+    console.log(`\n!! ${torn.length} shot(s) still torn after retries: ` +
+      torn.map((s) => s.name).join(', '));
+    process.exitCode = 1;
   }
 };
 

@@ -7,15 +7,20 @@
  *  the composer (passes + effects) and the per-frame uniform sync.
  *
  *  Chain, in order:
- *    RenderPass            scene -> HDR (half-float) multisampled buffer
- *    N8AOPostPass          ground-truth-ish AO, multiplied into the lit colour
+ *    RenderPass            scene -> HDR (half-float) buffer
+ *    N8AOPostPass          ground-truth-ish AO, multiplied into the lit colour.
+ *                          NB: this pass renders the scene AGAIN into its own
+ *                          buffer and composites onto that, so when AO is on it
+ *                          — not the composer — owns the multisampling. See
+ *                          build().
  *    EffectPass[DoF]       shallow bokeh focused on the player kart
  *    EffectPass[Bloom]     high-threshold mipmap bloom, wide + soft
  *    EffectPass[Grade]     ONE shader: reprojection motion blur + chromatic
  *                          aberration + highlight shoulder + ACES + S-curve +
  *                          split tone (teal lift / warm gain) + sat rolloff +
  *                          speed lines + vignette + grain
- *    EffectPass[SMAA]      final AA resolve, dithered on the way to the screen
+ *    EffectPass[SMAA]      final edge resolve on top of MSAA, dithered on the
+ *                          way to the screen
  *
  *  Everything downstream of the RenderPass works in scene-linear HDR until the
  *  grade shader tone maps; postprocessing re-linearises between passes and
@@ -85,9 +90,38 @@ float krValueNoise(float x) {
 //
 // The curve is a power law above the knee, not a saturating exponential. An
 // asymptote would buy separation at the cost of never reaching white, and the
-// art bible is explicit that chrome and water must clip to white and bloom;
-// x^0.30 keeps climbing forever, so a specular two orders of magnitude up still
-// gets there.
+// art bible is explicit that chrome and water must clip to white and bloom.
+//
+// THE EXPONENT IS THE CLAMP THE REVIEW FOUND, and the old comment here was
+// wrong about it. "x^0.30 keeps climbing forever, so a specular two orders of
+// magnitude up still gets there" is true only in the limit and false in every
+// frame we actually ship. Work it through: the ACES RRT/ODT rational fit reaches
+// 1.0 at v = 25.67, and v = mc * (exposure / 0.6) = mc * 1.75, so the shoulder
+// has to hand ACES mc = 14.67. With knee 0.75 and p = 0.30 that needs
+//
+//     m = knee * (mc / knee)^(1/p) = 0.75 * (19.56)^3.333 ~= 15100 scene-linear
+//
+// i.e. NOTHING in this game reaches display white — the brightest thing in
+// r1/boost.png measures ~32 scene-linear, which the old curve delivered at 232.
+// Every shot ceilinged in the 232-250 band, 0.00% of pixels above 252, no sun
+// disc, and the bloom that WAS firing (threshold 2.0 linear sits around display
+// 202 on the old curve, so plenty cleared it) got squashed back into the same
+// five percent of range as the thing it was blooming off. That is the "milky
+// diffuse smear with no disc" and the "identical ~249 ceiling" in one bug: 249.6
+// is simply where this curve puts 1000 scene-linear.
+//
+// Fixed by making the shoulder reach white at a level the scene can produce.
+// Knee 0.90, p = 0.72 puts display white at m ~= 43 scene-linear:
+//
+//     m     0.7    0.9    1.0    2.0    4.0    8.0   20.0   43+
+//     old   174    183    185    205    218    228    237    <=249  (asymptote)
+//     new   174    191    196    220    236    245    252    255    (clips)
+//
+// Below the knee nothing moves at all, so the shadows, the tarmac and the key's
+// own falloff are untouched and the golden-hour mood is unchanged; the exposure
+// stays at the bible's 1.05. What changes is that the top two stops stop being
+// a single value: sun-on-chrome, water sparkle, the sun disc and boost flame now
+// clip and bloom, and a roof at 4x still separates cleanly from one at 20x.
 //
 // It is gated on the brightest channel rather than on luminance: a saturated red
 // at 1.2 linear has a luminance of only 0.49, so a luminance gate would let it
@@ -95,23 +129,14 @@ float krValueNoise(float x) {
 // highlight breaks to a flat primary. max(rgb) compresses the channel that is
 // actually about to clip.
 //
-// rolloff.z is the highlight desaturation and it is the thing that was wrong.
-// At 0.55 over a span of 12x the knee, EVERY bright coloured thing in the game
-// arrived at white well before it arrived at 255: measured through the whole
-// chain, a tier-3 drift plume at scene-linear (12, 4, 20) came out rgb(243, 225,
-// 238) — chroma 0.07, i.e. grey — a blue boost pad at (4, 9, 14) came out
-// rgb(241, 241, 238), chroma 0.01, and a boost flame at (22, 11, 3) came out
-// rgb(250, 242, 234), chroma 0.06. The brief's "boost pads clipping to
-// featureless white" was not the shoulder failing to compress; it was the
-// shoulder deliberately bleaching the colour out first, and then bloom spreading
-// the result. At 0.14 over 40x the same three land at chroma 0.19 / 0.07 / 0.21
-// — highlights that roll off INTO colour, as the bible asks — while the sun disc
-// and sun-on-chrome, which are another half-order up again, still reach white
-// and still bloom, because that part of the bible is also non-negotiable.
-//
-// The knee moved with it, 0.90 -> 0.75. It has to sit just above sunlit diffuse
-// white (a 0.18 grey card under the 4.2 key measures ~0.70 scene-linear) so the
-// shoulder shapes specular and emission and leaves the key's own falloff alone.
+// rolloff.z is the highlight desaturation. At 0.55 over a span of 12x the knee,
+// EVERY bright coloured thing in the game arrived at white well before it
+// arrived at 255: a tier-3 drift plume at scene-linear (12, 4, 20) came out
+// rgb(243, 225, 238) — chroma 0.07, i.e. grey. It sits at 0.16 over a span of
+// 30x now: highlights that roll off INTO colour, as the bible asks, while the
+// sun disc and sun-on-chrome still bleach to white on the way out. The span came
+// down from 40x with the knee moving up, so the desat still lands in the same
+// place in absolute scene-linear terms (0.9 * 30 = 27, was 0.75 * 40 = 30).
 vec3 krHighlightRolloff(vec3 c) {
   float m = max(max(c.r, c.g), c.b);
   float knee = rolloff.x;
@@ -144,6 +169,12 @@ vec3 krToneMap(vec3 c) {
 
 void mainImage(const in vec4 inputColor, const in vec2 uv, const in float depth, out vec4 outputColor) {
   vec2 fromCentre = uv - 0.5;
+
+  // Normalised so 1.0 is the frame corner at any aspect ratio — otherwise the
+  // vignette, the aberration ramp and the streak band all drift as the window
+  // is resized. Needed up here now because the aberration is gated on it.
+  vec2 aspectVec = vec2(aspect, 1.0);
+  float rad = length(fromCentre * aspectVec) / (0.5 * length(aspectVec));
 
   // --- screen-space velocity -----------------------------------------------
   // Unproject this pixel to world space with the current inverse view-proj,
@@ -217,20 +248,47 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, const in float depth,
   velocity = vec2(0.0);
 #endif
 
-  // Aberration grows with r^2 so the centre of frame stays clean.
-  vec2 fringe = fromCentre * lens.x * (0.35 + dot(fromCentre, fromCentre) * 3.4);
-  // ...and is rolled off once the smear gets long. R and B are fetched at a
-  // FIXED lateral offset while the tap itself walks along the streak, so the
-  // three channels integrate three different sets of specular highlights. Over
-  // a calm surface that is invisible; over the grazing sun sheen on the near
-  // road it decorrelates the channels and the smear comes out as rainbow
-  // speckle rather than a clean radial fringe. Nothing showed this until the
-  // hero hold-out replaced the old depth band, because the band had been
-  // freezing exactly that stretch of road to zero velocity. A long exposure
-  // has no business carrying crisp lateral colour separation anyway.
-  // length(velocity) here is post-cap and post-hold-out, so it is 0 on the
-  // subject and 0 on the single-tap capture path — both keep full aberration.
-  fringe *= 1.0 - 0.75 * smoothstep(0.0, 0.010, length(velocity));
+  // --- lateral chromatic aberration ----------------------------------------
+  // Two things were wrong here and both of them printed as per-pixel magenta /
+  // green speckle over the tarmac, which four reviewers independently read as a
+  // compression fault or as coloured grain.
+  //
+  // 1. It was never actually zero in the middle of frame. 0.35 + r^2 * 3.4
+  //    still fringes dead centre at 35% of full strength, and the art bible
+  //    (§2) asks for aberration "at the frame edge only". It is a genuine
+  //    smoothstep from a third of the way out now, so the middle third — where
+  //    the kart and the vanishing point live — is bit-exact clean, and that
+  //    branch also drops the pass from three fetches per tap to one there.
+  //
+  // 2. The magnitude was allowed past a texel. Cross-correlating the R and B
+  //    high-frequency content of r1/grid.png over the foreground gravel:
+  //    corr(R,B) is 0.16 at zero lag and 0.61 once R is shifted back by one
+  //    pixel — i.e. the aberration was displacing R and B across each other by
+  //    ~1-2 px over a surface whose per-pixel luma sigma is 20-34, so it turned
+  //    that surface's own specular aliasing into decorrelated chroma. Below
+  //    about a texel the bilinear fetch IS the low-pass: R lands as a lerp of
+  //    the same two texels G sampled, the channels stay correlated, and the
+  //    fringe reads as a fringe instead of as confetti. So the offset is capped
+  //    in PIXELS, which also makes it safe at any render scale.
+  //
+  // Strength tracks the eased speed signal on the CPU side (lens.x), NOT the
+  // length of the motion smear. The old 1 - 0.75 * smoothstep(0, 0.010,
+  // length(velocity)) rolloff was dead code on the capture path — that path
+  // builds with one tap and zeroes the velocity above, so the rolloff measured
+  // zero and never engaged, leaving full boost-strength fringing on exactly the
+  // frames the reviewers were sent. Gating on speed is what was meant.
+  float caShape = smoothstep(0.34, 1.0, rad);
+  vec2 fringe = fromCentre * (lens.x * caShape * caShape);
+  float fringePx = length(fringe / texelSize);
+  // Under a twentieth of a texel there is no fringe, only two redundant texture
+  // fetches per tap. Snap it off so the whole middle of the frame takes the
+  // cheap branch below.
+  if (fringePx < 0.05) {
+    fringe = vec2(0.0);
+    fringePx = 0.0;
+  } else {
+    fringe *= min(fringePx, CA_MAX_TEXELS) / fringePx;
+  }
 
   vec2 lo = texelSize;
   vec2 hi = vec2(1.0) - texelSize;
@@ -243,12 +301,19 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, const in float depth,
 #endif
 
   vec3 c = vec3(0.0);
-  for (int i = 0; i < MB_SAMPLES; ++i) {
-    float k = (float(i) + 0.5 + jitter) / float(MB_SAMPLES) - 0.5;
-    vec2 p = uv + velocity * k;
-    c.r += texture2D(inputBuffer, clamp(p + fringe, lo, hi)).r;
-    c.g += texture2D(inputBuffer, clamp(p, lo, hi)).g;
-    c.b += texture2D(inputBuffer, clamp(p - fringe, lo, hi)).b;
+  if (fringePx > 0.0) {
+    for (int i = 0; i < MB_SAMPLES; ++i) {
+      float k = (float(i) + 0.5 + jitter) / float(MB_SAMPLES) - 0.5;
+      vec2 p = uv + velocity * k;
+      c.r += texture2D(inputBuffer, clamp(p + fringe, lo, hi)).r;
+      c.g += texture2D(inputBuffer, clamp(p, lo, hi)).g;
+      c.b += texture2D(inputBuffer, clamp(p - fringe, lo, hi)).b;
+    }
+  } else {
+    for (int i = 0; i < MB_SAMPLES; ++i) {
+      float k = (float(i) + 0.5 + jitter) / float(MB_SAMPLES) - 0.5;
+      c += texture2D(inputBuffer, clamp(uv + velocity * k, lo, hi)).rgb;
+    }
   }
   c /= float(MB_SAMPLES);
 
@@ -283,11 +348,6 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, const in float depth,
   // sun on water go white rather than neon.
   c = max(mix(vec3(lum), c, grade.z * (1.0 - 0.40 * smoothstep(0.70, 1.0, lum))), 0.0);
 
-  // Normalised so 1.0 is the frame corner at any aspect ratio — otherwise the
-  // vignette and the streak band drift as the window is resized.
-  vec2 aspectVec = vec2(aspect, 1.0);
-  float rad = length(fromCentre * aspectVec) / (0.5 * length(aspectVec));
-
   // --- speed lines ---------------------------------------------------------
   float streakGain = lens.z * rush.y;
   if (streakGain > 0.001) {
@@ -300,11 +360,24 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, const in float depth,
     c += streak * band * streakGain * vec3(1.0, 0.965, 0.900);
   }
 
+  // Vignette AFTER the display transform, deliberately. Applied in linear it
+  // would be a light-loss term that the shoulder then has to re-expand, which
+  // is a second way to lose the top end; here it is what it is supposed to be,
+  // a print-down of the finished image.
   c *= 1.0 - grade.w * smoothstep(0.30, 1.02, rad);
 
-  // Grain last, weighted toward the midtones and shadows like real stock.
+  // Grain last, and monochrome — the same scalar is added to all three
+  // channels, so it can only ever be luma noise. (The coloured speckle in the
+  // review frames is not this; it is surface specular aliasing fringed by the
+  // aberration above, plus the tarmac/sand normal maps aliasing on their own.)
+  //
+  // Weighted toward the midtones, but now rolled OFF again below ~0.14 display
+  // luma. Full-amplitude grain in the bottom eighth of the range is where 8-bit
+  // dither, the teal shadow lift and the AO all live, and adding +/-2 counts of
+  // white noise on top of them is what makes a shadow read as sensor noise
+  // rather than as shadow.
   float g = krHash12(uv * resolution * 1.37 + fract(time * 0.37) * 977.0) - 0.5;
-  c += g * lens.y * (1.15 - 0.75 * lum);
+  c += g * lens.y * (1.15 - 0.75 * lum) * smoothstep(0.015, 0.14, lum);
 
   outputColor = vec4(max(c, 0.0), inputColor.a);
 }
@@ -326,13 +399,20 @@ export class GradeEffect extends Effect {
     super('KartGrade', GRADE_FRAGMENT, {
       attributes: EffectAttribute.CONVOLUTION | EffectAttribute.DEPTH,
       blendFunction: BlendFunction.SRC,
-      defines: new Map([['MB_SAMPLES', String(Math.max(1, Math.round(opts.samples)))]]),
+      defines: new Map([
+        ['MB_SAMPLES', String(Math.max(1, Math.round(opts.samples)))],
+        // Hard ceiling on the aberration offset, in pixels. See the aberration
+        // block in GRADE_FRAGMENT: past about a texel the fringe stops being a
+        // fringe and starts decorrelating the channels of whatever specular
+        // aliasing is already on screen.
+        ['CA_MAX_TEXELS', '1.25'],
+      ]),
       uniforms: new Map<string, THREE.Uniform>([
         ['prevViewProj', new THREE.Uniform(new THREE.Matrix4())],
         ['invViewProj', new THREE.Uniform(new THREE.Matrix4())],
         ['grade', new THREE.Uniform(
           new THREE.Vector4(opts.exposure, opts.contrast, opts.saturation, opts.vignette))],
-        ['lens', new THREE.Uniform(new THREE.Vector4(0.0007, opts.grain, 0.15, 0.0))],
+        ['lens', new THREE.Uniform(new THREE.Vector4(CA_REST, opts.grain, 0.15, 0.0))],
         ['rush', new THREE.Uniform(new THREE.Vector2(0, 0))],
         ['subject', new THREE.Uniform(new THREE.Vector3())],
         // Released until `sync` finds a player kart: with a negative outer
@@ -349,10 +429,12 @@ export class GradeEffect extends Effect {
         // produce it. Sized to sit just above the noise floor of an 8-bit write.
         ['shadowLift', new THREE.Uniform(new THREE.Vector3(-0.0015, 0.0035, 0.0092))],
         // Highlight shoulder: knee just above sunlit diffuse white, then
-        // x^0.30 above it, with only a light pull toward luminance so a hot
+        // x^0.72 above it, with only a light pull toward luminance so a hot
         // colour stays a colour until it is genuinely an order of magnitude
-        // over. See krHighlightRolloff.
-        ['rolloff', new THREE.Uniform(new THREE.Vector4(0.75, 0.30, 0.14, 40.0))],
+        // over. The exponent is sized so display white lands at ~43x
+        // scene-linear — reachable by the sun disc, sun-on-chrome, water
+        // sparkle and boost flame, and by nothing else. See krHighlightRolloff.
+        ['rolloff', new THREE.Uniform(new THREE.Vector4(0.90, 0.72, 0.16, 30.0))],
       ]),
     });
   }
@@ -372,9 +454,21 @@ export class GradeEffect extends Effect {
 const _viewProj = new THREE.Matrix4();
 const _dofTarget = new THREE.Vector3();
 
-/** How aggressively speedIntensity is allowed to move the lens, per tier. */
-const CA_REST = 0.0007;  // ~0.0004 uv of separation at the frame edge
-const CA_BOOST = 0.0032; // ~0.0018 uv at the frame edge
+/**
+ * How aggressively speedIntensity is allowed to move the lens, per tier.
+ *
+ * These are the per-channel offset at |fromCentre| = 1, so the actual offset at
+ * the frame CORNER (|fromCentre| = 0.707, radial shape = 1) is 0.707x them:
+ * 0.00032 uv at rest and 0.00113 uv flat out, against the art bible's 0.0012 at
+ * the frame edge scaling with speed. In pixels at 1080p that is 0.5 px and
+ * 1.8 px, and the shader caps the offset at CA_MAX_TEXELS on top of that.
+ *
+ * They were 0.0007 / 0.0032, which put the corner at 0.0046 uv — nearly 4x what
+ * §2 asks for, ~9 px of separation, and the direct cause of the coloured
+ * speckle over the boost road.
+ */
+const CA_REST = 0.00045;
+const CA_BOOST = 0.0016;
 
 /**
  * Radius around the player kart's centre of mass, in metres, inside which the
@@ -425,10 +519,54 @@ export class PostFX {
     if (s.ssao) {
       const ao = new N8AOPostPass(ctx.scene, ctx.camera, ctx.width, ctx.height);
       const cfg = ao.configuration;
+
+      // MSAA lives on the COMPOSER's input buffer, and this pass is the reason
+      // it has to.
+      //
+      // The note that used to sit here said N8AOPostPass re-renders the scene
+      // into a `beautyRenderTarget` and composites onto that, so the samples
+      // had to be moved off the composer and onto that target. Both halves of
+      // that are wrong, and the second half threw:
+      //
+      //   - `beautyRenderTarget` is a field of `N8AOPass`, the raw three.js
+      //     pass. `N8AOPostPass` — the postprocessing-compatible one we build
+      //     here — has no such field. It takes the composer's `inputBuffer` as
+      //     `sceneDiffuse` and composites the occlusion onto that, which is
+      //     exactly what a well-behaved post pass should do.
+      //   - So `ao.beautyRenderTarget.samples = ...` was a TypeError on
+      //     undefined. `PostFX.build` is called inside a try/catch in
+      //     RenderPipeline.rebuild, which caught it, tore the composer down and
+      //     set `usePost = false`.
+      //
+      // `msaaSamples()` returns non-zero at Quality.High and Ultra on every
+      // device (4 on hardware, 2 on a software rasteriser), and `ssao` is on at
+      // both. So this line threw on every High/Ultra boot and the game ran with
+      // NO post chain at all: no AO, no DoF, no bloom, no grade, no tone map
+      // beyond the renderer's own fallback, no SMAA. The whole of §2's colour
+      // grade and §6's bloom were dead on the tier the art direction targets.
+      //
+      // Nothing needs to be assigned here. RenderPipeline keeps the samples on
+      // the composer, where the surviving scene render actually happens.
+
       // A short world-space radius keeps the darkening where contact actually
       // happens (tyre/tarmac, kerb/road, planter/pavement). Large radii are
       // what produce the flat grey haze that gives cheap AO away.
-      cfg.aoRadius = 1.5;
+      //
+      // 1.5 m was still a room-scale radius on a vehicle-scale subject: a kart
+      // sits 0.25 m off the deck and its contact patches are ~0.2 m across, so
+      // with a 1.5 m hemisphere the tyre subtends a small enough solid angle at
+      // the road beside it that the occlusion term never gets dark — which is
+      // exactly the review note that "the road under the sill samples the same
+      // value as road five metres away". 0.9 m still reaches the kerb/tarmac
+      // joint and the wall bases, and it puts most of the sample budget inside
+      // the contact band where §9.4 needs it.
+      cfg.aoRadius = 0.9;
+      // Left at 1.0 deliberately while the radius came down. N8AO folds the two
+      // together — the depth rejection band is radius * distanceFalloff * 0.2,
+      // so this is already tightening from 0.30 m to 0.18 m on its own. Pulling
+      // the falloff down as well would take the band under the kart's 0.25 m
+      // ride height and throw away the chassis-footprint darkening, which is
+      // half of what §9.4 is asking for.
       cfg.distanceFalloff = 1.0;
       // N8AO's `intensity` is the exponent on the visibility term, so it is the
       // only knob that changes how *dark* contact gets. Measured against this
@@ -443,9 +581,12 @@ export class PostFX {
       cfg.denoiseSamples = 8;
       // A 6-texel poisson denoise at half res is a 12-pixel blur, which is
       // wider than the contact band it is supposed to be cleaning up and turns
-      // a tyre patch into a smudge. Tighter, and one iteration at High — the
-      // second buys smoothness the tyre contact does not want.
-      cfg.denoiseRadius = 3;
+      // a tyre patch into a smudge. Tighter still now that the radius came
+      // down — a 0.9 m radius produces a contact band only a few pixels wide at
+      // chase distance, and a 3-texel half-res denoise is 6 px, i.e. wider than
+      // the signal. One iteration at High; the second buys smoothness the tyre
+      // contact does not want.
+      cfg.denoiseRadius = 2;
       cfg.denoiseIterations = q >= Quality.Ultra ? 2 : 1;
       // Occlusion tinted toward the sky fill instead of black — the art bible
       // forbids pure-black shadow, and cool crevices sit right next to the
@@ -491,15 +632,26 @@ export class PostFX {
       // 0.9 lands around 0.6 on screen, i.e. below every lit road surface, wall
       // and kerb in the game. The whole frame was above threshold, so bloom
       // welded the sun-facing tarmac into the sky and ate the vanishing point,
-      // the roof ridges and the boost chevrons. 2.0 linear is just past display
-      // white, which is what "above diffuse white" was always supposed to mean;
-      // chrome, water sparkle, sparks and flame sit an order of magnitude above
-      // it and still bloom exactly as the art bible requires.
+      // the roof ridges and the boost chevrons.
+      //
+      // 2.0 was NOT the reason r1 has no visible bloom — 2.0 linear displayed
+      // at about 202 on the old tone curve, so the sun disc, the road sheen and
+      // the sky around the sun all cleared it comfortably; the shoulder then
+      // crushed the bloom and its source into the same 232-250 band, which is
+      // what made it read as a milky smear instead of a glow. Dropping the
+      // threshold to the 1.15-1.3 the review suggested would have re-created
+      // the milky-frame regression above without touching the actual cause.
+      //
+      // With the shoulder fixed the threshold has to move a little anyway: the
+      // new curve puts linear 2.0 at display ~220, so holding the number would
+      // quietly RAISE the gate. 1.55 lands back at ~205, i.e. the same "just
+      // above sunlit diffuse white" population as before, now on a curve that
+      // lets the result read.
       const bloom = new BloomEffect({
         // ADD, not SCREEN: the buffer is scene-linear HDR, and screen blending
         // values above 1 actually *darkens* them. Bloom is light being added.
         blendFunction: BlendFunction.ADD,
-        luminanceThreshold: 2.0,
+        luminanceThreshold: 1.55,
         luminanceSmoothing: 0.32,
         mipmapBlur: true,
         // Slightly hotter to pay back the pixels the higher threshold removed:
@@ -528,7 +680,11 @@ export class PostFX {
       contrast: 0.18,
       saturation: 1.12,
       vignette: 0.22,
-      grain: 0.012,
+      // Trimmed with the shadow rolloff added in the shader — the grain was
+      // never the coloured speckle the review saw, but at 0.012 flat it was
+      // still +/-1.8 counts of white noise sitting on top of the darkest eighth
+      // of the frame, which is where it is most visible and least wanted.
+      grain: 0.009,
     });
     this.grade = grade;
     this.gradePass = new EffectPass(ctx.camera, grade);
@@ -538,7 +694,14 @@ export class PostFX {
     const smaa = new SMAAEffect({
       // Low tier runs without MSAA, so SMAA has to carry the whole edge budget.
       preset: high ? SMAAPreset.ULTRA : SMAAPreset.HIGH,
-      edgeDetectionMode: EdgeDetectionMode.COLOR,
+      // LUMA, not COLOR. COLOR edge detection compares all three channels, so
+      // on a frame that carries any chroma noise at all it fires on the noise
+      // and spends its edge budget smearing speckle instead of finding the kerb
+      // stripe underneath — and it runs last, after grain and aberration, so it
+      // sees the worst version of the image. LUMA is also the cheaper of the
+      // two and is what SMAA was designed around; with real MSAA restored
+      // underneath it there is nothing left for COLOR to buy.
+      edgeDetectionMode: EdgeDetectionMode.LUMA,
     });
     this.smaa = smaa;
     const smaaPass = new EffectPass(ctx.camera, smaa);

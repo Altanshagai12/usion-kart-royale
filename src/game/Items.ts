@@ -34,7 +34,17 @@ const BOX_SIZE = 1.55;
  */
 const BOX_RESPAWN = 2.5;
 const BOX_PICKUP_R = 1.9;
-const BOX_HEIGHT = 1.25;
+/**
+ * Clearance from the tarmac to the *centre* of the box, metres, measured along
+ * the local ground normal.
+ *
+ * 1.25 put the underside 0.48 m clear, which at racing distance is far enough
+ * that the eye stops connecting the box to its shadow and starts reading the
+ * pair as a sprite over a decal. 1.05 keeps the hover unmistakable — the box is
+ * still visibly floating, still above the kart's nose — while halving the gap
+ * the contact shadow has to bridge.
+ */
+const BOX_HEIGHT = 1.05;
 /** seconds the roulette spins before the item can be spent (matches the HUD) */
 const ARM_TIME = 1.05;
 
@@ -96,8 +106,8 @@ interface Slot {
 
 interface Box {
   pos: THREE.Vector3;
-  /** ground point + normal, for the contact shadow */
-  groundY: number;
+  /** the point on the tarmac directly under the box, for the contact shadow */
+  ground: THREE.Vector3;
   normal: THREE.Vector3;
   phase: number;
   /** >0 = collected, counting down to respawn */
@@ -137,7 +147,12 @@ function clamp(v: number, lo: number, hi: number) {
  * separate under any exposure. Only the trim and the mark are allowed to bloom.
  */
 function boxMaterial(ctx: Ctx): THREE.MeshPhysicalMaterial {
-  const S = 256;
+  // 1024², not 256². The player drives *through* these, so they are inside the
+  // bible's "within 5 m" band (§4) every few seconds, and at 256 the glyph was
+  // being magnified roughly 4x past its native size — the single most obvious
+  // thing wrong with the box in the round-1 frame. One texture, ~5 MB with
+  // mips, shared by every instance.
+  const S = 1024;
   const p = pad(S);
   const g = p.g;
   // Sea-glass, keyed to `sea shallow #3fc9c4` and `sky-warm #ffd0a0`. Mid
@@ -174,8 +189,14 @@ function boxMaterial(ctx: Ctx): THREE.MeshPhysicalMaterial {
   g.textAlign = 'center';
   g.textBaseline = 'middle';
   g.lineJoin = 'round';
-  g.lineWidth = S * 0.085;
-  g.strokeStyle = '#5c2f08';
+  // Two-pass outline: a wide dark keyline that survives bloom, then a thin
+  // warm one inside it. At 256 the wide stroke alone was all that resolved and
+  // the glyph read as a soft brown smudge.
+  g.lineWidth = S * 0.095;
+  g.strokeStyle = '#4a2404';
+  g.strokeText('?', S * 0.5, S * 0.55);
+  g.lineWidth = S * 0.042;
+  g.strokeStyle = '#8c4a10';
   g.strokeText('?', S * 0.5, S * 0.55);
   const q = g.createLinearGradient(0, S * 0.2, 0, S * 0.85);
   q.addColorStop(0, '#fff6d8');
@@ -184,23 +205,75 @@ function boxMaterial(ctx: Ctx): THREE.MeshPhysicalMaterial {
   g.fillStyle = q;
   g.fillText('?', S * 0.5, S * 0.55);
 
+  // Glass sweep. A single diagonal band of near-specular white across the pane,
+  // clipped to the inside of the frame. It is what makes a flat quad read as
+  // something with a surface between you and the mark.
+  g.save();
+  g.beginPath();
+  g.rect(S * 0.145, S * 0.145, S * 0.71, S * 0.71);
+  g.clip();
+  const sweep = g.createLinearGradient(S * 0.1, S * 0.75, S * 0.72, S * 0.05);
+  sweep.addColorStop(0.00, 'rgba(255,255,255,0)');
+  sweep.addColorStop(0.44, 'rgba(255,255,255,0)');
+  sweep.addColorStop(0.52, 'rgba(238,252,255,0.30)');
+  sweep.addColorStop(0.58, 'rgba(255,255,255,0)');
+  sweep.addColorStop(1.00, 'rgba(255,255,255,0)');
+  g.fillStyle = sweep;
+  g.fillRect(0, 0, S, S);
+  g.restore();
+
+  // --- roughness -----------------------------------------------------------
+  // §4: "Roughness must vary spatially. A constant roughness value reads as
+  // plastic and is the #1 tell of an amateur real-time scene." The pane is
+  // polished glass, the frame trim is brushed metal-ish, the glyph's raised
+  // outline is matte lacquer — three different responses to the same key.
+  const rp = pad(S >> 1);
+  const rg = rp.g;
+  const R = rp.size;
+  rg.fillStyle = '#3d3d3d';                              // pane: glossy
+  rg.fillRect(0, 0, R, R);
+  const rgrd = rg.createRadialGradient(R * 0.42, R * 0.36, R * 0.02, R * 0.5, R * 0.5, R * 0.8);
+  rgrd.addColorStop(0, '#242424');                       // polished toward the hot spot
+  rgrd.addColorStop(1, '#5a5a5a');                       // duller at the edges
+  rg.fillStyle = rgrd;
+  rg.fillRect(0, 0, R, R);
+  rg.strokeStyle = '#1e1e1e';                            // trim: near-mirror
+  rg.lineWidth = R * 0.035;
+  rg.strokeRect(R * 0.085, R * 0.085, R * 0.83, R * 0.83);
+  rg.font = `900 ${R * 0.62}px "SF Pro Display", system-ui, sans-serif`;
+  rg.textAlign = 'center';
+  rg.textBaseline = 'middle';
+  rg.lineJoin = 'round';
+  rg.lineWidth = R * 0.095;
+  rg.strokeStyle = '#a8a8a8';                            // glyph keyline: matte
+  rg.strokeText('?', R * 0.5, R * 0.55);
+  rg.fillStyle = '#7c7c7c';
+  rg.fillText('?', R * 0.5, R * 0.55);
+  const rghMap = padTexture(rp, false);
+
   const m = new THREE.MeshPhysicalMaterial({
     map: padTexture(p, true),
+    roughnessMap: rghMap,
     transparent: true,
-    // More opaque than before: at 0.72 the far face and the core both showed
-    // through the near face and averaged the whole cube to one value.
-    opacity: 0.86,
+    // Near-opaque, and paired with `depthWrite` below. At 0.86 with no depth
+    // write, whichever instance the buffer happened to submit last won, so a
+    // box 20 m further down the row composited over the one in front of it and
+    // the whole group averaged to the milky wash the review picked up on.
+    opacity: 0.94,
     // Not a mirror. A little roughness is what lets the facets take different
-    // amounts of key instead of all returning the same sky.
-    roughness: 0.24,
+    // amounts of key instead of all returning the same sky. The map above
+    // modulates this, so it is the ceiling rather than the value.
+    roughness: 1,
     metalness: 0,
     clearcoat: 1,
     clearcoatRoughness: 0.08,
     emissive: new THREE.Color(0x1d5566),
     emissiveIntensity: 0.22,
     // Grazing-angle rim, so the silhouette survives against a blown sky
-    // instead of dissolving into it.
-    sheen: 1,
+    // instead of dissolving into it. Pulled back from 1 now that an explicit
+    // fresnel term (below) does this job properly — the two stacked was two
+    // rims on the same edge.
+    sheen: 0.55,
     sheenRoughness: 0.34,
     sheenColor: new THREE.Color(0xbff2ff),
     // Front faces only. `DoubleSide` is the intuitive choice for glass and it is
@@ -214,8 +287,53 @@ function boxMaterial(ctx: Ctx): THREE.MeshPhysicalMaterial {
     // read the key honestly, and halves the transparent fragment cost of ~70
     // instances while it is at it.
     side: THREE.FrontSide,
-    depthWrite: false,
+    // Writes depth. At 0.94 the shell is opaque enough that the usual reason to
+    // skip it — soft edges bleeding into each other — does not apply, and
+    // without it the transparent queue sorts *objects*, not the ~70 instances
+    // inside this one mesh, so box-behind-box ordering was decided by buffer
+    // index. The glow shell and the ground pool are both drawn ahead of it
+    // (lower `renderOrder`) so they are unaffected.
+    depthWrite: true,
   });
+
+  // --- fresnel rim ---------------------------------------------------------
+  // Sheen alone is a cloth lobe; it lifts the grazing angles a little but it is
+  // energy-conserving and tinted by the key, so against a blown golden-hour sky
+  // the silhouette still dissolved. This is an explicit view-dependent term
+  // added to emissive: the edge of the glass lights up regardless of what is
+  // behind it, which is the whole job of a rim on a translucent pickup.
+  m.onBeforeCompile = (shader) => {
+    // Tight and confined to the silhouette. This feeds emissive, which is
+    // un-lit and un-exposed, so a broad term here is a free trip past the bloom
+    // threshold across a third of the cube — power 3 keeps it to the last few
+    // degrees of grazing angle, which is where a real glass edge lights up.
+    shader.uniforms.uRimColor = { value: new THREE.Color(0x9fe8ff) };
+    shader.uniforms.uRimPower = { value: 3.0 };
+    shader.uniforms.uRimStrength = { value: 0.9 };
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+uniform vec3 uRimColor;
+uniform float uRimPower;
+uniform float uRimStrength;`,
+      )
+      .replace(
+        '#include <emissivemap_fragment>',
+        // `normal` (not the raw `vNormal` varying) is the shading normal after
+        // <normal_fragment_begin>, so the rim follows the fillet's interpolated
+        // curvature — which is the whole point of chamfering the edges.
+        `#include <emissivemap_fragment>
+{
+  float rimF = 1.0 - saturate( abs( dot( normal, normalize( vViewPosition ) ) ) );
+  totalEmissiveRadiance += uRimColor * pow( rimF, uRimPower ) * uRimStrength;
+}`,
+      );
+  };
+  // One material, one program — but be explicit so a future variant does not
+  // silently share this one's compiled shader.
+  m.customProgramCacheKey = () => 'itembox-fresnel';
+
   if (ctx.envMap) {
     m.envMap = ctx.envMap;
     m.envMapIntensity = 0.75;
@@ -238,6 +356,7 @@ export class Items implements IItems {
   private boxMesh!: THREE.InstancedMesh;
   private coreMesh!: THREE.InstancedMesh;
   private boxShadows!: BlobShadows;
+  private boxGlow!: BlobShadows;
   private orbitMesh!: THREE.InstancedMesh;
   private boxMat!: THREE.MeshPhysicalMaterial;
   private coreMat!: THREE.MeshBasicMaterial;
@@ -307,15 +426,31 @@ export class Items implements IItems {
       );
       for (let j = 0; j < lanes; j++) {
         const lat = ((j / (lanes - 1)) * 2 - 1) * reach;
+        // Lay the row out on the centreline frame first — that is what makes it
+        // a wall across the tangent rather than a line down the road.
         const p = new THREE.Vector3()
           .copy(s.pos)
-          .addScaledVector(s.binormal, lat)
-          .addScaledVector(s.normal, BOX_HEIGHT);
+          .addScaledVector(s.binormal, lat);
+
+        // ...then re-seat it off the surface actually underneath. The centreline
+        // frame is a plane; the road is not. Crown, camber and the banked
+        // sections all mean that offsetting laterally from `s.pos` and *then*
+        // lifting along `s.normal` leaves the outer boxes of a row at a
+        // different clearance from the inner ones — up to half a metre on the
+        // 20 degree coastal curve — which is exactly the "no consistent height,
+        // no ground contact" read in the review. Probing under each box and
+        // lifting along the local ground normal gives every box in every row the
+        // same clearance over the tarmac it is actually floating above, and
+        // hands the contact shadow an exact ground point instead of a guess.
         const probe = track.probe(p, t);
+        const ground = new THREE.Vector3(p.x, probe.y, p.z);
+        const normal = probe.normal.clone();
+        p.copy(ground).addScaledVector(normal, BOX_HEIGHT);
+
         this.boxes.push({
           pos: p,
-          groundY: probe.y,
-          normal: probe.normal.clone(),
+          ground,
+          normal,
           phase: (this.boxes.length % 7) * 0.9 + t * 11,
           down: 0,
           scale: 1,
@@ -324,7 +459,16 @@ export class Items implements IItems {
     }
 
     this.boxMat = boxMaterial(ctx);
-    const geo = roundedBox(BOX_SIZE, BOX_SIZE * 0.17, 4);
+    if (this.boxMat.map) {
+      this.boxMat.map.anisotropy = Math.min(8, ctx.renderer.capabilities.getMaxAnisotropy());
+    }
+    // seg 6, not 4. `roundedBox` subdivides uniformly and then projects
+    // everything outside the inner core onto the fillet, so at seg 4 the only
+    // ring outside the core was the outermost one: every rounded edge was a
+    // *single* quad, which is a chamfer the shading cannot resolve into a
+    // highlight. Six puts two rings in the fillet and the edges start catching
+    // the key the way §5 asks for. 432 tris, one instanced draw.
+    const geo = roundedBox(BOX_SIZE, BOX_SIZE * 0.17, 6);
     this.boxMesh = new THREE.InstancedMesh(geo, this.boxMat, this.boxes.length);
     this.boxMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.boxMesh.castShadow = false;   // a translucent shell casts a poor shadow
@@ -332,28 +476,53 @@ export class Items implements IItems {
     this.boxMesh.renderOrder = 4;
     this.boxMesh.name = 'item-boxes';
 
-    // The inner core. Additive and un-tone-mapped, so every pixel it covers is
-    // a pixel the shell's shading cannot win back — at 0.9 opacity across 30%
-    // of the box it was averaging the whole cube up to white before bloom even
-    // started. Smaller and dimmer: it is a glow *inside* a glass box, not a
-    // lamp with a box painted on it.
+    // The glow. This used to be a core *inside* the cube, and with the shell now
+    // writing depth at 0.94 an interior lamp is a lamp in a box: 94% of it is
+    // thrown away and the 6% that survives lands as a white bloom directly over
+    // the mark, which is the milky centre the review saw. So it is turned inside
+    // out — a soft additive shell a little larger than the box, drawn *before*
+    // it. Everything inside the silhouette is covered by the shell; what
+    // survives is a warm halo bleeding out past the edges. Against the sky that
+    // is the "this is a pickup" read, and it is the same instanced mesh and the
+    // same draw call it always was.
     this.coreMat = new THREE.MeshBasicMaterial({
-      color: 0xffe6a8,
-      map: radialSprite(64, 0.0, 1.4),
+      color: 0xffd9a0,
+      map: radialSprite(64, 0.0, 2.1),
       transparent: true,
-      opacity: 0.44,
+      opacity: 0.34,
       blending: THREE.AdditiveBlending,
       depthWrite: false,
       toneMapped: false,
     });
-    const coreGeo = new THREE.OctahedronGeometry(BOX_SIZE * 0.20, 0);
+    const coreGeo = new THREE.OctahedronGeometry(BOX_SIZE * 0.92, 1);
     this.coreMesh = new THREE.InstancedMesh(coreGeo, this.coreMat, this.boxes.length);
     this.coreMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.coreMesh.frustumCulled = false;
     this.coreMesh.renderOrder = 3;
 
-    this.boxShadows = new BlobShadows(this.boxes.length);
-    this.group.add(this.boxMesh, this.coreMesh, this.boxShadows.mesh);
+    // Contact shadow. Tighter and denser than the shared default: a 1.9 m blob
+    // at 0.44 over a 1.55 m box spread the darkness so thin it was inside the
+    // tarmac's own aggregate noise, which is why the review read it as absent.
+    this.boxShadows = new BlobShadows(this.boxes.length, {
+      opacity: 0.62,
+      gamma: 1.9,
+      inner: 0.10,
+      name: 'item-box-shadows',
+    });
+    // ...and the light the box spills back down onto the road. An emissive
+    // object with a hole punched in the tarmac under it and nothing else is
+    // half a lighting event. Additive, warm, wider and much softer than the
+    // shadow, drawn under it so the shadow core still reads.
+    this.boxGlow = new BlobShadows(this.boxes.length, {
+      color: 0xffc478,
+      opacity: 0.30,
+      gamma: 2.6,
+      additive: true,
+      lift: 0.035,
+      renderOrder: 1,
+      name: 'item-box-glow',
+    });
+    this.group.add(this.boxMesh, this.coreMesh, this.boxGlow.mesh, this.boxShadows.mesh);
   }
 
   private buildOrbit() {
@@ -630,6 +799,7 @@ export class Items implements IItems {
 
   private updateBoxes(dt: number, karts: readonly IKart[], now: number) {
     this.boxShadows.begin();
+    this.boxGlow.begin();
     let live = 0;
 
     for (let i = 0; i < this.boxes.length; i++) {
@@ -665,6 +835,8 @@ export class Items implements IItems {
       const pop = b.scale < 1
         ? 1 - Math.pow(1 - b.scale, 3) + Math.sin(b.scale * Math.PI) * 0.22
         : 1;
+      // Bob along the *local ground normal*, not world Y, so on the banked
+      // sections the box rises off the road rather than leaning away from it.
       const bob = Math.sin(now * 1.7 + b.phase) * 0.16;
       _e.set(
         Math.sin(now * 0.7 + b.phase) * 0.22,
@@ -672,23 +844,30 @@ export class Items implements IItems {
         Math.cos(now * 0.53 + b.phase * 1.3) * 0.18,
       );
       _q.setFromEuler(_e);
-      _v2.copy(b.pos);
-      _v2.y += bob;
+      _v2.copy(b.pos).addScaledVector(b.normal, bob);
       _s.setScalar(pop);
       _m.compose(_v2, _q, _s);
       this.boxMesh.setMatrixAt(live, _m);
 
-      // the core counter-rotates and breathes — two motions, never in sync
-      const pulse = 0.82 + Math.sin(now * 4.1 + b.phase * 2.1) * 0.18;
+      // the halo counter-rotates and breathes — two motions, never in sync
+      const pulse = 0.94 + Math.sin(now * 4.1 + b.phase * 2.1) * 0.10;
       _e.set(now * -0.9, now * 1.9 + b.phase, 0);
       _q.setFromEuler(_e);
       _s.setScalar(pop * pulse);
       _m.compose(_v2, _q, _s);
       this.coreMesh.setMatrixAt(live, _m);
 
-      // the shadow shrinks and softens as the box rises on its bob
-      const lift = clamp((_v2.y - b.groundY) / 3, 0, 1);
-      this.boxShadows.add(b.pos.x, b.groundY, b.pos.z, b.normal, (1.9 - lift * 0.5) * pop);
+      // Ground contact. `b.ground` is the probed point on the tarmac directly
+      // under the box, so both layers land on the surface rather than on a
+      // plane through the centreline. The shadow shrinks and softens as the box
+      // rises on its bob; the light pool does the opposite and spreads, which is
+      // what a lamp moving away from a surface actually does.
+      // Both spans are full widths, not radii: 1.85 m of shadow under a 1.55 m
+      // box, and a light pool a little over twice that.
+      const lift = clamp((BOX_HEIGHT + bob) / 3, 0, 1);
+      const g = b.ground;
+      this.boxShadows.add(g.x, g.y, g.z, b.normal, (1.85 - lift * 0.42) * pop);
+      this.boxGlow.add(g.x, g.y, g.z, b.normal, (3.4 + lift * 0.9) * pop);
       live++;
     }
 
@@ -697,12 +876,17 @@ export class Items implements IItems {
     this.boxMesh.instanceMatrix.needsUpdate = true;
     this.coreMesh.instanceMatrix.needsUpdate = true;
     this.boxShadows.end();
+    this.boxGlow.end();
 
-    // The core cycles hue slowly, which is what makes the box catch the eye.
-    // Lightness held well below 1: this feeds an additive pass, so 0.78 was
-    // adding most of a full white on top of an already-lit face.
-    const h = (now * 0.11) % 1;
-    this.coreMat.color.setHSL(h, 0.62, 0.52);
+    // The halo breathes rather than cycling the full hue wheel. Two reasons:
+    // the old sweep spent a third of its cycle in greens and magentas the
+    // course palette does not contain, and the halo now sits *outside* the
+    // silhouette against a sky that is already near the bloom threshold, where
+    // §6's "three effects must not white the frame out" bites hardest. So it
+    // stays in the sky-warm band (`#ffd0a0` is hue ~0.08) and pulses value
+    // instead — complementary to the sea-glass shell, so the two separate.
+    const h = 0.085 + Math.sin(now * 0.6) * 0.025;
+    this.coreMat.color.setHSL(h, 0.72, 0.50 + Math.sin(now * 2.3) * 0.06);
   }
 
   // ------------------------------------------------------------- carried items
@@ -739,8 +923,10 @@ export class Items implements IItems {
     this.orbitMesh.geometry.dispose();
     (this.orbitMesh.material as THREE.Material).dispose();
     this.boxMat.map?.dispose();
+    this.boxMat.roughnessMap?.dispose();
     this.boxMat.dispose();
     this.coreMat.dispose();
     this.boxShadows.dispose();
+    this.boxGlow.dispose();
   }
 }

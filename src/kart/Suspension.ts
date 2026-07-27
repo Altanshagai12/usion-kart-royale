@@ -45,6 +45,13 @@ export interface SuspensionConfig {
   dampingCompress: number;
   dampingRebound: number;
   /**
+   * Half the width of the tyre's contact patch. A wheel is not a point: it
+   * rests on the highest ground anywhere under its footprint, which is the
+   * whole reason a tyre *rides over* a kerb lip instead of letting its sidewall
+   * slice through the profile. See `probeGround`.
+   */
+  tyreHalfWidth: number;
+  /**
    * Anti-roll bar rate, N.m per radian per kg of chassis. The four springs
    * alone cannot hold the chassis flat: at a lateral load of only ~1.5 g the
    * inside pair reaches zero compression, after which the outside pair is
@@ -67,6 +74,11 @@ export const DEFAULT_SUSPENSION: SuspensionConfig = {
   comHeight: 0.34,
   dampingCompress: 0.44,
   dampingRebound: 0.66,
+  // KartModel builds its tyres 0.30 m wide (WHEEL_HW = 0.15). Keeping the
+  // physical footprint the same width as the visible one is what stops a
+  // kerb-riding wheel showing daylight on one side and geometry through the
+  // other.
+  tyreHalfWidth: 0.15,
   antiRoll: 58,
 };
 
@@ -113,6 +125,25 @@ export interface Wheel {
 const _p = new THREE.Vector3();
 const _d = new THREE.Vector3();
 const _n = new THREE.Vector3();
+const _right = new THREE.Vector3();
+const _probeAt = new THREE.Vector3();
+
+/** lateral offsets across the contact patch, as a fraction of the tyre half-width */
+const FOOTPRINT = [0, -0.92, 0.92];
+
+/**
+ * How badly a surface hurts, for choosing which one to *report*. Derived from
+ * the speed multiplier so it can never disagree with the handling constants:
+ * road is 0, a boost pad is negative, everything loose is positive.
+ */
+function surfacePenalty(s: Surface): number {
+  return 1 - SURFACE_PROPS[s].maxSpeedMul;
+}
+
+/** Out of bounds and water are respawn territory, not just slow going. */
+function isFatalSurface(s: Surface): boolean {
+  return s === Surface.OffTrack || s === Surface.Water;
+}
 
 function makeWheel(index: number, cfg: SuspensionConfig): Wheel {
   const front = index < 2;
@@ -178,8 +209,26 @@ export class Suspension {
   totalForce = 0;
   /** deepest travel past the bump stop this solve, metres */
   bottomDepth = 0;
-  /** surface under the most heavily loaded wheel */
+  /** surface under the most heavily loaded wheel — what the kart is driving ON */
   dominantSurface: Surface = Surface.Road;
+  /**
+   * The most punishing surface any meaningfully loaded wheel is standing on.
+   *
+   * `dominantSurface` answers "what is holding the kart up", which is the right
+   * question for the respawn watchdog and the wrong one for everything the
+   * player can see. Drop two wheels onto a verge and the kart rolls onto the
+   * pair still up on the kerb, so the heaviest-loaded wheel is on tarmac and
+   * the kart cheerfully reports Road while half of it ploughs through grass —
+   * no dust, no squeal, no readable penalty. That is round 1's drift shot.
+   *
+   * OffTrack and Water are only reported when *every* loaded wheel is on them,
+   * so hanging one wheel over the line still cannot arm a respawn.
+   */
+  worstSurface: Surface = Surface.Road;
+  /** 0..1 share of the vertical load carried on something other than tarmac */
+  offRoadLoad = 0;
+  /** any loaded wheel is on a boost pad — one wheel clipping the strip counts */
+  boostContact = false;
   /** load-weighted blend of the per-wheel surface constants */
   gripMul = 1;
   dragMul = 1;
@@ -211,6 +260,10 @@ export class Suspension {
     this.roll = this.rollVel = this.pitch = this.pitchVel = 0;
     this.groundNormal.set(0, 1, 0);
     this.contacts = 4;
+    this.dominantSurface = Surface.Road;
+    this.worstSurface = Surface.Road;
+    this.offRoadLoad = 0;
+    this.boostContact = false;
     for (const w of this.wheels) {
       w.compression = this.cfg.restCompression;
       w.compressionVel = 0;
@@ -231,26 +284,60 @@ export class Suspension {
    * the suspension fight itself.
    */
   probeGround(track: ITrack, position: THREE.Vector3, quat: THREE.Quaternion, hintT: number) {
+    // Chassis right, for stepping across the contact patch.
+    _right.set(1, 0, 0).applyQuaternion(quat);
+    const halfW = this.cfg.tyreHalfWidth;
+
     for (let i = 0; i < 4; i++) {
       const w = this.wheels[i];
       w.attachWorld.copy(w.attach).applyQuaternion(quat).add(position);
-      const probe = track.probe(w.attachWorld, hintT);
-      const ny = probe.normal.y;
-      if (!Number.isFinite(probe.y) || !Number.isFinite(ny)) {
-        w.groundValid = false;
-        continue;
-      }
-      w.groundValid = true;
-      w.surface = probe.surface;
-      w.groundT = probe.t;
-      w.edgeRatio = probe.edgeRatio;
-      w.groundNormal.copy(probe.normal);
-      if (w.groundNormal.lengthSq() < 1e-6) w.groundNormal.set(0, 1, 0);
-      else w.groundNormal.normalize();
 
-      const rumble = SURFACE_PROPS[probe.surface].rumble;
-      const jitter = rumble > 0 ? rumble * rumbleAt(w.attachWorld.x, w.attachWorld.z) : 0;
-      w.groundPoint.set(w.attachWorld.x, probe.y + jitter, w.attachWorld.z);
+      // A rigid wheel rests on the HIGHEST ground anywhere under its footprint.
+      // Probing only the hub axis makes the wheel a point, and a point walks
+      // straight through the kerb's inner face — 86 mm of rise over 140 mm of
+      // lateral travel — until its centre has already crossed it, which is what
+      // "the kart passes through the kerb rather than riding over it" looks
+      // like. Three samples across the tread pick the lip up half a tyre width
+      // early instead, so the wheel climbs on.
+      //
+      // Height and surface come from the winning sample; the contact NORMAL and
+      // the track frame stay with the hub sample. Taking the normal off a
+      // chamfer that only the tread edge is touching would inject a lateral
+      // kick every time anyone brushed a kerb, and the ride-over does not need
+      // it.
+      let bestY = -Infinity;
+      let bestSurface = Surface.Road;
+      let valid = false;
+      let haveFrame = false;
+
+      for (let s = 0; s < FOOTPRINT.length; s++) {
+        _probeAt.copy(w.attachWorld);
+        const off = FOOTPRINT[s];
+        if (off !== 0) _probeAt.addScaledVector(_right, off * halfW);
+        const probe = track.probe(_probeAt, hintT);
+        if (!Number.isFinite(probe.y) || !Number.isFinite(probe.normal.y)) continue;
+
+        if (!haveFrame) {
+          haveFrame = true;
+          w.groundT = probe.t;
+          w.edgeRatio = probe.edgeRatio;
+          w.groundNormal.copy(probe.normal);
+          if (w.groundNormal.lengthSq() < 1e-6) w.groundNormal.set(0, 1, 0);
+          else w.groundNormal.normalize();
+        }
+
+        const rumble = SURFACE_PROPS[probe.surface].rumble;
+        const y = probe.y + (rumble > 0 ? rumble * rumbleAt(_probeAt.x, _probeAt.z) : 0);
+        if (y <= bestY) continue;
+        bestY = y;
+        bestSurface = probe.surface;
+        valid = true;
+      }
+
+      w.groundValid = valid;
+      if (!valid) continue;
+      w.surface = bestSurface;
+      w.groundPoint.set(w.attachWorld.x, bestY, w.attachWorld.z);
     }
   }
 
@@ -362,6 +449,7 @@ export class Suspension {
     this.contacts = contacts;
     this.totalForce = total;
     this.bottomDepth = bottom;
+    this.classifySurfaces(total);
 
     if (normalWeight > 0) {
       _n.divideScalar(normalWeight);
@@ -414,11 +502,65 @@ export class Suspension {
   }
 
   /**
+   * Which surfaces are worth *telling anyone about*, as opposed to which one is
+   * doing the work. Split out of the force loop because it needs the load total
+   * the loop is still accumulating.
+   *
+   * "Engaged" is a share of the total load rather than a raw newton threshold,
+   * so it means the same thing for a heavyweight as for a featherweight, and so
+   * a wheel merely grazing the ground on the rebound stroke does not get a vote.
+   */
+  private classifySurfaces(total: number) {
+    const floor = total * 0.05;
+    let worst = Surface.Road;
+    let worstPen = -Infinity;
+    let fatal = Surface.Road;
+    let fatalPen = -Infinity;
+    let engaged = 0;
+    let clean = 0;
+    let offRoad = 0;
+    let boost = false;
+
+    for (let i = 0; i < 4; i++) {
+      const w = this.wheels[i];
+      if (!w.contact || w.load <= floor) continue;
+      engaged++;
+      const s = w.surface;
+      if (s === Surface.Boost) boost = true;
+      if (s !== Surface.Road && s !== Surface.Boost) offRoad += w.load;
+      const pen = surfacePenalty(s);
+      if (isFatalSurface(s)) {
+        if (pen > fatalPen) { fatalPen = pen; fatal = s; }
+      } else {
+        clean++;
+        if (pen > worstPen) { worstPen = pen; worst = s; }
+      }
+    }
+
+    this.boostContact = boost;
+    this.offRoadLoad = total > 1 ? offRoad / total : 0;
+    if (engaged === 0) this.worstSurface = this.dominantSurface;
+    else if (clean === 0) this.worstSurface = fatal;
+    else this.worstSurface = worst;
+  }
+
+  /**
    * How far the visual wheel node sits from its modelled rest position.
    * Positive = the wheel has risen into its well because the chassis dropped.
+   *
+   * The bounds are the spring's own travel, not a round number: `solve` already
+   * clamps compression to [-maxDroop, maxCompression + bump], and clipping it
+   * again here only decouples the rendered wheel from the one the tyre model is
+   * solving. The old symmetric ±0.18 m clamp cut 70 mm off full droop, which
+   * left a wheel dangling over a verge drawn 70 mm higher than the physics had
+   * it — floating, with its contact shadow floating too, since KartModel drives
+   * the shadow lobes off these very node heights.
    */
   visualOffset(w: Wheel): number {
-    const o = w.compression - this.cfg.restCompression;
-    return o < -0.18 ? -0.18 : o > 0.18 ? 0.18 : o;
+    const cfg = this.cfg;
+    const lo = -(cfg.maxDroop + cfg.restCompression);
+    const hi = cfg.maxCompression + 0.06 - cfg.restCompression;
+    const o = w.compression - cfg.restCompression;
+    return o < lo ? lo : o > hi ? hi : o;
   }
 }

@@ -215,37 +215,62 @@ const _s = new THREE.Vector3();
 const _pos = new THREE.Vector3();
 const UP = new THREE.Vector3(0, 1, 0);
 
+/**
+ * Tuning for one blob layer. The defaults are the contact shadow every dropped
+ * item gets; passing an additive colour instead turns the same machinery into a
+ * pool of bounced light, which is what an emissive pickup should be spilling
+ * onto the tarmac under it.
+ */
+export interface BlobOptions {
+  color?: number;
+  opacity?: number;
+  /** falloff exponent of the radial sprite — higher = tighter core */
+  gamma?: number;
+  /** flat centre fraction before the falloff starts */
+  inner?: number;
+  additive?: boolean;
+  /** metres of lift off the ground, to clear z-fighting with the road */
+  lift?: number;
+  renderOrder?: number;
+  name?: string;
+  /** defaults off, matching the contact shadow this class was written for */
+  toneMapped?: boolean;
+}
+
 export class BlobShadows {
   readonly mesh: THREE.InstancedMesh;
   private n = 0;
+  private readonly lift: number;
 
-  constructor(private readonly max: number) {
+  constructor(private readonly max: number, opt: BlobOptions = {}) {
     const geo = new THREE.PlaneGeometry(1, 1);
     geo.rotateX(-Math.PI / 2);
     const mat = new THREE.MeshBasicMaterial({
-      color: 0x2a2230,          // warm-shadow tint; never pure black
-      map: radialSprite(64, 0.05, 1.55),
+      color: opt.color ?? 0x2a2230,   // warm-shadow tint; never pure black
+      map: radialSprite(64, opt.inner ?? 0.05, opt.gamma ?? 1.55),
       transparent: true,
-      opacity: 0.44,
+      opacity: opt.opacity ?? 0.44,
       depthWrite: false,
-      blending: THREE.NormalBlending,
-      toneMapped: false,
+      blending: opt.additive ? THREE.AdditiveBlending : THREE.NormalBlending,
+      toneMapped: opt.toneMapped ?? false,
     });
+    this.lift = opt.lift ?? 0.045;
     this.mesh = new THREE.InstancedMesh(geo, mat, max);
     this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.mesh.frustumCulled = false;
-    this.mesh.renderOrder = 2;
+    this.mesh.renderOrder = opt.renderOrder ?? 2;
     this.mesh.count = 0;
-    this.mesh.name = 'item-blob-shadows';
+    this.mesh.name = opt.name ?? 'item-blob-shadows';
   }
 
   begin() { this.n = 0; }
 
-  add(x: number, y: number, z: number, normal: THREE.Vector3, radius: number) {
+  /** `width` is the full span of the blob in metres, not its radius. */
+  add(x: number, y: number, z: number, normal: THREE.Vector3, width: number) {
     if (this.n >= this.max) return;
     _q.setFromUnitVectors(UP, normal);
-    _pos.set(x, y + 0.045, z);
-    _s.set(radius, 1, radius);
+    _pos.set(x, y + this.lift, z);
+    _s.set(width, 1, width);
     _m.compose(_pos, _q, _s);
     this.mesh.setMatrixAt(this.n++, _m);
   }

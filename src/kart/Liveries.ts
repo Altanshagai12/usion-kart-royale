@@ -262,6 +262,57 @@ function fbmFill(
   c.putImageData(img, x0, y0);
 }
 
+/**
+ * Add fine grain to a horizontal band of a HEIGHT canvas, seamless in U.
+ *
+ * The wheel atlas's U axis is the tyre's circumference, so any field generated
+ * straight from a noise function carries a discontinuity down the whole height
+ * of the tyre at u=0 — one hard vertical crease on the closest object to the
+ * camera all race. Crossfading the field with a copy of itself shifted exactly
+ * one period in U closes it: at u=1 the shifted copy is sampling what the
+ * original samples at u=0, so the two ends meet. The price is a ~30% amplitude
+ * dip mid-tile, which on a grain is invisible.
+ *
+ * Generated at half resolution and box-upscaled by the browser. That is not a
+ * compromise: the atlas is 2.3 mm per texel at the tread radius, so a grain
+ * authored per-texel is sub-pixel noise that mips straight into aliasing. Two
+ * to three texels — 5 to 7 mm — is real moulded-rubber grain.
+ */
+function addGrain(
+  dst: CanvasRenderingContext2D, y0: number, h: number,
+  cell: number, amp: number, seed: number,
+) {
+  const w = dst.canvas.width;
+  const gw = Math.max(1, w >> 1);
+  const gh = Math.max(1, h >> 1);
+  const noise = createNoise2D(lcg(seed));
+  const tmp = canvas(gw, gh);
+  const img = tmp.createImageData(gw, gh);
+  const d = img.data;
+  const f = 1 / cell;
+  for (let y = 0; y < gh; y++) {
+    for (let x = 0; x < gw; x++) {
+      const t = x / gw;
+      const n = noise(x * f, y * f) * (1 - t) + noise((x - gw) * f, y * f) * t;
+      const i = (y * gw + x) * 4;
+      const v = 128 + n * 127;
+      d[i] = d[i + 1] = d[i + 2] = v < 0 ? 0 : v > 255 ? 255 : v;
+      d[i + 3] = 255;
+    }
+  }
+  tmp.putImageData(img, 0, 0);
+  const up = canvas(w, h);
+  up.drawImage(tmp.canvas, 0, 0, w, h);
+  const g = up.getImageData(0, 0, w, h).data;
+  const band = dst.getImageData(0, y0, w, h);
+  const b = band.data;
+  for (let i = 0; i < w * h; i++) {
+    const v = b[i * 4] + ((g[i * 4] - 128) / 127) * amp;
+    b[i * 4] = b[i * 4 + 1] = b[i * 4 + 2] = v < 0 ? 0 : v > 255 ? 255 : v;
+  }
+  dst.putImageData(band, 0, y0);
+}
+
 function rr(c: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
   c.beginPath();
   c.moveTo(x + r, y);
@@ -397,15 +448,23 @@ function surfaceDetail(): SurfaceDetail {
   const plasticRough = toksvigTexture(prg, grainSlope, PLASTIC_NORMAL_SCALE, PLASTIC_REPEAT, true, 0.48);
 
   // ---- chrome ------------------------------------------------------------
-  // 0.10..0.23 around the bible's 0.15, riding the same long-wave flow as the
+  // 0.08..0.24 around the bible's 0.15, riding the same long-wave flow as the
   // clearcoat so a bumper and the bodywork next to it feel hand-polished by
   // the same person.
+  //
+  // The frequency is the change from round 3. At scale 0.012 on a 256 map one
+  // roughness feature is ~83 texels, and against COAT_REPEAT's 588 mm tile that
+  // is a 190 mm cell: the front rub strip is a metre long and got five of them,
+  // which is not a break, it is a slow drift. 0.045 puts a cell every ~50 mm,
+  // so the highlight running along a bumper is interrupted several times per
+  // its own width. Chrome does not look polished because it is uniformly
+  // smooth; it looks polished because it is ALMOST uniformly smooth.
   const chr = canvas(C);
-  fbmFill(chr, 0, 0, C, C, 0.012, 3, 6611, (n) => {
-    const v = Math.round((0.10 + n * 0.13) * 255);
+  fbmFill(chr, 0, 0, C, C, 0.045, 3, 6611, (n) => {
+    const v = Math.round((0.08 + n * 0.16) * 255);
     return [v, v, v];
   });
-  const chromeRough = toksvigTexture(chr, flowSlope, COAT_NORMAL_SCALE, COAT_REPEAT, true, 0.09);
+  const chromeRough = toksvigTexture(chr, flowSlope, COAT_NORMAL_SCALE, COAT_REPEAT, true, 0.075);
 
   // ---- race-suit cloth ---------------------------------------------------
   // The driver shared the moulded-plastic family in round 1, so the suit, the
@@ -560,19 +619,34 @@ function wheelMaps() {
   hgt.fillRect(0, 0, S, S);
 
   /**
-   * A block whose height ramps in over `bevel` px instead of stepping. A hard
-   * white rounded-rect in the height field Sobels into a one-texel wall, which
-   * is a hard 90 deg edge no matter how round the corner radius is — the same
-   * amateur tell as an unchamfered mesh edge, just in texture space.
+   * A block whose height ramps in over a rolled shoulder instead of stepping.
+   *
+   * Round 3's version was a five-step staircase from 0x46 to 0xdc, and it laid
+   * that staircase on a groove floor of 0x30. Two things came out of that, both
+   * of them in the closeup note. The outermost tread of the staircase is a
+   * FLAT 22-level jump off the groove floor with no ramp under it at all — a
+   * one-texel wall, i.e. the §5 hard-90-degree tell in texture space, which
+   * Sobels into the thin blown-white wire running round every block. And five
+   * steps over a 6 px bevel is a 1.2 px tread each, so even the ramp that is
+   * there arrives as four more little walls rather than a curve.
+   *
+   * `lo` is now taken to be the groove floor the block is sitting on, so the
+   * shoulder leaves it with no discontinuity, and the profile is a quarter
+   * cosine over 16 rings across a 9 px (≈21 mm of tread circumference) bevel.
+   * The Sobel of that is a smooth gradient that peaks in the middle of the
+   * shoulder — a rolled highlight, which is what the note asked for.
    */
   const chamferedBlock = (
     c: CanvasRenderingContext2D, x: number, y: number, w: number, h: number,
-    r: number, lo: number, hi: number, steps = 5,
+    r: number, lo: number, hi: number, steps = 16,
   ) => {
+    const bevel = Math.min(9, Math.min(w, h) * 0.22);
     for (let k = 0; k < steps; k++) {
       const s = k / (steps - 1);
-      const inset = (1 - s) * Math.min(6, Math.min(w, h) * 0.16);
-      const v = Math.round(lo + (hi - lo) * s);
+      const inset = (1 - s) * bevel;
+      // quarter cosine: tangential to the groove floor at s=0 and to the block
+      // face at s=1, so neither end of the shoulder carries an edge
+      const v = Math.round(lo + (hi - lo) * (1 - Math.cos(s * Math.PI * 0.5)));
       c.fillStyle = `rgb(${v},${v},${v})`;
       rr(c, x + inset, y + inset, w - inset * 2, h - inset * 2, Math.max(1, r - inset));
       c.fill();
@@ -597,13 +671,14 @@ function wheelMaps() {
       const h = th * 0.26;
       const w = bw * (row === 1 ? 0.74 : 0.66);
       const top = row === 1 ? '#33353e' : '#2d2f37';
-      chamferedBlock(hgt, x, y, w, h, 10, 0x46, 0xdc);
+      // lo == the groove floor painted above, so the shoulder starts flush
+      chamferedBlock(hgt, x, y, w, h, 10, 0x30, 0xdc);
       alb.fillStyle = top;
       rr(alb, x + 2, y + 2, w - 4, h - 4, 9);
       alb.fill();
       // wrap the block that runs off the right edge back onto the left
       if (x + w > S) {
-        chamferedBlock(hgt, x - S, y, w, h, 10, 0x46, 0xdc);
+        chamferedBlock(hgt, x - S, y, w, h, 10, 0x30, 0xdc);
         alb.fillStyle = top;
         rr(alb, x - S + 2, y + 2, w - 4, h - 4, 9); alb.fill();
       }
@@ -615,21 +690,9 @@ function wheelMaps() {
     const v = Math.round(20 + n * 60);
     return [v, v - 2, v - 6];
   });
-  // Road dust picked up on the shoulders only — the crown wipes itself clean
-  // every revolution, which is half of why a real tyre reads as two surfaces.
   alb.globalAlpha = 1;
-  // The crown is NOT clean either: a kart running a dusty coastal circuit picks
-  // up a thin warm film everywhere and a heavy one on the shoulders. Round 1
-  // took the crown to exactly zero dust, which left the one band of the tyre
-  // the camera sees most as pure neutral charcoal against a warm-graded frame.
-  const shoulder = alb.createLinearGradient(0, tx0, 0, tx0 + th);
-  shoulder.addColorStop(0.00, 'rgba(201,169,126,0.34)');
-  shoulder.addColorStop(0.22, 'rgba(201,169,126,0.10)');
-  shoulder.addColorStop(0.50, 'rgba(193,158,118,0.05)');
-  shoulder.addColorStop(0.78, 'rgba(201,169,126,0.10)');
-  shoulder.addColorStop(1.00, 'rgba(201,169,126,0.34)');
-  alb.fillStyle = shoulder;
-  alb.fillRect(0, tx0, S, th);
+  // (the tread's dust is applied after the height field is complete — see the
+  // valley pass below the sidewall, which needs to know where the valleys are)
 
   // ---- sidewall ----------------------------------------------------------
   const sw = WHEEL_UV.sidewall;
@@ -714,6 +777,56 @@ function wheelMaps() {
   swDust.addColorStop(1.00, 'rgba(201,169,126,0.22)'); // shoulder, kerb-scuffed
   alb.fillStyle = swDust;
   alb.fillRect(0, sy, S, sh);
+
+  // ---- rubber grain ------------------------------------------------------
+  // The closeup note: "no rubber micro-normal ... sidewall and tread have the
+  // same response". The roughness plateaus were already different; what was
+  // missing is any relief at all between the moulded features, so both bands
+  // answered the sun as a perfectly smooth surface at two different gloss
+  // levels — which is a painted plastic doughnut, not rubber. One moulded grain
+  // across both bands (rows 297..1024 of the atlas are sidewall + tread and
+  // nothing else) gives the whole tyre a break-up finer than any of its
+  // features, and the Toksvig bake below converts whatever mips away into
+  // roughness rather than losing it to sparkle.
+  const grainY = Math.round(sy);
+  addGrain(hgt, grainY, S - grainY, 1.6, 7.0, 61207);
+
+  // ---- dust in the tread valleys -----------------------------------------
+  // §6 asks for surface-keyed dirt and the review asked for build-up in the
+  // tread despite the beach and off-track sections. Round 3 answered it with a
+  // vertical gradient, which dusts the crown of a block and the floor of the
+  // groove beside it by exactly the same amount — i.e. it reads as a tint, not
+  // as dirt. Dirt is where dirt can stay: the groove floors and the moulded
+  // shoulders keep it, a block face is wiped clean once a revolution. The
+  // height field is the only thing that knows which is which, so this runs
+  // after it is finished (grain included).
+  {
+    const ty = Math.round(tx0);
+    const tH = Math.min(S - ty, Math.round(th));
+    const band = alb.getImageData(0, ty, S, tH);
+    const hb = hgt.getImageData(0, ty, S, tH).data;
+    const ab = band.data;
+    const DR = 201, DG = 169, DB = 126; // the sand/stone dust of §3
+    for (let y = 0; y < tH; y++) {
+      // across the tread: 0 at the crown, 1 at either shoulder
+      const across = Math.abs((y / tH) * 2 - 1);
+      const rim = 0.08 + 0.20 * across * across;
+      for (let x = 0; x < S; x++) {
+        const i = (y * S + x) * 4;
+        // 1 on the groove floor, 0 on a block face
+        let depth = (hb[i] - 0x38) / (0xd0 - 0x38);
+        depth = 1 - (depth < 0 ? 0 : depth > 1 ? 1 : depth);
+        // Peaks at 0.28 in a shoulder groove and falls to 0.03 on the crown of a
+        // block, against round 3's flat 0.34 everywhere on the shoulder — so
+        // this is LESS total dust, arranged where dust can actually stay.
+        const a = rim * (0.35 + 0.65 * depth * depth);
+        ab[i] += (DR - ab[i]) * a;
+        ab[i + 1] += (DG - ab[i + 1]) * a;
+        ab[i + 2] += (DB - ab[i + 2]) * a;
+      }
+    }
+    alb.putImageData(band, 0, ty);
+  }
 
   // ---- rim face ----------------------------------------------------------
   const rf = WHEEL_UV.rimFace;
@@ -811,7 +924,7 @@ function wheelMaps() {
   // as one extruded matte shape (round 2's note). The polished contact band is
   // still there, it just no longer wins.
   roughRamp(0, tx0, S, th, 0, [
-    [0.00, 0.93], [0.16, 0.92], [0.34, 0.80], [0.50, 0.72], [0.66, 0.80], [0.84, 0.92], [1.00, 0.93],
+    [0.00, 0.94], [0.16, 0.93], [0.34, 0.84], [0.50, 0.78], [0.66, 0.84], [0.84, 0.93], [1.00, 0.94],
   ]);
   // Sidewall: glossiest at the mid-flank (0.58), where a real tyre's moulded
   // rubber is unscuffed and slightly waxy, dulling to 0.66 at the bead and 0.86
@@ -819,16 +932,27 @@ function wheelMaps() {
   // v is the rim end. That mid-flank band is what catches the low sun as a
   // curved highlight running round the wheel.
   roughRamp(0, sy, S, sh, 0, [
-    [0.00, 0.66], [0.22, 0.60], [0.46, 0.58], [0.72, 0.72], [1.00, 0.86],
+    [0.00, 0.68], [0.22, 0.64], [0.46, 0.62], [0.72, 0.74], [1.00, 0.88],
   ]);
   zone(rx, ry, rw, rh, 0.30, 1);
   zone(0, px(nb[1]), S, px(nb[3]), 0.10, 1);
   zone(dx, dy, dw, dh, 0.42, 0.9);
-  // scuff the tread roughness so it is not a flat value either
-  orm.globalAlpha = 0.35;
-  fbmFillInto(orm, 0, tx0, S, th, 0.03, 3, 1207, (n) => [255, Math.round(190 + n * 60), 0]);
-  orm.globalAlpha = 0.30;
-  fbmFillInto(orm, 0, sy, S, sh, 0.025, 3, 4409, (n) => [255, Math.round(180 + n * 62), 0]);
+  // Scuff the rubber so it is not a flat value either.
+  //
+  // The note is that the scuff "range is too narrow to see", and it is right:
+  // one pass at alpha 0.35 over a 190..250 source is +-0.04 of roughness
+  // against a 0.78..0.94 plateau. Nothing at that amplitude survives a tone
+  // map. Two passes now, at different scales for the same reason the lacquer
+  // runs two lobes — a broad worn/unworn patchiness round the circumference
+  // (kart tyres do not wear evenly) under a finer kerb-and-gravel scuff — and
+  // together they swing roughness by about 0.28. §9.3 asks for spatially
+  // varying roughness; this is the tyre's share of it.
+  orm.globalAlpha = 0.55;
+  fbmFillInto(orm, 0, tx0, S, th, 0.012, 2, 4021, (n) => [255, Math.round(150 + n * 105), 0]);
+  orm.globalAlpha = 0.40;
+  fbmFillInto(orm, 0, tx0, S, th, 0.05, 3, 1207, (n) => [255, Math.round(165 + n * 90), 0]);
+  orm.globalAlpha = 0.40;
+  fbmFillInto(orm, 0, sy, S, sh, 0.025, 3, 4409, (n) => [255, Math.round(160 + n * 90), 0]);
   orm.globalAlpha = 0.4;
   fbmFillInto(orm, rx, ry, rw, rh, 0.02, 3, 71, (n) => [255, Math.round(52 + n * 78), 255]);
   orm.globalAlpha = 1;
@@ -1696,7 +1820,62 @@ export function kartMaterials() {
     }),
   };
   addSunRim(_mats.paint, 0.30);
+  // The two surfaces on the kart whose highlights the review found aliased.
+  addSpecularAA(_mats.wheel, 0.85);
+  addSpecularAA(_mats.chrome, 0.60);
   return _mats;
+}
+
+// --- specular antialiasing ---------------------------------------------------
+//
+// "Those rim lines are aliased." They are, and the tyre is the worst case on
+// the kart for it: a normal map with a rolled shoulder every few texels, on a
+// surface that is spinning, under a 14 degree key and a bipolar golden-hour
+// environment (warm sun one side, blue zenith the other). Every shoulder is a
+// small mirror pointed somewhere slightly different, and once the wheel is more
+// than a few metres away those mirrors land under a pixel each — so which one a
+// pixel happens to catch changes every frame. That is the crawl.
+//
+// The offline Toksvig bake already handles the part of this that MIPPING
+// causes. It cannot handle the part that CURVATURE causes: a tyre's own
+// silhouette turns through 90 degrees over a handful of pixels, and no amount
+// of texture filtering knows that. This is the runtime half — Kaplanyan's
+// normal-variance-to-roughness, measured from the screen-space derivative of
+// the shaded normal, which is the same idea the road material's `specAA` uses.
+//
+// Injected after `<normal_fragment_maps>`: `roughnessFactor` is assigned four
+// chunks earlier and not consumed until `<lights_physical_fragment>` several
+// chunks later, so the mapped normal and the roughness are both live here and
+// it costs no extra texture fetch.
+//
+// Cost: two derivatives and about eight ALU, on the wheel and chrome materials
+// only. Two draw calls per kart.
+function addSpecularAA(m: THREE.MeshStandardMaterial, strength: number) {
+  const uSpecAA = { value: strength };
+  const prev = m.onBeforeCompile;
+  m.onBeforeCompile = (shader, renderer) => {
+    prev?.call(m, shader, renderer);
+    shader.uniforms.uSpecAA = uSpecAA;
+    shader.fragmentShader = shader.fragmentShader
+      .replace('void main() {', 'uniform float uSpecAA;\nvoid main() {')
+      .replace(
+        '#include <normal_fragment_maps>',
+        [
+          '#include <normal_fragment_maps>',
+          '{',
+          '  vec3 dnx = dFdx( normal );',
+          '  vec3 dny = dFdy( normal );',
+          '  float variance = uSpecAA * ( dot( dnx, dnx ) + dot( dny, dny ) );',
+          // GGX alpha = roughness^2; alpha'^2 = alpha^2 + 2 * variance
+          '  float alpha = roughnessFactor * roughnessFactor;',
+          '  float aP = sqrt( alpha * alpha + min( 2.0 * variance, 0.5 ) );',
+          '  roughnessFactor = clamp( sqrt( aP ), roughnessFactor, 1.0 );',
+          '}',
+        ].join('\n'),
+      );
+  };
+  m.customProgramCacheKey = () => `specaa${strength.toFixed(3)}`;
+  m.needsUpdate = true;
 }
 
 // --- hero rim light ----------------------------------------------------------
@@ -1896,111 +2075,222 @@ export function liveryGeometry(built: Built, l: Livery | null): THREE.BufferGeom
 /** Half track / front axle Z / rear axle Z, so the lobes land on the tyres. */
 export interface BlobLayout { trackX: number; frontZ: number; rearZ: number; }
 
-const BLOB_W = 2.8;   // plane extent in X
-const BLOB_D = 2.6;   // plane extent in Z
-/** Radius of one wheel's contact darkening, metres. */
-const BLOB_LOBE_R = 0.40;
+/**
+ * ---------------------------------------------------------------------------
+ * Contact shadow — §9.4 "every object has contact shadow and AO. Nothing floats"
+ * ---------------------------------------------------------------------------
+ * Round 3 failed this outright: in the hero crop the tarmac under and behind
+ * both karts is the same value as open road, and the tyres meet it at a hard
+ * line. A patch WAS being built and it was authored dark enough to be obvious
+ * (a 0.38 multiplier at the contact patches), so the interesting question is
+ * why none of it reached a pixel. Three separate reasons, all fixed here:
+ *
+ * 1. IT WAS BURIED. The old quad was 2.8 x 2.6 m, dead flat, floating 12 mm
+ *    above the kart's contact plane. The bible's course is "never flat for more
+ *    than 120 m", with 20 deg of banking; a crest of only 60 m radius drops the
+ *    far edge of a 2.8 m quad 16 mm below the road, and the wheel lobes — the
+ *    part that matters — sit 0.72 m out where the sag is already at the 12 mm
+ *    clearance. So on anything but a flat plane the strongest part of the patch
+ *    was depth-rejected. The quad is now smaller (2.24 x 2.16 m, so the field
+ *    reaches zero sooner) and rides 30 mm proud instead of 12. The kart's own
+ *    quaternion already lays it on the local surface tangent, so it is only
+ *    CURVATURE that has to be cleared, never slope: 30 mm covers a 20 m-radius
+ *    crest out at the wheels and a 60 m one out to the rim, which is more than
+ *    anything the course has. Against that, a soft blob sitting 30 mm proud is
+ *    displaced 10 cm along the ground at the chase camera's angle, which on a
+ *    shadow with no hard edge in it is not a thing you can see.
+ *
+ *    (A shallow SAUCER was tried here first — rim pulled below the centre so
+ *    that the dead margin is what gets clipped on a crest. It is a worse idea
+ *    than it sounds and the render proved it: the wheel lobes sit at 0.69 of
+ *    the half-extent, most of the way to the rim, so any drop steep enough to
+ *    be worth having buries the lobes on FLAT ground. Kart floated exactly as
+ *    it does in the round-3 shots. Flat quad, shorter reach, more clearance.)
+ * 2. IT WAS STATIC. The note asks for it to be driven from suspension
+ *    compression per wheel, and it should be: a loaded tyre has a small hard
+ *    contact patch and a drooping one has none. `setWheel` does that.
+ * 3. IT WAS ONE FROZEN TEXTURE. A 128 px map of the whole footprint spends
+ *    almost all of its texels on the dead margin and cannot move a lobe. This
+ *    is now evaluated in the fragment shader — no texture, no upload, two
+ *    triangles, one draw call per kart, unchanged.
+ *
+ * On the blend: the note asks for multiply. This alpha-blends toward a
+ * near-black cool tint instead, which is the SAME operation — with a tint at
+ * ~0.005 linear, `mix(dst, tint, occ)` and `dst * (1 - occ)` differ by half a
+ * percent of a stop — but it reaches it through `NormalBlending`, which is
+ * always wired. `MultiplyBlending` only gets a blend func out of three when
+ * `premultipliedAlpha` is true; on the other path three logs an error and sets
+ * no func at all, so the quad silently inherits whatever the previous draw
+ * bound. This material has already shipped that exact bug once. The tint also
+ * buys something multiply cannot: §2 asks for teal-leaning shadows, and a
+ * multiply can only ever desaturate toward the surface's own hue.
+ */
+/**
+ * Plane extent, metres. Sized off the FIELD, not off the kart: the outermost
+ * thing drawn is a wheel lobe centred 0.74 m out with a radius that reaches
+ * 0.73 m when that corner is fully drooped, so the field runs to ~1.47 m and
+ * the half-extent has to be at least that or the guard band below eats the
+ * lobes. (Round 4's first attempt shrank this to 2.24 x 2.16 to help with the
+ * burial problem in note 1, which put the wheels at 0.64 of the half-extent —
+ * inside a guard that starts at 0.56 — and quietly cut a third off the darkest
+ * part of the patch. Rendered, measured, reverted.)
+ */
+const SHADOW_W = 3.00;
+const SHADOW_D = 3.00;
+/** Clearance above the kart's contact plane, metres. See note 1 above. */
+const SHADOW_LIFT = 0.030;
+/**
+ * Contact lobe radius at rest, metres — 1.4x the old 0.40 m, so the falloff is
+ * comfortably wider than the axle footprint and the four lobes read as one
+ * connected shadow under the kart rather than four coins.
+ */
+const SHADOW_LOBE_R = 0.56;
+/** Droop past which a corner has no contact patch left at all, metres. */
+const SHADOW_DROOP = 0.10;
+/** Compression past rest at which the patch is at its tightest, metres. */
+const SHADOW_LOAD = 0.09;
+/** Peak occlusion at a fully loaded contact patch. */
+const SHADOW_LOBE_MAX = 0.66;
+/** Occlusion under the chassis, away from any wheel. */
+const SHADOW_BODY = 0.38;
+/** Never pure black (§3), and cool, so the contact reads as sky occlusion. */
+const SHADOW_TINT = new THREE.Color(0x0c161c);
 
-function smoothstep(a: number, b: number, x: number) {
-  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
-  return t * t * (3 - 2 * t);
+export interface ContactShadow {
+  mesh: THREE.Mesh;
+  /**
+   * @param i       wheel index, FL FR RL RR — the order `buildKart` returns
+   * @param offset  visual offset of the wheel from its rest height, metres.
+   *                Positive = compressed (chassis has dropped onto it).
+   */
+  setWheel(i: number, offset: number): void;
+}
+
+let _shadowGeo: THREE.BufferGeometry | null = null;
+
+function shadowGeometry(): THREE.BufferGeometry {
+  if (_shadowGeo) return _shadowGeo;
+  const g = new THREE.PlaneGeometry(SHADOW_W, SHADOW_D);
+  g.rotateX(-Math.PI / 2);
+  g.translate(0, SHADOW_LIFT, 0);
+  g.computeBoundingSphere();
+  _shadowGeo = g;
+  return g;
+}
+
+const SHADOW_VERT = /* glsl */`
+varying vec2 vP;
+void main() {
+  vP = position.xz;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+}
+`;
+
+function shadowFragment(layout: BlobLayout): string {
+  const w = (x: number, z: number) => `vec2(${x.toFixed(4)}, ${z.toFixed(4)})`;
+  return /* glsl */`
+uniform vec4 uK;      // per-wheel strength, FL FR RL RR
+uniform vec4 uR;      // per-wheel lobe radius, metres
+uniform vec3 uTint;
+uniform vec2 uHalf;
+varying vec2 vP;
+
+float lobe( vec2 c, float r, float k ) {
+  float d = length( vP - c );
+  float t = clamp( d / max( r, 1e-3 ), 0.0, 1.0 );
+  float skirt = 1.0 - t * t * ( 3.0 - 2.0 * t );
+  // Two radii, not one. The skirt is the ambient occlusion of a wheel-sized
+  // object on the ground and it is what joins the four corners into one
+  // shadow; the core is the contact patch itself, and it is the part the
+  // review actually found missing — "the tyres meet the tarmac at a hard line
+  // with zero darkening at the contact patch". A single falloff wide enough to
+  // do the first job is far too soft to do the second.
+  float u = clamp( d / max( r * 0.40, 1e-3 ), 0.0, 1.0 );
+  float core = 1.0 - u * u * ( 3.0 - 2.0 * u );
+  return k * clamp( 0.45 * skirt + 0.55 * core, 0.0, 1.0 );
+}
+
+void main() {
+  // body: a soft ellipse over the chassis footprint
+  float body = 1.0 - smoothstep( 0.0, 1.0, length( vP / vec2( 0.76, 0.96 ) ) );
+  body *= ${SHADOW_BODY.toFixed(3)};
+
+  float l = lobe( ${w(-layout.trackX, layout.frontZ)}, uR.x, uK.x );
+  l = max( l, lobe( ${w(layout.trackX, layout.frontZ)}, uR.y, uK.y ) );
+  l = max( l, lobe( ${w(-layout.trackX, layout.rearZ)}, uR.z, uK.z ) );
+  l = max( l, lobe( ${w(layout.trackX, layout.rearZ)}, uR.w, uK.w ) );
+
+  // screen combine, so the chassis AO and a contact lobe can overlap without
+  // ever stacking into a black bar
+  float occ = body + l - body * l;
+
+  // Hard guarantee: zero within the outer margin, so the four straight edges of
+  // the mesh sit in dead field and can never draw a line on the road.
+  vec2 e = abs( vP ) / uHalf;
+  occ *= ( 1.0 - smoothstep( 0.74, 0.98, e.x ) ) * ( 1.0 - smoothstep( 0.74, 0.98, e.y ) );
+
+  gl_FragColor = vec4( uTint, clamp( occ, 0.0, 1.0 ) );
+}
+`;
 }
 
 /**
- * Soft contact patch under the kart so it is grounded even with shadows off.
- *
- * Round 2 raised this as a blocker — "a hard-edged quadrilateral LIGHTER than
- * the tarmac". The quadrilateral in those frames is not this mesh (it is the
- * road's own patch-repair decal; see the report), but the note's *diagnosis* of
- * how a fake shadow can go wrong is correct and the round-1 build was one bad
- * pipeline change away from it, so this is now built so it cannot happen:
- *
- *  - MULTIPLICATIVE, not alpha-lerp. The texture is a darkening FACTOR in
- *    [0.38, 1] and the blend is dst * src, so the worst case is "no change".
- *    There is no colour in the material that could ever be added to the road.
- *    It also means the patch scales with the surface instead of dragging it
- *    toward a fixed near-black, so it reads the same on lit tarmac, on sand and
- *    in the tunnel. The map is authored in NoColorSpace because a multiplier is
- *    not a colour and must not be sRGB-decoded.
- *  - The field reaches EXACTLY 1.0 (no darkening at all) at 0.78 of the plane's
- *    half-extent and stays there, so the plane's four straight edges sit in
- *    dead texture. There is no border texel that can carry a value, whatever
- *    the filter does.
- *  - The shape is four wheel lobes plus a body ellipse rather than one blob:
- *    that is where a kart's occlusion actually is, and it means the darkest
- *    part of the patch is under the tyres, where the bible asks for contact AO.
+ * One kart's contact shadow. The geometry and the shader source are shared; the
+ * material is per kart because the four lobe uniforms are per kart. All eight
+ * therefore compile one program between them.
  */
-let _blob: { geo: THREE.PlaneGeometry; mat: THREE.MeshBasicMaterial } | null = null;
-export function contactBlob(layout: BlobLayout = { trackX: 0.72, frontZ: 0.72, rearZ: -0.74 }) {
-  if (_blob) return _blob;
-  const S = 128;
-  const c = canvas(S);
-  const img = c.createImageData(S, S);
-  const d = img.data;
-  const hw = BLOB_W * 0.5;
-  const hh = BLOB_D * 0.5;
-  const wheels: [number, number][] = [
-    [-layout.trackX, layout.frontZ], [layout.trackX, layout.frontZ],
-    [-layout.trackX, layout.rearZ], [layout.trackX, layout.rearZ],
-  ];
-  for (let py = 0; py < S; py++) {
-    for (let px = 0; px < S; px++) {
-      // `PlaneGeometry(w, h).rotateX(-PI/2)` sends local +Y to world -Z, and
-      // the texture is flipY, so canvas row 0 is the REAR of the kart.
-      const u = ((px + 0.5) / S) * 2 - 1;
-      const v = ((py + 0.5) / S) * 2 - 1;
-      const x = u * hw;
-      const z = v * hh;
+export function contactShadow(
+  layout: BlobLayout = { trackX: 0.72, frontZ: 0.72, rearZ: -0.74 },
+): ContactShadow {
+  const uK = { value: new THREE.Vector4(1, 1, 1, 1) };
+  const uR = { value: new THREE.Vector4(SHADOW_LOBE_R, SHADOW_LOBE_R, SHADOW_LOBE_R, SHADOW_LOBE_R) };
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uK,
+      uR,
+      uTint: { value: SHADOW_TINT },
+      uHalf: { value: new THREE.Vector2(SHADOW_W * 0.5, SHADOW_D * 0.5) },
+    },
+    vertexShader: SHADOW_VERT,
+    fragmentShader: shadowFragment(layout),
+    transparent: true,        // queues it after the opaque road
+    depthWrite: false,
+    polygonOffset: true,
+    polygonOffsetFactor: -4,
+    polygonOffsetUnits: -16,
+    // A ShaderMaterial gets no tone-mapping chunk, which is what is wanted: the
+    // composer grades the buffer this has already been blended into.
+    side: THREE.FrontSide,
+  });
+  const mesh = new THREE.Mesh(shadowGeometry(), mat);
+  mesh.castShadow = false;
+  mesh.receiveShadow = false;
+  // matches the previous mesh's behaviour: first in the transparent queue, so
+  // skid marks and dust decals composite on top of it rather than under it
+  mesh.renderOrder = -1;
 
-      // body: a soft ellipse over the chassis footprint
-      let occ = 0.30 * (1 - smoothstep(0.0, 1.0, Math.hypot(x / 0.80, z / 1.00)));
-      // wheels: tight lobes at each contact patch, taken as a max so two lobes
-      // meeting never stack into a black bar
-      let lobe = 0;
-      for (const [wx, wz] of wheels) {
-        const t = Math.hypot(x - wx, z - wz) / BLOB_LOBE_R;
-        if (t < 1) lobe = Math.max(lobe, 1 - smoothstep(0.0, 1.0, t));
-      }
-      occ = Math.min(0.62, occ + lobe * 0.54);
-
-      // Hard guarantee: no darkening within the outer 22% of the plane, so the
-      // straight edge can never draw a line on the road. Separable, so it bites
-      // the sides and the corners identically.
-      occ *= (1 - smoothstep(0.62, 0.78, Math.abs(u))) * (1 - smoothstep(0.62, 0.78, Math.abs(v)));
-
-      const m = Math.round((1 - occ) * 255);
-      const i = (py * S + px) * 4;
-      d[i] = d[i + 1] = d[i + 2] = m;
-      d[i + 3] = 255;
+  const kv = uK.value;
+  const rv = uR.value;
+  const setWheel = (i: number, offset: number) => {
+    // Two independent terms, because a tyre's contact patch has two independent
+    // behaviours and rest has to sit at full strength in both. `planted` fades
+    // the lobe out as the corner droops away from the ground — that is what
+    // stops a kart's shadow staying nailed on under a wheel that has left the
+    // road. `load` tightens it as the chassis presses down: a loaded tyre has a
+    // small hard patch, an unloaded one a wide soft one, and the same total
+    // darkness concentrated into a smaller lobe is what reads as weight.
+    const planted = Math.min(1, Math.max(0, (offset + SHADOW_DROOP) / SHADOW_DROOP));
+    const load = Math.min(1, Math.max(0, offset / SHADOW_LOAD));
+    const k = SHADOW_LOBE_MAX * planted;
+    const r = SHADOW_LOBE_R * (1 + 0.30 * (1 - planted) - 0.22 * load);
+    switch (i) {
+      case 0: kv.x = k; rv.x = r; break;
+      case 1: kv.y = k; rv.y = r; break;
+      case 2: kv.z = k; rv.z = r; break;
+      default: kv.w = k; rv.w = r; break;
     }
-  }
-  c.putImageData(img, 0, 0);
-  const t = tex(c, false);
-  t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
-  const geo = new THREE.PlaneGeometry(BLOB_W, BLOB_D);
-  geo.rotateX(-Math.PI / 2);
-  _blob = {
-    geo,
-    mat: new THREE.MeshBasicMaterial({
-      map: t,
-      color: 0xffffff,
-      transparent: true,     // queues it after the opaque road
-      blending: THREE.MultiplyBlending,
-      // three only wires MultiplyBlending's blend func on the premultiplied
-      // path; on the other one it logs an error and sets no func at all, so the
-      // quad inherits whatever the previous draw left bound. That is how a
-      // patch authored as a darkening FACTOR came out as a white rectangle
-      // under every kart. The alpha channel is a solid 1 here and the shader
-      // never premultiplies anything, so this flag only selects the blend func
-      // (DST_COLOR, ONE_MINUS_SRC_ALPHA) — dst * src, which is what was meant.
-      // Same fix, same reason, as the one in fx/Decals.ts.
-      premultipliedAlpha: true,
-      depthWrite: false,
-      polygonOffset: true,
-      polygonOffsetFactor: -4,
-      polygonOffsetUnits: -4,
-      toneMapped: false,     // a multiplier must not be tone mapped
-    }),
   };
-  return _blob;
+  for (let i = 0; i < 4; i++) setWheel(i, 0);
+
+  return { mesh, setWheel };
 }

@@ -16,11 +16,11 @@ import * as THREE from 'three';
 import type { Ctx, ITrack, SurfaceProbe, TrackSample } from '../types';
 import { Surface } from '../types';
 import {
-  buildCenterline, terrainDetail, smoothstep as ss, gridSlot, BOOST_PADS, CHECKPOINTS,
+  buildCenterline, findCorners, terrainDetail, smoothstep as ss, gridSlot, BOOST_PADS, CHECKPOINTS,
   CROWN, GRID_LAT, KERB_CROWN0, KERB_CROWN1, KERB_END, KERB_HS, KERB_QS,
   KERB_RIPPLE_A, KERB_RIPPLE_K, KERB_W, SEA_Y,
   SKIRT_W, WALL_HEIGHT, WALL_NONE, ZONES,
-  type Centerline,
+  type Centerline, type Corner,
 } from './TrackLayout';
 import { buildTrackGeometry } from './TrackGeometry';
 
@@ -48,6 +48,18 @@ export class Track implements ITrack {
 
   /** baked station table — TrackGeometry reads this directly */
   readonly cl: Centerline;
+
+  /**
+   * Every corner on the lap, apex-first, with its turn direction and strength.
+   *
+   * Published rather than kept private because it is the answer to the round-1
+   * read-ahead note and *only the track can compute it*. Scenery is asked to put
+   * a tall landmark on the outside of every blind corner exit; it currently has
+   * three of them (banner arch, windmill, lighthouse) pinned to hand-typed `t`
+   * values that do not coincide with any corner. `landmarkAnchor()` below turns
+   * an entry here into the world point where that landmark belongs.
+   */
+  readonly corners: readonly Corner[];
 
   // --- macro heightfield of the surrounding land -------------------------
   hmX0 = 0; hmZ0 = 0; hmCell = 6; hmW = 0; hmH = 0;
@@ -78,6 +90,7 @@ export class Track implements ITrack {
 
   constructor() {
     this.cl = buildCenterline();
+    this.corners = findCorners(this.cl);
     this.length = this.cl.length;
     for (let i = 0; i < 16; i++) this.probePool.push(makeProbe());
     for (let i = 0; i < 8; i++) {
@@ -691,6 +704,31 @@ export class Track implements ITrack {
     min.y = Math.min(min.y, SEA_Y - 2);
     max.y += 60; // the headland and cliff mass sit well above the road
     this.bounds.set(min, max);
+  }
+
+  /**
+   * Where a read-ahead landmark for corner `c` belongs, in world space.
+   *
+   * `out` lands on the ground `off` metres outside the kerb, `ahead` metres past
+   * the mark point — i.e. on the *exit* of the corner, on the *outside*, which
+   * is the sightline a driver on the entry is already looking down. That is the
+   * position a Nintendo course puts its arch, its windmill or its lighthouse,
+   * and the reason those read as navigation rather than as decoration.
+   *
+   * Returns the outward horizontal direction as well, so a caller can face the
+   * landmark back at the road without recomputing the frame.
+   */
+  landmarkAnchor(c: Corner, out: THREE.Vector3, outward?: THREE.Vector3,
+    ahead = 55, off = 9): THREE.Vector3 {
+    const cl = this.cl;
+    const d = ((c.d + ahead) % cl.length + cl.length) % cl.length;
+    const i = Math.floor(d / cl.ds) % cl.count;
+    const side = -c.sign;   // the outside of the turn
+    const lat = side * (cl.half[i] + KERB_W + off);
+    this.crossPoint(i, lat, out);
+    out.y = this.groundAt(out.x, out.z);
+    if (outward) outward.set(cl.hx[i] * side, 0, cl.hz[i] * side).normalize();
+    return out;
   }
 
   /** Zone id at a normalised progress — used by the geometry builder. */

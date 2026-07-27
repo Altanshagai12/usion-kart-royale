@@ -32,7 +32,7 @@
 import * as THREE from 'three';
 import type { KartStats } from '../types';
 import {
-  Mesher, PANEL_SIZE, PANEL_UV, Role, WHEEL_UV, contactBlob, getLivery, heroPaint,
+  Mesher, PANEL_SIZE, PANEL_UV, Role, WHEEL_UV, contactShadow, getLivery, heroPaint,
   impostorMaterial, kartMaterials, liveryGeometry, mat, shadowOnlyMaterial, syncKartEnv,
   type Built, type Livery, type Section,
 } from './Liveries';
@@ -310,7 +310,19 @@ function buildChassis(): ChassisGeo {
     mesher.addLoft(secs, role, mat(0, 0, 1.03, 0, Math.PI / 2, 0), { corner, capStart: 0.05, capEnd: 0.05 });
   };
   bumper(0.085, 0.075, 0.30, Role.Base, P, 0, 3);
-  bumper(0.030, 0.030, 0.30, Role.Steel, C, -0.085, 1);
+  // Rub strip, corner 3 and not 1.
+  //
+  // At corner 1 the ring is an octagon, and an octagon swept along a gentle bow
+  // gives ONE flat facet aimed at the sky for the strip's whole 1 m length. A
+  // flat facet on a metalness-1 / roughness-0.15 surface returns one env sample
+  // over its entire area, so it clips to a single uniform white-blue bar with
+  // no break in it anywhere — which is the closeup note verbatim, and it is a
+  // geometry defect, not a roughness one. No roughness map can put a highlight
+  // gradient on a surface whose normal never changes. corner 3 makes it a
+  // 16-gon: the normal now turns continuously across the top, the reflection
+  // sweeps through the env instead of sampling one point of it, and the bar
+  // becomes a rolled highlight with a dark shoulder either side. 96 triangles.
+  bumper(0.030, 0.030, 0.30, Role.Steel, C, -0.085, 3);
   // splitter under the bumper
   M.addLoft(
     [
@@ -501,21 +513,51 @@ function buildChassis(): ChassisGeo {
 
 let _wheel: Built | null = null;
 
+/**
+ * Radial segments on the tyre. MUST stay an integer multiple of TREAD_BLOCKS.
+ *
+ * Round 3 shipped 26 against a 10-lobe shoulder scallop, and the comment beside
+ * it claimed the two divided. They do not: gcd(26, 10) = 2, so the sine was
+ * sampled at a different phase on every segment and the pattern only closed
+ * every half revolution. What that produces is not a 26-gon — it is thirteen
+ * unequal facets of alternating depth, which is exactly the "about twelve
+ * segments on the front tyre" the hero-shot review counted. The beat, not the
+ * segment count, was doing the damage.
+ *
+ * 30 is three samples per block, so every lobe is identical and closes on
+ * itself: ten equal scallops instead of thirteen unequal facets. It also takes
+ * the polygonal sagitta at the tread radius from 2.74 mm to 2.06 mm, about one
+ * pixel at the closeup framing. Both changes are paid for by the rim and
+ * inboard-flank reductions below — geometry the camera cannot reach — so the
+ * kart's triangle total is unchanged and §5's 6-12 k still holds.
+ *
+ * If this is ever raised, raise it to 40 or 50, never to 32 or 36.
+ */
+const TREAD_BLOCKS = 10;
+const TYRE_RAD = 30;
+
 function buildWheel(): Built {
   if (_wheel) return _wheel;
   const W = new Mesher();
-  const RAD = 26; // this is the closest object to the camera all race
+  const RAD = TYRE_RAD; // this is the closest object to the camera all race
   const RF = WHEEL_UV.rimFace; // metal zone of the atlas
   const DC = WHEEL_UV.disc;
 
   // Tyre: a real sidewall profile — bead, bulge, shoulder, crowned tread. The
   // v coordinate walks into the sidewall band of the atlas and back out, so
   // the moulded lettering lands on both flanks automatically.
+  //
+  // ASYMMETRIC on purpose. +x is outboard (see the rim revolve's V ramp and the
+  // hub's `rotation.y` flip), and the outboard flank is the one the camera is
+  // ever alongside; the inboard flank looks into the floor pan. So the outboard
+  // side keeps its full bead/bulge/shoulder break and the inboard side collapses
+  // to a single taper. That is 2 x RAD triangles a wheel bought back from a
+  // surface that is in shadow behind the tyre it belongs to, and it is most of
+  // what pays for the radial density above.
   const hw = WHEEL_HW;
   const profile = [
     -hw * 0.80, 0.200, 0.300,
-    -hw * 0.99, 0.292, 0.470,
-    -hw * 0.92, 0.350, 0.575,
+    -hw * 0.95, 0.330, 0.545,
     -hw * 0.78, 0.366, 0.620,
     0.000, 0.374, 0.800,
     hw * 0.78, 0.366, 0.980,
@@ -523,11 +565,10 @@ function buildWheel(): Built {
     hw * 0.99, 0.292, 0.470,
     hw * 0.80, 0.200, 0.300,
   ];
-  // Scallop the shoulders. The block count matches the atlas (10) and divides
-  // into the segment count, so the nibble lands on the drawn tread instead of
-  // beating against it.
+  // Scallop the shoulders: rings 2 and 4 are the tread edges, ring 3 the crown.
   W.addRevolve(profile, RAD, Role.Rubber, undefined, 1, 0, (i, a) =>
-    i === 3 || i === 5 ? Math.sin(a * 10) * 0.004 : i === 4 ? Math.sin(a * 10) * 0.0018 : 0,
+    i === 2 || i === 4 ? Math.sin(a * TREAD_BLOCKS) * 0.004
+      : i === 3 ? Math.sin(a * TREAD_BLOCKS) * 0.0018 : 0,
   );
 
   // Rim: a closed back plate (so you never see through the spokes into the
@@ -535,7 +576,7 @@ function buildWheel(): Built {
   // DOWN the atlas's baked AO ramp as the surface goes deeper into the wheel:
   // 0.06 on the outboard lip, 0.16-0.19 on the barrel wall, 0.24 on the back
   // plate you see between the spokes. That is the occlusion term the spoke
-  // recesses were missing. 16 radial, not 26 — the whole revolve lives inside
+  // recesses were missing. 12 radial, not 40 — the whole revolve lives inside
   // the tyre bead, so it never reaches a silhouette; all it ever has to do is
   // be a continuous surface behind five spoke gaps. (Round 2 spent its budget
   // on the driver's hands, which are on the hero silhouette. This is where it
@@ -548,7 +589,7 @@ function buildWheel(): Built {
       hw * 0.78, 0.203, 0.150,
       hw * 0.68, 0.174, 0.060,
     ],
-    16, Role.Rim, undefined, RF[2], RF[0],
+    12, Role.Rim, undefined, RF[2], RF[0],
   );
   // Spokes: five chunky blades from the hub out to the lip. corner 2 rounds the
   // blade's long edges and a 2-segment cap chamfers the outboard END, which was
@@ -793,6 +834,79 @@ function mergeToImpostor(root: THREE.Object3D): THREE.BufferGeometry | null {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Shadow debugging
+// ---------------------------------------------------------------------------
+
+/**
+ * Every kart built this session, so the capture harness can interrogate the
+ * shadow path without reaching through Race into Kart into `visual`.
+ *
+ * Why this exists: a kart's ENTIRE contribution to both cascades is one mesh
+ * (`kartImpostor`) — `buildKart` force-clears `castShadow` on all fifteen
+ * detail meshes the moment the bake succeeds, and `DrawBudget` then owns that
+ * mesh's `visible` and `castShadow` flags from `lateUpdate`. So there are four
+ * independent ways for a kart to end up casting nothing at all, and from a
+ * screenshot they are indistinguishable from each other and from "the cascade
+ * never saw it". `__kartShadow.report()` separates them in one call, and
+ * `detailShadows(true)` is the A/B: if the kart's shadow appears with the
+ * detail meshes casting, the bake or its flags are at fault; if it still does
+ * not, the caster was never the problem and the cascade is.
+ */
+const _built: THREE.Group[] = [];
+
+export interface KartShadowDebug {
+  /** Per kart: is it in the scene, is its impostor visible, is it casting. */
+  report(): Array<Record<string, unknown>>;
+  /** Hide the contact shadows, to judge the cascade's own shadow alone. */
+  contact(on: boolean): void;
+  /**
+   * Put every detail mesh back in the shadow map. Costs ~15 extra shadow draws
+   * per kart, so it is a diagnostic and never a shipping state.
+   */
+  detailShadows(on: boolean): void;
+}
+
+function kartShadowDebug(): KartShadowDebug {
+  const live = () => _built.filter((r) => r.parent !== null);
+  return {
+    report: () => live().map((r) => {
+      const imp = r.userData.impostor as THREE.Mesh | null;
+      const blob = r.userData.shadowBlob as THREE.Mesh | undefined;
+      const geo = imp?.geometry;
+      if (geo && !geo.boundingSphere) geo.computeBoundingSphere();
+      let casters = 0;
+      r.traverse((o) => { if ((o as THREE.Mesh).isMesh && o.castShadow) casters++; });
+      return {
+        kart: r.name,
+        worldY: r.getWorldPosition(_iv).y.toFixed(3),
+        impostor: imp ? 'built' : 'MISSING',
+        impostorVisible: imp?.visible ?? false,
+        impostorCastShadow: imp?.castShadow ?? false,
+        impostorRadius: geo?.boundingSphere?.radius.toFixed(3) ?? '-',
+        impostorTris: geo?.getIndex() ? geo.getIndex()!.count / 3 : 0,
+        meshesCastingShadow: casters,
+        contactShadowVisible: blob?.visible ?? false,
+      };
+    }),
+    contact: (on: boolean) => {
+      for (const r of live()) {
+        const b = r.userData.shadowBlob as THREE.Mesh | undefined;
+        if (b) b.visible = on;
+      }
+    },
+    detailShadows: (on: boolean) => {
+      for (const r of live()) {
+        const imp = r.userData.impostor as THREE.Mesh | null;
+        r.traverse((o) => {
+          const m = o as THREE.Mesh;
+          if (m.isMesh && m !== imp && m.name !== 'shadowBlob') m.castShadow = on;
+        });
+      }
+    },
+  };
+}
+
 /** Anchor whose +Z points along `dir` — VFX emits along an anchor's forward. */
 function anchor(name: string, x: number, y: number, z: number, dir?: THREE.Vector3): THREE.Object3D {
   const o = new THREE.Object3D();
@@ -936,17 +1050,25 @@ export function buildKart(
   ];
   for (const s of sparks) root.add(s);
 
-  // --- fake contact shadow -------------------------------------------------
-  // The blob is shaped from the axle layout, so its four dark lobes land on the
-  // four contact patches rather than smearing one oval over the whole footprint
-  // — that is the contact AO the bible calls mandatory, and it is what stops
-  // the kart reading as a body hovering over a grey oval.
-  const blob = contactBlob({ trackX: TRACK_X, frontZ: FRONT_Z, rearZ: REAR_Z });
-  const shadowBlob = new THREE.Mesh(blob.geo, blob.mat);
+  // --- contact shadow ------------------------------------------------------
+  // Shaped from the axle layout, so its four dark lobes land on the four
+  // contact patches rather than smearing one oval over the whole footprint —
+  // that is the contact AO §9.4 calls mandatory, and it is what stops the kart
+  // reading as a sprite composited onto the road.
+  //
+  // The lobes are driven from the wheels every frame, which is what makes the
+  // shadow move with the suspension rather than sit under the kart like a mat:
+  // the loaded corner of a kart in a drift gets a small hard patch and the
+  // unloaded one goes wide and faint. `onBeforeRender` is used for the same
+  // reason the fenders use it — it is the only hook that runs after physics has
+  // posed the wheels for the frame being drawn.
+  const contact = contactShadow({ trackX: TRACK_X, frontZ: FRONT_Z, rearZ: REAR_Z });
+  const shadowBlob = contact.mesh;
   shadowBlob.name = 'shadowBlob';
-  shadowBlob.position.y = 0.012;
-  shadowBlob.renderOrder = -1;
   root.add(shadowBlob);
+  shadowBlob.onBeforeRender = () => {
+    for (let i = 0; i < 4; i++) contact.setWheel(i, wheels[i].position.y - WHEEL_R);
+  };
 
   // --- far LOD / shadow proxy ----------------------------------------------
   // Built last, after every part is in place and posed, because it is just a
@@ -985,6 +1107,9 @@ export function buildKart(
   root.userData.livery = livery;
   root.userData.shadowBlob = shadowBlob;
   root.userData.triangles = geos.tris;
+
+  _built.push(root);
+  (globalThis as unknown as { __kartShadow?: KartShadowDebug }).__kartShadow ??= kartShadowDebug();
 
   return { root, wheels };
 }

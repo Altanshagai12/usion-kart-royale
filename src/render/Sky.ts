@@ -100,6 +100,15 @@ const ENV_INTENSITY = 1.0;
  * 0.25 / 0.12 a golden-hour reference gives.
  */
 const DIFFUSE_ENV_INTENSITY = 0.16;
+/**
+ * Roughness rolloff on the SPECULAR half of the IBL — see `envDiffuseChunk`.
+ * Full strength below ROUGH_ENV_START so nothing §4 asks to mirror the sky is
+ * touched (chrome 0.15, clearcoat 0.06, bodywork 0.28); ROUGH_ENV_SCALE at and
+ * beyond ROUGH_ENV_END, which is where tarmac, rock, stucco and grass live.
+ */
+const ROUGH_ENV_START = 0.35;
+const ROUGH_ENV_END = 0.85;
+const ROUGH_ENV_SCALE = 0.42;
 /** SH ambient on top of the env map — energy compensation for the bounces
  *  single-scattering IBL cannot see, and the only ambient that reaches
  *  materials which ignore environment maps. Deliberately small. */
@@ -135,7 +144,110 @@ const BOUNCE_INTENSITY = 0.13;
  * term weighted to it can put that blue on the shaded side. One extra
  * DirectionalLight, no shadow map, no draw calls.
  */
-const SKY_FILL_INTENSITY = 0.85;
+const SKY_FILL_INTENSITY = 1.05;
+/**
+ * How much of the cool fill survives on a surface the KEY is already reaching.
+ *
+ * THIS IS THE FIX FOR "THE KEY DOES NOT REACH THE RACING SURFACE".
+ *
+ * The fill was tuned on a sphere, where key and fill meet a given normal on
+ * comparable terms. The surface the player stares at for the whole race is not
+ * a sphere, it is horizontal, and there the geometry is wildly lopsided: the
+ * key arrives at 14° so it lands with cos = 0.24, while the fill arrives at 35°
+ * and lands with cos = 0.57. On flat road the fill therefore gets 2.4x the
+ * cosine advantage, and #a8c8ff at 1.05 against #ffd9a8 at 4.2 works out at
+ * R 1.02 / B 0.40 from the key against R 0.20 / B 0.51 from the fill. Multiply
+ * by tarmac's own cool #4a4a52 and the blue channel wins. Every horizontal
+ * surface in the game was mathematically guaranteed to read cool at golden
+ * hour, and no amount of pushing the key could change it, because pushing the
+ * key pushes both.
+ *
+ * So the fill is coupled to the key instead of competing with it: a fragment
+ * the sun is actually landing on keeps only this fraction of the cool term, and
+ * a fragment in shadow — or turned away from the sun — gets all of it. That is
+ * both what the reference does (a sunlit road is lit by the sun; a shadowed one
+ * is lit by the sky) and what §2 asks for in words: warm key, cool fill, teal
+ * shadows, and an actual separation between them. On flat tarmac the incident
+ * R:B goes from 1.02 (neutral, measured off the round-1 frames) to 1.76 in sun
+ * and 0.39 in shade.
+ *
+ * 0.34 rather than 0: a sunlit road still sees most of the sky hemisphere, and
+ * zeroing it makes lit ground read as if it were lit in a vacuum.
+ */
+const FILL_KEY_COUPLING = 0.34;
+/**
+ * Same coupling for the two warm bounce terms. Much weaker, because a bounce
+ * is warm and does not fight the key for hue — its only job is to keep shaded
+ * mass off the floor, and the sunlit side does not need help.
+ */
+const BOUNCE_KEY_COUPLING = 0.55;
+/**
+ * How sharply "the key is reaching this fragment" saturates with N·L. Raw N·L
+ * is 0.24 on flat ground at a 14° sun, so keying the coupling off it directly
+ * would decouple almost nothing on the one surface this exists for. 1/0.30
+ * takes flat road to 0.81 and anything facing the sun's azimuth to 1.0, while
+ * a surface genuinely turned away still gets the full cool fill.
+ */
+const KEY_LIT_SHAPE = 1 / 0.30;
+/**
+ * Lateral warm bounce, art bible §2's `#c98f5a` again but arriving nearly
+ * HORIZONTALLY from the sun's own azimuth.
+ *
+ * The existing bounce points straight up from below, which is structurally
+ * incapable of carrying the transfer that actually matters in this course: a
+ * sunlit facade into the shaded street beside it, a sunlit cliff into the road
+ * under it, the sunlit dunes into the shade of a parasol. Those all travel
+ * SIDEWAYS, and they all travel from the sun's side of the world toward the
+ * shaded side, which is exactly one more shadowless directional light — no
+ * draw calls, no shadow map, one BRDF evaluation. Coupled to the key like the
+ * other fills, so it only ever shows up in shade, which is where bounce is the
+ * only thing there is.
+ */
+const LATERAL_BOUNCE_INTENSITY = 0.34;
+/** Elevation of that bounce, negative = arriving slightly from below the
+ *  horizontal, because the sunlit mass it stands in for is mostly ground. */
+const LATERAL_BOUNCE_SLOPE = -0.14;
+
+// --- the shadow floor --------------------------------------------------------
+/**
+ * Irradiance floor, art bible §3 (never pure `#000`) and §9.6 (no pure-black
+ * shadows). Teal-leaning, because §2's grade wants shadows to lean teal and
+ * because the deepest holes in this world — under a chassis, inside a wheel
+ * arch, the back of a wall recess — are lit by the sky and by nothing else.
+ *
+ * Quoted as IRRADIANCE, i.e. what `RE_IndirectDiffuse` multiplies by albedo/PI.
+ * On tarmac this lands a fragment that no directional term reaches at roughly
+ * sRGB (5, 9, 11) — a teal near-black with hue in it rather than a hole.
+ *
+ * Kept deliberately low, and deliberately DESATURATED from the bible's #a8c8ff.
+ * This is a term that reaches every normal, so every unit of it lands on the
+ * road; a saturated blue floor big enough to be felt in the cavities would put
+ * the carriageway straight back where FILL_KEY_COUPLING just took it from.
+ */
+const FLOOR_IRRADIANCE = 0.34;
+const FLOOR_COLOR = 0x7d9aa8;
+/**
+ * The same floor inside an interior volume, warm sodium instead of teal. The
+ * tunnel's premise is sodium strips; rock that falls off the bottom of the
+ * lamps' falloff should read as unlit ROCK, not as a hole cut in the frame.
+ * Brighter than the open-air floor because the interior cut below removes the
+ * indirect terms that would otherwise be doing this job.
+ *
+ * Sized against the wall the critique sampled: rock at albedo ~0.12 that was
+ * reading RGB(19,18,31) now lands at roughly (20,14,6) from this term ALONE,
+ * i.e. before a single lamp, and it lands warm. A sunlit rock face is sRGB 136
+ * for comparison, and the exit portal is 200+, so nothing here can invert the
+ * tunnel against its own mouth again.
+ */
+const INTERIOR_FLOOR_IRRADIANCE = 0.70;
+const INTERIOR_FLOOR_COLOR = 0xc07a3c;
+/**
+ * Warm penumbra band, art bible §2 ("long, soft, warm-tinted penumbra").
+ * Added where the shadow test is partial, peaking at the half-shadow line and
+ * vanishing at both ends, tinted with the key's own `#ffd9a8`. Small on
+ * purpose: it is a lick of warmth across the terminator, not a rim light.
+ */
+const TERMINATOR_IRRADIANCE = 0.22;
 
 // --- aerial perspective ------------------------------------------------------
 // Replaces FogExp2. The old single exp2 term at density 0.0019 reached 44% at
@@ -180,6 +292,15 @@ const FOG_START = 20;
  * backdrop layers from fusing, and 8% is enough for that.
  */
 const FOG_MAX = 0.92;
+/**
+ * How much faster chroma converges on the haze than value does. See the note in
+ * `fogChunks`. 1.85 puts a 600 m ridge at 78% desaturated against 42% lightened
+ * and a 1.2 km one at 96% against 66%.
+ */
+const FOG_CHROMA_RATE = 1.85;
+/** Ceiling on that, so the deepest plate keeps a whisper of its own hue rather
+ *  than becoming a flat sky-coloured hole in the horizon. */
+const FOG_CHROMA_MAX = 0.96;
 
 /**
  * Cascade splits, art bible §2. Two maps: the near one carries 12/45, the far
@@ -203,7 +324,135 @@ const CASCADE_BLEND = 0.80;
  *  in it moves fast enough on screen for the staleness to read. */
 const FAR_UPDATE_INTERVAL = 3;
 
+// --- the shadow filter -------------------------------------------------------
+// THE OTHER HALF OF "THE KEY DOES NOT REACH THE RACING SURFACE", and the reason
+// the mid-ground carriageway was reading as a flat cool wash while the hills
+// BEHIND it — outside every cascade, therefore never shadow-tested — were a hot
+// saturated orange in the same frame.
+//
+// three r185's PCF is a five-tap Vogel disc scaled by `shadowRadius`, so at
+// radius 3 it reaches three texels off the sample point. The depth error that
+// introduces on a receiver is `lateral * tan(angle between the surface normal
+// and the light)`, and at a 14° sun on flat ground that angle is 76°, i.e. a
+// factor of FOUR:
+//
+//   near cascade  110 m / 3072 = 3.6 cm/texel, 3 texels = 10.7 cm  ->  0.43 m
+//   far  cascade  440 m / 2048 = 21.5 cm/texel, 3 texels = 64 cm   ->  2.58 m
+//
+// against a constant bias of 0.032 m and 0.14 m respectively. The ground was
+// self-shadowing everywhere, and because the taps are rotated per pixel it did
+// not even look like acne — it looked like a uniform 40–70% dimming of the key
+// over every horizontal surface inside 220 m. That is not something a bias
+// number can fix: a constant bias big enough to cover 2.58 m detaches every
+// contact shadow in the game by two and a half metres.
+//
+// The fix is the receiver-plane bias the geometry actually calls for. The light
+// is orthographic and its basis is known on the CPU, so the gradient of stored
+// depth with respect to shadow-map UV is exact and closed-form for any surface
+// normal — see `krPcfGlsl`. With it, the bias is correct per tap at every slope,
+// acne is structurally impossible, contact shadows stay attached, AND the
+// kernel can finally be widened for the soft warm penumbra §2 asks for instead
+// of being held down to hide the acne.
+//
+/** Tap counts and disc radii, in texels, for the two cascades. Nine taps at 4
+ *  texels is the same sample DENSITY the stock five-at-three had, over twice
+ *  the area; the far cascade's texels are 21 cm on their own and need no help. */
+const NEAR_PCF_TAPS = 9;
+const NEAR_PCF_RADIUS = 4.0;
+const FAR_PCF_TAPS = 5;
+const FAR_PCF_RADIUS = 2.0;
+/** Residual constant bias, metres along the light ray. Absorbs depth-buffer
+ *  quantisation and the normal-offset already applied in the vertex stage; it
+ *  is NOT doing the slope work any more, so it can be small enough that contact
+ *  shadows stay welded to their casters. */
+const NEAR_CONST_BIAS = 0.035;
+const FAR_CONST_BIAS = 0.22;
+/**
+ * Ceiling on the receiver-plane gradient, as a tangent. Past this the surface is
+ * within ~7° of edge-on to the light, where the exact bias diverges and the
+ * fragment is being killed by N·L anyway. Clamping keeps a silhouette texel from
+ * punching a bright hole.
+ */
+const SLOPE_BIAS_TAN_MAX = 9.0;
+
 const UP = new THREE.Vector3(0, 1, 0);
+
+/**
+ * The light's own orthographic basis, world space. Derived exactly the way
+ * `Matrix4.lookAt` does it with up = +Y, which is what `DirectionalLightShadow`
+ * uses, so `x`/`y` are the shadow map's u/v axes and `z` points at the sun.
+ * Shared between the CPU texel snap and the GLSL receiver-plane bias — if these
+ * two ever disagree the bias points the wrong way and the ground self-shadows
+ * again, so there is exactly one of them.
+ */
+const SHADOW_BASIS = (() => {
+  const z = SUN_DIRECTION.clone().normalize();
+  const x = UP.clone().cross(z).normalize();
+  const y = z.clone().cross(x).normalize();
+  return { x, y, z };
+})();
+
+/** Everything one cascade needs, resolved before any shader is generated. */
+interface CascadeSpec {
+  intensity: number;
+  extent: number;
+  distance: number;
+  mapSize: number;
+  bias: number;
+  normalBias: number;
+  interval: number;
+  /** three's own `shadow.radius`; only the non-PCF fallback path reads it. */
+  radius: number;
+  taps: number;
+  pcfRadius: number;
+  constBias: number;
+}
+
+/** Ortho depth range of a cascade, metres. Must match `makeCascade`. */
+function shadowDepthRange(s: CascadeSpec): number {
+  return s.distance + s.extent * 2 + 400 - 5;
+}
+
+/**
+ * The cascade table. Resolved in `init` BEFORE the shader chunks are installed,
+ * because the receiver-plane bias bakes each cascade's extent and depth range in
+ * as literals — there is no uniform channel into `shadowmap_pars_fragment`.
+ */
+function cascadeSpecs(shadows: boolean, quality: Quality): CascadeSpec[] {
+  const two = shadows && quality >= Quality.High;
+  const near: CascadeSpec = {
+    intensity: SUN_INTENSITY,
+    extent: two ? NEAR_EXTENT : SOLO_EXTENT,
+    distance: NEAR_DISTANCE,
+    mapSize: quality >= Quality.Ultra ? 4096 : quality >= Quality.High ? 3072 : 2048,
+    bias: -0.00004,
+    // Down from 0.022/0.05. The normal offset is a vertex-stage nudge that helps
+    // at silhouettes and does almost nothing at a 14° sun (it converts to depth
+    // through sin 14° = 0.24); with the receiver-plane bias carrying the slope
+    // it is no longer being asked to do a job it is bad at, and shrinking it
+    // pulls contact shadows back under the wheels.
+    normalBias: 0.012,
+    interval: 1,
+    radius: 3.0,
+    taps: NEAR_PCF_TAPS,
+    pcfRadius: two ? NEAR_PCF_RADIUS : NEAR_PCF_RADIUS * 0.6,
+    constBias: two ? NEAR_CONST_BIAS : NEAR_CONST_BIAS * 2.4,
+  };
+  if (!two) return [near];
+  return [near, {
+    intensity: 0,
+    extent: FAR_EXTENT,
+    distance: FAR_DISTANCE,
+    mapSize: quality >= Quality.Ultra ? 3072 : 2048,
+    bias: -0.00008,
+    normalBias: 0.06,
+    interval: FAR_UPDATE_INTERVAL,
+    radius: 3.0,
+    taps: FAR_PCF_TAPS,
+    pcfRadius: FAR_PCF_RADIUS,
+    constBias: FAR_CONST_BIAS,
+  }];
+}
 
 // --- global shader patches ---------------------------------------------------
 // Three exposes no hook for either of these: fog is hard-wired to one exp/exp2
@@ -243,8 +492,18 @@ const PATCHED_CHUNKS = [
 // bore's own baked vertex-colour rhythm. The exit is then a genuinely bright
 // hole, which is what it always should have been.
 
-/** Fraction of indirect diffuse removed at the centre of an interior volume. */
-const INTERIOR_IRRADIANCE_CUT = 0.90;
+/**
+ * Fraction of indirect diffuse removed at the centre of an interior volume.
+ *
+ * Down from 0.90. The cut is right in principle — the rock IS between the
+ * fragment and the sky — but at 0.90 the residual was a tenth of a golden-hour
+ * hemisphere with nothing else underneath it, and the lower walls fell to a
+ * cool RGB(19,18,31): a near-black with no sodium in it at all, in a tunnel
+ * whose entire premise is sodium. It is now 0.82, and the floor that catches
+ * what is left is `INTERIOR_FLOOR_COLOR` — warm, so what the residual light in
+ * there is made of is the lamps rather than a memory of the sky outside.
+ */
+const INTERIOR_IRRADIANCE_CUT = 0.82;
 /** Same for the specular half of the IBL. Slightly gentler: a wet floor and the
  *  karts' chrome still need something to reflect, and what they should reflect
  *  in there is mostly the lamps, which N8AO and the point lights supply. */
@@ -417,7 +676,30 @@ ${hazeGlsl(model, 'krFogHaze')}
 	// out-shone its own exit.
 	fogFactor *= 1.0 - krInterior * ${glslFloat(INTERIOR_FOG_CUT)};
 
-	gl_FragColor.rgb = mix( gl_FragColor.rgb, krFogHaze( krFwd.xz ), fogFactor );
+	// CHROMA CONVERGES FASTER THAN VALUE. This is the difference between "fog"
+	// and aerial perspective, and its absence is why the backdrop read as a
+	// cardboard cut-out: a ridge at 600 m was landing at 42% haze, which is the
+	// right VALUE mix and leaves 58% of a hot #dc6428 rock behind — measured on
+	// the round-1 frames, a chroma spread of 116 against a sky of 27, i.e. the
+	// most distant thing in shot was four times more saturated than the air in
+	// front of it. Real distance does not work that way: scattered light fills
+	// in the shadows and washes the hue out long before it equalises the
+	// brightness, which is exactly what lets a painter stack four ridges at four
+	// different values and still have all four read as "far".
+	//
+	// So the fragment is first rotated onto the haze's own chromaticity at a
+	// faster rate, KEEPING ITS OWN LUMINANCE — the layer ladder survives intact,
+	// only the colour drains — and only then mixed toward the haze by the honest
+	// Beer factor. At 600 m that is 78% desaturated but only 42% lightened; at
+	// 3 km both are at the cap and the headland sits a couple of percent off the
+	// sky it stands in front of, which is what §9.5 is asking for.
+	vec3 krHazeCol = krFogHaze( krFwd.xz );
+	float krHazeL = max( dot( krHazeCol, vec3( 0.2126, 0.7152, 0.0722 ) ), 1e-4 );
+	float krOwnL = dot( gl_FragColor.rgb, vec3( 0.2126, 0.7152, 0.0722 ) );
+	vec3 krDrained = krHazeCol * ( krOwnL / krHazeL );
+	float krChroma = min( fogFactor * ${glslFloat(FOG_CHROMA_RATE)}, ${glslFloat(FOG_CHROMA_MAX)} );
+
+	gl_FragColor.rgb = mix( mix( gl_FragColor.rgb, krDrained, krChroma ), krHazeCol, fogFactor );
 
 #endif
 `,
@@ -475,6 +757,26 @@ function commonChunk(original: string, volume: InteriorVolume | null): string {
 // shadowless fill lights and by aerial perspective.
 float krInterior = 0.0;
 
+/** World-space shading normal. Written alongside krInterior; the shadow filter
+ *  needs it for its receiver-plane bias and the fills need it for nothing at
+ *  all, but recovering it twice from the view matrix would be silly. */
+vec3 krWorldNormal = vec3( 0.0, 1.0, 0.0 );
+
+/** The key's own shadow test, 0 = fully occluded .. 1 = fully lit. Written by
+ *  the directional loop at cascade 0 and read by the fill coupling and by the
+ *  warm terminator band. 1 when there is no shadow map at all, which is right:
+ *  with nothing to occlude the key, nothing is in its shadow. */
+float krKeyShadow = 1.0;
+
+/** How much of the KEY this fragment is actually receiving, shaped — shadow
+ *  test times a saturating N·L. This, not the shadow test alone, is what the
+ *  cool fill is coupled against: a surface turned away from the sun is in shade
+ *  whatever the shadow map says. */
+float krKeyLit = 0.0;
+
+/** Peaks at the half-shadow line, zero at both ends. The penumbra band. */
+float krPenumbra = 0.0;
+
 float krInteriorAt( vec3 p ) {
 ${body}
 }
@@ -521,19 +823,53 @@ function interiorLightsChunk(original: string): string {
   return original.replace(anchor, `${anchor}
 
 	krInterior = krInteriorAt( ( ( vec4( geometryPosition, 1.0 ) - viewMatrix[ 3 ] ) * viewMatrix ).xyz );
+	// three's own inverseTransformDirection: the view rotation is orthonormal, so
+	// right-multiplying by it is the inverse. The shadow filter's receiver-plane
+	// bias is expressed in the light's WORLD basis and needs this.
+	krWorldNormal = normalize( ( vec4( geometryNormal, 0.0 ) * viewMatrix ).xyz );
 `);
 }
 
-/** Occlude the indirect terms inside an interior volume. */
-function interiorMapsChunk(original: string): string {
+/**
+ * Occlude the indirect terms inside an interior volume, then put back the two
+ * floors and the penumbra band that the direct rig cannot reach.
+ *
+ * This runs after `lights_fragment_begin` and before `RE_IndirectDiffuse`, so
+ * `irradiance` here is the complete non-directional budget for the fragment.
+ *
+ *  · THE FLOOR. §3 forbids pure `#000` in albedo and §9.6 forbids pure-black
+ *    shadows; a cavity with no normal pointing at any of the four directional
+ *    terms had neither. Teal in the open (§2's grade leans shadows teal), warm
+ *    sodium inside the bore (a tunnel lit by sodium strips should fall off
+ *    toward sodium, not toward a hole).
+ *
+ *  · THE PENUMBRA BAND. §2 asks for a warm-tinted penumbra, and a shadow term
+ *    that only ever multiplies toward zero can produce a grey stencil and
+ *    nothing else. `krPenumbra` peaks on the half-shadow line, so this lays a
+ *    lick of the key's own #ffd9a8 exactly across the terminator and nowhere
+ *    else.
+ */
+function indirectMapsChunk(original: string): string {
+  const F = glslFloat;
+  // `new Color(hex)` already lands in the working (linear-sRGB) space — three's
+  // ColorManagement decodes the hex on the way in. Converting again here is the
+  // classic double-decode and it cost this floor a factor of seven.
+  const floor = new THREE.Color(FLOOR_COLOR);
+  const cave = new THREE.Color(INTERIOR_FLOOR_COLOR);
+  const warm = new THREE.Color(SUN_LIGHT_COLOR);
+  const v = (c: THREE.Color, k: number) =>
+    `vec3( ${F(c.r * k)}, ${F(c.g * k)}, ${F(c.b * k)} )`;
   return `${original}
 #if defined( RE_IndirectDiffuse )
-	irradiance *= 1.0 - krInterior * ${glslFloat(INTERIOR_IRRADIANCE_CUT)};
-	iblIrradiance *= 1.0 - krInterior * ${glslFloat(INTERIOR_IRRADIANCE_CUT)};
+	irradiance *= 1.0 - krInterior * ${F(INTERIOR_IRRADIANCE_CUT)};
+	iblIrradiance *= 1.0 - krInterior * ${F(INTERIOR_IRRADIANCE_CUT)};
+	irradiance += mix( ${v(floor, FLOOR_IRRADIANCE)},
+		${v(cave, INTERIOR_FLOOR_IRRADIANCE)}, krInterior );
+	irradiance += ${v(warm, TERMINATOR_IRRADIANCE)} * krPenumbra;
 #endif
 #if defined( RE_IndirectSpecular )
-	radiance *= 1.0 - krInterior * ${glslFloat(INTERIOR_RADIANCE_CUT)};
-	clearcoatRadiance *= 1.0 - krInterior * ${glslFloat(INTERIOR_RADIANCE_CUT)};
+	radiance *= 1.0 - krInterior * ${F(INTERIOR_RADIANCE_CUT)};
+	clearcoatRadiance *= 1.0 - krInterior * ${F(INTERIOR_RADIANCE_CUT)};
 #endif
 `;
 }
@@ -544,13 +880,44 @@ function interiorMapsChunk(original: string): string {
  * reflection, keeps the material's authored intensity.
  */
 function envDiffuseChunk(original: string, scale: number): string {
+  const F = glslFloat;
+  let out = original;
+
   const from = 'return PI * envMapColor.rgb * envMapIntensity;';
-  const to = `return PI * envMapColor.rgb * envMapIntensity * ${glslFloat(scale)};`;
-  if (!original.includes(from)) {
+  const to = `return PI * envMapColor.rgb * envMapIntensity * ${F(scale)};`;
+  if (!out.includes(from)) {
     console.warn('[sky] getIBLIrradiance signature moved; diffuse IBL left unscaled');
-    return original;
+  } else {
+    out = out.replace(from, to);
   }
-  return original.replace(from, to);
+
+  // ...AND A ROUGHNESS ROLLOFF ON THE SPECULAR HALF.
+  //
+  // Decomposed on a 0.72-roughness tarmac under this rig, the environment was
+  // contributing sRGB (22,20,34) of the road's (89,74,81) — the largest single
+  // COOL term in the frame and, unlike the fill, one that lands on lit and
+  // shaded road alike. It is not a fill at all; it is a mirror image of the blue
+  // upper sky in a surface that is nearly matte, arriving at full strength
+  // because three's split-sum IBL gathers the whole hemisphere with no
+  // occlusion by the microfacets the surface is made of and no multiple-
+  // scattering loss. On a mirror that error is nil; on rough dielectric it is
+  // most of the term.
+  //
+  // So: full strength up to roughness 0.35 and rolled off beyond it. Every
+  // material §4 actually cares about reflecting the sky is under that line —
+  // chrome trim at 0.15, clearcoat at 0.06, painted bodywork at 0.28 — so the
+  // one thing ENV_INTENSITY = 1.0 exists to protect is untouched, while the
+  // tarmac, the rock and the stucco stop mirroring a blue sky they should only
+  // be scattering.
+  const specFrom = 'return envMapColor.rgb * envMapIntensity;';
+  const specTo = 'return envMapColor.rgb * envMapIntensity * mix( 1.0, '
+    + `${F(ROUGH_ENV_SCALE)}, smoothstep( ${F(ROUGH_ENV_START)}, ${F(ROUGH_ENV_END)}, roughness ) );`;
+  const n = out.split(specFrom).length - 1;
+  if (n < 1) {
+    console.warn('[sky] getIBLRadiance signature moved; specular IBL left unscaled');
+    return out;
+  }
+  return out.split(specFrom).join(specTo);
 }
 
 /**
@@ -609,39 +976,69 @@ function shadowBorderChunk(original: string): string {
  * this same chunk, and because Sky is the only thing in the game that creates a
  * DirectionalLight and adds the near one first (see `buildLights`).
  */
-function cascadeShadowChunk(original: string): string {
+function cascadeShadowChunk(original: string, specs: CascadeSpec[]): string {
+  const F = glslFloat;
+  const near = specs[0];
+  const far = specs.length > 1 ? specs[1] : null;
+
   const helper = /* glsl */`
-	#if NUM_DIR_LIGHT_SHADOWS > 1
+	#if NUM_DIR_LIGHT_SHADOWS > 0
+	#if defined( SHADOWMAP_TYPE_PCF )
+
+		// world-space basis of the light's own orthographic camera, identical to
+		// the one DirectionalLightShadow derives via lookAt with up = +Y. u runs
+		// along KR_LX, v along KR_LY, and stored depth increases along -KR_LZ.
+		const vec3 KR_LX = vec3( ${F(SHADOW_BASIS.x.x)}, ${F(SHADOW_BASIS.x.y)}, ${F(SHADOW_BASIS.x.z)} );
+		const vec3 KR_LY = vec3( ${F(SHADOW_BASIS.y.x)}, ${F(SHADOW_BASIS.y.y)}, ${F(SHADOW_BASIS.y.z)} );
+		const vec3 KR_LZ = vec3( ${F(SHADOW_BASIS.z.x)}, ${F(SHADOW_BASIS.z.y)}, ${F(SHADOW_BASIS.z.z)} );
+
+${pcfGlsl('krPcfNear', near)}
+${far ? pcfGlsl('krPcfFar', far) : ''}
+
+	#endif
 
 		float krCascadeShadow() {
 
-			vec4 nc = vDirectionalShadowCoord[ 0 ];
-			vec3 ndc = nc.xyz / max( nc.w, 1e-6 );
-			// distance to the near box's border, 0 at the centre and 1 at the face,
-			// taken over depth as well as the two lateral axes so a fragment leaving
-			// through the back of the frustum hands over just as smoothly
-			vec3 krE = abs( ndc - 0.5 ) * 2.0;
-			float krW = 1.0 - smoothstep( ${glslFloat(CASCADE_BLEND)}, 1.0,
-				max( max( krE.x, krE.y ), krE.z ) );
+			#if !defined( SHADOWMAP_TYPE_PCF )
 
-			float krFar = getShadow(
-				directionalShadowMap[ 1 ], directionalLightShadows[ 1 ].shadowMapSize,
-				directionalLightShadows[ 1 ].shadowIntensity, directionalLightShadows[ 1 ].shadowBias,
-				directionalLightShadows[ 1 ].shadowRadius, vDirectionalShadowCoord[ 1 ] );
+				// Defensive: the receiver-plane filter below is written against the
+				// sampler2DShadow the PCF path declares. Anything else falls back to
+				// three's own, which is at least correct if not soft.
+				return getShadow(
+					directionalShadowMap[ 0 ], directionalLightShadows[ 0 ].shadowMapSize,
+					directionalLightShadows[ 0 ].shadowIntensity, directionalLightShadows[ 0 ].shadowBias,
+					directionalLightShadows[ 0 ].shadowRadius, vDirectionalShadowCoord[ 0 ] );
 
-			if ( krW <= 0.0 ) return krFar;
+			#elif NUM_DIR_LIGHT_SHADOWS > 1
 
-			float krNear = getShadow(
-				directionalShadowMap[ 0 ], directionalLightShadows[ 0 ].shadowMapSize,
-				directionalLightShadows[ 0 ].shadowIntensity, directionalLightShadows[ 0 ].shadowBias,
-				directionalLightShadows[ 0 ].shadowRadius, vDirectionalShadowCoord[ 0 ] );
+				vec4 nc = vDirectionalShadowCoord[ 0 ];
+				vec3 ndc = nc.xyz / max( nc.w, 1e-6 );
+				// distance to the near box's border, 0 at the centre and 1 at the face,
+				// taken over depth as well as the two lateral axes so a fragment leaving
+				// through the back of the frustum hands over just as smoothly
+				vec3 krE = abs( ndc - 0.5 ) * 2.0;
+				float krW = 1.0 - smoothstep( ${F(CASCADE_BLEND)}, 1.0,
+					max( max( krE.x, krE.y ), krE.z ) );
 
-			// Inside the box the near map is authoritative and complete: in LIGHT
-			// space an occluder sits at the same xy as the surface it shadows, so
-			// any caster of a fragment inside the box is also inside the box. There
-			// is nothing for the far map to add here, and mixing it in would only
-			// drag its 21 cm texels and its every-third-frame staleness forward.
-			return mix( krFar, krNear, krW );
+				// Order inverted from the obvious one on purpose. Inside the box the
+				// near map is authoritative and COMPLETE — in light space an occluder
+				// sits at the same xy as the surface it shadows, so any caster of a
+				// fragment inside the box is also inside the box — which means the far
+				// map's five taps are pure waste over the majority of the screen. Most
+				// fragments now cost nine shadow fetches instead of ten, and only the
+				// 20% cross-fade band pays for both.
+				if ( krW >= 1.0 ) return krPcfNear( directionalShadowMap[ 0 ], vDirectionalShadowCoord[ 0 ] );
+
+				float krFar = krPcfFar( directionalShadowMap[ 1 ], vDirectionalShadowCoord[ 1 ] );
+				if ( krW <= 0.0 ) return krFar;
+
+				return mix( krFar, krPcfNear( directionalShadowMap[ 0 ], vDirectionalShadowCoord[ 0 ] ), krW );
+
+			#else
+
+				return krPcfNear( directionalShadowMap[ 0 ], vDirectionalShadowCoord[ 0 ] );
+
+			#endif
 
 		}
 
@@ -655,6 +1052,77 @@ function cascadeShadowChunk(original: string): string {
     return original;
   }
   return original.slice(0, at) + '\n' + helper + original.slice(at);
+}
+
+/**
+ * One cascade's shadow filter, with every constant it needs resolved on the CPU.
+ *
+ * THE RECEIVER-PLANE BIAS. A PCF tap does not sample the depth the fragment
+ * would have; it samples the depth of a point `o` away in shadow-map UV, and on
+ * a sloped receiver that point is at a different distance from the light. Bias
+ * it by a constant and you are choosing between acne (too small) and detached
+ * shadows (too big); at a 14° sun on flat ground the required constant is four
+ * times the tap's lateral reach, so there is no value that is both.
+ *
+ * The gradient is closed-form here, because the light is orthographic and its
+ * basis is a compile-time constant. Stay on the receiver plane while moving δx
+ * along the light's u axis and δy along its v axis, and the required travel
+ * along the light direction follows from `dp · n = 0`:
+ *
+ *     δz = -( δx (X·n) + δy (Y·n) ) / (Z·n)
+ *
+ * Stored depth is linear in -δz over the ortho range, and one unit of UV is
+ * `2 * extent` metres, so
+ *
+ *     d(depth) / d(uv) = ( X·n, Y·n ) * 2 * extent / ( (Z·n) * (far - near) )
+ *
+ * — two dot products and a divide, exact at every slope, and it makes the tap
+ * offsets self-biasing. What is left over as a constant is then only depth
+ * quantisation, which is centimetres.
+ */
+function pcfGlsl(name: string, s: CascadeSpec): string {
+  const F = glslFloat;
+  const depthRange = shadowDepthRange(s);
+  const span = 2 * s.extent;
+  const radiusUv = s.pcfRadius / s.mapSize;
+  const taps: string[] = [];
+  for (let i = 0; i < s.taps; i++) {
+    taps.push(
+      `\t\t\to = vogelDiskSample( ${i}, ${s.taps}, phi ) * ${F(radiusUv)};`,
+      '\t\t\ts += texture( map, vec3( c.xy + o, z + dot( o, g ) ) );',
+    );
+  }
+  return /* glsl */`
+		float ${name}( sampler2DShadow map, vec4 coord ) {
+
+			vec3 c = coord.xyz / max( coord.w, 1e-6 );
+			if ( c.x < 0.0 || c.x > 1.0 || c.y < 0.0 || c.y > 1.0 || c.z > 1.0 ) return 1.0;
+
+			// N·L against the light's own axis. Floored rather than branched: below
+			// ~6° of grazing the exact gradient diverges and the fragment is being
+			// killed by its own N·L anyway.
+			float nz = max( dot( krWorldNormal, KR_LZ ), 0.11 );
+			vec2 g = clamp(
+				vec2( dot( krWorldNormal, KR_LX ), dot( krWorldNormal, KR_LY ) )
+					* ( ${F(span / depthRange)} / nz ),
+				-${F((SLOPE_BIAS_TAN_MAX * span) / depthRange)},
+				${F((SLOPE_BIAS_TAN_MAX * span) / depthRange)} );
+
+			float phi = interleavedGradientNoise( gl_FragCoord.xy ) * PI2;
+			float z = c.z - ${F(s.constBias / depthRange)};
+			float s = 0.0;
+			vec2 o;
+${taps.join('\n')}
+			s *= ${F(1 / s.taps)};
+
+			// Soft frustum border: three hands back "fully lit" the instant a
+			// fragment leaves a map, which on flat ground is a straight line of
+			// constant value across the road.
+			vec2 e = abs( c.xy - 0.5 ) * 2.0;
+			return mix( 1.0, s, 1.0 - smoothstep( ${F(SHADOW_BORDER_FADE)}, 1.0, max( e.x, e.y ) ) );
+
+		}
+`;
 }
 
 /**
@@ -684,10 +1152,11 @@ function cascadeLightsChunk(original: string): string {
   const reLine = '		RE_Direct( directLight, geometryPosition, geometryNormal, ' +
     'geometryViewDir, geometryClearcoatNormal, material, reflectedLight );';
 
-  // Cascade 0 resolves both maps itself.
+  // Cascade 0 resolves every map itself and publishes the raw shadow term.
   let body = original.slice(h + head.length, t).replace(shadowLine, `		directionalLightShadow = directionalLightShadows[ i ];
-		#if ( NUM_DIR_LIGHT_SHADOWS > 1 ) && ( UNROLLED_LOOP_INDEX == 0 )
-		directLight.color *= ( directLight.visible && receiveShadow ) ? krCascadeShadow() : 1.0;
+		#if ( UNROLLED_LOOP_INDEX == 0 )
+		krKeyShadow = ( directLight.visible && receiveShadow ) ? krCascadeShadow() : 1.0;
+		directLight.color *= krKeyShadow;
 		#else
 ${shadowLine.split('\n')[1]}
 		#endif`);
@@ -703,10 +1172,34 @@ ${shadowLine.split('\n')[1]}
   //    the volume is the only thing that can.
   //
   //  · Light 0 is always the key, and after it has been shaded and shadowed it
-  //    is also the only correct source for a rim.
+  //    is also the only correct source for a rim — and for `krKeyLit`, which is
+  //    the whole warm/cool axis of the frame (see FILL_KEY_COUPLING). It has to
+  //    be written from inside iteration 0, because the loop is unrolled and the
+  //    three fills at the tail read it in the same statement block.
+  //
+  //  · THE FILL COUPLING, in the last three iterations. Which light is which is
+  //    known exactly: `buildLights` adds skyFill, then bounce, then the lateral
+  //    bounce, after however many cascades exist, and three is stable-sorted
+  //    with shadow casters first. Keying off `NUM_DIR_LIGHTS - 3` rather than
+  //    off `NUM_DIR_LIGHT_SHADOWS` matters, because with shadows disabled the
+  //    KEY lands in the `>= NUM_DIR_LIGHT_SHADOWS` bucket and coupling the key
+  //    to itself would put the road out entirely.
   if (body.includes(reLine)) {
-    body = body.replace(reLine, `		#if ( UNROLLED_LOOP_INDEX >= NUM_DIR_LIGHT_SHADOWS )
+    body = body.replace(reLine, `		#if ( UNROLLED_LOOP_INDEX == 0 )
+		krKeyLit = krKeyShadow * saturate( dot( geometryNormal, directLight.direction )
+			* ${glslFloat(KEY_LIT_SHAPE)} );
+		krPenumbra = 4.0 * krKeyShadow * ( 1.0 - krKeyShadow )
+			* saturate( dot( geometryNormal, directLight.direction ) * ${glslFloat(KEY_LIT_SHAPE)} );
+		#endif
+
+		#if ( UNROLLED_LOOP_INDEX >= NUM_DIR_LIGHT_SHADOWS )
 		directLight.color *= 1.0 - krInterior * ${glslFloat(INTERIOR_FILL_CUT)};
+		#endif
+
+		#if ( UNROLLED_LOOP_INDEX == NUM_DIR_LIGHTS - 3 )
+		directLight.color *= 1.0 - krKeyLit * ${glslFloat(1 - FILL_KEY_COUPLING)};
+		#elif ( UNROLLED_LOOP_INDEX >= NUM_DIR_LIGHTS - 2 )
+		directLight.color *= 1.0 - krKeyLit * ${glslFloat(1 - BOUNCE_KEY_COUPLING)};
 		#endif
 
 ${reLine}
@@ -816,6 +1309,8 @@ export class Sky implements System {
   private probe!: THREE.LightProbe;
   private skyFill!: THREE.DirectionalLight;
   private bounce!: THREE.DirectionalLight;
+  private lateralBounce!: THREE.DirectionalLight;
+  private specs: CascadeSpec[] = [];
   private interiorInstalled = false;
   private cubeRT: THREE.WebGLCubeRenderTarget | null = null;
   private envRT: THREE.WebGLRenderTarget | null = null;
@@ -832,6 +1327,13 @@ export class Sky implements System {
     // settled on is what the calibration should solve against.
     const exposure = ctx.renderer?.toneMappingExposure || 1.05;
     this.model = new AtmosphereModel(exposure);
+
+    // The cascade table is resolved first and then used by BOTH the shader
+    // patches and `buildLights`, because the receiver-plane bias bakes each
+    // cascade's extent and depth range in as GLSL literals. If the two ever
+    // came from different places the bias would point the wrong way and the
+    // ground would self-shadow, which is the round-1 blocker.
+    this.specs = cascadeSpecs(ctx.settings.shadows, ctx.settings.quality);
 
     // Before anything is drawn, therefore before any program is compiled. The
     // interior volume is filled in on the first frame; see buildInteriorVolume.
@@ -882,11 +1384,11 @@ export class Sky implements System {
     chunks.envmap_physical_pars_fragment =
       envDiffuseChunk(stock.envmap_physical_pars_fragment, DIFFUSE_ENV_INTENSITY);
     chunks.shadowmap_pars_fragment =
-      cascadeShadowChunk(shadowBorderChunk(stock.shadowmap_pars_fragment));
+      cascadeShadowChunk(shadowBorderChunk(stock.shadowmap_pars_fragment), this.specs);
     chunks.lights_pars_begin = stock.lights_pars_begin;
     chunks.lights_fragment_begin =
       interiorLightsChunk(cascadeLightsChunk(stock.lights_fragment_begin));
-    chunks.lights_fragment_maps = interiorMapsChunk(stock.lights_fragment_maps);
+    chunks.lights_fragment_maps = indirectMapsChunk(stock.lights_fragment_maps);
   }
 
   /**
@@ -1033,14 +1535,14 @@ export class Sky implements System {
 
   private buildLights(ctx: Ctx): void {
     const shadows = ctx.settings.shadows;
-    const q = ctx.settings.quality;
-    const twoCascades = shadows && q >= Quality.High;
 
     // basis used for texel snapping; identical to the one
-    // DirectionalLightShadow derives via camera.lookAt with up = +Y
-    this.axisZ.copy(this.sunDirection);
-    this.axisX.copy(UP).cross(this.axisZ).normalize();
-    this.axisY.copy(this.axisZ).cross(this.axisX).normalize();
+    // DirectionalLightShadow derives via camera.lookAt with up = +Y, and
+    // identical to the one the shadow filter's receiver-plane bias is written
+    // against — that is why both come out of SHADOW_BASIS.
+    this.axisX.copy(SHADOW_BASIS.x);
+    this.axisY.copy(SHADOW_BASIS.y);
+    this.axisZ.copy(SHADOW_BASIS.z);
 
     // The key is ONE light at full intensity. The second DirectionalLight below
     // is a shadow-only slave: three needs it to exist for its map to be rendered
@@ -1049,19 +1551,11 @@ export class Sky implements System {
     // ever see a step in key brightness at a cascade border again — and as a
     // side effect `ctx.sun.intensity` is finally the bible's 4.2, which is what
     // src/world/Water.ts scales its sun glitter by.
-    const nearMap = q >= Quality.Ultra ? 4096 : q >= Quality.High ? 3072 : 2048;
-    const nearExtent = twoCascades ? NEAR_EXTENT : SOLO_EXTENT;
-    // 3072 over a 110 m box is 3.6 cm/texel — finer than the 4.2 cm the old
-    // 130 m box gave, because the near cascade no longer has to be oversized to
-    // push its own handoff out of frame.
-    this.sun = this.makeCascade(ctx, SUN_INTENSITY, nearExtent, NEAR_DISTANCE,
-      nearMap, shadows, -0.00004, twoCascades ? 0.022 : 0.05, 1, 3.0);
+    this.sun = this.makeCascade(ctx, this.specs[0], shadows);
     this.sun.name = 'SunKeyNear';
 
-    if (twoCascades) {
-      this.sunFar = this.makeCascade(ctx, 0, FAR_EXTENT,
-        FAR_DISTANCE, q >= Quality.Ultra ? 3072 : 2048, true,
-        -0.00008, 0.35, FAR_UPDATE_INTERVAL, 3.0);
+    if (this.specs.length > 1) {
+      this.sunFar = this.makeCascade(ctx, this.specs[1], true);
       this.sunFar.name = 'SunKeyFarShadowOnly';
     }
 
@@ -1097,35 +1591,57 @@ export class Sky implements System {
     this.bounce.name = 'GroundBounce';
     ctx.scene.add(this.bounce);
     ctx.scene.add(this.bounce.target);
+
+    // LATERAL bounce. The one above points straight up from under the world and
+    // therefore cannot carry the transfer that this course is actually made of:
+    // a sunlit facade into the shaded street, a sunlit cliff onto the road below
+    // it, sunlit cobbles into the underside of an arch. All of those travel
+    // sideways, and all of them travel FROM the sun's side of the world, which
+    // is one more shadowless directional light aimed along the sun's own azimuth
+    // and tipped fractionally below the horizontal. Coupled to the key with the
+    // other fills, so it only ever appears in shade.
+    //
+    // MUST BE ADDED LAST: `cascadeLightsChunk` identifies the three fills by
+    // their position at the tail of the directional array.
+    this.lateralBounce =
+      new THREE.DirectionalLight(GROUND_BOUNCE_COLOR, LATERAL_BOUNCE_INTENSITY);
+    this.lateralBounce.position
+      .set(this.sunDirection.x, LATERAL_BOUNCE_SLOPE, this.sunDirection.z)
+      .normalize().multiplyScalar(100);
+    this.lateralBounce.castShadow = false;
+    this.lateralBounce.name = 'LateralBounce';
+    ctx.scene.add(this.lateralBounce);
+    ctx.scene.add(this.lateralBounce.target);
   }
 
-  private makeCascade(
-    ctx: Ctx, intensity: number, extent: number, distance: number,
-    mapSize: number, shadows: boolean, bias: number, normalBias: number, interval: number,
-    radius: number,
-  ): THREE.DirectionalLight {
-    const light = new THREE.DirectionalLight(SUN_LIGHT_COLOR, intensity);
-    light.position.copy(this.sunDirection).multiplyScalar(distance);
+  private makeCascade(ctx: Ctx, spec: CascadeSpec, shadows: boolean): THREE.DirectionalLight {
+    const light = new THREE.DirectionalLight(SUN_LIGHT_COLOR, spec.intensity);
+    light.position.copy(this.sunDirection).multiplyScalar(spec.distance);
     light.castShadow = shadows;
 
     if (shadows) {
       const s = light.shadow;
-      s.mapSize.set(mapSize, mapSize);
-      s.bias = bias;
-      s.normalBias = normalBias;
-      s.radius = radius;
+      s.mapSize.set(spec.mapSize, spec.mapSize);
+      s.bias = spec.bias;
+      s.normalBias = spec.normalBias;
+      s.radius = spec.radius;
       const cam = s.camera;
-      cam.left = -extent; cam.right = extent;
-      cam.top = extent; cam.bottom = -extent;
+      cam.left = -spec.extent; cam.right = spec.extent;
+      cam.top = spec.extent; cam.bottom = -spec.extent;
       cam.near = 5;
-      cam.far = distance + extent * 2 + 400;
+      // Kept in lockstep with `shadowDepthRange`, which the receiver-plane bias
+      // is quoted against. Change one and change the other.
+      cam.far = spec.distance + spec.extent * 2 + 400;
       cam.updateProjectionMatrix();
-      if (interval > 1) s.autoUpdate = false;
+      if (spec.interval > 1) s.autoUpdate = false;
     }
 
     ctx.scene.add(light);
     ctx.scene.add(light.target);
-    this.cascades.push({ light, extent, distance, mapSize, interval });
+    this.cascades.push({
+      light, extent: spec.extent, distance: spec.distance,
+      mapSize: spec.mapSize, interval: spec.interval,
+    });
     return light;
   }
 
@@ -1246,19 +1762,34 @@ export class Sky implements System {
    * after every system has finished building.
    */
   private checkCascadeOrder(ctx: Ctx): void {
-    if (this.cascades.length < 2) return;
     const lights: THREE.DirectionalLight[] = [];
     ctx.scene.traverse((o) => {
       const l = o as THREE.DirectionalLight;
       if (l.isDirectionalLight) lights.push(l);
     });
-    const ok = lights[0] === this.sun && lights[1] === this.sunFar
-      && !lights.slice(2).some((l) => l.castShadow);
-    if (!ok) {
-      console.warn('[sky] directional light order changed. krCascadeShadow reads ' +
-        'directionalShadowMap[0] as the near cascade and [1] as the far one, and three ' +
-        'fills that array in scene-traversal order with shadow casters first. Shadows ' +
-        'will be wrong until the new light is added after Sky\'s two.');
+
+    if (this.cascades.length >= 2) {
+      const ok = lights[0] === this.sun && lights[1] === this.sunFar
+        && !lights.slice(2).some((l) => l.castShadow);
+      if (!ok) {
+        console.warn('[sky] directional light order changed. krCascadeShadow reads ' +
+          'directionalShadowMap[0] as the near cascade and [1] as the far one, and three ' +
+          'fills that array in scene-traversal order with shadow casters first. Shadows ' +
+          'will be wrong until the new light is added after Sky\'s two.');
+      }
+    }
+
+    // The fill coupling in `cascadeLightsChunk` identifies the cool fill and the
+    // two bounces as the LAST THREE entries of the directional array. Anything
+    // else joining the list silently steals one of those slots and the key/fill
+    // separation on the road goes with it, so say so out loud.
+    const tail = lights.slice(-3);
+    if (lights.length < 3 || tail[0] !== this.skyFill || tail[1] !== this.bounce
+      || tail[2] !== this.lateralBounce) {
+      console.warn('[sky] the three shadowless fills are no longer the last three ' +
+        'DirectionalLights in the scene. FILL_KEY_COUPLING is keyed on ' +
+        'UNROLLED_LOOP_INDEX >= NUM_DIR_LIGHTS - 3 and is now coupling the wrong light; ' +
+        'add new directional lights before Sky\'s, or widen the test.');
     }
   }
 
@@ -1339,5 +1870,6 @@ export class Sky implements System {
     this.probe?.parent?.remove(this.probe);
     this.skyFill?.parent?.remove(this.skyFill);
     this.bounce?.parent?.remove(this.bounce);
+    this.lateralBounce?.parent?.remove(this.lateralBounce);
   }
 }

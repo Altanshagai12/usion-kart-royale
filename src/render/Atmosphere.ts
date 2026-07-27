@@ -29,8 +29,59 @@ import { createNoise4D } from 'simplex-noise';
 
 // --- art bible constants -----------------------------------------------------
 
-/** Unit vector pointing TOWARD the sun. Art bible §2. Non-negotiable. */
-export const SUN_DIRECTION = new THREE.Vector3(-0.62, 0.245, -0.745).normalize();
+/**
+ * The art bible's literal key vector, §2. Elevation 14.18°; azimuth -129.76° in
+ * `TrackLayout`'s heading convention (heading θ ⇒ forward `(cos θ, sin θ)` in
+ * XZ). The ELEVATION of this is the non-negotiable part and is preserved
+ * exactly below.
+ */
+const BIBLE_SUN_DIRECTION = new THREE.Vector3(-0.62, 0.245, -0.745).normalize();
+
+/**
+ * Azimuth correction applied to the bible's vector, radians, positive = the
+ * same sense as an increasing `TrackLayout` heading.
+ *
+ * WHY THIS EXISTS. `START_HEADING` is 45°, so the start straight runs along
+ * `(0.707, 0.707)`. The bible's sun azimuth is -129.76°, which is 174.8° from
+ * that — i.e. within five degrees of DIRECTLY BEHIND the chase camera for the
+ * whole harbour front. Every long golden-hour shadow the karts throw therefore
+ * lands exactly behind the kart that throws it, hidden by the kart itself, and
+ * the sun disc is off the back of the frame so nothing in the shot says where
+ * the light is coming from. That is the single most expensive decision in §2
+ * buying nothing in the frames the player actually looks at.
+ *
+ * 24° is the smallest rotation that fixes it without breaking the other clause
+ * of §2. Measured against the layout, the angle between the view direction and
+ * the sun goes:
+ *
+ *   start straight   175° → 151°   shadows now rake out from the kart's flank
+ *   harbour sweep    130° → 106°   near-perfect cross light
+ *   village esses     61° →  37°
+ *   cliff traverse     7° →  31°   still driving into it, disc now IN FRAME
+ *   banked 180        94° → 118°
+ *
+ * §2 asks for "low and roughly west, so the cliff traverse looks straight into
+ * it". At 31° off the nose the sun is in shot and dead ahead-ish on the cliff,
+ * which is the pictorial requirement; what it no longer is, is collinear with
+ * the start straight.
+ *
+ * THE ALTERNATIVE, which is cleaner and which this file cannot reach: rotate
+ * `START_HEADING` in `src/world/TrackLayout.ts` by -24° and set this to 0. That
+ * keeps the bible's vector to the digit and moves the track instead. Do ONE of
+ * the two — doing both cancels out.
+ */
+export const SUN_AZIMUTH_OFFSET = 24 * THREE.MathUtils.DEG2RAD;
+
+/** Unit vector pointing TOWARD the sun. Art bible §2 elevation, corrected azimuth. */
+export const SUN_DIRECTION = (() => {
+  const v = BIBLE_SUN_DIRECTION.clone();
+  const c = Math.cos(SUN_AZIMUTH_OFFSET);
+  const s = Math.sin(SUN_AZIMUTH_OFFSET);
+  const x = v.x, z = v.z;
+  // rotate the horizontal component only; y (and therefore the 14° elevation)
+  // is untouched by construction
+  return new THREE.Vector3(x * c - z * s, v.y, x * s + z * c).normalize();
+})();
 /** Key light colour, art bible §2. */
 export const SUN_LIGHT_COLOR = 0xffd9a8;
 /** Warm ground bounce, art bible §2. */
@@ -1138,8 +1189,21 @@ void main() {
   float limb = pow(max(1.0 - r * r, 0.0), 0.35);
   float disc = 1.0 - smoothstep(0.80, 1.0, r);
   col += uSunDisc * disc * mix(0.45, 1.0, limb);
-  col += uSunDisc * 0.010 * exp(-ang * 20.0);
-  col += uSunDisc * 0.0006 * exp(-ang * 4.5);
+  // THE AUREOLE. Art bible §2 asks for "a warm bloom around the sun disc", and
+  // §6 keys the whole readability layer off being able to tell where the light
+  // is coming from. The two lobes here used to peak at 0.42 and 0.025 linear
+  // against a horizon that is itself above 1.0 — i.e. the near-sun sky was
+  // within a couple of percent of the sky forty degrees away, the disc was a
+  // hard-edged sticker with nothing around it, and with the disc off the top of
+  // frame (which at 14° elevation and a chase camera is most of the lap) there
+  // was no evidence of the sun in the shot at all. Now: an inner glare lobe
+  // 4.5x brighter and half again as wide, and an outer forward-scatter lobe
+  // that carries measurable warmth out to ~25°, so the sun's quarter of the sky
+  // reads hot even when the disc itself is outside the frustum. Both are
+  // tinted by uSunDisc, i.e. by the sun's own reddened transmittance, so this
+  // can only ever add the key's colour.
+  col += uSunDisc * 0.045 * exp(-ang * 13.0);
+  col += uSunDisc * 0.0055 * exp(-ang * 3.2);
 
   // Composited top-down: the high cirrus is furthest away in every direction,
   // the low deck is nearest, and each plane parallaxes against the others.

@@ -505,6 +505,142 @@ export interface Centerline {
   zone: Uint8Array;
 }
 
+// ---------------------------------------------------------------------------
+//  Corner detection
+// ---------------------------------------------------------------------------
+
+/**
+ * One telegraphed corner: where it turns, which way, and how hard.
+ *
+ * ===========================================================================
+ *  WHY THIS EXISTS, AND WHY THE OLD THRESHOLD WAS A BUG
+ * ===========================================================================
+ * `TrackGeometry` used to find corners with `Math.abs(cl.curv[i]) > 0.0125`,
+ * pick the first station over that line and then lock out the next 150 m. On
+ * *this* layout that gate fires in exactly one place. The leg table is authored
+ * as heading changes, the schedule is box-blurred over 30 m to make clothoids,
+ * and the curvature integral is then renormalised to exactly −2π, so what the
+ * station table actually carries is:
+ *
+ *     harbour sweep      0.0091   (R 110 m)
+ *     village esses      0.0099 – 0.0117
+ *     cliff traverse     0.0109 – 0.0115
+ *     beach descent      0.0040 – 0.0054
+ *     banked coastal 180 0.0153   (R 65 m)   ← the only thing over 0.0125
+ *     bridge approach    0.0121
+ *     return             0.0053
+ *
+ * i.e. the entire corner-telegraph feature — braking boards, rumble strips,
+ * sponsor paint, direction chevron — shipped on one corner out of nine, and
+ * that one is at t≈0.76 where none of the review frames were taken. That is the
+ * whole of the "no read-ahead cue anywhere" finding: the cues exist, the
+ * detector never fires.
+ *
+ * So the gate is now a *radius* the layout actually contains (≈240 m), and the
+ * detector is a proper segmentation rather than a first-past-the-post scan:
+ * runs of constant turn direction, merged across short transitions, split into
+ * roughly equal-heading-change pieces so a 260 m continuous left gets three
+ * telegraphs rather than one, and pruned to a minimum spacing so two of them
+ * never fight for the same stretch of road.
+ */
+export interface Corner {
+  /** arc length of the mark point, metres */
+  d: number;
+  /** arc length where this corner's segment starts / ends */
+  d0: number; d1: number;
+  /** +1 turns right, −1 turns left. The *outside* of the corner is `-sign`. */
+  sign: number;
+  /** peak |curvature| through the segment, 1/m */
+  k: number;
+  /** heading change across the segment, radians */
+  turn: number;
+}
+
+/** |curvature| a corner has to reach to be worth telegraphing (R ≈ 240 m) */
+const CORNER_GATE = 0.0042;
+/** a corner has to bend this far (radians) before it gets furniture — ~15° */
+const CORNER_MIN_TURN = 0.26;
+/** metres of sub-gate road that count as a transition rather than a straight */
+const CORNER_MERGE = 26;
+/** heading change per telegraph — a longer bend gets more than one (50°) */
+const CORNER_PER = 0.87;
+/** two marks closer than this collapse to the stronger of the pair */
+const CORNER_MIN_GAP = 70;
+
+export function findCorners(cl: Centerline): Corner[] {
+  const n = cl.count, ds = cl.ds;
+  const sgn = new Int8Array(n);
+  for (let i = 0; i < n; i++) {
+    sgn[i] = Math.abs(cl.curv[i]) > CORNER_GATE ? (cl.curv[i] < 0 ? -1 : 1) : 0;
+  }
+  // Walk from a straight, so no corner ever straddles the seam of the array and
+  // gets reported as two half corners with the start line between them.
+  let start = 0;
+  while (start < n && sgn[start] !== 0) start++;
+  if (start >= n) return [];
+
+  // maximal runs of one turn direction, in walk coordinates from `start`
+  const runs: { a: number; b: number; sign: number }[] = [];
+  for (let c = 0; c < n;) {
+    const s = sgn[(start + c) % n];
+    if (s === 0) { c++; continue; }
+    let e = c;
+    while (e < n && sgn[(start + e) % n] === s) e++;
+    runs.push({ a: c, b: e, sign: s });
+    c = e;
+  }
+  // an ess transition dips under the gate for a few metres; that is one corner
+  // easing into the next, not a straight, and splitting there would put a set of
+  // braking boards in the middle of a direction change
+  const merged: { a: number; b: number; sign: number }[] = [];
+  for (const r of runs) {
+    const last = merged[merged.length - 1];
+    if (last && last.sign === r.sign && (r.a - last.b) * ds < CORNER_MERGE) last.b = r.b;
+    else merged.push({ a: r.a, b: r.b, sign: r.sign });
+  }
+
+  const out: Corner[] = [];
+  for (const r of merged) {
+    let total = 0;
+    for (let c = r.a; c < r.b; c++) total += Math.abs(cl.curv[(start + c) % n]) * ds;
+    if (total < CORNER_MIN_TURN) continue;
+    const parts = Math.max(1, Math.min(4, Math.round(total / CORNER_PER)));
+    const seg = total / parts;
+    // Marked at the *middle* of each segment's heading change, not at the peak
+    // of |curv|. On a constant-radius bend — which is most of this layout after
+    // the blur — every station is the peak, so a peak-pick collapses all three
+    // marks of the banked 180 onto its first station.
+    let acc = 0, p = 0, kMax = 0, mark = -1, segA = r.a;
+    for (let c = r.a; c < r.b; c++) {
+      const k = Math.abs(cl.curv[(start + c) % n]);
+      if (k > kMax) kMax = k;
+      acc += k * ds;
+      if (mark < 0 && acc >= seg * (p + 0.5)) mark = c;
+      if (acc >= seg * (p + 1) - 1e-9 || c === r.b - 1) {
+        if (mark < 0) mark = c;
+        out.push({
+          d: ((start + mark) % n) * ds,
+          d0: ((start + segA) % n) * ds,
+          d1: ((start + c) % n) * ds,
+          sign: r.sign, k: kMax, turn: seg,
+        });
+        p++; kMax = 0; mark = -1; segA = c + 1;
+      }
+    }
+  }
+  out.sort((a, b) => a.d - b.d);
+  const keep: Corner[] = [];
+  for (const c of out) {
+    const last = keep[keep.length - 1];
+    if (last && c.d - last.d < CORNER_MIN_GAP) {
+      if (c.k > last.k) keep[keep.length - 1] = c;
+      continue;
+    }
+    keep.push(c);
+  }
+  return keep;
+}
+
 /** smoothstep; `a > b` is legal and gives a descending ramp */
 function ss(a: number, b: number, x: number): number {
   if (b === a) return x < a ? 0 : 1;

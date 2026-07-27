@@ -144,21 +144,38 @@ export class Foliage {
       nz = 3;
     const L = 3.0,
       W = 0.92;
+    // The frond starts INSIDE the trunk. The crown attach point sits on the
+    // trunk's axis and the stem is ~0.16 m in radius up there, so a rachis
+    // beginning at x = 0 emerges exactly on the silhouette edge and every frond
+    // showed a visible plane/cylinder intersection with a hard seam — the
+    // critique's "frond planes visibly interpenetrate the trunk cylinder with
+    // no blend". Backing the root out by 0.18 m buries the first span in solid
+    // geometry, so what you see leaving the trunk is the second span, already
+    // clear of the surface.
+    const ROOT = -0.18;
     const pos: number[] = [],
       uv: number[] = [],
+      col: number[] = [],
       idx: number[] = [];
     for (let j = 0; j <= nz; j++) {
       const vz = j / nz;
       const zn = (vz - 0.5) * 2;
       for (let i = 0; i <= nx; i++) {
         const t = i / nx;
-        const x = t * L;
+        const x = ROOT + t * (L - ROOT);
         const arch = Math.sin(Math.min(t * 1.35, 1) * Math.PI * 0.62) * 0.52;
         const droop = Math.pow(t, 2.5) * 1.55;
         const fold = -Math.pow(Math.abs(zn), 1.6) * 0.16 * (0.35 + t * 0.9);
         const narrow = 0.42 + Math.sin(Math.pow(t, 0.6) * Math.PI) * 0.72;
         pos.push(x, arch - droop + fold, zn * W * 0.5 * narrow);
         uv.push(t, vz);
+        // Junction AO. The inside of a palm crown is the densest shade in the
+        // whole tree — a dozen frond bases packed round a stem — and without it
+        // the fronds read as separate cards stuck onto a pole. A vertex-colour
+        // ramp over the first 22% of the rachis costs nothing and is what makes
+        // the crown look like it grew out of the trunk.
+        const ao = lerp(0.4, 1.0, clamp01(t / 0.22));
+        col.push(ao, ao, ao);
       }
     }
     for (let j = 0; j < nz; j++)
@@ -169,6 +186,7 @@ export class Foliage {
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
     g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+    g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
     g.setIndex(idx);
     g.computeVertexNormals();
     // Volumetric canopy shading. A frond's true normal is the ribbon's, which
@@ -318,7 +336,12 @@ export class Foliage {
     patchWind(barkPineMat, this.u);
     patchLod(barkPineMat, this.u);
 
-    const frondMat = this.mats.foliage(T.palmFrond(), { alphaTest: 0.38, trans: 1.35 });
+    // `vcol` carries the frond's junction AO (see `frondGeo`). `alphaToCoverage`
+    // is set inside `foliage()` for every cut-out material including this one —
+    // checked against finding #6, which asked whether it was on the frond
+    // specifically or only on the grass. It is on both, and the renderer's MSAA
+    // is what makes it do anything, so the two have to ship together.
+    const frondMat = this.mats.foliage(T.palmFrond(), { alphaTest: 0.38, trans: 1.35, vcol: true });
     const pineMat = this.mats.foliage(T.pineCluster(), { alphaTest: 0.42, trans: 0.9, color: 0xdfe8d8 });
     const shrubMat = this.mats.foliage(T.shrubLeaves(), { alphaTest: 0.44, trans: 0.75 });
     const grassMat = this.mats.foliage(T.grassBlades(), { alphaTest: 0.34, trans: 1.0 });
