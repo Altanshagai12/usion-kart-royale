@@ -3,6 +3,7 @@ import type { Ctx, System } from './types';
 import { Bus } from './core/Bus';
 import { createSettings } from './core/Settings';
 import { Input } from './core/Input';
+import { Recorder } from './core/Recorder';
 import { RenderPipeline } from './render/Renderer';
 import { DrawBudget } from './render/DrawBudget';
 import { Sky } from './render/Sky';
@@ -90,6 +91,9 @@ async function boot() {
   addEventListener('resize', resize);
   resize();
   race.start();
+  // Press R to record. Deliberately not a System: it owns no scene state and
+  // must keep working while the game is paused or on a menu.
+  new Recorder().install();
   requestAnimationFrame(frame);
   // Signal to the screenshot harness that the first real frame is up.
   (window as any).__gameReady = false;
