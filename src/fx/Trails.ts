@@ -65,6 +65,14 @@ void main() {
 
 const FRAG = /* glsl */ `
 uniform float uGain;
+/**
+ * Per-fragment additive shoulder, matching the one in Particles. A ribbon is
+ * a long thin quad and a kart doubling back on its own boost trail — or two
+ * karts side by side in the tunnel — puts several of them through the same
+ * pixel. rgb / (1 + rgb * uClip) is monotonic, asymptotes at 1/uClip and never
+ * dims a single ribbon enough to notice, so the stack cannot run away.
+ */
+uniform float uClip;
 varying vec4 vColor;
 varying float vU;
 varying float vSide;
@@ -79,7 +87,9 @@ void main() {
   // also keeps its world-space read short.
   float a = vColor.a * pow(edge, 0.65) * pow(1.0 - vU, 2.4) * vNear;
   if (a < 0.004) discard;
-  gl_FragColor = vec4(vColor.rgb * uGain, a);
+  vec3 rgb = vColor.rgb * uGain;
+  rgb = rgb / (1.0 + rgb * uClip);
+  gl_FragColor = vec4(rgb, a);
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
 }
@@ -141,6 +151,9 @@ export class Trails {
       uniforms: {
         uGain: { value: 1 },
         uNearFade: { value: new THREE.Vector2(1.5, 4.5) },
+        // Only the additive pool needs a shoulder; an alpha-blended ribbon
+        // cannot sum past its own colour.
+        uClip: { value: additive ? 0.13 : 0.0 },
       },
       vertexShader: VERT,
       fragmentShader: FRAG,

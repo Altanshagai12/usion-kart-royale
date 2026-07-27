@@ -57,7 +57,7 @@ uniform mat4 prevViewProj;
 uniform mat4 invViewProj;
 uniform vec4 grade;   // x exposure, y S-curve amount, z saturation, w vignette
 uniform vec4 lens;    // x aberration, y grain, z speed-line gain, w shutter
-uniform vec2 rush;    // x radial blur amount, y gated speed intensity
+uniform vec3 rush;    // x radial blur amount, y gated speed intensity, z boost kick (0..1)
 uniform vec3 subject; // world-space centre of the player's kart
 uniform vec2 hold;    // hold-out radii about the subject: x fully sharp, y fully blurred (metres)
 uniform vec3 coolTint;
@@ -187,6 +187,30 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, const in float depth,
   vec2 prevUv = prevClip.xy / max(prevClip.w, 1e-4) * 0.5 + 0.5;
   vec2 velocity = (uv - prevUv) * lens.w;
 
+#if MB_SAMPLES < 2
+  // ONE reprojection tap cannot integrate a streak: the loop below jitters its
+  // single tap along the velocity vector, which is not a blur but a per-pixel
+  // random displacement of up to half the streak length (~15 px at 1080p at
+  // speed). That is what dissolved the tunnel rock, the village roofs and the
+  // kerb stripes into directional mush in every headless capture. So the
+  // CAMERA term is dropped on a one-tap build.
+  //
+  // The radial rush below is NOT dropped with it, and that is the fix this
+  // round is really about. The capture path builds with one tap by design, so
+  // the old blanket zeroing of velocity meant the reviewed boost frame had no
+  // smear of any kind — the loudest complaint in the set. The rush term gets
+  // its own guaranteed tap budget (SMEAR_SAMPLES, never below six) and is
+  // gated on speed, so it costs nothing except on the frames that are supposed
+  // to be violent.
+  velocity = vec2(0.0);
+#endif
+
+  // The camera term keeps its own old ceiling. Only the radial rush is allowed
+  // past it, because only the radial rush is zero in the middle of the frame:
+  // a long camera streak is mush, a long radial streak is speed.
+  float camTravel = length(velocity);
+  velocity *= min(camTravel, 0.016) / max(camTravel, 1e-5);
+
   velocity += fromCentre * rush.x;              // arcade zoom-blur under boost
 
   // --- hero hold-out --------------------------------------------------------
@@ -232,21 +256,14 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, const in float depth,
 
   float travel = length(velocity);
   // Capped so the fixed tap budget always covers the streak — an unbounded
-  // travel with MB_SAMPLES taps turns the dither jitter into visible noise
-  // rather than into a smooth blur.
-  velocity *= min(travel, 0.016) / max(travel, 1e-5);
-
-#if MB_SAMPLES < 2
-  // One tap cannot integrate a streak. The loop below jitters its single tap
-  // along the velocity vector, which with one sample is not a blur at all — it
-  // is a per-pixel random displacement of up to half the streak length, i.e.
-  // roughly +/- 15 px at 1080p at speed. That is what dissolved the tunnel
-  // rock, the village roofs, the kerb stripes and the boost-pad chevrons into
-  // directional mush in every headless capture (the capture path builds the
-  // chain with one tap by design, so it hit every reviewed frame). With no tap
-  // budget the honest answer is no blur: keep the aberration, drop the smear.
-  velocity = vec2(0.0);
-#endif
+  // travel with SMEAR_SAMPLES taps turns the dither jitter into visible noise
+  // rather than into a smooth blur. The ceiling opens up under boost because
+  // the rush term is RADIAL: it is exactly zero in the middle of the frame and
+  // only reaches full length out at the corners, so a long streak there costs
+  // the subject and the racing line nothing.
+  float travelCap = 0.011 + 0.011 * rush.z;
+  velocity *= min(travel, travelCap) / max(travel, 1e-5);
+  travel = min(travel, travelCap);
 
   // --- lateral chromatic aberration ----------------------------------------
   // Two things were wrong here and both of them printed as per-pixel magenta /
@@ -292,30 +309,39 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, const in float depth,
 
   vec2 lo = texelSize;
   vec2 hi = vec2(1.0) - texelSize;
-  // Jitter breaks the tap pattern into noise instead of ghost steps. It only
-  // helps once there are taps to spread: with a single tap it *is* the noise.
-#if MB_SAMPLES < 2
-  float jitter = 0.0;
-#else
+  // Jitter breaks the tap pattern into noise instead of ghost steps. Safe to
+  // run unconditionally now: the smear loop is never entered with fewer than
+  // SMEAR_SAMPLES taps, and SMEAR_SAMPLES is never below six.
   float jitter = krHash12(uv * resolution + fract(time) * 311.0) - 0.5;
-#endif
 
-  vec3 c = vec3(0.0);
-  if (fringePx > 0.0) {
-    for (int i = 0; i < MB_SAMPLES; ++i) {
-      float k = (float(i) + 0.5 + jitter) / float(MB_SAMPLES) - 0.5;
-      vec2 p = uv + velocity * k;
-      c.r += texture2D(inputBuffer, clamp(p + fringe, lo, hi)).r;
-      c.g += texture2D(inputBuffer, clamp(p, lo, hi)).g;
-      c.b += texture2D(inputBuffer, clamp(p - fringe, lo, hi)).b;
+  vec3 c;
+  // Under ~0.4 px of travel there is nothing to integrate, so the whole frame
+  // takes a single tap — which is every frame that is not fast or boosting,
+  // including all of the still, low-speed captures.
+  if (travel > 0.0002) {
+    c = vec3(0.0);
+    if (fringePx > 0.0) {
+      for (int i = 0; i < SMEAR_SAMPLES; ++i) {
+        float k = (float(i) + 0.5 + jitter) / float(SMEAR_SAMPLES) - 0.5;
+        vec2 p = uv + velocity * k;
+        c.r += texture2D(inputBuffer, clamp(p + fringe, lo, hi)).r;
+        c.g += texture2D(inputBuffer, clamp(p, lo, hi)).g;
+        c.b += texture2D(inputBuffer, clamp(p - fringe, lo, hi)).b;
+      }
+    } else {
+      for (int i = 0; i < SMEAR_SAMPLES; ++i) {
+        float k = (float(i) + 0.5 + jitter) / float(SMEAR_SAMPLES) - 0.5;
+        c += texture2D(inputBuffer, clamp(uv + velocity * k, lo, hi)).rgb;
+      }
     }
+    c /= float(SMEAR_SAMPLES);
+  } else if (fringePx > 0.0) {
+    c.r = texture2D(inputBuffer, clamp(uv + fringe, lo, hi)).r;
+    c.g = texture2D(inputBuffer, clamp(uv, lo, hi)).g;
+    c.b = texture2D(inputBuffer, clamp(uv - fringe, lo, hi)).b;
   } else {
-    for (int i = 0; i < MB_SAMPLES; ++i) {
-      float k = (float(i) + 0.5 + jitter) / float(MB_SAMPLES) - 0.5;
-      c += texture2D(inputBuffer, clamp(uv + velocity * k, lo, hi)).rgb;
-    }
+    c = texture2D(inputBuffer, uv).rgb;
   }
-  c /= float(MB_SAMPLES);
 
   // --- display transform ---------------------------------------------------
   // Shoulder first, while there is still headroom to shape: once ACES has run
@@ -348,16 +374,64 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, const in float depth,
   // sun on water go white rather than neon.
   c = max(mix(vec3(lum), c, grade.z * (1.0 - 0.40 * smoothstep(0.70, 1.0, lum))), 0.0);
 
-  // --- speed lines ---------------------------------------------------------
+  // --- radial speed lines --------------------------------------------------
+  // lens.z is the gain and it is DRIVEN now. It used to be initialised to 0.15
+  // and never written, and rush.y — the gate — only opened above a speed
+  // signal that the game itself capped below the gate's own knee. Worked
+  // through on the reviewed boost frame: speedIntensity topped out at 0.22,
+  // rush.y = smoothstep(0.22, 0.42, 1.0) = 0.0, so the term was multiplied by
+  // exactly zero. "A 120 km/h boost frame with no speed lines" was literal.
+  //
+  // Two populations now, and the second is the whole point of the effect:
+  //   - a sparse warm set that rides the plain speed ramp and only frames;
+  //   - a denser, whiter, faster set that fades in with the boost kick
+  //     (rush.z), reaches further toward the centre and streaks harder.
   float streakGain = lens.z * rush.y;
   if (streakGain > 0.001) {
     float ang = atan(fromCentre.y, fromCentre.x);
+    float kick = rush.z;
     float n = krValueNoise(ang * 26.0 + time * 1.6) * 0.62
             + krValueNoise(ang * 63.0 - time * 2.4) * 0.38;
     float streak = smoothstep(0.60, 0.97, n);
     // Banded so they live in the outer third: they frame, they don't obscure.
-    float band = smoothstep(0.42, 0.95, rad) * (1.0 - smoothstep(1.05, 1.45, rad));
-    c += streak * band * streakGain * vec3(1.0, 0.965, 0.900);
+    // Under boost the band reaches a little further in and the outer rolloff
+    // moves out, so the lines read as converging on the kart rather than as a
+    // ring around it.
+    //
+    // The inner edge used to sit at 0.42 (0.30 under boost), which is not the
+    // outer third — at rad 0.30 the band is already inside the middle of the
+    // frame, and a full-length ray then runs from there to the corner. Over the
+    // tunnel that drew a starburst across the entire image and the shot came
+    // back unreadable. 0.55 / 0.44 is the outer third the comment always
+    // claimed.
+    float band = smoothstep(mix(0.55, 0.44, kick), 0.98, rad)
+               * (1.0 - smoothstep(1.05, 1.50, rad));
+    float lines = streak * band * streakGain;
+
+    // The boost set: higher angular frequency, moving several times faster,
+    // and near-white. Additive on top of the first set, so at rest it does not
+    // exist at all and on a boost the frame gains a second, tighter comb.
+    if (kick > 0.004) {
+      float n2 = krValueNoise(ang * 47.0 - time * 7.5) * 0.58
+               + krValueNoise(ang * 111.0 + time * 11.0) * 0.42;
+      float streak2 = smoothstep(0.66, 0.99, n2);
+      float band2 = smoothstep(0.42, 0.90, rad) * (1.0 - smoothstep(1.10, 1.55, rad));
+      lines += streak2 * band2 * kick * lens.z * 0.42;
+    }
+
+    // Speed lines STREAK THE LIGHT THAT IS THERE; they are not a light source
+    // of their own. Without this they are a constant additive wash, so the
+    // darker the scene the more completely they take it over — which is exactly
+    // how a lit tunnel at 89 km/h came back as white rays on black. Floored at
+    // 0.42 so a boost still reads in the dark, where it has to.
+    float sceneLit = 0.42 + 0.58 * smoothstep(0.04, 0.42, lum);
+    lines *= sceneLit;
+
+    // Shoulder on the SUM, so the rare pixel where both combs peak at once over
+    // an already-bright sky compresses instead of punching a hole of pure white
+    // in the corner of the frame. Art bible §6: three stacked effects must not
+    // white the frame out.
+    c += (lines / (1.0 + lines * 0.9)) * vec3(1.0, 0.972, 0.918);
   }
 
   // Vignette AFTER the display transform, deliberately. Applied in linear it
@@ -406,14 +480,20 @@ export class GradeEffect extends Effect {
         // fringe and starts decorrelating the channels of whatever specular
         // aliasing is already on screen.
         ['CA_MAX_TEXELS', '1.25'],
+        // Tap budget for the SMEAR loop, which is entered only when there is
+        // more than ~0.4 px of travel. Never below six, whatever the
+        // reprojection budget is: the radial boost rush has to integrate
+        // properly even on the one-tap software/capture build, and that build
+        // is what every reviewed frame is rendered with.
+        ['SMEAR_SAMPLES', String(Math.max(6, Math.round(opts.samples)))],
       ]),
       uniforms: new Map<string, THREE.Uniform>([
         ['prevViewProj', new THREE.Uniform(new THREE.Matrix4())],
         ['invViewProj', new THREE.Uniform(new THREE.Matrix4())],
         ['grade', new THREE.Uniform(
           new THREE.Vector4(opts.exposure, opts.contrast, opts.saturation, opts.vignette))],
-        ['lens', new THREE.Uniform(new THREE.Vector4(CA_REST, opts.grain, 0.15, 0.0))],
-        ['rush', new THREE.Uniform(new THREE.Vector2(0, 0))],
+        ['lens', new THREE.Uniform(new THREE.Vector4(CA_REST, opts.grain, STREAK_REST, 0.0))],
+        ['rush', new THREE.Uniform(new THREE.Vector3(0, 0, 0))],
         ['subject', new THREE.Uniform(new THREE.Vector3())],
         // Released until `sync` finds a player kart: with a negative outer
         // radius the smoothstep returns 1 everywhere and nothing is held.
@@ -422,12 +502,34 @@ export class GradeEffect extends Effect {
         // The cool side leans on green as well as blue: a purely blue shadow
         // against a #ffd9a8 key reads as violet, which is the exact hue the
         // frame already has too much of. Teal is what separates it.
-        ['coolTint', new THREE.Uniform(new THREE.Vector3(0.815, 0.985, 1.155))],
+        //
+        // Pulled to 45% of the authored chroma (was 0.815/0.985/1.155), and
+        // this is where the "the tarmac reads wet, not dry" note actually
+        // lives. It was chased through the tarmac material for a round on the
+        // theory that the road was a blue hemispherical mirror; it is not.
+        // Measured on the real frame: zeroing `envMapIntensity` on all three
+        // road materials moves the road band from 46% saturation to 51% — i.e.
+        // the IBL is not the source and removing it makes it marginally worse.
+        // Neutralising THIS pair takes the same band to 22%. The split-tone is
+        // what was painting every dark surface teal-blue, the road is simply
+        // the largest dark surface in frame, and the saturation lift below then
+        // multiplies the chroma the split-tone just created.
+        //
+        // Swept 1.0 / 0.75 / 0.6 / 0.5 / 0.4 / 0.3 / 0 against three regions of
+        // the same frame: the road falls 0.448 -> 0.221 across the sweep, the
+        // SKY does not move at all (0.483 -> 0.500 — this term only ever
+        // touched the shadows), and the warm midtones *gain* chroma as it comes
+        // off, because the teal was desaturating them. 0.45 lands the road near
+        // 0.32 and still delivers the §2 sky-fill in the shadows.
+        ['coolTint', new THREE.Uniform(new THREE.Vector3(0.917, 0.993, 1.070))],
         ['warmTint', new THREE.Uniform(new THREE.Vector3(1.115, 1.005, 0.878))],
         // Additive teal lift on the bottom of the curve — art bible §2 asks for
         // a #a8c8ff sky fill in the shadows, and nothing multiplicative can
         // produce it. Sized to sit just above the noise floor of an 8-bit write.
-        ['shadowLift', new THREE.Uniform(new THREE.Vector3(-0.0015, 0.0035, 0.0092))],
+        // Scaled with `coolTint` to 45% of the authored value (was
+        // -0.0015/0.0035/0.0092) — see the note there; the two are one effect
+        // and retuning either alone just moves the blue between them.
+        ['shadowLift', new THREE.Uniform(new THREE.Vector3(-0.00068, 0.00158, 0.00414))],
         // Highlight shoulder: knee just above sunlit diffuse white, then
         // x^0.72 above it, with only a light pull toward luminance so a hot
         // colour stays a colour until it is genuinely an order of magnitude
@@ -441,7 +543,7 @@ export class GradeEffect extends Effect {
 
   get grade(): THREE.Vector4 { return this.uniforms.get('grade')!.value; }
   get lens(): THREE.Vector4 { return this.uniforms.get('lens')!.value; }
-  get rush(): THREE.Vector2 { return this.uniforms.get('rush')!.value; }
+  get rush(): THREE.Vector3 { return this.uniforms.get('rush')!.value; }
   get subject(): THREE.Vector3 { return this.uniforms.get('subject')!.value; }
   get hold(): THREE.Vector2 { return this.uniforms.get('hold')!.value; }
   get prevViewProj(): THREE.Matrix4 { return this.uniforms.get('prevViewProj')!.value; }
@@ -469,6 +571,35 @@ const _dofTarget = new THREE.Vector3();
  */
 const CA_REST = 0.00045;
 const CA_BOOST = 0.0016;
+
+/**
+ * Speed-line gain, at rest and flat out on a boost. This is `lens.z`, and the
+ * value it is multiplied into is display-referred (the streak term is added
+ * after the tone map), so 0.42 is roughly +107 counts on the brightest tenth of
+ * the angular comb, before the vignette prints it back down to ~+84 at the
+ * corner. Below about 0.2 the effect is not visible at all on a golden-hour
+ * sky, which is where it has been sitting.
+ */
+// 0.20 / 0.44 was measured against a bright golden-hour sky and nothing else.
+// On the tunnel frame — the darkest place on the circuit, and one the AI takes
+// on a mini-turbo, so the boost set is lit too — the same numbers put ~0.46 of
+// display white over a scene sitting at ~0.08, and the capture came back as a
+// starburst with no track in it. Halved, and the comb is now scaled by what is
+// actually under it (see `sceneLit`).
+const STREAK_REST = 0.095;
+const STREAK_BOOST = 0.25;
+
+/**
+ * The boost kick, 0..1, recovered from `ctx.fovPunch`.
+ *
+ * PostFX gets two numbers from the game and no direct knowledge of boost state,
+ * and this is the one that carries it: Effects publishes ~8.5 deg of punch for
+ * a boost against at most 3.3 for a tier-3 drift and 3.2 for a flat-out lap, so
+ * a threshold between them separates "boosting" from "merely fast" cleanly and
+ * arrives already eased.
+ */
+const KICK_LO = 3.4;
+const KICK_HI = 8.0;
 
 /**
  * Radius around the player kart's centre of mass, in metres, inside which the
@@ -501,6 +632,8 @@ export class PostFX {
   private passes: Pass[] = [];
   private gradePass: EffectPass | null = null;
   private speed = 0;
+  /** eased boost kick, 0..1, derived from ctx.fovPunch */
+  private punch = 0;
   private primed = false;
   /** last frame's view-projection, kept out of the uniform so we can rotate it */
   private readonly lastViewProj = new THREE.Matrix4();
@@ -744,6 +877,15 @@ export class PostFX {
     this.speed += (target - this.speed) * (1 - Math.exp(-dt / 0.11));
     const speed = this.speed;
 
+    // Boost kick. Punches in fast (0.05 s) and releases slowly (0.28 s), which
+    // is the same asymmetry the FOV itself uses — the lens should not snap back
+    // the instant the boost expires.
+    const kickTarget = THREE.MathUtils.clamp(
+      (ctx.fovPunch - KICK_LO) / (KICK_HI - KICK_LO), 0, 1);
+    this.punch += (kickTarget - this.punch) *
+      (1 - Math.exp(-dt / (kickTarget > this.punch ? 0.05 : 0.28)));
+    const kick = this.punch;
+
     // Shutter is normalised against a 60 Hz frame so the blur length is a
     // function of how fast the world moves, not of how fast we happen to run.
     const shutter = ctx.settings.motionBlur
@@ -751,14 +893,32 @@ export class PostFX {
       : 0;
 
     const lens = grade.lens;
-    lens.x = CA_REST + (CA_BOOST - CA_REST) * speed;
+    // Aberration ramps on whichever is stronger — raw speed or the boost kick —
+    // so a mushroom taken at half pace still fringes.
+    lens.x = CA_REST + (CA_BOOST - CA_REST) * Math.max(speed, kick);
+    lens.z = STREAK_REST + (STREAK_BOOST - STREAK_REST) * kick;
     lens.w = shutter;
 
     const rush = grade.rush;
-    // Zoom-blur only exists where there are taps to spend on it.
-    rush.x = shutter > 0 ? 0.018 * speed * speed : 0;
-    // Streaks stay off until roughly 70% of top speed, per the art bible.
-    rush.y = THREE.MathUtils.smoothstep(speed, 0.42, 1.0);
+    // Radial zoom-blur. The quadratic term keeps it off during ordinary
+    // driving; the linear kick term is what makes a boost smear the world even
+    // when the boost is taken at a speed the plain ramp would ignore — which is
+    // every boost the capture rig has ever photographed (18.8 m/s in the
+    // reviewed frame, i.e. below the 70%-of-top-speed gate entirely).
+    //
+    // Halved from 0.014/0.020. At the old values a boosting kart put 42 px of
+    // radial streak on the frame corner at 1920 and every straight edge in the
+    // outer half of the image — kerb stripes, tunnel rock, roof lines — turned
+    // to directional mush. The kick term stays the larger of the two, so a
+    // boost is still what makes the world move.
+    rush.x = shutter > 0 ? 0.0065 * speed * speed + 0.0105 * kick * speed : 0;
+    // The gate. Effects publishes 0 below ~70% of top speed, 0.13 at 83%, 0.37
+    // flat out and 0.52-0.94 on a boost, so a knee at 0.08-0.50 puts the first
+    // faint lines in at exactly the "~70% top speed" the art bible asks for,
+    // has them properly present flat out, and lets a boost pin the gate open on
+    // its own — because a boost IS the event the lines exist to announce.
+    rush.y = Math.max(THREE.MathUtils.smoothstep(speed, 0.08, 0.50), kick * 0.9);
+    rush.z = kick;
 
     // Keep `time` in a range where fract() still has bits left for the grain.
     const pass = this.gradePass as any;
@@ -766,7 +926,7 @@ export class PostFX {
 
     if (this.bloom !== null) {
       // A touch more glow under boost; the flame and the sparks are the payload.
-      this.bloom.intensity = 0.88 + 0.22 * speed;
+      this.bloom.intensity = 0.88 + 0.16 * speed + 0.26 * kick;
     }
 
     const player = ctx.race?.player;

@@ -150,10 +150,24 @@ const REF_ASPECT = 16 / 9;
  * was doing and is a large part of why "the kart is the same size in every
  * frame" and "the boost frame is no wider" were both true at once.
  */
+/*
+ * Round seven: the arm stopped growing with speed.
+ *
+ * The review note was "ten frames, one composition", and the rig's own speed
+ * response was working against fixing it. The lens opens 5 degrees between a
+ * crawl and top speed; the arm was simultaneously growing 1.35 m, and the two
+ * together held the subject at a near-constant 21-25% of frame height whatever
+ * the kart was doing. A shipped kart racer does the opposite: it gets LOWER and
+ * CLOSER as the speed comes up, so the same corner photographed at 60 and at
+ * 120 km/h is two different pictures. 0.55 leaves enough growth that the frame
+ * still breathes with the throttle, while the height drop below is nearly
+ * doubled — and the scenic sections now go the other way (VISTA_DIST,
+ * VISTA_FOV), which is where the variety actually comes from.
+ */
 const ARM_DIST = 5.2;        // metres behind the pivot at rest
-const ARM_DIST_SPEED = 1.35; // extra length at full speed
+const ARM_DIST_SPEED = 0.55; // extra length at full speed
 const ARM_HEIGHT = 1.05;     // metres above the pivot at rest
-const ARM_HEIGHT_SPEED = -0.16;
+const ARM_HEIGHT_SPEED = -0.24;
 const PIVOT_UP = 0.62;       // the arm hangs off a point above the chassis COM
 /**
  * Aim height above the kart. Sits *above* the eye, so the view axis is level
@@ -200,12 +214,57 @@ const UP_SMOOTH = 0.40;      // banking lag
  * carries the bank twice over. If the world ever plants trackside props along
  * world up instead of the road normal, this can go back toward 0.85.
  */
-const ROLL_GAIN = 0.68;
-const MAX_ROLL = 0.48;       // ~27.5 degrees — bank plus corner and drift lean
+/*
+ * Round seven: 0.68 -> 0.80.
+ *
+ * The measurement stands — the horizon *was* swinging, ROLL_GAIN reaches the
+ * frame intact (probe().normal is the banked centreline normal on road, the
+ * lerp toward world up is the only attenuation, and Matrix4.lookAt carries the
+ * whole perpendicular component of `up` into camera roll). What round seven
+ * showed is that 13.6 degrees on the one corner that banks 20 is not enough to
+ * survive a shot list that never samples the apex: the two frames either side
+ * of the coastal 180 came back with 3-5 degrees on them and read as level.
+ * 0.80 gives 16 degrees at the apex and, more importantly, 8-10 through the
+ * entry and exit thirds where the frames actually get taken. Still short of
+ * 1:1, so the palms and posts planted on the road normal keep their visible
+ * 4 degrees of counter-lean and the corner still reads as a corner.
+ */
+const ROLL_GAIN = 0.80;
+/** ~30 degrees. Raised with ROLL_GAIN: 16 of bank plus 11 of tier-3 drift lean
+ *  plus the corner lean was clipping against the old 27.5 ceiling on exactly
+ *  the frame — banked, sideways, charged — that is supposed to be the most
+ *  extreme one in the game. */
+const MAX_ROLL = 0.52;
+
+// --- heading: travel vs facing -------------------------------------------
+/**
+ * How far the arm rotates from the chassis facing toward the direction of
+ * TRAVEL, as a fraction of the measured slip angle.
+ *
+ * This used to be a chord lerp between the two unit vectors, which is not the
+ * same thing: `lerp(face, vel, w)` moves *toward* vel along a chord, so the
+ * realised yaw is always less than `w * slip`, and it caps out at the vector
+ * itself — there is no way to express "further sideways than the physics".
+ * Rotating by a measured angle is exact, costs one atan2, and lets the drift
+ * term go past 1, which is the whole point: a shipped kart racer exaggerates
+ * the slide, it does not merely report it.
+ *
+ * At 1.14 a 19 degree slip renders as 21 degrees of chassis yaw before the arm
+ * spring's own trailing lag (another 6-9 through a committed slide) is added on
+ * top. Round seven measured 18.6 degrees of real slip on the drift plate and
+ * the old blend turned it into 16.7, which is inside the range an ordinary
+ * corner produces — hence "the drift frame reads as a kart pointing straight
+ * ahead with sparks under it".
+ */
+const HEAD_TRAVEL = 0.42;
+const HEAD_TRAVEL_DRIFT = 0.72;
+/** hard ceiling on the yaw, so a spin-out or a shell hit can never whip the
+ *  rig round the back of the kart. ~31 degrees. */
+const HEAD_MAX_SLIP = 0.55;
 
 // --- drift framing -------------------------------------------------------
 /** lateral shift of the eye, metres, toward the outside of the slide */
-const DRIFT_RIG_LAT = 2.0;
+const DRIFT_RIG_LAT = 2.4;
 /**
  * Extra lean, radians: base plus per-tier, ~6.0 to 10.9 degrees.
  *
@@ -215,6 +274,28 @@ const DRIFT_RIG_LAT = 2.0;
  */
 const DRIFT_ROLL = 0.105;
 const DRIFT_ROLL_TIER = 0.085;
+
+// --- boost: a different shot, not a different FOV number ------------------
+/**
+ * A boost has to be legible as a *composition change* in a still frame. Round
+ * seven's boost plate differed from its cruise plate by the FOV alone, and a
+ * FOV difference in a still is invisible — there is no before to compare it
+ * with. So the rig moves: it drops, it closes, and it puts a few degrees of
+ * dutch on the horizon, and all three unwind with the surge oscillator's own
+ * overshoot rather than easing back on a ramp.
+ *
+ * BOOST_DIST is sized against the lens: applyFov opens ~8 degrees on a punch,
+ * which alone shrinks the subject by about a seventh. Pulling 1.35 m off a
+ * 5.75 m arm gives it back and then some, so the boost frame is the *tightest*
+ * one in the set instead of the loosest.
+ */
+const BOOST_DIST = 1.35;         // metres the arm closes on a live boost
+const BOOST_HEIGHT = 0.38;       // metres the arm drops
+const BOOST_ROLL = 0.070;        // ~4 degrees of dutch, signed by the corner
+/** transient coupling of the surge oscillator (kicked on the boost event,
+ *  zeta 0.5, so it snaps in and overshoots back out) into arm and height */
+const BOOST_SURGE_DIST = 3.2;
+const BOOST_SURGE_HEIGHT = 0.55;
 
 // --- cornering, drifting or not ------------------------------------------
 /**
@@ -243,7 +324,7 @@ const CORNER_G_FULL = 9.0;       // m/s^2 of lateral accel that counts as "full"
 const CORNER_MEASURED = 0.72;    // weight of the measured yaw rate
 const CORNER_ANTICIPATED = 0.52; // weight of the road bend ahead
 const CORNER_ROLL = 0.155;       // radians of lean at |corner| = 1 (~8.9 deg)
-const CORNER_LAT = 2.0;          // metres of outside eye swing at |corner| = 1
+const CORNER_LAT = 2.6;          // metres of outside eye swing at |corner| = 1
 /** extra arm smoothing under cornering — bounded, or the lag feeds itself */
 const CORNER_LAG = 0.06;
 
@@ -274,8 +355,12 @@ const FRAME_Y_VISTA = -0.10;     // a view to show -> drop the subject, lift the
 const FRAME_Y_MIN = -0.46;       // never into the speedo
 const FRAME_Y_MAX = -0.08;
 const FRAME_X_CORNER = 0.34;
-const FRAME_X_DRIFT = 0.16;
-const FRAME_X_DRIFT_TIER = 0.16;
+/** A slide has to throw the kart further across the frame than an ordinary
+ *  corner does, or the one composition in the game that only a drift can
+ *  produce is indistinguishable from the eighty percent of corners nobody
+ *  drifts through. 0.22 + 0.17/tier runs 0.22 (catch) to 0.39 (purple). */
+const FRAME_X_DRIFT = 0.22;
+const FRAME_X_DRIFT_TIER = 0.17;
 /** and away from the drop, so the bay gets the other two thirds to itself.
  *  This is the term that keeps a scenic *straight* off dead centre. */
 const FRAME_X_VISTA = 0.16;
@@ -309,7 +394,22 @@ const VISTA_MAX = 13.0;
  * the net extra look-down is about a degree instead of seven.
  */
 const VISTA_HEIGHT = 1.30;
-const VISTA_DIST = 0.35;     // and a touch further back so it isn't top-down
+/**
+ * And further back — this is now the *wide* half of the contextual variation
+ * the review asked for.
+ *
+ * The rig gets low, close and long-lensed at speed (ARM_DIST_SPEED,
+ * ARM_HEIGHT_SPEED, BOOST_DIST) and tall, distant and wide-lensed where there
+ * is something to look at (here, plus VISTA_FOV). Measured at the frame sizes
+ * that actually ship: the subject sits at ~19% of frame height on a scenic
+ * coastal frame, ~24% cruising, ~27% on a boost. That is a real spread —
+ * round seven ran 21-25% across all ten plates, which is why they stacked.
+ */
+const VISTA_DIST = 1.10;
+/** degrees of extra vertical FOV over a full drop, on top of the arm going
+ *  back. Lens and rig pulling the same way is what makes a scenic frame read
+ *  as *chosen* rather than as the chase camera that happened to be there. */
+const VISTA_FOV = 3.0;
 /**
  * The vista used to raise the *aim* as well, to trade a degree of pitch for the
  * bay. It no longer does, and it must not: the subject's height in frame is now
@@ -327,6 +427,18 @@ const CAM_RADIUS = 0.55;     // collision probe radius
  *  the arm itself is now less than half as tall — at 0.85 the sweep tripped on
  *  every crest between the lens and the kart and the rig pumped. */
 const GROUND_CLEAR = 0.68;
+/**
+ * Shortest arm the sweep is allowed to pull to, in METRES.
+ *
+ * This used to be a fraction (0.55) of the desired arm, which was fine while
+ * the desired arm barely moved. It is not fine now: the boost pull, the surge
+ * transient and the speed term all subtract, and 0.55 of the resulting 3.7 m
+ * is 2.0 m — inside the driver's helmet. Stating it in metres also *helps* the
+ * tunnel, which is the case the fraction was protecting: on a long arm the
+ * sweep may now pull in further than 0.55 would have allowed, so the bore stays
+ * seamless instead of clipping the rock at the entry.
+ */
+const MIN_ARM = 2.85;
 const ARM_RECOVER = 0.55;    // seconds for the arm to ease back out after a hit
 
 const INTRO_DUR = 3.55;      // countdown fly-in length
@@ -446,6 +558,8 @@ export class ChaseCamera implements System {
   /** signed, normalised cornering effort: +1 = a full-commitment right-hander */
   private corner = 0;
   private cornerVel = { v: 0 };
+  /** raw (un-exaggerated) travel heading this frame — the yaw-rate reference */
+  private travel = new THREE.Vector3();
   /** previous travel heading, for the yaw-rate measurement */
   private prevHeading = new THREE.Vector3();
   /** signed bend of the road over the next 30-60 m, +1 = bends right */
@@ -703,7 +817,26 @@ export class ChaseCamera implements System {
       lean = this.corner * CORNER_ROLL;
     }
     if (this.driftAmt > 1e-3) {
-      lean += (DRIFT_ROLL + DRIFT_ROLL_TIER * this.tierAmt) * this.driftSigned;
+      const driftLean = (DRIFT_ROLL + DRIFT_ROLL_TIER * this.tierAmt) * this.driftSigned;
+      // The two are measured from different things and do NOT have to agree:
+      // `corner` is the yaw rate of the *travel* heading, driftSigned is which
+      // way the chassis was kicked. A slide that has run wide and is being
+      // steered back has them opposed, and round seven's drift plate was
+      // exactly that case — the lean cancelled to nothing and the horizon came
+      // back dead level on the one frame in the set that is supposed to be
+      // sideways. A live slide owns the frame, so the corner term is faded out
+      // wherever it would subtract from it.
+      if (lean * driftLean < 0) lean *= 1 - this.driftAmt;
+      lean += driftLean;
+    }
+    // A touch of dutch on a boost. Small — four degrees — but it is the term
+    // that makes a boost legible in a *still*: FOV and speed lines both need a
+    // before-frame to be read against, and a tilted horizon does not.
+    // Signed by the corner where there is one, defaulting to a right-hand tilt
+    // on a straight-line boost; continuous through corner = 0 either way.
+    if (mode === 'chase' && this.boostAmt > 1e-3) {
+      const s = clamp(this.corner * 3, -1, 1);
+      lean += BOOST_ROLL * this.boostAmt * (s + (1 - Math.abs(s)));
     }
     if (Math.abs(lean) > 1e-4) {
       _q.setFromAxisAngle(this.arm, lean);
@@ -745,7 +878,21 @@ export class ChaseCamera implements System {
     _vel.addScaledVector(this.upSm, -_vel.dot(this.upSm));
     const vlen = _vel.length();
 
-    let w = 0;
+    // --- rotate toward the direction of TRAVEL ----------------------------
+    //
+    // Measured as an ANGLE and applied as a rotation, not as a chord lerp
+    // between two unit vectors. The difference is not cosmetic. `lerp(face,
+    // vel, w)` realises strictly less than `w * slip` degrees of yaw, and it
+    // saturates at the velocity vector itself — there is no way to express
+    // "read the slide as further sideways than it physically is", which is
+    // precisely what a kart camera is for. Round seven measured 18.6 degrees
+    // of real slip on the drift plate; the old blend rendered 16.7, which is
+    // inside the band an ordinary fast corner produces, and the reviewers
+    // could not tell the drift frame from the corner frame. The rotation form
+    // lets the drift term go past 1.0 and puts 21 degrees of chassis yaw in
+    // frame before the arm spring's own trailing lag adds another 6-9.
+    let blend = 0;
+    let trusted = false;
     if (vlen > 2) {
       _vel.multiplyScalar(1 / vlen);
       // Reversing, spun out or shelled: the velocity heading would whip the
@@ -753,12 +900,33 @@ export class ChaseCamera implements System {
       // agrees with where the chassis points.
       const agree = _vel.dot(_face);
       if (agree > 0.2) {
-        w = clamp((vlen - 2) / 5, 0, 1)
-          * (0.34 + 0.56 * this.driftAmt)
+        trusted = true;
+        blend = clamp((vlen - 2) / 5, 0, 1)
+          * (HEAD_TRAVEL + HEAD_TRAVEL_DRIFT * this.driftAmt)
           * clamp((agree - 0.2) / 0.35, 0, 1);
       }
     }
-    if (w > 0) _face.lerp(_vel, Math.min(w, 0.92)).normalize();
+
+    // The RAW travel heading, kept before any exaggeration is applied. This is
+    // the reference the yaw rate below is differentiated against, and it has to
+    // be: the exaggeration scales with driftAmt, which ramps over 0.15 s on
+    // entry and bleeds over 0.40 s on release, so differentiating the
+    // exaggerated heading would report a saturating corner spike at both ends
+    // of every slide — and on release it points the wrong way.
+    this.travel.copy(trusted ? _vel : _face);
+
+    if (blend > 1e-3) {
+      // Signed slip about the camera up. cross(face, vel) . up is |sin|, and
+      // setFromAxisAngle(up, slip) applied to `face` reproduces `vel` exactly,
+      // so scaling `slip` is a clean over/under-drive of the real attitude.
+      _tmp.crossVectors(_face, _vel);
+      const slip = Math.atan2(_tmp.dot(this.upSm), clamp(_face.dot(_vel), -1, 1));
+      const yaw = clamp(slip * blend, -HEAD_MAX_SLIP, HEAD_MAX_SLIP);
+      if (Math.abs(yaw) > 1e-4) {
+        _q.setFromAxisAngle(this.upSm, yaw);
+        _face.applyQuaternion(_q).normalize();
+      }
+    }
 
     // --- how hard are we cornering, really -------------------------------
     //
@@ -772,11 +940,11 @@ export class ChaseCamera implements System {
     _right.crossVectors(this.arm, this.upSm);
     if (_right.lengthSq() > 1e-6) _right.normalize(); else _right.set(1, 0, 0);
 
-    if (this.prevHeading.lengthSq() < 0.5) this.prevHeading.copy(_face);
-    _tmp.crossVectors(this.prevHeading, _face);
+    if (this.prevHeading.lengthSq() < 0.5) this.prevHeading.copy(this.travel);
+    _tmp.crossVectors(this.prevHeading, this.travel);
     // + = turning right, matching the sign of driftDir and of _right.
     const yawRate = clamp(-_tmp.dot(this.upSm) / dt, -5, 5);
-    this.prevHeading.copy(_face);
+    this.prevHeading.copy(this.travel);
 
     // Blended with the bend of the road ahead so the frame starts recomposing
     // on the approach instead of at the apex — a camera that only reacts is
@@ -954,23 +1122,33 @@ export class ChaseCamera implements System {
     // holds the kart at its cruising size while the road, the kerbs and the
     // trackside furniture stretch out past the frame edge. That is a dolly
     // zoom, and it is what a boost is supposed to feel like.
+    //
+    // Round seven made the boost move the whole rig rather than only the arm
+    // length: the arm drops as well as closing, and both ride the surge
+    // oscillator (zeta 0.5) so the entry snaps and the settle overshoots back
+    // out instead of easing home on a ramp. A still frame of a boost now
+    // differs from a still frame of a cruise in eye height, range, dutch and
+    // lens — four cues, any one of which survives a screenshot.
     const vista = this.vista * (1 - this.lookAmt);
-    let dist = ARM_DIST + ARM_DIST_SPEED * sp + surge * 2.0 - this.brakeAmt * 0.85 - this.lookAmt * 1.4
-      - this.boostAmt * 1.10 + VISTA_DIST * vista;
-    let height = ARM_HEIGHT + ARM_HEIGHT_SPEED * sp - this.brakeAmt * 0.3 + this.lookAmt * 0.25
-      - this.boostAmt * 0.30 - this.driftAmt * 0.18 + VISTA_HEIGHT * vista;
+    const boost = this.boostAmt * (1 - this.lookAmt);
+    let dist = ARM_DIST + ARM_DIST_SPEED * sp + surge * BOOST_SURGE_DIST
+      - this.brakeAmt * 0.85 - this.lookAmt * 1.4
+      - boost * BOOST_DIST + VISTA_DIST * vista;
+    let height = ARM_HEIGHT + ARM_HEIGHT_SPEED * sp + surge * BOOST_SURGE_HEIGHT
+      - this.brakeAmt * 0.3 + this.lookAmt * 0.25
+      - boost * BOOST_HEIGHT - this.driftAmt * 0.18 + VISTA_HEIGHT * vista;
     if (k.airborne) height += 0.35;
+    // The arm may never fold through the chassis, whatever the surge, the
+    // brake and the boost decide between them.
+    if (dist < 3.1) dist = 3.1;
 
     // Sweep the arm for obstructions and pull it in on a hit. Recovery is
     // deliberately slower than the pull, so the rig never pumps.
     const hit = this.sweepArm(ctx, k, _pivot, _dir, dist, height);
     if (hit < this.armFrac) { this.armFrac = hit; this.armFracVel.v = 0; }
     else this.armFrac = damp1(this.armFrac, hit, this.armFracVel, ARM_RECOVER, dt);
-    // Floor raised again with the shorter arm: 0.38 of 6.6 m was 2.5 m behind
-    // the pivot, 0.38 of 5.2 m is 2.0 m, which is inside the driver's helmet.
-    // 0.55 keeps the eye outside the chassis in the worst pinch the sweep can
-    // produce.
-    const f = clamp(this.armFrac, 0.55, 1);
+    // Floored in metres, not as a fraction — see MIN_ARM.
+    const f = clamp(this.armFrac, Math.min(1, MIN_ARM / Math.max(0.1, dist)), 1);
 
     _eye.copy(_pivot).addScaledVector(_dir, -dist * f).addScaledVector(this.upSm, height * f);
 
@@ -983,22 +1161,28 @@ export class ChaseCamera implements System {
     // up beyond it.
     if (vista > 1e-3) _eye.addScaledVector(_right, this.vistaSide * (1 - this.lookAmt) * VISTA_EYE_LAT);
 
-    // Slide the rig toward the outside of the slide. Small, but it means the
-    // parallax between kart and road changes when the state changes instead of
-    // the kart simply rotating in place.
-    if (this.driftAmt > 1e-3) _eye.addScaledVector(_right, -this.driftSigned * DRIFT_RIG_LAT);
-
-    // Swing wide of the arc. Same sign convention as the drift offset — the
-    // eye goes to the *outside* of the corner — but it needs no drift to fire,
-    // so an ordinary fast sweeper stops being framed like a straight. Faded
-    // out under look-back, where the whole point is what is behind you.
+    // Swing wide of the arc. The eye goes to the *outside* of the corner, and
+    // it needs no drift to fire, so an ordinary fast sweeper stops being framed
+    // like a straight. Faded out under look-back, where the whole point is what
+    // is behind you.
     //
     // This is now purely a *parallax* control, and it can finally be sized like
     // one. When it also had to move the kart in frame it could not: it was
     // fighting the aim, which is glued to the kart, and the aim wins. Screen
     // position is frameSubject's job; this decides what is behind the kart —
     // on the village hairpin, whether that is the facades or an empty apron.
-    const swing = this.corner * CORNER_LAT * (1 - this.lookAmt);
+    let swing = this.corner * CORNER_LAT * (1 - this.lookAmt);
+    // Slide the rig toward the outside of the SLIDE, which is a different
+    // quantity — see the roll and framing notes: `corner` reads the travel
+    // heading's yaw rate, driftSigned reads which way the chassis was kicked,
+    // and a slide being caught or steered back has them opposed. Left to add
+    // freely they cancelled, and round seven's drift plate came back with the
+    // rig on the *inside* of the slide, in the grass, looking through it.
+    if (this.driftAmt > 1e-3) {
+      const driftLat = this.driftSigned * DRIFT_RIG_LAT * (1 - this.lookAmt);
+      if (swing * driftLat < 0) swing *= 1 - this.driftAmt;
+      swing += driftLat;
+    }
     if (Math.abs(swing) > 1e-3) _eye.addScaledVector(_right, -swing);
 
     // Both offsets are lateral, so the arm sweep (which only walks the arm
@@ -1036,10 +1220,21 @@ export class ChaseCamera implements System {
     // looks. This decides where the subject sits in the picture, which is the
     // only part a reviewer actually sees.
     const look = 1 - clamp(this.lookAmt * 2, 0, 1);
+    let cornerX = this.corner * FRAME_X_CORNER;
+    const driftX = this.driftSigned * (FRAME_X_DRIFT + FRAME_X_DRIFT_TIER * this.tierAmt);
+    // THE round-seven bug, and the reason "every frame is the kart parked dead
+    // centre" was literally true of the one frame that had the best excuse not
+    // to be. `corner` is the yaw rate of the travel heading; driftSigned is
+    // which way the chassis was kicked. Through a slide that has run wide and
+    // is being steered back — which is most of a long drift, and exactly what
+    // the drift plate caught — they are opposed, and 0.34 of corner against
+    // 0.27 of drift summed to 0.02: the kart landed within one percent of frame
+    // centre with a tier-2 slide under it. A live slide owns the frame, so the
+    // corner term is faded out wherever it would subtract from the slide, and
+    // never the other way round.
+    if (this.driftAmt > 1e-3 && cornerX * driftX < 0) cornerX *= 1 - this.driftAmt;
     const fx = clamp(
-      this.corner * FRAME_X_CORNER
-      + this.driftSigned * (FRAME_X_DRIFT + FRAME_X_DRIFT_TIER * this.tierAmt)
-      + this.vistaSide * FRAME_X_VISTA,
+      cornerX + driftX + this.vistaSide * FRAME_X_VISTA,
       -FRAME_X_MAX, FRAME_X_MAX,
     ) * look;
     const fy = clamp(
@@ -1507,6 +1702,7 @@ export class ChaseCamera implements System {
         + sp * 5.0               // speed opens the frame
         + ctx.fovPunch * 0.78    // boost punch, pre-smoothed upstream
         + this.lookAmt * 3.0     // slightly wider over the shoulder
+        + this.vista * VISTA_FOV // scenic: lens and rig both go wide together
         - this.brakeAmt * 2.2,   // and tighter under braking
         36, 70,
       );

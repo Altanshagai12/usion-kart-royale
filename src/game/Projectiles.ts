@@ -19,6 +19,7 @@
  */
 import * as THREE from 'three';
 import { ItemKind, Surface, type Ctx, type IKart } from '../types';
+import { registerPrewarm } from '../core/Prewarm';
 import type { HazardLike, RacingLine } from './AI';
 
 // =============================================================================
@@ -654,10 +655,30 @@ export class Projectiles {
       if (ctx.envMap) a.mat.envMap = ctx.envMap;
       a.mat.envMapIntensity = 0.9;
     }
+    // Remember what we adopted, so `setEnv` can tell a real change from the
+    // echo `Items` sends on its first frame.
+    this.env = ctx.envMap ?? null;
 
-    const green = this.art.get(ItemKind.GreenShell)!;
+    // Every art set must be reachable from the scene graph before the pre-warm
+    // pass runs, or its program is compiled the first time that item type is
+    // ever fired — i.e. mid-race, in the frame the player pressed the button.
+    //
+    // The pool used to be dressed entirely in the green shell, so the red
+    // shell, the banana and the bomb existed as materials but hosted nothing
+    // and `compileAsync` never saw them. Dealing the four sets round-robin
+    // across the pool costs nothing (`dress()` rebinds geometry and material on
+    // every spawn anyway, and all of these start hidden) and puts each one on a
+    // real mesh with its own geometry — which matters, because the geometry is
+    // what decides the vertex-tangent and vertex-colour half of the cache key.
+    //
+    // Registered as well as hosted: the guarantee should be stated, not left to
+    // depend on the pool happening to be at least four deep.
+    const KINDS = [ItemKind.GreenShell, ItemKind.RedShell, ItemKind.Banana, ItemKind.Bomb];
+    for (const k of KINDS) registerPrewarm(this.art.get(k)!.mat, { label: 'item-' + k });
+
     for (let i = 0; i < POOL; i++) {
-      const mesh = new THREE.Mesh(green.geo, green.mat);
+      const art = this.art.get(KINDS[i % KINDS.length])!;
+      const mesh = new THREE.Mesh(art.geo, art.mat);
       mesh.castShadow = true;
       mesh.receiveShadow = false;
       mesh.visible = false;
@@ -706,13 +727,26 @@ export class Projectiles {
 
   setRacingLine(l: RacingLine) { this.line = l; }
 
-  /** The sky's environment map may arrive after our materials were built. */
+  /**
+   * The sky's environment map may arrive after our materials were built.
+   *
+   * Idempotent, and that matters: `Items` calls this the first time it notices
+   * `ctx.envMap`, which — because our own `init` already picked the same map up
+   * — is a re-assignment of the value the materials are holding. Bumping
+   * `needsUpdate` for it costs a full program-parameter rebuild per material on
+   * the frame after the pre-warm, and if the map identity ever DID change it
+   * would be a genuine recompile. Compare first.
+   */
   setEnv(env: THREE.Texture | null) {
+    if (env === this.env) return;
+    this.env = env;
     for (const a of this.art.values()) {
       a.mat.envMap = env;
       a.mat.needsUpdate = true;
     }
   }
+
+  private env: THREE.Texture | null | undefined = undefined;
 
   /** Drop every live projectile — called on a race reset. */
   clear() {
@@ -733,12 +767,19 @@ export class Projectiles {
 
   private acquire(): Proj | null {
     for (const p of this.pool) if (p.state === PState.Free) return p;
-    // Pool exhausted: recycle the oldest live banana rather than dropping the
+    // Pool exhausted: recycle the oldest LIVE banana rather than dropping the
     // player's input on the floor.
+    //
+    // Both qualifiers are load-bearing and both were wrong. Bananas count their
+    // life DOWN from 55 s, so `life > oldest.life` selected the one with the
+    // most life left — the banana that was just dropped, usually by the same
+    // kart that is asking for this slot, which read as the item never appearing
+    // at all. And a `Carried` banana is a shield somebody is actively towing;
+    // stealing that silently emptied their item slot mid-lap.
     let oldest: Proj | null = null;
     for (const p of this.pool) {
-      if (p.kind !== ItemKind.Banana) continue;
-      if (!oldest || p.life > oldest.life) oldest = p;
+      if (p.kind !== ItemKind.Banana || p.state !== PState.Live) continue;
+      if (!oldest || p.life < oldest.life) oldest = p;
     }
     if (oldest) oldest.mesh.visible = false;
     return oldest;
@@ -772,8 +813,29 @@ export class Projectiles {
     p.spin = 0;
     p.scale = 0.001;              // pops up to full size, never appears from nothing
     p.targetId = targetId;
-    p.homing = kind === ItemKind.RedShell && targetId >= 0;
-    p.ownerLock = carried ? 0 : backwards ? 0.55 : 0.12;
+    // Guidance is on for every red shell, target or no target — see
+    // `steerHoming`. A red shell that is not steering is a shell that drives
+    // straight into the first barrier the circuit puts in front of it.
+    p.homing = kind === ItemKind.RedShell;
+    // Owner immunity, per kind, because the three throws have nothing in
+    // common but the button.
+    //
+    //  - Deploying behind needs long enough for the kart to drive out from over
+    //    the drop.
+    //  - A shell thrown ahead outruns the thrower immediately: a beat is plenty.
+    //  - A bob-omb thrown ahead needs its whole ballistic flight. It flies a
+    //    straight line while the kart follows the corner, so the two are still
+    //    ~8 m apart — inside BLAST_RADIUS — when it lands. Measured on the
+    //    harbour sweep: every forward-thrown bomb took out its own thrower.
+    //  - A banana thrown ahead is a *stationary* hazard that lands on the road
+    //    the thrower is about to drive down, roughly a second in front of them.
+    //    The lock covers the flight and the pass over the top of it; after that
+    //    the banana is behind the thrower and, next lap, fair game again.
+    p.ownerLock = carried ? 0
+      : backwards ? 0.55
+        : kind === ItemKind.Bomb ? 1.15
+          : kind === ItemKind.Banana ? 1.7
+            : 0.25;
     p.up.set(0, 1, 0);
     this.dress(p, kind);
 
@@ -790,8 +852,20 @@ export class Projectiles {
       case ItemKind.Banana:
         p.life = 55;
         p.vel.set(0, backwards ? 0.5 : 5.5, 0);
-        if (!backwards) p.vel.addScaledVector(_dir, 12);
-        else p.vel.addScaledVector(owner.velocity, 0.15);
+        if (!backwards) {
+          // Lobbed AHEAD — which has to mean ahead of where the thrower will
+          // BE when it lands, not ahead of where they are now. A flat 12 m/s
+          // against a kart doing 20-30 leaves the banana behind almost as soon
+          // as it is out of the owner's grace window, so the thrower drove
+          // straight into it: measured, every forward-thrown banana spun its
+          // own thrower out inside 0.2 s. The thrower's planar velocity is
+          // therefore inherited in full and the 12 is the throw on top of it.
+          _v.copy(owner.velocity);
+          _v.y = 0;
+          p.vel.add(_v).addScaledVector(_dir, 12);
+        } else {
+          p.vel.addScaledVector(owner.velocity, 0.15);
+        }
         break;
       case ItemKind.Bomb:
         p.life = 2.7;
@@ -950,7 +1024,16 @@ export class Projectiles {
 
     if (p.kind === ItemKind.Banana) {
       // settles onto the road and stays there, banked with the surface
-      if (p.pos.y > floor) p.vel.y -= BOMB_GRAVITY * dt;
+      if (p.pos.y > floor) {
+        p.vel.y -= BOMB_GRAVITY * dt;
+        // A lob follows the road, not the tangent it left on. Thrown forward at
+        // the thrower's own speed plus the throw, a banana covers 30-40 m in
+        // the air; held to a straight line that puts it in the scenery on the
+        // outside of any corner, where it is neither a hazard nor visible.
+        // Bending it toward the racing line is also simply where a banana
+        // belongs.
+        this.curveWithRoad(p, dt);
+      }
       if (p.pos.y <= floor) {
         p.pos.y = floor;
         p.vel.set(0, 0, 0);
@@ -1010,35 +1093,82 @@ export class Projectiles {
     return false;
   }
 
+  /**
+   * Bend a projectile's horizontal velocity toward the racing line ahead of it,
+   * preserving speed. Bounded and gentle: over the half-second a lobbed banana
+   * is in the air this is worth a few metres of curve, which is exactly the
+   * difference between landing on the road and landing on the shoulder.
+   */
+  private curveWithRoad(p: Proj, dt: number) {
+    const line = this.line;
+    if (!line) return;
+    const speed = Math.hypot(p.vel.x, p.vel.z);
+    if (speed < 1e-3) return;
+    line.point(p.hintT * line.length + Math.max(8, speed * 0.5), _aim);
+    _dir.set(_aim.x - p.pos.x, 0, _aim.z - p.pos.z);
+    if (_dir.lengthSq() < 1e-6) return;
+    _dir.normalize();
+    const turn = Math.min(1, dt * 3.2);
+    p.vel.x += (_dir.x * speed - p.vel.x) * turn;
+    p.vel.z += (_dir.z * speed - p.vel.z) * turn;
+    const flat = Math.hypot(p.vel.x, p.vel.z) || 1;
+    p.vel.x = (p.vel.x / flat) * speed;
+    p.vel.z = (p.vel.z / flat) * speed;
+  }
+
+  /**
+   * Red-shell guidance.
+   *
+   * The important thing this does is **drive the road**, with or without a
+   * victim. Losing the target used to switch guidance off entirely, and a red
+   * shell with no guidance is a rock thrown along the tangent of whatever
+   * corner it was fired on: measured on the harbour sweep it left the tarmac
+   * inside 0.3 s, found the barrier, and — because a red shell detonates on its
+   * FIRST wall contact — was gone about a fifth of a second after the button
+   * was pressed.
+   *
+   * That was not an edge case. `Items.targetAhead` returns -1 for the race
+   * leader, by definition, so *every* red shell the leader threw forward died
+   * that way, plus every shell whose victim went out of range. So the target is
+   * now optional: with one, the shell converges on its lane and then takes it
+   * head-on; without one, it simply races down the racing line and hits
+   * whatever it catches.
+   */
   private steerHoming(p: Proj, karts: readonly IKart[], dt: number) {
     const line = this.line;
-    const target = karts[p.targetId];
-    if (!line || !target || target.finished) {
-      p.homing = false;
-      return;
-    }
-    _v.subVectors(target.position, p.pos);
-    const dist = _v.length();
-    // Lost it: the shell keeps flying, it just stops chasing. A red shell that
-    // vanishes feels like a bug; one that sails past feels like a near miss.
-    if (dist > 115) {
+    if (!line) {
       p.homing = false;
       return;
     }
 
+    let target: IKart | null = karts[p.targetId] ?? null;
+    if (target && (target.id !== p.targetId || target.finished)) target = null;
+    let dist = Infinity;
+    if (target) {
+      _v.subVectors(target.position, p.pos);
+      dist = _v.length();
+      // Lost it: the shell stops chasing but keeps driving. One that sails past
+      // is a near miss; one that stops steering is a dud.
+      if (dist > 115) target = null;
+    }
+    if (!target) p.targetId = -1;
+
     const myD = p.hintT * line.length;
-    if (dist < 16 && _v.dot(p.vel) > 0) {
+    if (target && dist < 16 && _v.dot(p.vel) > 0) {
       _aim.copy(target.position);
       _aim.y += 0.3;
     } else {
       // Follow the racing line, converging laterally onto the target's lane —
       // this is what carries the shell around blind corners instead of into a
-      // wall the moment the target leaves line of sight.
-      const look = 9 + Math.min(14, dist * 0.2);
+      // wall the moment the target leaves line of sight. With no target the
+      // lane it converges on is the racing line itself.
+      const look = 9 + Math.min(14, (target ? dist : 45) * 0.2);
       line.point(myD + look, _aim);
       const li = line.index(myD + look);
       const myLat = line.lateralOf(p.pos.x, p.pos.y, p.pos.z, p.hintT);
-      const tLat = line.lateralOf(target.position.x, target.position.y, target.position.z, target.t);
+      const tLat = target
+        ? line.lateralOf(target.position.x, target.position.y, target.position.z, target.t)
+        : line.off[li];
       const want = myLat + (tLat - myLat) * 0.6 - line.off[li];
       const lim = Math.max(0.5, line.half[li] - 0.8);
       const bias = Math.max(-lim, Math.min(lim, line.off[li] + want)) - line.off[li];
@@ -1099,6 +1229,11 @@ export class Projectiles {
     const r = BLAST_RADIUS * scale;
     for (let i = 0; i < karts.length; i++) {
       const k = karts[i];
+      // The blast honours owner immunity exactly as the contact test does. It
+      // did not, which is why a bob-omb thrown forward reliably killed the kart
+      // that threw it — `testKarts` politely declined to hit the owner and then
+      // the explosion did it anyway.
+      if (k.id === p.owner && p.ownerLock > 0) continue;
       _v.subVectors(k.position, p.pos);
       const d = _v.length();
       if (d > r || Math.abs(_v.y) > 5) continue;

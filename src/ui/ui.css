@@ -2,16 +2,38 @@
    Kart Royale — UI layer.
    Everything is scoped under .kr so nothing here can leak into the canvas host.
 
-   LAYOUT CONTRACT (round 2). The HUD is a five-zone grid driven off ONE
-   safe-area token, not a stack:
+   ROUND 7 REBUILD — ONE SYSTEM, NOT SIX WIDGETS.
 
-        top-left  LAP                                  TIME  top-right
-        left-c    POSITION + GAP            RIVAL BOARD       right-centre
-        bottom    [ ITEM ]   [ ---- MINIMAP ---- ]   [ SPEEDO ]
+   The review's finding was not "these elements are in the wrong place", it was
+   "these elements were each invented separately": type-only lockups with mitred
+   `-webkit-text-stroke` outlines next to iOS-app-icon plates next to an
+   infographic dial, three numeral treatments, two container radii, four shadow
+   recipes, and a minimap parked on the vanishing point.
 
-   Every anchor resolves against --safe / --safe-x, and the three bottom
-   panels share one height (--rail) and one bottom edge, so the bottom of the
-   frame reads as a single rail rather than three separately-invented widgets.
+   So there is now exactly one of each thing, and every widget is built from it:
+
+     ONE container   .kr-plate  — one fill, one border, one radius, one shadow.
+                     Every widget is a plate. Nothing floats on the world, so
+                     nothing needs an outline to survive the golden-hour sky:
+                     the contrast is structural.
+     ONE type scale  --t1 … --t6, ratio ~1.42.
+     ONE numeral     .kr-n — cream, weight 800, tabular, one soft shadow.
+                     Colour on a numeral means STATE (rank 1, final lap,
+                     redline) and nothing else.
+     ONE label       .kr-label — 800/0.2em/uppercase, one dim value.
+     NO text strokes anywhere in the HUD.
+
+   LAYOUT — ART_DIRECTION §7, six corners plus one centre, nothing stacked:
+
+        [LAP]           [-- MINIMAP --]            [TIME]     ← top rail
+        [POSITION]                              [STANDINGS]   ← centre
+        [ITEM]             (toast slot)            [SPEEDO]   ← bottom rail
+
+   The minimap moved from bottom-centre to TOP-centre (§7 permits either). At
+   bottom-centre it sat exactly on the player's kart and the road's vanishing
+   point in all ten review frames; the top-centre band is sky in every frame
+   and the plate is opaque, so it costs nothing there. The bottom centre is now
+   deliberately empty apart from a transient toast slot.
    ========================================================================== */
 
 .kr {
@@ -23,52 +45,52 @@
 
   /* --- ink & paper: never pure black, never pure white --- */
   --ink-2: #0a0d18;
-  --ink-warm: #1a1208;          /* §3: countdown / warm casing, never #000 */
-  --paper: #f8f2e6;
+  --ink-warm: #1a1208;          /* §3: countdown casing, never #000 */
+  --paper: #fff4e2;
+  --dim: rgba(206, 217, 240, 0.60);
   --gold: #ffcf6b;
-  /* Mini-turbo tier tint. The HUD overwrites this per frame from TIER_COLORS;
-     the value here is the "charging, no tier yet" grey. */
+  /* Mini-turbo tier tint. The HUD overwrites this per frame from TIER_COLORS. */
   --tier: #a8b6cc;
 
   /* --- THE safe-area token ---------------------------------------------
-     One number. 48 px vertical at 1080p, 64 px horizontal (title-safe wants
-     more margin on the sides than the top), both scaled by vmin so a 1440p
-     frame gets the same proportion rather than the same pixels. Nothing in
-     the HUD is allowed to invent its own margin. */
-  --safe: clamp(14px, 4.45vmin, 72px);
-  --safe-x: calc(var(--safe) * 1.3333);
+     One number. Nothing in the HUD is allowed to invent its own margin. */
+  --safe: clamp(14px, 3.9vmin, 60px);
+  --safe-x: calc(var(--safe) * 1.28);
 
-  /* --- ONE radius token. 24 px at 1080p, used by every plate and pill. --- */
-  --r: clamp(10px, 2.22vmin, 34px);
-  /* --- ONE inner padding, ONE gutter between adjacent panels ------------- */
-  --plate-pad: clamp(5px, 1.05vmin, 16px);
-  --gutter: clamp(8px, 1.6vmin, 24px);
+  /* --- ONE radius, ONE inner padding, ONE gutter ------------------------ */
+  --r: clamp(9px, 1.7vmin, 26px);
+  --pad: clamp(7px, 1.15vmin, 18px);
+  --gutter: clamp(8px, 1.4vmin, 22px);
 
-  /* --- the bottom rail --------------------------------------------------
-     Item, minimap and speedometer are all exactly this tall and all sit on
-     the same bottom line. The minimap takes its width from the track's own
-     aspect; the item box is square; the speedo is a touch wider than tall. */
-  --rail: clamp(96px, 17vmin, 240px);
+  /* --- the bottom rail: item and speedo are exactly this tall ----------- */
+  --rail: clamp(84px, 14.5vmin, 208px);
+  /* --- the minimap panel, top-centre ------------------------------------ */
+  --map-w: clamp(150px, 23vmin, 340px);
+  --map-h: clamp(78px, 13vmin, 188px);
 
   /* --- ONE plate recipe -------------------------------------------------
-     Opaque, deliberately. The round-1 panels were rgba fills and the scene's
-     render grain read straight through them, which made near-black chrome
-     look dirty and half-transparent over bright sand. A two-stop vertical
-     gradient costs nothing and cannot pick up scene noise. */
-  --plate-bg: linear-gradient(180deg, #141b32 0%, #070b18 100%);
-  --plate-border: rgba(255, 255, 255, 0.14);
+     Opaque. An alpha fill picks up the scene's render grain and reads dirty
+     over bright sand; a three-stop vertical ramp costs nothing, gives the
+     plate a top-lit form consistent with §2, and cannot pick up scene noise.
+     The 1 px inset highlight is the only bevel in the system. */
+  --plate-bg: linear-gradient(180deg, #1b2340 0%, #0d1328 58%, #070b18 100%);
+  --plate-border: rgba(206, 222, 255, 0.17);
   --plate-shadow:
-    0 0.2vmin 0.5vmin rgba(4, 7, 15, 0.45),
-    0 1.4vmin 3.0vmin rgba(4, 7, 15, 0.45);
+    inset 0 1px 0 rgba(255, 252, 240, 0.07),
+    0 0.16vmin 0.4vmin rgba(3, 6, 15, 0.42),
+    0 1.1vmin 2.6vmin rgba(3, 6, 15, 0.50);
 
-  /* The single gold ramp in the system. Variants retint it by overriding
-     this custom property rather than by declaring a second gradient. */
+  /* --- ONE type scale, ratio ~1.42 -------------------------------------- */
+  --t1: clamp(9px, 1.28vmin, 16px);    /* labels, units */
+  --t2: clamp(12px, 1.72vmin, 22px);   /* standings rows */
+  --t3: clamp(17px, 2.45vmin, 31px);   /* secondary numerals (gap, best) */
+  --t4: clamp(26px, 3.75vmin, 48px);   /* speed readout */
+  --t5: clamp(32px, 4.9vmin, 62px);    /* timer, lap */
+  --t6: clamp(44px, 6.7vmin, 86px);    /* position */
+
+  /* Reserved for the countdown and the menus: the one display gradient. */
   --gold-ramp: linear-gradient(180deg, #fffdf6 5%, #ffe7ae 45%, #f7ae3c 84%, #e07c14 100%);
-  /* Optional extra glow appended to the casing filter chain. */
   --gold-glow: drop-shadow(0 0 0 rgba(0, 0, 0, 0));
-  /* ONE outline weight, expressed as a ratio of font-size so a 64 px timer
-     and a 178 px position numeral case identically. */
-  --ink-w: 0.055em;
 
   --f: "SF Pro Display", "Segoe UI Variable Display", "Segoe UI", system-ui,
        -apple-system, "Helvetica Neue", Arial, sans-serif;
@@ -90,119 +112,88 @@
   -webkit-tap-highlight-color: transparent;
 }
 
-/* --- shared surfaces ------------------------------------------------------ */
+/* ==========================================================================
+   THE ONE CONTAINER
+   ==========================================================================
+   Every HUD widget is this. There is no second panel style, no second radius,
+   no second border and no second shadow anywhere below this rule. */
 
-/* The one container idiom: one radius, one border, one fill, one shadow, one
-   inner padding. Minimap, item box, speedometer, split pill, gap pill and
-   toast are all this. Nothing in the HUD may declare its own. */
-.kr-plate {
+.kr-plate,
+.kr-lap,
+.kr-timer,
+.kr-pos,
+.kr-board,
+.kr-item-frame,
+.kr-speed-face,
+.kr-pill,
+.kr-toast {
   background: var(--plate-bg);
   border: 1px solid var(--plate-border);
   border-radius: var(--r);
   box-shadow: var(--plate-shadow);
 }
 
-/* Outline + drop shadow so type survives a blown-out golden-hour sky. */
-.kr-ink {
-  paint-order: stroke fill;
-  -webkit-text-stroke: var(--ink-w) var(--ink-2);
-  text-shadow:
-    0 0.035em 0 rgba(6, 10, 22, 0.55),
-    0 0.09em 0.26em rgba(4, 7, 16, 0.55);
-}
-
-.kr-ink-thin {
-  paint-order: stroke fill;
-  -webkit-text-stroke: calc(var(--ink-w) * 0.62) var(--ink-2);
-  text-shadow: 0 0.06em 0.22em rgba(4, 7, 16, 0.6);
+/* The one WELL: the recessed area inside a plate that holds a graphic. Used by
+   the item box and the minimap and by nothing else. */
+.kr-well,
+.kr-item-frame::after {
+  border-radius: calc(var(--r) * 0.6);
+  background: rgba(3, 6, 15, 0.44);
+  box-shadow:
+    inset 0 0.35vmin 0.9vmin rgba(2, 4, 11, 0.62),
+    inset 0 -0.12vmin 0 rgba(255, 246, 228, 0.10);
 }
 
 /* ==========================================================================
-   CASED HEADLINE TYPE — the two-layer lockup
+   THE ONE NUMERAL / THE ONE LABEL
    ==========================================================================
-   Every large numeral in the HUD (lap, timer, position, speed, countdown) is
-   built twice into one wrapper: an INK layer carrying a real font stroke, and
-   a gradient-clipped TOP layer over it.
+   No `-webkit-text-stroke` and no chained drop-shadows: both were review
+   findings (mitre spikes on diagonals, stair-stepped contours). Everything
+   sits on an opaque plate, so a single soft shadow for form is enough and the
+   sky behind it is irrelevant. */
 
-   Why not the round-1 approach. `-webkit-text-stroke` cannot be combined with
-   `background-clip: text` on one element — Chromium clips the stroke against
-   the fill and leaves ghost contours in counters — so round 1 built the
-   outline out of chained zero-blur `drop-shadow()`s instead. Chained
-   drop-shadows COMPOUND: each one filters the output of the last, so N
-   shadows dilate the glyph by roughly N offsets, and Chromium's per-primitive
-   filter region clips the intermediate buffers and leaves stair-stepped
-   notches on the diagonals. That is exactly the artefact the review measured
-   at 3x zoom, and adding directions makes it worse, not better.
-
-   Two layers has no filter chain at all: ONE stroke, the font rasteriser's own
-   joins and antialiasing, and the gradient sits on top untouched. It is also
-   cheaper — the timer and speed digit re-rasterise every frame and now do so
-   with zero filter passes.
-
-   The gradient ALWAYS goes on the lockup, never on individual glyphs, so "1"
-   and "/3", or "5" and "th", ride one continuous ramp instead of each
-   re-ramping over its own little box. */
-
-.kr-cased { position: relative; display: inline-block; }
-.kr-cased-l {
-  display: flex;
-  align-items: baseline;
-  white-space: nowrap;
+/* EVERY numeral in the HUD is this rule and only this rule: cream, weight 800,
+   tabular figures, one soft shadow for form. Colour is reserved for STATE
+   (rank 1, final lap, redline, boost) and is applied by a state class on top.
+   Round 6 had three treatments in one frame — a gold-clipped position, a
+   cool-clipped timer and a flat-cream board. */
+.kr-lock-l,
+.kr-line-v,
+.kr-brow-p,
+.kr-item-count {
+  font-weight: 800;
+  letter-spacing: 0.005em;
+  color: var(--paper);
+  font-variant-numeric: tabular-nums lining-nums;
+  font-feature-settings: "tnum" 1, "lnum" 1;
+  text-shadow: 0 0.045em 0.10em rgba(3, 6, 15, 0.55);
 }
-/* the ink layer: one stroke, centred, so half of it shows outside the glyph */
-.kr-cased-ink {
-  position: absolute;
-  inset: 0;
-  color: var(--ink-2);
-  -webkit-text-stroke: calc(var(--ink-w) * 1.9) var(--ink-2);
-  paint-order: stroke fill;
-  text-shadow: 0 0.05em 0.18em rgba(4, 7, 16, 0.62);
-  pointer-events: none;
-}
-.kr-cased-top { position: relative; }
 
+/* The lockup wrapper. One layer — round 6 built every numeral twice (an ink
+   layer carrying a font stroke under a gradient-clipped layer) which is where
+   the mitres came from. `Pair` in HUD.ts now points both slots at this one
+   node, so the call sites did not have to change shape. */
+.kr-lock { position: relative; display: inline-block; }
+.kr-lock-l { display: flex; align-items: baseline; white-space: nowrap; }
+
+.kr-label {
+  font-size: var(--t1);
+  font-weight: 800;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--dim);
+  line-height: 1;
+}
+
+/* The one display gradient, used ONLY by the countdown and the menus — a
+   full-screen, transient, non-competing surface. No HUD widget uses it. */
 .kr-gold {
   background-image: var(--gold-ramp);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
+  text-shadow: none;
   filter: var(--gold-glow);
-  transition: filter 0.26s var(--e-out);
-}
-
-/* The quiet member of the same family — same construction, cooler ramp.
-   Hierarchy is carried by saturation and size, never by a second treatment. */
-.kr-gold-q {
-  --gold-ramp: linear-gradient(180deg, #fffdf6 5%, #f6ecd8 52%, #cfc0a4 100%);
-}
-
-/* Secondary type. Opaque fills, never alpha. */
-.kr-label {
-  font-size: clamp(11px, 1.7vmin, 22px);
-  font-weight: 800;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  color: var(--paper);
-  paint-order: stroke fill;
-  -webkit-text-stroke: var(--ink-w) var(--ink-2);
-  text-shadow: 0 0.07em 0.24em rgba(4, 7, 16, 0.8);
-}
-
-/* A shaped scrim, used behind the two type-only clusters (top-left lap, the
-   position lockup) so they survive over arbitrary world content — a
-   grandstand roof, a terracotta wall, a blown-out sun. Radial and generously
-   inset so the falloff completes inside the box and it never reads as a
-   panel. §7: "everything must have a subtle drop shadow or outline so it
-   survives over a bright sky." */
-.kr-scrim::before {
-  content: "";
-  position: absolute;
-  inset: -3.4vmin -9vmin -3.4vmin -6vmin;
-  z-index: -1;
-  background: radial-gradient(ellipse 52% 52% at 38% 50%,
-              rgba(6, 10, 22, 0.62) 0%, rgba(6, 10, 22, 0.34) 50%, rgba(6, 10, 22, 0) 100%);
-  pointer-events: none;
-  transition: background 0.4s var(--e-out);
 }
 
 /* ==========================================================================
@@ -236,8 +227,8 @@
   opacity: 0;
 }
 
-/* Edge tint only. The precise charge read lives on the speedometer's charge
-   rail; this is peripheral-vision confirmation. */
+/* Edge tint only. The precise charge read lives on the speedometer's inner
+   arc; this is peripheral-vision confirmation. */
 .kr-drift {
   background: radial-gradient(ellipse 72% 64% at 50% 54%,
               transparent 64%, var(--tier) 116%);
@@ -268,12 +259,12 @@
 }
 
 /* ==========================================================================
-   HUD frame — five zones, one safe area
+   HUD frame
    ========================================================================== */
 
 .kr-hud {
   position: absolute;
-  isolation: isolate;   /* keeps the z-index:-1 scrims inside the HUD layer */
+  isolation: isolate;
   top: calc(var(--safe) + env(safe-area-inset-top, 0px));
   right: calc(var(--safe-x) + env(safe-area-inset-right, 0px));
   bottom: calc(var(--safe) + env(safe-area-inset-bottom, 0px));
@@ -289,602 +280,461 @@
   opacity: 0.28;
   filter: blur(3px) saturate(0.5);
 }
-/* The HUD enters as ONE eased group on GO. No widget is allowed to pop into
-   existence on its own — during the countdown the whole frame sits back a
-   touch and comes forward together when the lights go out. */
+/* The HUD enters as ONE eased group on GO. No widget pops in on its own. */
 .kr.is-counting .kr-hud {
-  opacity: 0.72;
-  transform: translateY(0.7vmin) scale(0.985);
+  opacity: 0.78;
+  transform: translateY(0.6vmin) scale(0.99);
 }
 
-/* --- lap counter (TOP-LEFT) ----------------------------------------------- */
+/* The scrim class is retained as a no-op hook: every cluster is a plate now,
+   so there is nothing left for a shaped darken to do. */
+.kr-scrim::before { content: none; }
 
-.kr-lap { position: absolute; top: 0; left: 0; }
-.kr-lap::before { inset: -2.6vmin -8vmin -2.2vmin -5vmin; }
+/* --- LAP — top-left ------------------------------------------------------- */
+
+/* One top-left column, one gutter: the lap plate with the split flash under
+   it. Both anchor off the single safe-area token via .kr-hud. */
+.kr-tl {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--gutter);
+}
+.kr-lap { padding: calc(var(--pad) * 0.9) calc(var(--pad) * 1.25) var(--pad); }
 .kr-lap-in {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
+  gap: 0.35em;
   transform-origin: 0% 50%;
 }
 .kr-lap-in.punch { animation: kr-punch 0.62s var(--e-spring) both; }
 @keyframes kr-punch {
   0%   { transform: scale(1); }
-  22%  { transform: scale(1.16); }
+  22%  { transform: scale(1.12); }
   100% { transform: scale(1); }
 }
 
-/* The whole "1/3" lockup is ONE gold-clipped word: the ramp and its casing
-   live on this box and the children carry only size, so the big numeral and
-   the small "/3" sit on one continuous ramp. */
-.kr-lap-nums {
-  line-height: 0.86;
-  margin-top: 0.2vmin;
-  font-size: clamp(38px, 8.2vmin, 112px);
-}
-.kr-lap-cur {
-  font-size: 1em;
-  font-weight: 900;
-  letter-spacing: -0.03em;
-  /* Optical left rail. Tabular figures centre each glyph in a fixed advance,
-     so a "1" sits ~0.11em inside the rail that every other left-anchored
-     element lands on. Proportional figures shrink the bearing and one
-     correction then lands the ink on the rail. The lap number changes three
-     times in a race, so trading a rare "/3" reflow for a permanently correct
-     rail is the right way round. font-feature-settings has to be restated:
-     the low-level property on .kr wins over font-variant-numeric. */
-  font-variant-numeric: proportional-nums lining-nums;
-  font-feature-settings: "tnum" 0, "lnum" 1, "case" 1, "ss01" 1;
-  margin-left: -0.075em;
-}
+.kr-lap-nums { font-size: var(--t5); line-height: 0.86; }
+.kr-lap-cur { font-size: 1em; font-weight: 900; letter-spacing: -0.02em; }
 .kr-lap-sep {
-  font-size: 0.48em;
-  font-weight: 800;
-  margin: 0 0.1em 0 0.14em;
-  transform: translateY(-0.06em);
-  opacity: 0.78;
-}
-.kr-lap-tot {
   font-size: 0.5em;
   font-weight: 800;
-  opacity: 0.9;
+  margin: 0 0.06em 0 0.12em;
+  transform: translateY(-0.05em);
+  color: var(--dim);
 }
-/* Final lap: the lockup goes to the hot ramp. One state change, one element. */
-.kr-lap.final .kr-lap-nums {
-  --gold-ramp: linear-gradient(180deg, #fffdf6 5%, #ffe7ae 45%, #f7ae3c 84%, #e07c14 100%);
-  --gold-glow: drop-shadow(0 0 0.06em rgba(255, 200, 100, 0.7));
-}
+.kr-lap-tot { font-size: 0.52em; font-weight: 800; color: var(--dim); }
+/* Final lap: the ONE state colour, on the numeral only. */
+.kr-lap.final .kr-lap-cur { color: var(--gold); }
+.kr-lap.final { border-color: rgba(255, 207, 107, 0.55); }
 
-/* lap-split flash, directly under the lap lockup */
-.kr-split {
-  position: absolute;
-  top: clamp(58px, 11vmin, 150px);
-  left: 0;
-  opacity: 0;
-  transform-origin: 0% 50%;
-}
+/* lap-split flash, directly under the lap plate */
+.kr-split { opacity: 0; transform-origin: 0% 50%; }
 .kr-split.on { animation: kr-split 2.5s var(--e-out) both; }
 @keyframes kr-split {
-  0%   { opacity: 0; transform: translateX(-2.4vmin) scale(0.9); }
-  9%   { opacity: 1; transform: translateX(0) scale(1.04); }
+  0%   { opacity: 0; transform: translateX(-1.6vmin) scale(0.94); }
+  9%   { opacity: 1; transform: translateX(0) scale(1.02); }
   16%  { transform: translateX(0) scale(1); }
   82%  { opacity: 1; transform: translateX(0) scale(1); }
-  100% { opacity: 0; transform: translateX(-1.6vmin) scale(0.96); }
+  100% { opacity: 0; transform: translateX(-1.2vmin) scale(0.97); }
 }
 
-/* --- the pill: the small-format member of the plate family ---------------- */
-/* Same radius token as the big plates. Round 1 had this as a stadium — the
-   only fully-rounded shape in a HUD otherwise built from rounded rects — so
-   the padding is now deep enough that a 24 px corner reads as a corner. */
-.kr-pill {
-  display: inline-flex;
+/* --- THE ONE KEY/VALUE ROW ------------------------------------------------
+   Lap split, best lap and the interval are the same object: a dim uppercase
+   key and one tabular value. `.kr-pill` is that row wrapped in a plate (it
+   floats over the world); `.kr-line` is the same row living inside a plate
+   already, so it carries a hairline rule instead of a second border. Two
+   contexts, one recipe, one set of child classes. */
+.kr-pill,
+.kr-line {
+  display: flex;
   align-items: baseline;
-  gap: 0.75em;
-  padding: 0.62em 0.95em 0.68em;
-  border-radius: var(--r);
-  background: var(--plate-bg);
-  border: 1px solid var(--plate-border);
-  box-shadow: var(--plate-shadow);
-  font-size: clamp(11px, 1.7vmin, 22px);
+  justify-content: space-between;
+  gap: 1.4em;
+  font-size: var(--t1);
 }
-.kr-pill-k {
+.kr-pill { padding: 0.5em 0.85em 0.55em; }
+.kr-line {
+  align-self: stretch;
+  border-top: 1px solid rgba(206, 222, 255, 0.13);
+  padding-top: 0.7em;
+}
+.kr-line-k {
   font-weight: 800;
-  letter-spacing: 0.18em;
+  letter-spacing: 0.2em;
   text-transform: uppercase;
-  color: var(--gold);
+  color: var(--dim);
+  white-space: nowrap;
 }
-.kr-pill-v {
-  font-weight: 800;
-  letter-spacing: 0.01em;
-  font-size: 1.5em;
-  font-variant-numeric: tabular-nums lining-nums;
-  font-feature-settings: "tnum" 1, "lnum" 1;
-}
-.kr-split.best .kr-pill,
-.kr-best-line.best-new .kr-pill {
-  border-color: rgba(255, 214, 110, 0.85);
-  box-shadow: 0 0 2.2vmin rgba(255, 200, 100, 0.5), var(--plate-shadow);
+.kr-line-v { font-size: var(--t3); }
+.kr-split.best .kr-pill { border-color: rgba(255, 207, 107, 0.7); }
+.kr-split.best .kr-line-v,
+.kr-best-line.best-new .kr-line-v { color: var(--gold); }
+
+/* --- TIME — top-right ----------------------------------------------------- */
+
+.kr-timer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  padding: calc(var(--pad) * 0.9) calc(var(--pad) * 1.25) var(--pad);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.35em;
 }
 
-/* --- timer (TOP-RIGHT) ---------------------------------------------------- */
+/* JITTER FIX — the review measured 5 px of horizontal jump on this element.
+   Two independent guarantees, because one was not enough last round:
 
-.kr-timer { position: absolute; top: 0; right: 0; text-align: right; }
-.kr-timer .kr-label { display: block; margin-right: 0.12em; }
+     1. The digits are tabular (tnum, restated locally — the low-level
+        font-feature-settings on .kr wins over font-variant-numeric).
+     2. The clock block has a HARD `width` in em and packs to its right edge.
+        `width` (not `min-width`) means no advance-width difference, no
+        subpixel rounding and no font fallback can change the box. Even a
+        two-digit minute just consumes reserved space instead of pushing the
+        head of the string sideways sixty times a second.
 
-/* Fixed-width slots, not a right-anchored string.
-   The hundredths roll every frame, so ANY residual advance-width difference
-   between "0" and "1" pumps the head of the string sideways sixty times a
-   second. Each field is its own inline-block of fixed em width with tabular
-   figures inside it, so the block's total width is a constant and the left
-   edge physically cannot move — belt and braces over tnum. */
+   The plate is right-anchored, so the only thing that could move is the left
+   edge of a fixed-width box, which cannot move. */
 .kr-timer-v {
-  font-size: clamp(26px, 5.4vmin, 74px);
+  width: 4.62em;
+  justify-content: flex-end;
+  font-size: var(--t5);
   font-weight: 800;
-  letter-spacing: 0.005em;
   line-height: 0.94;
-  margin-top: 0.24vmin;
-  font-variant-numeric: tabular-nums lining-nums;
-  font-feature-settings: "tnum" 1, "lnum" 1;
+  letter-spacing: 0;
 }
-.kr-t-m { min-width: 0.62em; text-align: right; }
-.kr-t-s { min-width: 1.24em; text-align: right; }
-/* Subordinate the fraction so the eye locks on minutes:seconds instead of
-   reading the block as two equal halves. */
-.kr-t-sep { opacity: 0.62; margin: 0 0.02em; font-size: 0.8em; }
+.kr-timer-v > span { flex: 0 0 auto; }
+.kr-t-m { width: 0.66em; text-align: right; }
+.kr-t-sep { width: 0.30em; text-align: center; color: var(--dim); }
+.kr-t-s { width: 1.30em; text-align: left; }
+/* Subordinate the fraction so the eye locks on minutes:seconds. */
 .kr-t-f {
-  font-size: 0.66em;
-  opacity: 0.82;
-  min-width: 1.5em;      /* ".82" at 0.66em */
+  width: 1.62em;
   text-align: left;
-  margin-left: 0.08em;
+  font-size: 0.64em;
+  color: rgba(255, 244, 226, 0.72);
+  align-self: baseline;
 }
-.kr-t-f i { font-style: normal; opacity: 0.6; font-size: 0.8em; margin-right: 0.04em; }
 
 /* Persistent best lap — the number the player is actually racing. */
 .kr-best-line {
-  margin-top: 0.9vmin;
   opacity: 0;
-  transform: translateY(-0.7vmin);
+  max-height: 0;
+  transform: translateY(-0.4vmin);
   transition: opacity 0.4s var(--e-out), transform 0.5s var(--e-out);
 }
-.kr-timer.has-best .kr-best-line { opacity: 1; transform: none; }
-.kr-best-line .kr-pill-v { font-size: 1.75em; }
+.kr-timer.has-best .kr-best-line { opacity: 1; max-height: 6em; transform: none; }
 
-/* --- position (LEFT-CENTRE) ----------------------------------------------- */
+/* --- POSITION — left-centre ----------------------------------------------- */
 
 .kr-pos {
   position: absolute;
   left: 0;
   top: 50%;
-  transform: translateY(-50%) scale(1);
-  transform-origin: 0% 50%;
-  transition: transform 0.5s var(--e-spring), opacity 0.45s var(--e-out);
+  transform: translateY(-50%);
+  padding: calc(var(--pad) * 0.9) calc(var(--pad) * 1.25) var(--pad);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.5em;
+  transition: border-color 0.4s var(--e-out), opacity 0.45s var(--e-out);
 }
-/* Mounted during the countdown, not hidden: the HUD must not change shape
-   between the grid and the race. It shows the STARTING GRID slot, dimmed,
-   with the gap pill reading GRID; the pill cross-fades to the live interval
-   on GO. */
-.kr.is-counting .kr-pos { opacity: 0.6; }
+.kr.is-counting .kr-pos { opacity: 0.7; }
 
 .kr-pos-in {
+  position: relative;
   transform-origin: 12% 60%;
   line-height: 0.8;
+  font-size: var(--t6);
 }
-.kr-pos-in .kr-cased-l { align-items: flex-start; }
+.kr-pos-in .kr-lock-l { align-items: flex-start; }
 .kr-pos-in.punch { animation: kr-posPunch 0.72s var(--e-spring) both; }
 @keyframes kr-posPunch {
   0%   { transform: scale(1); }
-  20%  { transform: scale(1.2); }
-  52%  { transform: scale(0.97); }
+  20%  { transform: scale(1.16); }
+  52%  { transform: scale(0.98); }
   100% { transform: scale(1); }
 }
-.kr-pos-n {
-  font-size: clamp(56px, 13vmin, 178px);
-  font-weight: 900;
-  letter-spacing: -0.045em;
-  /* same optical-rail correction as .kr-lap-cur — see the note there */
-  font-variant-numeric: proportional-nums lining-nums;
-  font-feature-settings: "tnum" 0, "lnum" 1, "case" 1, "ss01" 1;
-  margin-left: -0.026em;
-}
-/* The suffix is part of the same word and takes the same ramp, because the
-   ramp is on .kr-pos-in. `margin-top` is the cap-height correction. */
+.kr-pos-n { font-size: 1em; font-weight: 900; letter-spacing: -0.035em; }
+/* The suffix is part of the same word, same colour, same treatment. */
 .kr-pos-s {
-  font-size: clamp(22px, 4.6vmin, 62px);
+  font-size: 0.36em;
   font-weight: 900;
-  letter-spacing: 0.01em;
-  margin-top: 0.155em;
-  margin-left: 0.16em;
+  margin-top: 0.42em;
+  margin-left: 0.14em;
+  color: var(--dim);
 }
 
-/* --- RANK RAMP -----------------------------------------------------------
-   Rank is a fixed semantic, not a mood. Round 1 tinted the numeral by the
-   DIRECTION of the last change, which is why the review sampled a salmon-red
-   "2nd" (the player had just been passed) next to a gold "5th" (steady) and
-   concluded the ramp was inverted. Direction now rides entirely on the
-   chevron and the punch; colour means rank and nothing else. Casing weight is
-   identical across all four so contrast against a bright sky does not change
-   with position. */
-.kr-pos { --gold-ramp: linear-gradient(180deg, #fffdf6 6%, #f2ece0 55%, #cdc3b0 100%); }
-.kr-pos.p1 { --gold-ramp: linear-gradient(180deg, #fff6d8 4%, #ffd36a 46%, #ff9d2e 100%); }
-.kr-pos.p2 { --gold-ramp: linear-gradient(180deg, #ffffff 4%, #e8eef2 46%, #a8b6c0 100%); }
-.kr-pos.p3 { --gold-ramp: linear-gradient(180deg, #ffe4c8 4%, #e8a86a 46%, #b5643f 100%); }
+/* RANK is a fixed semantic, not a mood: rank 1 is the only state that changes
+   the numeral's colour, and it changes it to the ONE accent in the system. */
+.kr-pos.p1 .kr-pos-n,
+.kr-pos.p1 .kr-pos-s { color: var(--gold); }
+.kr-pos.p1 { border-color: rgba(255, 207, 107, 0.55); }
 
 .kr-pos-arrow {
   position: absolute;
   left: 100%;
-  top: 0.1em;
-  margin-left: 0.22em;
-  font-size: clamp(16px, 3vmin, 40px);
+  top: 0.06em;
+  margin-left: 0.12em;
+  font-size: 0.3em;
   font-weight: 900;
   line-height: 1;
   opacity: 0;
   color: var(--paper);
-  text-shadow: 0 0.05em 0.16em rgba(4, 7, 16, 0.85);
-  -webkit-text-stroke: 0.05em var(--ink-2);
-  paint-order: stroke fill;
+  text-shadow: 0 0.05em 0.14em rgba(3, 6, 15, 0.8);
 }
 .kr-pos.gain .kr-pos-arrow { color: #7ef0a4; }
 .kr-pos.loss .kr-pos-arrow { color: #ff8a7a; }
 .kr-pos-arrow.run { animation: kr-posArrow 0.68s var(--e-out) both; }
 @keyframes kr-posArrow {
   0%   { opacity: 0; transform: translateY(0.5em) scale(0.7); }
-  22%  { opacity: 1; transform: translateY(0) scale(1.12); }
+  22%  { opacity: 1; transform: translateY(0) scale(1.1); }
   34%  { transform: translateY(0) scale(1); }
   68%  { opacity: 1; transform: translateY(0) scale(1); }
   100% { opacity: 0; transform: translateY(-0.35em) scale(0.95); }
 }
 
-/* Leading is categorical: a held scale step, a warm glow, a hotter scrim. */
-.kr-pos.p1 { transform: translateY(-50%) scale(1.06); }
-.kr-pos.p1 .kr-pos-in { --gold-glow: drop-shadow(0 0 0.09em rgba(255, 208, 110, 0.85)); }
-.kr-pos.p1::before {
-  background:
-    radial-gradient(ellipse 32% 36% at 38% 50%, rgba(255, 176, 60, 0.24), rgba(255, 176, 60, 0) 100%),
-    radial-gradient(ellipse 52% 52% at 38% 50%,
-      rgba(12, 8, 3, 0.66) 0%, rgba(10, 8, 8, 0.38) 50%, rgba(6, 10, 22, 0) 100%);
-}
-
-/* Interval to the kart being raced. Fixed width, so a close battle does not
-   pump the pill horizontally under a static numeral, and pulled left by the
-   casing width so its box aligns with the numeral's OPTICAL left edge rather
-   than its bounding box. */
-.kr-gap {
-  position: absolute;
-  left: 0;
-  top: 100%;
-  margin-top: 1.1vmin;
-  margin-left: -0.16vmin;
-  white-space: nowrap;
-}
-.kr-gap .kr-pill-v {
-  font-size: 1.3em;
-  min-width: 4.4em;
+/* The interval lives INSIDE the position plate — it is the same fact. Round 6
+   hung it off the outside as a second free-floating pill, which is one of the
+   six separately-invented widgets the review counted. */
+.kr-gap { align-self: stretch; }
+.kr-gap .kr-line-v {
+  min-width: 3.4em;
   text-align: right;
-  display: inline-block;
   transition: opacity 0.35s var(--e-out);
 }
-.kr-gap .kr-pill-k { min-width: 2.6em; }
-/* countdown: the value slot stays mounted (layout-stable) but empty */
-.kr-pos.grid .kr-gap .kr-pill-v { opacity: 0; }
+.kr-pos.grid .kr-gap .kr-line-v { opacity: 0; }
 
-/* --- rival board (RIGHT-CENTRE) -------------------------------------------
-   The element the round-1 frame was missing, and the reason it read as
-   left-heavy: there was nothing on the right between the timer and the
-   speedo. Eight rows — place ordinal, livery chip, driver name — is what
-   balances a racing HUD, and it is information the player actually wants.
-   Type only, no per-row plate; only the player's own row is chromed. */
+/* --- STANDINGS — right-centre --------------------------------------------- */
 
 .kr-board {
   position: absolute;
   right: 0;
   top: 50%;
   transform: translateY(-50%);
+  padding: calc(var(--pad) * 0.85) var(--pad);
   display: flex;
   flex-direction: column;
-  gap: 0.34vmin;
-  width: clamp(146px, 21vmin, 300px);
+  gap: 0.1em;
+  width: clamp(132px, 19vmin, 268px);
   transition: opacity 0.45s var(--e-out);
-}
-.kr-board::before {
-  content: "";
-  position: absolute;
-  inset: -3vmin -5.5vmin -3vmin -8vmin;
-  z-index: -1;
-  background: radial-gradient(ellipse 56% 54% at 64% 50%,
-              rgba(6, 10, 22, 0.66) 0%, rgba(6, 10, 22, 0.34) 52%, rgba(6, 10, 22, 0) 100%);
-  pointer-events: none;
 }
 .kr-brow {
   display: grid;
-  grid-template-columns: 1.9em 0.62em 1fr;
+  grid-template-columns: 1.75em 0.6em 1fr;
   align-items: center;
-  gap: 0.5em;
-  padding: 0.30em 0.6em 0.34em;
+  gap: 0.55em;
+  padding: 0.3em 0.5em 0.34em;
   border-radius: calc(var(--r) * 0.42);
   border: 1px solid transparent;
-  font-size: clamp(11px, 1.72vmin, 22px);
+  font-size: var(--t2);
   transition: background 0.3s var(--e-out), border-color 0.3s var(--e-out);
 }
-.kr-brow-p {
-  font-weight: 900;
-  letter-spacing: -0.01em;
-  text-align: right;
-  color: #f2ece0;
-  font-variant-numeric: tabular-nums lining-nums;
-  paint-order: stroke fill;
-  -webkit-text-stroke: 0.06em var(--ink-2);
-}
-.kr-brow.r1 .kr-brow-p { color: #ffd36a; }
-.kr-brow.r2 .kr-brow-p { color: #e8eef2; }
-.kr-brow.r3 .kr-brow-p { color: #e8a86a; }
-.kr-brow-p i { font-style: normal; font-size: 0.66em; margin-left: 0.06em; }
+.kr-brow-p { font-weight: 900; text-align: right; color: var(--dim); }
+/* The podium reads at a glance, but with ONE accent plus two neutral values —
+   not three invented metal ramps. */
+.kr-brow.r1 .kr-brow-p { color: var(--gold); }
+.kr-brow.r2 .kr-brow-p { color: rgba(255, 244, 226, 0.9); }
+.kr-brow.r3 .kr-brow-p { color: rgba(255, 244, 226, 0.75); }
+.kr-brow-p i { font-style: normal; font-size: 0.62em; margin-left: 0.06em; }
 .kr-brow-c {
-  width: 0.62em;
-  height: 0.62em;
+  width: 0.6em;
+  height: 0.6em;
   border-radius: 50%;
   background: var(--c, #888);
-  border: 1px solid rgba(6, 10, 22, 0.85);
-  box-shadow: 0 0 0.5vmin color-mix(in srgb, var(--c, #888) 55%, transparent);
+  box-shadow: 0 0 0 1px rgba(3, 6, 15, 0.7);
 }
 .kr-brow-n {
   font-weight: 800;
-  letter-spacing: 0.09em;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: rgba(248, 242, 230, 0.86);
+  color: rgba(255, 244, 226, 0.82);
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-  paint-order: stroke fill;
-  -webkit-text-stroke: 0.05em var(--ink-2);
 }
 .kr-brow.you {
-  background: linear-gradient(90deg, rgba(255, 196, 90, 0.04), rgba(60, 44, 14, 0.66));
-  border-color: rgba(255, 214, 120, 0.5);
+  background: rgba(255, 207, 107, 0.13);
+  border-color: rgba(255, 207, 107, 0.45);
 }
-.kr-brow.you .kr-brow-n { color: #fff3d0; }
-.kr-brow.out { opacity: 0.28; }
-.kr-brow.out .kr-brow-c { display: none; }
+.kr-brow.you .kr-brow-n,
+.kr-brow.you .kr-brow-p { color: var(--paper); }
+.kr-brow.out { opacity: 0.26; }
+.kr-brow.out .kr-brow-c { visibility: hidden; }
 
-/* --- the BOTTOM RAIL: item | minimap | speedo ----------------------------
-   All three are exactly --rail tall and share one bottom edge, one radius,
-   one border, one fill and one shadow. */
+/* --- MINIMAP — top-centre (§7: "bottom-centre or top-centre") ------------- */
+/* Bottom-centre put it on the kart and the vanishing point in every review
+   frame. Top-centre is sky in every frame, and the plate is opaque. */
+.kr-map {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: var(--map-w);
+  height: var(--map-h);
+}
+/* The well is inset by the ONE inner padding, like the item box's. */
+.kr-map .kr-well { position: absolute; inset: calc(var(--pad) * 0.6); overflow: hidden; }
+.kr-map canvas { display: block; width: 100%; height: 100%; }
+
+/* --- ITEM — bottom-left --------------------------------------------------- */
 
 .kr-item,
-.kr-map,
-.kr-speed {
-  position: absolute;
-  bottom: 0;
-  height: var(--rail);
-}
+.kr-speed { position: absolute; bottom: 0; height: var(--rail); }
 
-/* item box (bottom-left) */
-.kr-item {
-  left: 0;
-  width: var(--rail);
-}
-/* An empty slot has to advertise that it wants filling. One compositor-only
-   opacity animation on a rim; it stops the moment an item lands, because then
-   the tint glow is doing the talking. */
-.kr-item::after {
-  content: "";
-  position: absolute;
-  inset: -1px;
-  border-radius: calc(var(--r) + 1px);
-  border: 1px solid rgba(255, 214, 120, 0.9);
-  box-shadow: 0 0 1.4vmin rgba(255, 196, 90, 0.42);
-  opacity: 0;
-  pointer-events: none;
-  animation: kr-slotPulse 3.6s var(--e-soft) infinite;
-}
-.kr-item.has-item::after,
-.kr-item.spinning::after { animation: none; opacity: 0; }
-@keyframes kr-slotPulse {
-  0%, 100% { opacity: 0.06; }
-  50%      { opacity: 0.5; }
-}
-/* The plate's CHROME is identical in every state — same border, same well,
-   same sheen. Round 1 faded the inner well out when an item landed, so the
-   widget's own construction changed shape on a state change. Only the
-   CONTENTS swap now. */
+.kr-item { left: 0; width: var(--rail); }
 .kr-item-frame {
   position: absolute;
   inset: 0;
-  border-radius: var(--r);
-  background: var(--plate-bg);
-  border: 1px solid var(--plate-border);
-  box-shadow: var(--plate-shadow);
+  overflow: hidden;
   transition: box-shadow 0.3s var(--e-out);
-  overflow: hidden;     /* nothing an icon draws may escape the corner */
 }
+/* An empty slot advertises that it wants filling: one compositor-only opacity
+   animation on a rim laid exactly on the plate's own border — same radius,
+   same 1 px, so it reads as the border warming rather than as a second ring. */
 .kr-item-frame::before {
   content: "";
   position: absolute;
-  inset: -40%;
-  background: linear-gradient(115deg, transparent 38%, rgba(255, 248, 225, 0.12) 48%,
-              transparent 58%);
-  animation: kr-sheen 6.5s var(--e-soft) infinite;
+  inset: 0;
+  border-radius: inherit;
+  border: 1px solid var(--gold);
+  opacity: 0;
+  animation: kr-slotPulse 3.6s var(--e-soft) infinite;
 }
-/* the well: permanent, in every state */
-.kr-item-frame::after {
-  content: "";
-  position: absolute;
-  inset: 9%;
-  border-radius: calc(var(--r) * 0.55);
-  background: rgba(4, 7, 16, 0.22);
-  box-shadow:
-    inset 0 0.4vmin 1.1vmin rgba(3, 5, 13, 0.5),
-    inset 0 -0.14vmin 0 rgba(255, 246, 228, 0.12);
+.kr-item.has-item .kr-item-frame::before,
+.kr-item.spinning .kr-item-frame::before { animation: none; opacity: 0; }
+@keyframes kr-slotPulse {
+  0%, 100% { opacity: 0.05; }
+  50%      { opacity: 0.5; }
 }
-/* Empty state: the item-box diamond struck into the well floor, in the HUD's
-   own gold. Deliberate, shaped and breathing — not a placeholder glyph. */
+/* the well: permanent, in every state — the SAME well idiom as the minimap */
+.kr-item-frame::after { content: ""; position: absolute; inset: 8%; }
+/* Empty state: the item-box diamond struck into the well floor. */
 .kr-item-motif {
   position: absolute;
-  inset: 26%;
-  opacity: 0.55;
+  inset: 27%;
+  opacity: 0.5;
   transition: opacity 0.26s var(--e-out);
-  animation: kr-motif 3.6s var(--e-soft) infinite;
-  filter: drop-shadow(0 0.25vmin 0.4vmin rgba(4, 7, 16, 0.7));
 }
 .kr-item-motif svg { width: 100%; height: 100%; display: block; }
 .kr-item.has-item .kr-item-motif,
-.kr-item.spinning .kr-item-motif { opacity: 0; animation: none; }
-@keyframes kr-motif {
-  0%, 100% { opacity: 0.44; transform: scale(0.975); }
-  50%      { opacity: 0.62; transform: scale(1.02); }
-}
+.kr-item.spinning .kr-item-motif { opacity: 0; }
 
 .kr-item.has-item .kr-item-frame {
   box-shadow:
-    0 0 2.6vmin color-mix(in srgb, var(--item-tint, #fff) 46%, transparent),
+    0 0 2.2vmin color-mix(in srgb, var(--item-tint, #fff) 38%, transparent),
     var(--plate-shadow);
 }
 .kr-item.spinning .kr-item-frame {
-  box-shadow:
-    0 0 3.6vmin rgba(255, 214, 130, 0.65),
-    inset 0 0 2.6vmin rgba(255, 214, 130, 0.28),
-    var(--plate-shadow);
+  box-shadow: 0 0 3vmin rgba(255, 207, 107, 0.55), var(--plate-shadow);
 }
-/* The icon canvas is clipped by its own rounded box as well as by the frame,
-   so a glow can never bleed past the plate's corner. */
 .kr-item-icon {
   position: absolute;
-  inset: 9%;
-  border-radius: calc(var(--r) * 0.55);
+  inset: 8%;
+  border-radius: calc(var(--r) * 0.6);
   overflow: hidden;
   transform-origin: 50% 56%;
   transition: transform 0.12s var(--e-out), opacity 0.12s linear;
 }
 .kr-item-icon canvas { width: 100%; height: 100%; display: block; }
-.kr-item.spinning .kr-item-icon { transform: scaleY(1.10) scaleX(0.96); opacity: 0.88; }
+.kr-item.spinning .kr-item-icon { transform: scaleY(1.08) scaleX(0.97); opacity: 0.88; }
 .kr-item-icon.land { animation: kr-itemLand 0.72s var(--e-spring) both; }
+@keyframes kr-itemLand {
+  0%   { transform: scale(1.36) rotate(-4deg); }
+  38%  { transform: scale(0.92) rotate(2deg); }
+  66%  { transform: scale(1.06) rotate(-1deg); }
+  100% { transform: scale(1) rotate(0deg); }
+}
 
 .kr-item-count {
   position: absolute;
-  right: -3%;
-  bottom: -3%;
-  min-width: 2.1em;
-  padding: 0.12em 0.34em 0.16em;
+  right: -2%;
+  bottom: -2%;
+  min-width: 1.9em;
+  padding: 0.16em 0.36em 0.2em;
   text-align: center;
-  border-radius: 999px;
-  font-size: clamp(11px, 2vmin, 26px);
+  border-radius: calc(var(--r) * 0.6);
+  font-size: var(--t2);
   font-weight: 900;
   color: var(--ink-warm);
-  background: linear-gradient(180deg, #fff3c8, #ffc84e 55%, #ee9a18);
-  border: 1px solid rgba(60, 34, 8, 0.5);
-  box-shadow: 0 0.4vmin 1.2vmin rgba(4, 7, 16, 0.6), inset 0 0.12vmin 0 rgba(255, 255, 255, 0.7);
+  text-shadow: none;   /* the one numeral shadow is for cream on dark, not this */
+  background: var(--gold);
+  border: 1px solid rgba(60, 34, 8, 0.45);
+  box-shadow: 0 0.35vmin 1vmin rgba(3, 6, 15, 0.6);
   opacity: 0;
   transform: scale(0.5);
   transition: opacity 0.24s var(--e-out), transform 0.34s var(--e-spring);
 }
 .kr-item.multi .kr-item-count { opacity: 1; transform: scale(1); }
 
-@keyframes kr-sheen {
-  0%, 62% { transform: translateX(-58%); }
-  86%, 100% { transform: translateX(58%); }
-}
-@keyframes kr-itemLand {
-  0%   { transform: scale(1.42) rotate(-5deg); }
-  38%  { transform: scale(0.90) rotate(2.5deg); }
-  66%  { transform: scale(1.08) rotate(-1deg); }
-  100% { transform: scale(1) rotate(0deg); }
-}
-
-/* minimap (BOTTOM-CENTRE, per ART_DIRECTION §7) --------------------------- */
-/* Centred on the frame's vertical axis and locked to the bottom rail. It is
-   deliberately short and wide: the chase camera parks the kart above this
-   line, and a rail-height panel stays under it. */
-.kr-map {
-  left: 50%;
-  transform: translateX(-50%);
-  padding: var(--plate-pad);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-/* Minimap.resize() writes the canvas box explicitly from the panel's content
-   height and the track's own aspect, so the plate shrink-wraps the map. */
-.kr-map canvas { display: block; }
-
-/* speedometer (BOTTOM-RIGHT) --------------------------------------------- */
+/* --- SPEEDOMETER — bottom-right ------------------------------------------ */
+/* §7 asks for an analogue arc with a needle plus a digital readout. Round 6
+   also had twenty tick marks, five majors, a redline segment, a hub cap with
+   an inner dot and a separate three-pip charge rail — the "Grafana-grade
+   infographic" the review named. What is left is the arc, five majors, one
+   slim needle, one inner charge ring and the readout. */
 .kr-speed {
   right: 0;
-  width: calc(var(--rail) * 1.02);
+  width: calc(var(--rail) * 1.04);
   transform-origin: 100% 100%;
 }
-/* The plate and the canvas are the SAME rect, and the rect is a real clip, so
-   no dial geometry can escape the rounded card. The outer drop shadow is on
-   this box too — `overflow: hidden` clips children, never the element's own
-   shadow — which removes the second, differently-inset box round 1 had here
-   (the stray rectangle under the bottom-left corner in the review). */
-.kr-speed-face {
-  position: absolute;
-  inset: 0;
-  border-radius: var(--r);
-  overflow: hidden;
-  background:
-    radial-gradient(circle at 50% 42%, rgba(4, 7, 16, 0.5) 0%,
-                    rgba(4, 7, 16, 0.22) 58%, rgba(4, 7, 16, 0) 86%),
-    var(--plate-bg);
-  border: 1px solid var(--plate-border);
-  box-shadow: var(--plate-shadow);
-}
+.kr-speed-face { position: absolute; inset: 0; overflow: hidden; }
 .kr-speed-face canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
 .kr-speed.tier { animation: kr-dialPop 0.52s var(--e-spring) both; }
 @keyframes kr-dialPop {
   0%   { transform: scale(1); }
-  26%  { transform: scale(1.12); }
+  26%  { transform: scale(1.09); }
   100% { transform: scale(1); }
 }
-/* The readout lives BELOW the dial's open bottom wedge, in a strip of the
-   plate the needle sweep cannot reach — round 1 had it under the hub, and the
-   needle crossed the digits at both ends of the range. */
+/* The readout sits in the dial's open bottom wedge, outside the needle sweep. */
 .kr-speed-read {
   position: absolute;
   left: 0;
   right: 0;
-  bottom: 7%;
+  bottom: 9%;
   display: flex;
   align-items: baseline;
   justify-content: center;
-  gap: 0.26em;
+  gap: 0.3em;
   line-height: 0.86;
 }
 .kr-speed-n {
-  font-size: clamp(18px, 3.6vmin, 48px);
+  font-size: var(--t4);
   font-weight: 900;
-  letter-spacing: -0.02em;
-  font-variant-numeric: tabular-nums lining-nums;
-  font-feature-settings: "tnum" 1, "lnum" 1;
-  min-width: 2.1em;
+  letter-spacing: -0.015em;
+  /* fixed box: 0 → 188 km/h must not shuffle the unit sideways */
+  width: 2.35em;
 }
-.kr-speed-n .kr-cased-l { justify-content: flex-end; }
-/* '101' on its own is a number. This makes it a speed. */
+.kr-speed-n .kr-lock-l { justify-content: flex-end; }
 .kr-speed-u {
-  font-size: clamp(8px, 1.45vmin, 19px);
+  font-size: var(--t1);
   font-weight: 800;
-  letter-spacing: 0.14em;
+  letter-spacing: 0.16em;
   text-transform: uppercase;
-  color: rgba(248, 242, 230, 0.62);
-  paint-order: stroke fill;
-  -webkit-text-stroke: 0.06em var(--ink-2);
+  color: var(--dim);
 }
-.kr-speed.red .kr-speed-n { --gold-glow: drop-shadow(0 0 0.06em rgba(255, 150, 110, 0.7)); }
-.kr-speed.boosting .kr-speed-n {
-  --gold-glow: drop-shadow(0 0 0.07em rgba(255, 202, 120, 0.75));
-}
+.kr-speed.red .kr-speed-n .kr-lock-l { color: #ff9d6a; }
+.kr-speed.boosting .kr-speed-n .kr-lock-l { color: var(--gold); }
 
-/* --- toast: ONE slot, transient events only, above the minimap ------------ */
+/* --- TOAST: one slot, bottom-centre, on the bottom rail's own line -------- */
+/* The centre of the bottom edge is where the minimap used to sit on top of the
+   kart. It is now empty except for this, which is transient by definition. */
 
 .kr-bottom {
   position: absolute;
   left: 50%;
-  bottom: calc(var(--rail) + var(--gutter));
+  bottom: 0;
   transform: translateX(-50%);
   display: flex;
-  flex-direction: column;
-  align-items: center;
-  width: clamp(140px, 23vmin, 320px);
+  justify-content: center;
+  align-items: flex-end;
+  width: clamp(140px, 26vmin, 380px);
 }
 .kr-toasts {
   position: relative;
@@ -892,7 +742,6 @@
   justify-items: center;
   align-items: end;
   width: 100%;
-  height: clamp(28px, 4.6vmin, 60px);
   pointer-events: none;
 }
 .kr-toast {
@@ -900,38 +749,36 @@
   display: flex;
   align-items: center;
   gap: 0.7em;
-  padding: 0.5em 1.1em 0.55em;
-  border-radius: var(--r);
+  padding: 0.55em 1em 0.6em;
   white-space: nowrap;
-  font-size: clamp(11px, 1.85vmin, 24px);
+  font-size: var(--t2);
   font-weight: 800;
-  letter-spacing: 0.10em;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--paper);
-  background: var(--plate-bg);
-  border: 1px solid var(--tc, var(--plate-border));
-  box-shadow: var(--plate-shadow),
-              0 0 1.6vmin color-mix(in srgb, var(--tc, #fff) 30%, transparent);
+  border-color: var(--tc, var(--plate-border));
   animation: kr-toast 2.4s var(--e-out) both;
-  text-shadow: 0 0.08em 0.22em rgba(4, 7, 16, 0.7);
 }
 .kr-toast.out { animation: kr-toastOut 0.18s var(--e-soft) both; }
-.kr-toast i {
-  font-style: normal;
-  font-size: 1.15em;
-  line-height: 1;
-  color: var(--tc, var(--gold));
-}
+.kr-toast i { font-style: normal; font-size: 1.1em; line-height: 1; color: var(--tc, var(--gold)); }
 @keyframes kr-toast {
-  0%   { opacity: 0; transform: translateY(2.2vmin) scale(0.88); }
-  8%   { opacity: 1; transform: translateY(0) scale(1.03); }
+  0%   { opacity: 0; transform: translateY(1.8vmin) scale(0.9); }
+  8%   { opacity: 1; transform: translateY(0) scale(1.02); }
   14%  { transform: translateY(0) scale(1); }
   80%  { opacity: 1; transform: translateY(0) scale(1); }
-  100% { opacity: 0; transform: translateY(-1.4vmin) scale(0.97); }
+  100% { opacity: 0; transform: translateY(-1.2vmin) scale(0.97); }
 }
 @keyframes kr-toastOut {
   0%   { opacity: 1; transform: translateY(0) scale(1); }
   100% { opacity: 0; transform: translateY(-0.9vmin) scale(0.94); }
+}
+
+/* --- narrow / short frames ------------------------------------------------
+   At 1280x720 the standings plate and the position plate are the two tallest
+   things on the centre line; below 620 px of height the board sheds its lower
+   half rather than colliding with the bottom rail. */
+@media (max-height: 620px) {
+  .kr-brow:nth-child(n + 7) { display: none; }
 }
 
 /* ==========================================================================
@@ -981,27 +828,27 @@
   14%  { opacity: 1; }
   100% { opacity: 0; }
 }
-/* ONE dark treatment: the shared rounded casing, in the warm near-black §3
-   asks for. The separate blurred down-right drop shadow is gone — two
-   competing darks on one glyph read as a sticker with a printing fault. */
+/* The countdown is the ONE place the display gradient is used in gameplay: it
+   is full-screen, transient, and nothing else is competing with it while it is
+   up. Its dark is a soft drop-shadow, NOT a font stroke — the mitre spikes the
+   review measured came from stroking a 480 px glyph. */
 .kr-count-n {
   font-size: clamp(140px, 34vmin, 480px);
   font-weight: 900;
   letter-spacing: -0.04em;
   line-height: 1;
   opacity: 0;
-  --ink-2: var(--ink-warm);
   --gold-glow:
-    drop-shadow(0 0 0.05em rgba(255, 214, 130, 0.9))
-    drop-shadow(0 0 0.16em rgba(255, 160, 60, 0.5));
+    drop-shadow(0 0.014em 0.012em rgba(26, 18, 8, 0.95))
+    drop-shadow(0 0 0.10em rgba(255, 170, 70, 0.55));
 }
 .kr-count-n.go {
   font-size: clamp(110px, 27vmin, 380px);
   letter-spacing: -0.02em;
   --gold-ramp: linear-gradient(180deg, #fdfff6 4%, #d6ffd0 36%, #6fe06a 72%, #1d9c38 100%);
   --gold-glow:
-    drop-shadow(0 0 0.05em rgba(150, 255, 150, 0.9))
-    drop-shadow(0 0 0.18em rgba(60, 220, 90, 0.55));
+    drop-shadow(0 0.014em 0.012em rgba(6, 26, 10, 0.95))
+    drop-shadow(0 0 0.12em rgba(60, 220, 90, 0.5));
 }
 .kr-count-n.run { animation: kr-countIn 1.02s var(--e-out) both; }
 .kr-count-n.go.run { animation: kr-goIn 1.1s var(--e-spring) both; }
@@ -1341,12 +1188,15 @@
   align-items: center;
   gap: 0.9em;
   padding: 0.5em 1em 0.55em;
-  border-radius: 999px;
+  border-radius: calc(var(--r) * 0.7);
   background: linear-gradient(180deg, rgba(24, 31, 56, 0.55), rgba(7, 11, 24, 0.72));
   border: 1px solid rgba(255, 240, 214, 0.12);
   opacity: 0;
 }
 .kr-screen.on .kr-row { animation: kr-rowIn 0.6s var(--e-out) both; animation-delay: var(--d); }
+/* Rebuilt rows (a straggler crossed and the board reordered) must not re-deal
+   the whole entrance animation — the board is already on screen and being read. */
+.kr-screen.on .kr-standings.settled .kr-row { animation: none; }
 @keyframes kr-rowIn {
   0%   { opacity: 0; transform: translateX(-3vmin) scale(0.97); }
   100% { opacity: 1; transform: translateX(0) scale(1); }

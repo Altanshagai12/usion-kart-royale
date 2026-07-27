@@ -516,6 +516,12 @@ export class Kart implements IKart {
     this.trickArmed = false;
     this.offRoadLoad = 0;
     this.badSurfaceTime = 0;
+    // Being *placed* satisfies any respawn that was still queued. Without this
+    // a kart that had tripped `sanitize` and then been gridded by `formGrid`
+    // spent the first frame of the countdown teleporting itself off its slot
+    // and onto the centreline, because `doRespawn` was still pending and its
+    // idea of "where you were" is the track sample, not the grid.
+    this.respawnPending = false;
     this.suspension.reset();
     this.updateBasis(1);
     this.object.position.copy(this.position);
@@ -918,7 +924,13 @@ export class Kart implements IKart {
     }
     const rate = sus.contacts > 0 ? 15 : 3.2;
     this.up.lerp(_targetUp, smooth(rate, h));
-    if (this.up.lengthSq() < 1e-6 || this.up.y < 0.15) this.up.set(0, 1, 0);
+    // Written as negated ">" tests rather than "<" tests so that a NaN takes
+    // the reset branch. `sanitize` guards position, velocity and yaw but not
+    // this vector, and every comparison against NaN is false — so the old
+    // `up.y < 0.15` form waved a NaN straight through into `makeBasis`, and
+    // from there into `quaternion`, where it is permanent: the kart's transform
+    // is non-finite for the rest of the race and nothing downstream can tell.
+    if (!(this.up.lengthSq() > 1e-6) || !(this.up.y > 0.15)) this.up.set(0, 1, 0);
     this.up.normalize();
 
     _fwdFlat.set(Math.sin(this.yaw), 0, Math.cos(this.yaw));

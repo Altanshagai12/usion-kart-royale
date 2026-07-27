@@ -669,6 +669,7 @@ function injectBreakup(mat: THREE.Material, o: BreakupOpts): void {
                 smoothstep( 0.42, 0.80, kV ) * uVariant.w );
             }`;
   const prev = mat.onBeforeCompile;
+  const prevKey = mat.customProgramCacheKey;
 
   mat.onBeforeCompile = (shader, renderer) => {
     prev?.call(mat, shader, renderer);
@@ -798,7 +799,16 @@ ${VARIANT_BLEND}
     `_${settles ? settle.join(',') : 'x'}_${o.variantTint ?? 'x'}_${o.wearGloss ?? 0}` +
     `_${heights ? ht.join(',') : 'x'}` +
     `_${hasMacroB ? 1 : 0}${stains ? 1 : 0}${streaks ? 1 : 0}${tints ? 1 : 0}${specAA ? 1 : 0}`;
-  mat.customProgramCacheKey = () => key;
+  // Chained, not assigned. Three keys its program cache on the material's
+  // parameters plus this string, and it has no way to see an `onBeforeCompile`;
+  // so two materials that differ ONLY in which injections they carry — dry
+  // tarmac and the tunnel's wet tarmac are exactly that pair, identical
+  // breakup options and different env handling — would hash to one key and the
+  // second would be handed the first one's compiled program.
+  mat.customProgramCacheKey =
+    prevKey && prevKey !== THREE.Material.prototype.customProgramCacheKey
+      ? () => prevKey.call(mat) + key
+      : () => key;
 }
 
 export interface TriplanarOpts {
@@ -1276,45 +1286,172 @@ export interface EnvGroundOpts {
 export function injectEnvGround(mat: THREE.Material, o: EnvGroundOpts): void {
   const g = new THREE.Color(o.ground).convertSRGBToLinear();
   const h = new THREE.Color(o.horizon).convertSRGBToLinear();
-  const uGround = { value: new THREE.Vector4(g.r, g.g, g.b, o.amount) };
-  const uHorizon = { value: new THREE.Vector4(h.r, h.g, h.b, o.soft ?? 0.035) };
-  const prev = mat.onBeforeCompile;
-  const prevKey = mat.customProgramCacheKey;
-  const FROM = 'return envMapColor.rgb * envMapIntensity;';
-  const TO = /* glsl */ `
+  patchEnvRadiance(mat, {
+    key: `envg${o.ground}_${o.horizon}_${o.amount}_${o.soft ?? 0.035}`,
+    decl: 'uniform vec4 uEnvGround;\nuniform vec4 uEnvHorizon;',
+    uniforms: {
+      uEnvGround: { value: new THREE.Vector4(g.r, g.g, g.b, o.amount) },
+      uEnvHorizon: { value: new THREE.Vector4(h.r, h.g, h.b, o.soft ?? 0.035) },
+    },
+    glsl: /* glsl */ `
 			float kBelow = -reflectVec.y;
 			float kSoft = uEnvHorizon.w + roughness * 0.65;
 			vec3 kGround = mix( uEnvHorizon.rgb, uEnvGround.rgb, smoothstep( 0.0, 0.5, kBelow ) );
 			envMapColor.rgb = mix( envMapColor.rgb, kGround,
-				smoothstep( -kSoft, kSoft, kBelow ) * uEnvGround.w );
-			return envMapColor.rgb * envMapIntensity;`;
+				smoothstep( -kSoft, kSoft, kBelow ) * uEnvGround.w );`,
+  });
+}
+
+/**
+ * How a specific surface answers the environment probe, as a function of
+ * incidence — magnitude AND chroma.
+ *
+ * Two failures this exists to fix, and they are the same failure seen from
+ * opposite ends:
+ *
+ *  • DRY ASPHALT THAT READS WET. three's split-sum IBL hands a rough dielectric
+ *    the whole upper hemisphere, Fresnel-boosted at grazing, with no
+ *    microfacet shadowing and no multiple-scattering loss. A racing camera sees
+ *    the road at 60–87° of incidence in every pixel of the frame, so that
+ *    boosted term is not an edge case, it is the entire road — and because the
+ *    fetch at high roughness lands near the top of the mip chain it is not even
+ *    an image of the sky, it is the sky's *average*, which is blue. A dark
+ *    surface with weak diffuse (a 14° key on a horizontal plane gives
+ *    N·L ≈ 0.24) plus a blue hemispherical mirror is exactly the look of a road
+ *    after rain. Measured on r7/hero.png the tarmac ran 55–76% saturation at
+ *    hue 217–229 — the bible's `#4a4a52` is 10% saturation. Dry asphalt does
+ *    keep a sheen at genuinely shallow incidence and the lighting note asks for
+ *    it, so the term is *shaped*, not deleted: near-neutral and heavily damped
+ *    where the surface faces the camera, released back to a real reflection in
+ *    the last few degrees before grazing.
+ *
+ *  • LACQUER THAT REPAINTS THE CAR. The same fetch on a `clearcoat 1` panel is
+ *    correct in shape and wrong in chroma: reflecting a procedurally saturated
+ *    sunset at full chroma over a saturated pigment gives a panel whose hue is
+ *    a running average of "roster colour" and "sky", and one that swings with
+ *    view angle. That is what reads as iridescence. Keeping the reflection's
+ *    LUMINANCE and taking most of its chroma out leaves the lacquer highlight
+ *    exactly where it was, the same brightness and the same shape, and lets the
+ *    pigment win the hue — which is what a shiny red toy car looks like.
+ *
+ * Cost: one dot, one pow and two mixes inside `getIBLRadiance`, on the
+ * materials that ask for it. No extra texture fetch, no extra pass.
+ */
+export interface EnvResponseOpts {
+  /** radiance multiplier at normal incidence */
+  faceScale: number;
+  /** radiance multiplier at full grazing */
+  grazeScale: number;
+  /** chroma kept at normal incidence — 0 = a neutral sheen, 1 = the sky verbatim */
+  faceChroma: number;
+  /** chroma kept at full grazing */
+  grazeChroma: number;
+  /** shaping exponent on (1 - N·V); higher = the release happens later */
+  power?: number;
+}
+
+export function injectEnvResponse(mat: THREE.Material, o: EnvResponseOpts): void {
+  const p = o.power ?? 3;
+  patchEnvRadiance(mat, {
+    key: `envr${o.faceScale}_${o.grazeScale}_${o.faceChroma}_${o.grazeChroma}_${p}`,
+    decl: 'uniform vec4 uEnvResp;\nuniform vec2 uEnvRespC;',
+    uniforms: {
+      uEnvResp: { value: new THREE.Vector4(o.faceScale, o.grazeScale, p, 0) },
+      uEnvRespC: { value: new THREE.Vector2(o.faceChroma, o.grazeChroma) },
+    },
+    glsl: /* glsl */ `
+			float kNdV = clamp( dot( normal, viewDir ), 0.0, 1.0 );
+			float kGraze = pow( 1.0 - kNdV, uEnvResp.z );
+			envMapColor.rgb *= mix( uEnvResp.x, uEnvResp.y, kGraze );
+			envMapColor.rgb = mix(
+				vec3( dot( envMapColor.rgb, vec3( 0.2126, 0.7152, 0.0722 ) ) ),
+				envMapColor.rgb,
+				mix( uEnvRespC.x, uEnvRespC.y, kGraze ) );`,
+  });
+}
+
+interface EnvPatch {
+  key: string;
+  decl: string;
+  glsl: string;
+  uniforms: Record<string, THREE.IUniform>;
+}
+
+/**
+ * Shared plumbing for every patch that wants to sit inside `getIBLRadiance`.
+ *
+ * Two things it exists to get right, both of which the first version of
+ * `injectEnvGround` got wrong and neither of which announces itself:
+ *
+ * 1. THE RETURN STATEMENT IS NOT STABLE TEXT. The sky system rewrites this same
+ *    chunk during its own init to hang a roughness rolloff off the specular
+ *    half, so by the time anything here compiles the line reads
+ *    `return envMapColor.rgb * envMapIntensity * mix( 1.0, 0.42, ... );`. An
+ *    exact-string match against the stock `... * envMapIntensity;` therefore
+ *    never fires, the guard takes the early return, and the injection is a
+ *    no-op that logs one warning and is never thought about again — the same
+ *    class of silent disable that turned the whole post chain off for four
+ *    rounds. Match the head of the statement and INSERT ahead of it instead, so
+ *    whatever multipliers anyone else has hung off the tail survive untouched.
+ * 2. TWO PATCHES ON ONE MATERIAL MUST NOT FIGHT. Each patch inlines the chunk
+ *    in place of `#include <envmap_physical_pars_fragment>`; the second one to
+ *    run would find the include already gone and silently do nothing. So the
+ *    snippets are accumulated per material and inlined exactly once, in call
+ *    order. (The list is captured by closure, not looked up inside the hook, so
+ *    a `variant()` clone that inherits the bound hook shares it correctly.)
+ */
+const _envPatches = new WeakMap<THREE.Material, EnvPatch[]>();
+const ENV_INCLUDE = '#include <envmap_physical_pars_fragment>';
+/** Head of getIBLRadiance's return, without the tail anyone may have added. */
+const ENV_RADIANCE_RETURN = /([ \t]*)return envMapColor\.rgb \* envMapIntensity/;
+
+function patchEnvRadiance(mat: THREE.Material, patch: EnvPatch): void {
+  const existing = _envPatches.get(mat);
+  if (existing) { existing.push(patch); return; }
+  const list: EnvPatch[] = [patch];
+  _envPatches.set(mat, list);
+
+  const prev = mat.onBeforeCompile;
+  const prevKey = mat.customProgramCacheKey;
 
   mat.onBeforeCompile = (shader, renderer) => {
     prev?.call(mat, shader, renderer);
-    shader.uniforms.uEnvGround = uGround;
-    shader.uniforms.uEnvHorizon = uHorizon;
+    for (const p of list) {
+      for (const name of Object.keys(p.uniforms)) shader.uniforms[name] = p.uniforms[name];
+    }
     // `#include` directives are still unresolved at this point, so the chunk has
     // to be pulled in and inlined by hand. Read it *now*, not at module load:
     // the sky system installs its own override of this same chunk during init,
     // and inlining a stale snapshot would quietly undo their diffuse-IBL scale.
     const chunk = (THREE.ShaderChunk as unknown as Record<string, string>)
       .envmap_physical_pars_fragment;
-    if (!chunk || !chunk.includes(FROM)) {
-      console.warn('[materials] getIBLRadiance signature moved; env ground half skipped');
+    // Both guards LOUD. A shader injection that quietly does nothing is the
+    // most expensive kind of bug this project has: it costs a review round to
+    // notice and another to diagnose, and by then the numbers around it have
+    // been retuned to compensate for an effect that was never running.
+    if (!chunk || !ENV_RADIANCE_RETURN.test(chunk)) {
+      console.warn('[materials] getIBLRadiance signature moved; env response skipped');
       return;
     }
+    if (!shader.fragmentShader.includes(ENV_INCLUDE)) {
+      console.warn('[materials] envmap chunk already inlined; env response skipped');
+      return;
+    }
+    const body = list.map((p) => p.glsl).join('\n');
+    const inlined = chunk.replace(
+      ENV_RADIANCE_RETURN,
+      (_m, indent: string) => `${indent}{${body}\n${indent}}\n${indent}return envMapColor.rgb * envMapIntensity`,
+    );
     shader.fragmentShader = shader.fragmentShader
-      .replace(
-        '#include <common>',
-        '#include <common>\nuniform vec4 uEnvGround;\nuniform vec4 uEnvHorizon;',
-      )
-      .replace('#include <envmap_physical_pars_fragment>', chunk.split(FROM).join(TO));
+      .replace('#include <common>', '#include <common>\n' + list.map((p) => p.decl).join('\n'))
+      .replace(ENV_INCLUDE, inlined);
   };
-  const key = `envg${o.ground}_${o.horizon}_${o.amount}_${o.soft ?? 0.035}`;
+
+  const key = () => list.map((p) => p.key).join('|');
   mat.customProgramCacheKey =
     prevKey && prevKey !== THREE.Material.prototype.customProgramCacheKey
-      ? () => prevKey.call(mat) + key
-      : () => key;
+      ? () => prevKey.call(mat) + key()
+      : key;
 }
 
 /**
@@ -1921,7 +2058,40 @@ export class Materials implements System {
     // saying "aggregate" at all. Down ~20% — enough that the chip crowns still
     // catch a 14° key, not so much that every texel is its own facet.
     const m = this.maps(f, { normalStrength: wet ? 0.30 : racingLine ? 0.40 : 0.58 });
-    const mat = this.std(m, { envMapIntensity: wet ? 1.25 : 0.7 });
+    // 0.7 was the single largest term in the dry road's final colour and almost
+    // none of it belonged there. Decomposed on r7/hero.png the tarmac came back
+    // at 55–76% saturation around hue 222 — a blue surface, not the bible's 10%
+    // saturated `#4a4a52` — because at the incidence a chase camera sees the
+    // road at, the split-sum IBL is worth an order more than the 14° key's
+    // diffuse. The tunnel's standing damp keeps its 1.25: that road IS wet.
+    const mat = this.std(m, { envMapIntensity: wet ? 1.25 : 0.60 });
+    // ...and the rest of it is shaped rather than scaled, so the one reflection
+    // dry asphalt genuinely has — the grazing sheen the lighting note asked for
+    // — survives while the broad wet gloss over the whole surface does not. See
+    // `injectEnvResponse`. The polished racing line is the same asphalt worn
+    // flat, so it gets the same treatment with a little more left at the face.
+    // Most of the correction is taken in CHROMA rather than in energy, because
+    // chroma is what says "wet": a road that answers the sky with the sky's own
+    // colour is a mirror with water in it, and the same road answering with a
+    // neutral sheen at the same brightness is dry asphalt catching a low sun.
+    // Taking it all out of energy instead would have cost the road a stop and a
+    // half and buried the macro variation, the patch repairs and the wear that
+    // this material is otherwise carrying well.
+    if (!wet) {
+      injectEnvResponse(mat, {
+        faceScale: racingLine ? 0.56 : 0.45,
+        grazeScale: 1.0,
+        faceChroma: 0.14,
+        grazeChroma: 0.70,
+        // 3.0 puts the release inside the last ~25° before the tangent plane:
+        // N·V 0.5 (road ~4 m ahead of a 2.5 m camera) keeps 12% of the swing,
+        // N·V 0.24 (~10 m) 44%, N·V 0.06 (~40 m, the long sheen band) 83%.
+        // So the near field goes neutral and near-matte, the far field keeps a
+        // warm reflection of the horizon, and the transition between them is
+        // the grazing sheen the lighting note asked for.
+        power: 3.0,
+      });
+    }
     injectBreakup(mat, {
       macroTex,
       period: 29.7,
@@ -1966,7 +2136,18 @@ export class Materials implements System {
       // flat. Anything under that is a *wet* road, and a wet road under a 14°
       // key and a blue zenith is a field of coloured pinpoints. This is the
       // backstop the six stacked gloss multipliers above never had.
-      roughFloor: wet ? 0.22 : racingLine ? 0.38 : 0.44,
+      //
+      // Up from 0.44/0.38. Two reasons, and the second is the one that bites.
+      // A 0.44 floor is a GGX alpha of 0.19 — that is a satin lacquer, not
+      // crushed stone with bitumen between it. And the sky's own specular
+      // rolloff starts at roughness 0.35 and does not reach full strength until
+      // 0.85, so every texel the six gloss multipliers pushed down to the floor
+      // was also the one exempting itself from the rolloff that exists to stop
+      // rough ground mirroring a blue sky. The spread that landed well is kept:
+      // 0.58 floor against a 0.72 base and a 0.97 ceiling is still the whole
+      // macro band, the patch repairs and the polish ribbons, just no longer
+      // bottoming out into gloss.
+      roughFloor: wet ? 0.22 : racingLine ? 0.46 : 0.54,
       // ...and the term that stops the chip-scale normal map from aliasing into
       // that same sparkle at the grazing angles a chase camera lives at.
       specAA: 1.0,

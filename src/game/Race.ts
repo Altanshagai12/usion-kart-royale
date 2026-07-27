@@ -323,6 +323,35 @@ export class Race implements IRace {
     this.updateProgress();
   }
 
+  /**
+   * Pause / resume on behalf of the UI.
+   *
+   * `RaceState.Paused` lives here, but the pause *screen* lives in `Menus`, and
+   * its Resume button used to do nothing but clear the UI's own local copy of
+   * the flag. With the director actually modelling the pause — which it does on
+   * every real race — the state stayed `Paused` and the only ways out were the
+   * Escape key or the throttle escape hatch below. Clicking Resume, or
+   * confirming it on a gamepad or a phone (where there is no Escape key at
+   * all), left the race suspended for good.
+   */
+  setPaused(paused: boolean) {
+    if (paused) {
+      if (this.state === RaceState.Racing || this.state === RaceState.Countdown) {
+        this.prePause = this.state;
+        this.state = RaceState.Paused;
+        this.ctx?.bus.emit({ type: 'ui', name: 'pause' });
+      }
+    } else if (this.state === RaceState.Paused) {
+      // Same handover the key path uses: `prePause` restores a mid-count
+      // countdown without rearming it (see the `state` setter).
+      this.state = this.prePause;
+      // The throttle hatch re-arms from scratch, so resuming with a finger
+      // already on the accelerator cannot instantly re-trigger anything.
+      this.pauseThrottleClear = false;
+      this.ctx?.bus.emit({ type: 'ui', name: 'resume' });
+    }
+  }
+
   // -------------------------------------------------------------------- frame
 
   update(ctx: Ctx, dt: number) {
@@ -345,11 +374,10 @@ export class Race implements IRace {
       }
     }
     if (this.state === RaceState.Paused) {
-      // Escape hatch. The pause *screen* belongs to the UI and its Resume
-      // button only clears the UI's own copy of the flag, so a mouse click
-      // there cannot reach us. Reaching for the throttle is unambiguous intent
-      // to drive — but only once it has been released, or pausing mid-corner
-      // would un-pause on the very next frame.
+      // Secondary escape hatch, kept alongside `setPaused` for the case where
+      // the player reaches for the throttle rather than the menu. Only once it
+      // has been released, or pausing mid-corner would un-pause on the very
+      // next frame.
       if (input.accel < 0.2) this.pauseThrottleClear = true;
       else if (this.pauseThrottleClear) {
         this.state = this.prePause;
@@ -363,6 +391,17 @@ export class Race implements IRace {
     if (this.state === RaceState.Countdown) {
       this.tickCountdown(ctx, dt);
     } else if (this.state === RaceState.Racing || this.state === RaceState.Finished) {
+      this.raceTime += dt;
+    } else if (this.state === RaceState.Results && this.finishedCount < this.karts.length) {
+      // The clock belongs to the RACE, not to the screen in front of it. The
+      // results board appears `RESULTS_DELAY` after the *player* crosses, and
+      // the field behind them is usually still running — on a three-lap race,
+      // for up to half a minute. Parking the clock at that transition stamped
+      // every one of those stragglers with the identical finishing time, three
+      // and four abreast, because the only thing anybody reads a finish time
+      // off is `raceTime` at the moment the `finish` event fires. It also gave
+      // them ~0.00 s lap splits. So it keeps running until the last kart is
+      // home, and then stops for good.
       this.raceTime += dt;
     }
     if (this.state === RaceState.Finished) {
@@ -593,7 +632,12 @@ export class Race implements IRace {
       // which is what makes a shortcut worthless without a hard-coded penalty.
       rel = clamp(rel, 0, cpLen * 1.6);
       k.raceDistance = p.lapIndex * L + anchor + rel;
-      k.lap = Math.max(0, p.lapIndex);
+      // Clamped at the top as well as the bottom. `lapIndex` keeps counting
+      // after the flag — the field circulates behind the results screen and
+      // `raceDistance` has to stay monotonic for the gap readout — but the
+      // published lap is what the HUD, the minimap and the rival board print,
+      // and "4/3" is nonsense on any of them.
+      k.lap = clamp(p.lapIndex, 0, this.totalLaps);
     }
 
     // --- placement ----------------------------------------------------------
@@ -615,6 +659,14 @@ export class Race implements IRace {
     const ctx = this.ctx;
     p.lapIndex++;
     if (p.lapIndex <= 0) return;    // that was the start, not a completed lap
+
+    // A kart whose race is run keeps circulating — the results screen wants a
+    // moving circuit behind it, not a car park — but those tours are laps of
+    // honour, not laps of the race. Counting them pushed a fourth entry into
+    // `lapTimes`, and since the clock is parked once the state reaches
+    // `Results` the entry was ~0.00 s, which the HUD immediately promoted to
+    // "best lap" while a "Lap 4" split flashed over the standings.
+    if (k.finished) return;
 
     const t = this.raceTime - p.lapStart;
     p.lapStart = this.raceTime;

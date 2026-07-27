@@ -262,6 +262,12 @@ export interface IRace extends System {
   readonly standings: IKart[];
   start(): void;
   reset(): void;
+  /**
+   * Pause / resume from the UI. The director owns `RaceState.Paused`, so the
+   * pause screen's own buttons cannot get out of it by clearing a local flag —
+   * they have to say so here.
+   */
+  setPaused(paused: boolean): void;
 }
 
 // ---------------------------------------------------------------------------

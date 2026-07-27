@@ -24,6 +24,7 @@
 import * as THREE from 'three';
 import { createNoise2D } from 'simplex-noise';
 import type { KartStats } from '../types';
+import { injectEnvResponse } from '../render/Materials';
 
 // ---------------------------------------------------------------------------
 // 0. Palette constants shared by every kart (the non-livery colours)
@@ -528,7 +529,16 @@ export function paintTextures() {
 // global of 1) and `syncKartEnv` rescales them from the live scene value. One
 // float compare per frame, called from the kart's own onBeforeRender.
 const ENV_TARGET = {
-  paint: 1.25,
+  // 1.25 was authored against a 0.40 global that no longer exists, and with the
+  // global back at 1.0 it means the lacquer was reflecting the sky at 125% —
+  // more light than the environment contains. A clear coat cannot do that. What
+  // it produced is the r7 note: on the closeup the red kart's saturated pixels
+  // ran hue 300–345 with an 8% clump at 240–260, against `#ff3b5c`'s own 350,
+  // i.e. the panel's hue was a running average of "roster red" and "sunset sky"
+  // that swung with view angle — which is precisely what reads as iridescence.
+  // 0.95 is the honest ceiling; `PAINT_ENV_RESPONSE` below does the rest, and
+  // it does it in chroma rather than in energy so the highlight is untouched.
+  paint: 0.95,
   chrome: 1.55,
   plastic: 0.55,
   wheel: 0.95,
@@ -536,8 +546,33 @@ const ENV_TARGET = {
   character: 0.70,
   // The distant kart is one merged surface standing in for six, so its env
   // response is the area-weighted middle of the set it replaces: mostly paint,
-  // with the tyres and the suit pulling it down.
-  impostor: 1.05,
+  // with the tyres and the suit pulling it down. Follows the paint down: it is
+  // a stand-in for the paint and the roster colour has to survive the LOD swap.
+  impostor: 0.85,
+} as const;
+
+/**
+ * What the lacquer is allowed to take from the environment probe.
+ *
+ * The reflection keeps its LUMINANCE (so the coat's highlight is the same
+ * brightness and the same shape it was — the lobe is what makes a kart read as
+ * a toy with real lacquer and nothing here touches it) and gives up most of its
+ * CHROMA, so a bright pink-to-violet procedural sunset can no longer out-vote
+ * the pigment underneath it. Slightly harder at grazing than head-on, because
+ * grazing is where clearcoat Fresnel goes to 1 and where a panel edge was
+ * turning violet outright.
+ *
+ * This matters beyond one kart looking right: the HUD, the position board and
+ * the minimap all identify racers by roster colour, and `#ff3b5c` (Vela) drifted
+ * far enough toward magenta to start colliding with `#8b5cf6` (Onyx) and
+ * `#e8456b` (Cinder) — three of the eight, unreadable at minimap dot size.
+ */
+const PAINT_ENV_RESPONSE = {
+  faceScale: 1.0,
+  grazeScale: 0.72,
+  faceChroma: 0.45,
+  grazeChroma: 0.30,
+  power: 3.0,
 } as const;
 
 /** Last observed `scene.environmentIntensity`; 0.40 until the sky reports in. */
@@ -1705,6 +1740,11 @@ export function getLivery(stats: KartStats): Livery {
       envMapIntensity: envFor('paint'),
     }),
   };
+  // The decal panel lies flush against the bodywork, so it has to answer the
+  // environment identically or the number roundel sits in a patch of differently
+  // tinted lacquer — a sticker, which is the exact note this material exists to
+  // avoid.
+  injectEnvResponse(l.decalMat, PAINT_ENV_RESPONSE);
   _liveries.set(key, l);
   return l;
 }
@@ -1792,6 +1832,13 @@ export function kartMaterials() {
     // turns away, a real specular glint off the SUN rather than off the env map
     // alone, and a clearcoat lobe on top of the tint. `reflectivity` is pushed
     // to glass's F0 (~0.078) rather than the 0.5 default's 0.04.
+    //
+    // What it does NOT get is `iridescence`. A thin-film term at 0.4 / IOR 1.5
+    // over a near-black body is a hue that walks the spectrum with view angle,
+    // and it sat 30 cm from bodywork the r7 review had already called
+    // iridescent — two rainbow surfaces on one kart is how a note about the
+    // paint becomes a note about the whole model. The three effects listed
+    // above are what the visor was rebuilt for; the film was never one of them.
     glass: new THREE.MeshPhysicalMaterial({
       color: 0x141d2e,
       metalness: 0.0,
@@ -1800,8 +1847,6 @@ export function kartMaterials() {
       specularIntensity: 1,
       clearcoat: 1,
       clearcoatRoughness: 0.02,
-      iridescence: 0.4,
-      iridescenceIOR: 1.5,
       envMapIntensity: envFor('glass'),
     }),
     // RACE SUIT. Its own cloth family, not the moulded-plastic one it borrowed
@@ -1819,7 +1864,10 @@ export function kartMaterials() {
       envMapIntensity: envFor('character'),
     }),
   };
+  // Order matters: `addSunRim` REPLACES `onBeforeCompile` rather than chaining
+  // it, so anything that chains has to be installed after it.
   addSunRim(_mats.paint, 0.30);
+  injectEnvResponse(_mats.paint, PAINT_ENV_RESPONSE);
   // The two surfaces on the kart whose highlights the review found aliased.
   addSpecularAA(_mats.wheel, 0.85);
   addSpecularAA(_mats.chrome, 0.60);
@@ -1958,6 +2006,11 @@ export function impostorMaterial(): THREE.MeshStandardMaterial {
     metalness: 0.04,
     envMapIntensity: envFor('impostor'),
   });
+  // The same chroma limit as the near paint. One material, one program, no draw
+  // call — and without it the LOD swap at 26 m is a visible hue pop, because the
+  // near kart would be answering the sunset in its roster colour and the far one
+  // in the sunset's.
+  injectEnvResponse(_impostor, PAINT_ENV_RESPONSE);
   return _impostor;
 }
 
@@ -2007,6 +2060,7 @@ export function heroPaint(): THREE.MeshPhysicalMaterial {
     envMapIntensity: src.envMapIntensity,
   });
   addSunRim(m, 0.72);
+  injectEnvResponse(m, PAINT_ENV_RESPONSE);
   _heroPaint = m;
   return m;
 }

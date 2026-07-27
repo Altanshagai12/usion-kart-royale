@@ -1065,8 +1065,16 @@ export class AIField {
    * over half a lap by the final tour.
    */
   beginFrame(karts: readonly IKart[], player: IKart, dt: number) {
+    // Karts that have taken the flag are excluded from the reference. They keep
+    // circulating for the results-screen backdrop and their `raceDistance` keeps
+    // climbing, so leaving them in meant that the moment the winner crossed the
+    // line every kart still racing was measured against a car that was already
+    // most of a lap "ahead": the catch-up term pinned itself to maximum for the
+    // rest of the race and the leash never engaged again, because no live kart
+    // could ever be the leader.
     let leadDist = -Infinity;
-    for (const k of karts) if (k.raceDistance > leadDist) leadDist = k.raceDistance;
+    for (const k of karts) if (!k.finished && k.raceDistance > leadDist) leadDist = k.raceDistance;
+    if (leadDist === -Infinity) for (const k of karts) if (k.raceDistance > leadDist) leadDist = k.raceDistance;
 
     for (const k of karts) {
       if (k.isPlayer) continue;

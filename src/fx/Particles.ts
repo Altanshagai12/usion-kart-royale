@@ -509,9 +509,20 @@ uniform float uGain;
  * saturated primary put 30 units of radiance through one pixel and the tone
  * mapper has nothing left to do but return white. rgb / (1 + rgb * uClip)
  * is a Reinhard shoulder applied to the *emission*, so a lone core still
- * clears the 2.0 bloom threshold and a pile of them asymptotes just above it
+ * clears the bloom threshold and a pile of them asymptotes just above it
  * instead of running away. Cheap, monotonic, and it never dims a single
  * particle enough to notice.
+ *
+ * 0.13, down from 0.19. The claim above — that a lone core still clears the
+ * bloom threshold — stopped being true when the two numbers moved past each
+ * other. At 0.19 the shoulder asymptotes at 1/0.19 = 5.26 and, more to the
+ * point, it takes a spark authored at 2.35 down to 1.61 before it ever reaches
+ * the framebuffer, so a drift spark composited onto shadowed tarmac landed at
+ * a luminance of about 1.2 against PostFX's 1.55 gate: no bloom, ever, on any
+ * spark in the game. That is the whole of "the sparks read as dust motes" —
+ * a spark IS its glow. At 0.13 the same core arrives at 1.79, clears the gate,
+ * and the asymptote is still a hard 7.7, so ten overlapping cores cannot run
+ * away and the boost + tier-3 + tunnel-exit stack still cannot white out.
  */
 uniform float uClip;
 #ifdef LIT
@@ -682,7 +693,7 @@ class Layer {
         uAtlas: { value: atlas },
         uAtlasTiles: { value: new THREE.Vector2(4, 2) },
         uGain: { value: 1 },
-        uClip: { value: additive ? 0.19 : 0.0 },
+        uClip: { value: additive ? 0.13 : 0.0 },
         // 0.40 of viewport height. Big enough for an explosion fireball to feel
         // enormous, small enough that no single sprite can ever become the
         // frame — which is what the boost plume was doing into the chase cam.

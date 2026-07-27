@@ -3,9 +3,10 @@
  *
  * These are a *view* of `IRace.state`, never a driver of it: `state` is
  * readonly on the interface and the race director owns it. Where a menu needs
- * to act it calls the sanctioned commands (`start()` / `reset()`), and where
- * the race director does not model a state (the current build never enters
- * `Menu` or `Paused`) we hold that screen locally instead of writing to it.
+ * to act it calls the sanctioned commands (`start()` / `reset()` /
+ * `setPaused()`), and where the race director does not model a state we hold
+ * that screen locally instead of writing to it — `localTitle` / `localPause`
+ * are the fallbacks, not the primary path.
  *
  * `?ui=title|select|pause|results` forces a screen, for capture and review.
  */
@@ -151,6 +152,8 @@ export class Menus {
 
   private prevSteer = 0;
   private resultsBuilt = false;
+  /** How many karts were classified when the board was last built. */
+  private resultsFinished = -1;
   private finishTimes = new Map<number, number>();
   private lastRaceTime = 0;
 
@@ -207,6 +210,7 @@ export class Menus {
     // A race reset rewinds the clock; drop stale results so they rebuild.
     if (race.raceTime < this.lastRaceTime - 0.25) {
       this.resultsBuilt = false;
+      this.resultsFinished = -1;
       this.finishTimes.clear();
     }
     this.lastRaceTime = race.raceTime;
@@ -242,7 +246,21 @@ export class Menus {
     else if (race.state === RaceState.Finished || race.state === RaceState.Results) want = 'results';
     else want = 'none';
 
-    if (want === 'results' && !this.resultsBuilt) this.fillResults(ctx);
+    // The board is not final the moment it appears. It goes up `RESULTS_DELAY`
+    // after the *player* crosses, and on a three-lap race the field behind them
+    // is still running for up to half a minute. Building it once meant a
+    // winning player saw a classification frozen at their own crossing: every
+    // row below them ordered by distance-on-track, printing a metre gap instead
+    // of a finish time, and never corrected. Rebuild while anyone is still out
+    // there — `finishedCount` only moves 7 more times, so this is a handful of
+    // rebuilds, not a per-frame one.
+    if (want === 'results') {
+      const done = ctx.race.karts.reduce((n, k) => n + (k.finished ? 1 : 0), 0);
+      if (!this.resultsBuilt || done !== this.resultsFinished) {
+        this.resultsFinished = done;
+        this.fillResults(ctx);
+      }
+    }
 
     if (want !== this.screen) {
       if (this.screen !== 'none') this.screens[this.screen].classList.remove('on');
@@ -317,6 +335,7 @@ export class Menus {
     this.selecting = false;
     this.localPause = false;
     this.resultsBuilt = false;
+    this.resultsFinished = -1;
     this.finishTimes.clear();
     ctx.race.reset();
   }
@@ -413,7 +432,15 @@ export class Menus {
     const list = el('div', 'kr-menu-list', box);
 
     const resume = el('div', 'kr-btn', list, 'Resume');
-    resume.onclick = () => { this.localPause = false; this.forced = null; };
+    // Clearing `localPause` alone is not enough: on a real race the director
+    // owns the pause and `race.state` is `Paused`, which keeps `want` pinned to
+    // this screen no matter what the UI's own flag says. Resume has to tell the
+    // director too, or the button does nothing — which is exactly what it did.
+    resume.onclick = () => {
+      this.localPause = false;
+      this.forced = null;
+      this.ctx?.race.setPaused(false);
+    };
     const restart = el('div', 'kr-btn', list, 'Restart race');
     restart.onclick = () => { this.localPause = false; this.forced = null; this.startRace(this.ctx); };
     const quit = el('div', 'kr-btn', list, 'Quit to title');
@@ -459,6 +486,9 @@ export class Menus {
   }
 
   private fillResults(ctx: Ctx) {
+    // Second and subsequent builds land on a board the player is already
+    // reading; only the first one gets the staggered entrance.
+    this.standingsEl.classList.toggle('settled', this.resultsBuilt);
     this.resultsBuilt = true;
     const race = ctx.race;
     const player = race.player;

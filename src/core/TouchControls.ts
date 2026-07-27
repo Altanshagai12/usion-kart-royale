@@ -389,6 +389,20 @@ html[data-touch] .kr-speed {
   right: 47vmin;
   transform: scale(.82);   /* transform-origin is already 100% 100% */
 }
+/* The standings plate is right-centre on desktop. On a phone in landscape the
+   BRAKE and LOOK buttons reach up into the lower half of that column, so the
+   board rides a little high and a little small; it is already trimmed to six
+   rows under 620 px of height by ui.css. Measured clear of every button rect
+   at 844x390, 1024x600 and 1280x720. */
+html[data-touch] .kr-board {
+  top: 41%;
+  transform: translateY(-50%) scale(.88);
+  transform-origin: 100% 50%;
+}
+/* The AUTO / PAUSE chips start at 17vmin, which is inside the lap plate on a
+   short landscape phone. Push them clear; the minimap sits at frame centre and
+   is nowhere near them. */
+html[data-touch] .tc-top { left: calc(env(safe-area-inset-left, 0px) + 26vmin); }
 /* The item box deliberately stays in its desktop bottom-left home. Moving it up
    the left edge to dodge the thumb put it straight through the position
    indicator, and it is a read-only display the floating stick can safely

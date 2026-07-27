@@ -31,6 +31,7 @@ import {
 } from './TrackLayout';
 import { createNoise2D } from 'simplex-noise';
 import { getMaterials } from '../render/Materials';
+import { registerPrewarm } from '../core/Prewarm';
 
 // ---------------------------------------------------------------------------
 //  Palette (art bible §3). THREE.Color is linear working space here.
@@ -2684,24 +2685,40 @@ function buildTunnel(track: Track, lib: MatLib, root: THREE.Group) {
   }
 
   // wound to face inward, so plain front-face culling is exactly right here
-  const bore = new THREE.Mesh(finish(b), lib.vc('tunnel-bore', () => rockMaterial(lib)));
+  const boreMat = lib.vc('tunnel-bore', () => rockMaterial(lib));
+  const bore = new THREE.Mesh(finish(b), boreMat);
   bore.name = 'tunnel-bore';
   bore.castShadow = true;
   bore.receiveShadow = true;
   root.add(bore);
+
+  // The bore is the single worst shader hitch in the game and it is purely
+  // geographic: one mesh, frustum-culled for the 52% of a lap before the tunnel
+  // mouth, so its program was compiled the frame the player first saw daylight
+  // stop. (`Prewarm` now compiles against the composer's render target, which
+  // is the actual reason the boot pass was missing it — see that file.) Stating
+  // the requirement here as well means a future change that moves the bore out
+  // of the scene graph, or builds it lazily on approach, cannot quietly bring
+  // the 56 ms frame back.
+  registerPrewarm(boreMat, { label: 'tunnel-bore-vc' });
 
   if (lights.length) {
     // housing + diffuser rather than one bare emissive slab: the housing gives
     // the fixture a silhouette and an unlit underside, which is what makes the
     // diffuser look like a lit object instead of a floating white quad
     const housing = new THREE.BoxGeometry(0.60, 0.22, 5.0);
-    const hInst = new THREE.InstancedMesh(
-      housing, lib.get('metal-painted', () => metalMaterial(lib)), lights.length,
-    );
+    const housingMat = lib.get('metal-painted', () => metalMaterial(lib));
+    const hInst = new THREE.InstancedMesh(housing, housingMat, lights.length);
     const diffuser = new THREE.BoxGeometry(0.44, 0.10, 4.6);
-    const dInst = new THREE.InstancedMesh(
-      diffuser, lib.get('tunnel-light', () => lightMaterial()), lights.length,
-    );
+    const stripMat = lib.get('tunnel-light', () => lightMaterial());
+    const dInst = new THREE.InstancedMesh(diffuser, stripMat, lights.length);
+    // Both are drawn ONLY through an InstancedMesh, and `instancing` is part of
+    // the program cache key — a warm-up that hosted them on a plain mesh would
+    // compile a variant the renderer never asks for and leave the real one to
+    // compile at the tunnel mouth. The strip material in particular exists
+    // nowhere else on the circuit.
+    registerPrewarm(stripMat, { instanced: true, label: 'tunnel-light' });
+    registerPrewarm(housingMat, { instanced: true, label: 'metal-painted (instanced)' });
     const m = new THREE.Matrix4();
     const drop = new THREE.Matrix4().makeTranslation(0, -0.15, 0);
     for (let i = 0; i < lights.length; i++) {
@@ -2837,7 +2854,15 @@ function buildBridge(track: Track, lib: MatLib, root: THREE.Group) {
 
   const geo = finish(b);
   geo.computeVertexNormals();
-  const mesh = new THREE.Mesh(geo, twoSided(lib.get('stone-wall', () => stoneMaterial(lib))));
+  // The DoubleSide clone is its own program (`doubleSided` is a cache-key
+  // boolean) and it is unnamed, because the shared library does not name what
+  // it bakes. It is also the only place that clone is used, on one mesh that is
+  // frustum-culled for the 86% of a lap before the inlet — so it was compiling
+  // on approach to the bridge. Declared up front instead.
+  const bridgeMat = twoSided(lib.get('stone-wall', () => stoneMaterial(lib)));
+  bridgeMat.name = bridgeMat.name || 'bridge-stone-2s';
+  registerPrewarm(bridgeMat, { label: 'bridge-stone-2s' });
+  const mesh = new THREE.Mesh(geo, bridgeMat);
   mesh.name = 'bridge';
   mesh.castShadow = true;
   mesh.receiveShadow = true;

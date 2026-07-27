@@ -16,7 +16,7 @@
  * ============================================================================
  */
 import * as THREE from 'three';
-import { ItemKind, type Ctx, type IItems, type IKart } from '../types';
+import { ItemKind, RaceState, type Ctx, type IItems, type IKart } from '../types';
 import type { RacingLine } from './AI';
 import {
   BlobShadows, Projectiles, mushroomArt, pad, padTexture, radialSprite, roundedBox,
@@ -745,18 +745,30 @@ export class Items implements IItems {
       this.proj.setEnv(this.env);
     }
 
-    this.updateBoxes(dt, karts, now);
+    // The pause menu stops `Race`, and `Race` is the only thing that knows the
+    // game is paused — every other system, this one included, keeps getting
+    // ticked so the frame still renders. Left to itself that turns the pause
+    // screen into a cheat: a kart's physics is frozen by `Race`, so its star and
+    // its stun sit exactly where they were, while every timer *this* module owns
+    // runs on. Wait behind the menu and you come back with the bolt's shrink
+    // gone, the roulette armed and the boxes you drove through already back up.
+    // Visuals (the bob, the spin, the halo) are deliberately left running: the
+    // world behind the menu should still look alive.
+    const paused = ctx.race?.state === RaceState.Paused;
+    const step = paused ? 0 : dt;
+
+    this.updateBoxes(step, karts, now);
 
     // --- per-kart item state ------------------------------------------------
     for (const k of karts) {
       const s = this.slot(k);
-      if (s.arm > 0) s.arm = Math.max(0, s.arm - dt);
-      if (s.starHit > 0) s.starHit -= dt;
+      if (s.arm > 0) s.arm = Math.max(0, s.arm - step);
+      if (s.starHit > 0) s.starHit -= step;
       if (s.carried >= 0 && !this.proj.isCarried(s.carried, k.id)) s.carried = -1;
 
       // bolt: shrunk, slowed, and visibly smaller until it wears off
       if (s.shrink > 0) {
-        s.shrink = Math.max(0, s.shrink - dt);
+        s.shrink = Math.max(0, s.shrink - step);
         const u = clamp(s.shrink / BOLT_TIME, 0, 1);
         // quick squash down, slow grow back — recovery should be felt
         const shrunk = 0.52 + 0.48 * Math.pow(1 - u, 2.2);
@@ -769,10 +781,10 @@ export class Items implements IItems {
       }
 
       // star: barge anyone you touch out of the way
-      if (k.starTime > 0 && s.starHit <= 0) this.starSweep(ctx, k, s);
+      if (!paused && k.starTime > 0 && s.starHit <= 0) this.starSweep(ctx, k, s);
     }
 
-    this.proj.update(ctx, dt, karts);
+    this.proj.update(ctx, step, karts);
     this.updateOrbit(karts, now);
   }
 

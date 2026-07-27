@@ -456,8 +456,36 @@ export class Scenery implements System {
    * Bakes a coarse shore field over the play area:
    *   R = water depth 0..1 (drives the #3fc9c4 -> #0d5a7a ramp and shoaling)
    *   G = shore foam mask, B = cliff-foot foam mask
-   * Built by splatting the centreline rather than sampling every cell against
-   * every centreline point — 400 splats instead of 12 million comparisons.
+   *
+   * ==========================================================================
+   *  ROUND 8: THIS FIELD WAS MEASURING THE WRONG DISTANCE.
+   * ==========================================================================
+   *  Every channel used to be keyed off distance to the track CENTRELINE, on
+   *  the assumption that the centreline is roughly where the coast is. It is
+   *  not. Probing the shipped circuit, the waterline sits anywhere from 10 m
+   *  (the harbour quay) to 85 m (above the village climb) outboard of the road
+   *  edge, and 55 m off the beach descent. Two consequences, both visible in
+   *  every review frame:
+   *
+   *    · THE SURF LINE FIRED NOWHERE THE SEA WAS. The band was centred on
+   *      `depth < 0.30`, i.e. within ~20 m of the centreline — which on the
+   *      beach descent is dry sand, and off the harbour is the quay. At the
+   *      actual waterline `depth` had already climbed past the band. Ten
+   *      frames, no foam anywhere, which is the one cue that reads as "water"
+   *      at any distance and in any lighting.
+   *
+   *    · THE DEPTH RAMP WAS A RING ROUND THE ROAD, not a bathymetry. The
+   *      turquoise shelf appeared under the tarmac and the water was already
+   *      at full #0d5a7a by the time it became visible.
+   *
+   *  So it is now a genuine two-pass chamfer distance transform over a real
+   *  land/sea mask, carrying the nearest shore's HEIGHT along with the
+   *  distance. That height is what separates a beach (wide turquoise shelf, a
+   *  broad lazy surf line) from a cliff foot (the water is deep within fifteen
+   *  metres and what you get is a hard white collar of spray). The mask itself
+   *  comes from the track's own macro heightfield, which is a bilinear table
+   *  lookup — 83 k of them cost about a millisecond, against the 1.5 M cell
+   *  writes the old splat loop was doing.
    */
   private bakeSeaField(): SeaField {
     const track = this.ctx.track;
@@ -469,54 +497,142 @@ export class Scenery implements System {
     const size = half * 2;
     const cell = size / res;
     const origin = new THREE.Vector2(cx - half, cz - half);
+    const n = res * res;
 
-    const dLow = new Float32Array(res * res).fill(1e9);
-    const dAny = new Float32Array(res * res).fill(1e9);
-    const yNear = new Float32Array(res * res).fill(this.seaLevel);
+    // --- 1. land/sea mask, and the land's height where it is land -----------
+    //
+    // `sampleHeightfield` is the macro terrain without the detail noise: a
+    // bilinear lookup, and exactly the field `probe()` blends to past 34 m off
+    // the road, so the two agree about where the coast is. It is not part of
+    // ITrack, so it is taken through a guarded probe — a track that does not
+    // publish one falls back to the contract method at a quarter of the grid
+    // resolution, which is still a better shoreline than the centreline was.
+    const hf = (track as unknown as { sampleHeightfield?: (x: number, z: number) => number }).sampleHeightfield;
+    const step = hf ? 1 : 3;
+    const height = new Float32Array(n);
+    for (let j = 0; j < res; j += step) {
+      const z = origin.y + (j + 0.5) * cell;
+      for (let i = 0; i < res; i += step) {
+        const x = origin.x + (i + 0.5) * cell;
+        let y: number;
+        if (hf) y = hf.call(track, x, z);
+        else {
+          _p.set(x, this.seaLevel + 60, z);
+          y = track.probe(_p, -1).y;
+        }
+        // hold the sample across the block when we had to sub-sample
+        for (let jj = j; jj < Math.min(res, j + step); jj++)
+          for (let ii = i; ii < Math.min(res, i + step); ii++) height[jj * res + ii] = y;
+      }
+    }
 
-    const N = 460;
-    const REACH = 90;
-    const cr = Math.ceil(REACH / cell);
-    for (let i = 0; i < N; i++) {
-      const s = track.sample(i / N);
-      const gx = (s.pos.x - origin.x) / cell;
-      const gz = (s.pos.z - origin.y) / cell;
-      const lowLying = s.pos.y < this.seaLevel + 9;
-      const i0 = Math.max(0, Math.floor(gx) - cr),
-        i1 = Math.min(res - 1, Math.ceil(gx) + cr);
-      const j0 = Math.max(0, Math.floor(gz) - cr),
-        j1 = Math.min(res - 1, Math.ceil(gz) + cr);
-      for (let j = j0; j <= j1; j++) {
-        const dz = (j + 0.5 - gz) * cell;
-        for (let ii = i0; ii <= i1; ii++) {
-          const dx = (ii + 0.5 - gx) * cell;
-          const d = Math.sqrt(dx * dx + dz * dz);
-          if (d > REACH) continue;
-          const c = j * res + ii;
-          if (d < dAny[c]) {
-            dAny[c] = d;
-            yNear[c] = s.pos.y;
+    // A degenerate mask — all land, or all water — means the track agent has
+    // shipped a flat world (or one whose datum disagrees with ours), and a
+    // distance transform out of nothing is a white plate or a bare one. Fall
+    // back to treating the road corridor itself as the coast, which is the
+    // approximation this function used to make unconditionally.
+    let landCells = 0;
+    for (let c = 0; c < n; c++) if (height[c] - this.seaLevel > 0.15) landCells++;
+    if (landCells < n * 0.01 || landCells > n * 0.99) {
+      height.fill(this.seaLevel - 6);
+      const N = 520;
+      const REACH = 16;
+      const cr = Math.ceil(REACH / cell);
+      for (let k = 0; k < N; k++) {
+        const s = track.sample(k / N);
+        const gx = (s.pos.x - origin.x) / cell, gz = (s.pos.z - origin.y) / cell;
+        const reach = s.halfWidth + REACH;
+        const rr = Math.ceil(reach / cell);
+        for (let j = Math.max(0, Math.floor(gz) - rr); j <= Math.min(res - 1, Math.ceil(gz) + rr); j++)
+          for (let i = Math.max(0, Math.floor(gx) - cr - rr); i <= Math.min(res - 1, Math.ceil(gx) + cr + rr); i++) {
+            const dx = (i + 0.5 - gx) * cell, dz = (j + 0.5 - gz) * cell;
+            if (dx * dx + dz * dz > reach * reach) continue;
+            const c = j * res + i;
+            if (s.pos.y > height[c]) height[c] = s.pos.y;
           }
-          if (lowLying && d < dLow[c]) dLow[c] = d;
+      }
+    }
+
+    // --- 1b. how tall the land is BEHIND each shore cell --------------------
+    // Taking the height of the shore cell itself would classify every coast on
+    // the circuit as a beach: the toe of a 42 m cliff is, by definition, the
+    // one cell of it that is a metre above the water. A separable max over
+    // ±3 cells (±15 m) asks "what is standing behind this waterline", which is
+    // the question that actually separates a quay from a precipice.
+    const K = 3;
+    const tmpH = new Float32Array(n);
+    const topH = new Float32Array(n);
+    for (let j = 0; j < res; j++)
+      for (let i = 0; i < res; i++) {
+        let m = -1e9;
+        for (let k = Math.max(0, i - K); k <= Math.min(res - 1, i + K); k++) m = Math.max(m, height[j * res + k]);
+        tmpH[j * res + i] = m;
+      }
+    for (let i = 0; i < res; i++)
+      for (let j = 0; j < res; j++) {
+        let m = -1e9;
+        for (let k = Math.max(0, j - K); k <= Math.min(res - 1, j + K); k++) m = Math.max(m, tmpH[k * res + i]);
+        topH[j * res + i] = m;
+      }
+
+    // --- 2. chamfer distance transform out of the land ----------------------
+    // `dist` = metres from this cell to the nearest DRY cell (0 on land).
+    // `shoreY` = height of the land standing behind that nearest dry cell,
+    // which is what tells the shader whether it is a beach or a cliff foot.
+    const BIG = 1e9;
+    const dist = new Float32Array(n);
+    const shoreY = new Float32Array(n);
+    for (let c = 0; c < n; c++) {
+      if (height[c] - this.seaLevel > 0.15) { dist[c] = 0; shoreY[c] = topH[c] - this.seaLevel; }
+      else { dist[c] = BIG; shoreY[c] = 0; }
+    }
+    // 3-4 chamfer, scaled so the diagonal step is a true sqrt(2) cells
+    const D1 = cell, D2 = cell * Math.SQRT2;
+    const relax = (c: number, from: number, w: number) => {
+      const d = dist[from] + w;
+      if (d < dist[c]) { dist[c] = d; shoreY[c] = shoreY[from]; }
+    };
+    for (let j = 0; j < res; j++) {
+      for (let i = 0; i < res; i++) {
+        const c = j * res + i;
+        if (dist[c] === 0) continue;
+        if (i > 0) relax(c, c - 1, D1);
+        if (j > 0) {
+          relax(c, c - res, D1);
+          if (i > 0) relax(c, c - res - 1, D2);
+          if (i < res - 1) relax(c, c - res + 1, D2);
+        }
+      }
+    }
+    for (let j = res - 1; j >= 0; j--) {
+      for (let i = res - 1; i >= 0; i--) {
+        const c = j * res + i;
+        if (dist[c] === 0) continue;
+        if (i < res - 1) relax(c, c + 1, D1);
+        if (j < res - 1) {
+          relax(c, c + res, D1);
+          if (i < res - 1) relax(c, c + res + 1, D2);
+          if (i > 0) relax(c, c + res - 1, D2);
         }
       }
     }
 
-    const data = new Uint8Array(res * res * 4);
-    for (let c = 0; c < res * res; c++) {
-      // Shallow where a low-lying stretch of coast is close by; the cliffs
-      // plunge, so height above the water deepens the sea fast.
-      let depth = smoothstep(4, 58, dLow[c]);
-      const cliffness = smoothstep(this.seaLevel + 11, this.seaLevel + 30, yNear[c]);
-      depth = Math.max(depth, cliffness * smoothstep(2, 16, dAny[c]));
-      // A surf line is a band about ten metres wide, not a quarter of the bay.
-      // The band is keyed off distance to the CENTRELINE, but the waterline
-      // sits a road half-width plus a verge out from there, where depth has
-      // already climbed to ~0.1. A band centred on depth 0 therefore fired
-      // nowhere the sea was actually visible, which is why no round-1 frame
-      // had a foam line. Centre it on the depth the shoreline really has.
-      const shoreFoam = (1 - smoothstep(0.04, 0.30, depth)) * (1 - cliffness) * smoothstep(90, 40, dLow[c]);
-      const cliffFoam = cliffness * smoothstep(20, 5, dAny[c]);
+    // --- 3. resolve to the three channels the shader wants ------------------
+    const data = new Uint8Array(n * 4);
+    for (let c = 0; c < n; c++) {
+      const d = Math.min(dist[c], 4000);
+      // How abruptly the nearest shore drops. A quay or a beach is a couple of
+      // metres above the water and shelves for a long way; the cliff traverse
+      // stands 40 m up and the bottom is gone within fifteen.
+      const steep = smoothstep(10, 38, shoreY[c]);
+      const shelf = lerp(82, 19, steep);
+      const depth = smoothstep(2.5, shelf, d);
+      // The surf band is now centred on the WATERLINE, because `d` is measured
+      // from it: 24 m of broken water shelving off a beach, 12 m of hard white
+      // spray at the foot of a cliff. Wide enough to survive being read at
+      // 300 m, which is where most of the coastline in a chase frame sits.
+      const shoreFoam = (1 - smoothstep(2, 24, d)) * (1 - steep);
+      const cliffFoam = (1 - smoothstep(1, 12, d)) * steep;
       const o = c * 4;
       data[o] = clamp(depth, 0, 1) * 255;
       data[o + 1] = clamp(shoreFoam, 0, 1) * 255;
@@ -2636,7 +2752,6 @@ export class Scenery implements System {
    */
   private dressOpenWater() {
     const rng = this.rng;
-    const track = this.ctx.track;
 
     // --- near band: buoy lines and mooring posts marking the fairway
     this.walk(0.0, 0.30, 16, (t, s, i) => {
@@ -2688,48 +2803,178 @@ export class Scenery implements System {
       }
     });
 
-    // --- far band: a breakwater arm with a light on the end, closing the bay
-    {
-      const s = track.sample(0.13);
-      const sea = this.seaSide(0.13);
-      const start = s.halfWidth + 150;
-      const yaw = Math.atan2(s.tangent.x, s.tangent.z);
-      if (this.isSea(0.13, sea * start, s)) {
-        this.at(0.13, sea * start, _p, s);
-        _p.y = this.seaLevel;
-        const segs = 22;
-        for (let k = 0; k < segs; k++) {
-          const off = (k - segs / 2) * 11;
-          _p2.set(_p.x + s.tangent.x * off, this.seaLevel, _p.z + s.tangent.z * off);
-          // the arm is 240 m long: probe every segment so it never drives
-          // through the coastline it is supposed to shelter
-          if (!this.flatWorld && this.groundY(_p2, 0.13) > this.seaLevel + 0.6) continue;
-          // taper the arm so it does not read as an extruded ribbon
-          const hgt = 5.4 - Math.abs(k - segs / 2) * 0.11 + Math.sin(k * 1.7) * 0.35;
-          this.acc.stone.add(bevelBox(9.5, hgt, 11.4, 0.25, 0.18), trs(_p2.x, this.seaLevel + hgt / 2 - 2.6, _p2.z, yaw + Math.sin(k * 0.4) * 0.05), new THREE.Color(0xbfae95), (_x, y) => lerp(0.5, 1, smoothstep(-hgt * 0.5, -hgt * 0.15, y)));
-          // armour blocks tumbled along the seaward toe
-          if (k % 2 === 0) {
-            this.sets['debris' + (k % 3)].add(trs(_p2.x + s.binormal.x * sea * 5.6, this.seaLevel - 0.4, _p2.z + s.binormal.z * sea * 5.6, k * 1.3, 3.0 + rng() * 1.6), {
-              color: _col.set(0xb2a48c).clone(),
-              uv: new THREE.Vector4(1, 1, 0, 0),
-              lod: 0,
-            });
-          }
-        }
-        // a small light tower at the head of the arm
-        _p2.set(_p.x + s.tangent.x * (segs / 2) * 11, this.seaLevel + 2.6, _p.z + s.tangent.z * (segs / 2) * 11);
-        const lh = lighthouseGeo(_p2.y, this.seaLevel);
-        const base = trs(_p2.x, _p2.y, _p2.z, rng() * 6.28, 0.55);
-        this.acc.stone.add(lh.stone, base, new THREE.Color(0xefe6d6));
-        this.acc.trim.add(lh.trim, base, new THREE.Color(0xe8dcc8));
-        const lampMesh = new THREE.Mesh(lh.glass, this.mats.lamp);
-        lampMesh.applyMatrix4(base);
-        lampMesh.name = 'breakwater-lamp';
-        this.group.add(lampMesh);
-      }
+    // --- far band: breakwater arms with a light on the end, closing the bay.
+    //
+    // Three of them now, not one. A breakwater is the single most legible thing
+    // that can be put on open water: a long, dead-horizontal masonry line with
+    // surf breaking white along its seaward toe, read against a surface that
+    // has no other straight edges anywhere in it. One arm off the harbour left
+    // the beach descent and the banked curve — the two sections §1 builds
+    // around the view — with nothing on the water but scattered dots.
+    // The head lamps of all three arms share one merged mesh, so three
+    // breakwaters cost exactly the one draw call the single arm used to.
+    const lamps = new GeoAccum();
+    this.breakwaterArm(0.13, 150, 22, 11, lamps);
+    this.breakwaterArm(0.655, 210, 16, 12, lamps);
+    this.breakwaterArm(0.805, 260, 18, 13, lamps);
+    const lampGeo = lamps.build();
+    if (lampGeo) {
+      const lampMesh = new THREE.Mesh(lampGeo, this.mats.lamp);
+      lampMesh.name = 'breakwater-lamps';
+      this.group.add(lampMesh);
     }
 
     this.dressBay();
+    this.dressSeaTraffic();
+  }
+
+  /**
+   * One breakwater: a tapered masonry arm laid along the local tangent at
+   * `dist` metres out from the road edge, armour blocks tumbled down its
+   * seaward toe, and a light tower on its head.
+   *
+   * All of it lands in the shared `stone` / `trim` accumulators and the
+   * existing debris instance sets, so however many of these get built the cost
+   * is triangles, not draw calls.
+   */
+  private breakwaterArm(t: number, dist: number, segs: number, segLen: number, lamps: GeoAccum) {
+    const rng = this.rng;
+    const track = this.ctx.track;
+    const s = track.sample(t);
+    const sea = this.seaSide(t);
+    const start = s.halfWidth + dist;
+    const yaw = Math.atan2(s.tangent.x, s.tangent.z);
+    if (!this.isSea(t, sea * start, s)) return;
+    this.at(t, sea * start, _p, s);
+    _p.y = this.seaLevel;
+    let placed = 0;
+    for (let k = 0; k < segs; k++) {
+      const off = (k - segs / 2) * segLen;
+      _p2.set(_p.x + s.tangent.x * off, this.seaLevel, _p.z + s.tangent.z * off);
+      // probe every segment so the arm never drives through the coastline it
+      // is supposed to shelter
+      if (!this.flatWorld && this.groundY(_p2, t) > this.seaLevel + 0.6) continue;
+      // taper the arm so it does not read as an extruded ribbon
+      const hgt = 5.4 - Math.abs(k - segs / 2) * 0.11 + Math.sin(k * 1.7) * 0.35;
+      this.acc.stone.add(bevelBox(9.5, hgt, segLen * 1.04, 0.25, 0.18), trs(_p2.x, this.seaLevel + hgt / 2 - 2.6, _p2.z, yaw + Math.sin(k * 0.4) * 0.05), new THREE.Color(0xbfae95), (_x, y) => lerp(0.5, 1, smoothstep(-hgt * 0.5, -hgt * 0.15, y)));
+      // armour blocks tumbled along the seaward toe
+      if (k % 2 === 0) {
+        this.sets['debris' + (k % 3)].add(trs(_p2.x + s.binormal.x * sea * 5.6, this.seaLevel - 0.4, _p2.z + s.binormal.z * sea * 5.6, k * 1.3, 3.0 + rng() * 1.6), {
+          color: _col.set(0xb2a48c).clone(),
+          uv: new THREE.Vector4(1, 1, 0, 0),
+          lod: 0,
+        });
+      }
+      placed++;
+    }
+    if (placed < 3) return;
+    // a small light tower at the head of the arm
+    _p2.set(_p.x + s.tangent.x * (segs / 2) * segLen, this.seaLevel + 2.6, _p.z + s.tangent.z * (segs / 2) * segLen);
+    if (!this.flatWorld && this.groundY(_p2, t) > this.seaLevel + 0.6) return;
+    const lh = lighthouseGeo(_p2.y, this.seaLevel);
+    const base = trs(_p2.x, _p2.y, _p2.z, rng() * 6.28, 0.55);
+    this.acc.stone.add(lh.stone, base, new THREE.Color(0xefe6d6));
+    this.acc.trim.add(lh.trim, base, new THREE.Color(0xe8dcc8));
+    lamps.add(lh.glass, base, new THREE.Color(1, 1, 1));
+  }
+
+  /**
+   * Everything that MOVES on the water, placed where a chase camera can see it.
+   *
+   * The seaward frame band that actually reaches a driver is narrow: probed
+   * from all ten review camera marks, open water begins 30–250 m ahead and the
+   * roadside berm and barrier hide most of what is nearer than that, while the
+   * scene's aerial perspective has taken 80% of the chroma off anything past
+   * 900 m. So the readable window is roughly 120–700 m, and before this pass
+   * the only things in it were a scatter of buoys off the first third of the
+   * lap. Sails, rafted boats and gulls now run the WHOLE seaward side, weighted
+   * into that window, and every one of them rides an existing instance set.
+   */
+  private dressSeaTraffic() {
+    const rng = mulberry32(0x5ea11fe);
+    const sailSet = this.sets.farSail;
+
+    // --- rafted boats at 60–200 m, the whole lap. Three or four hulls in a
+    // clump with their bows the same way reads as moorings; one hull on its own
+    // at that range reads as a speck of noise.
+    this.walk(0, 1, 52, (t, s, i) => {
+      const sea = this.seaSide(t);
+      const base = 62 + this.hash1(i, 0x7a1) * 140;
+      if (!this.isSea(t, sea * (s.halfWidth + base), s)) return;
+      const n = 2 + ((this.hash1(i, 0x7a2) * 3) | 0);
+      const yaw0 = Math.atan2(s.tangent.x, s.tangent.z) + (rng() - 0.5) * 0.5;
+      for (let k = 0; k < n; k++) {
+        const lat = sea * (base + (rng() - 0.5) * 30);
+        if (!this.isSea(t, lat, s)) continue;
+        this.at(t, lat, _p, s);
+        _p.x += (rng() - 0.5) * 26;
+        _p.z += (rng() - 0.5) * 26;
+        if (!this.flatWorld && this.groundY(_p, t) > this.seaLevel - 0.6) continue;
+        _p.y = this.seaLevel;
+        this.boatAt(trs(_p.x, _p.y, _p.z, yaw0 + (rng() - 0.5) * 0.25 + (rng() < 0.5 ? 0 : Math.PI)), rng, 1.1 + rng() * 0.7);
+        // a marker buoy off the raft — a second, smaller object at the same
+        // depth is what tells the eye the water has a surface at all
+        if (rng() < 0.4) {
+          this.sets.buoy.add(trs(_p.x + (rng() - 0.5) * 16, this.seaLevel, _p.z + (rng() - 0.5) * 16, rng() * 6.28, 1.0 + rng() * 0.6), {
+            color: _col.set(pick(rng, [0xe0453f, 0xff9d2e, 0xf2ece0, 0x2f5d43])).clone(),
+            uv: new THREE.Vector4(1, 1, 0, 0),
+            bob: new THREE.Vector4(0.11 + rng() * 0.07, rng() * 6.28, 0.05 + rng() * 0.05, 0),
+            lod: 460,
+          });
+        }
+      }
+    });
+
+    // --- sails in the 140–620 m window. Two or three to a group, because a
+    // regatta is boats near each other and a scatter is dust. A sail is 14
+    // triangles and it is the brightest small thing that can stand on water, so
+    // this is the cheapest legibility per triangle anywhere in the file.
+    if (sailSet) {
+      this.walk(0, 1, 26, (t, s, i) => {
+        const sea = this.seaSide(t);
+        const base = 140 + this.hash1(i, 0x5b11) * 480;
+        if (!this.isSea(t, sea * (s.halfWidth + base), s)) return;
+        const n = 2 + ((this.hash1(i, 0x5b22) * 3) | 0);
+        const yaw0 = rng() * 6.28;
+        for (let k = 0; k < n; k++) {
+          this.at(t, sea * (base + (rng() - 0.5) * 130), _p, s);
+          _p.x += (rng() - 0.5) * 110;
+          _p.z += (rng() - 0.5) * 110;
+          if (!this.flatWorld && this.groundY(_p, t) > this.seaLevel - 1.2) continue;
+          _p.y = this.seaLevel;
+          // scaled up with distance so the angular size holds: a 2.2x sail at
+          // 550 m is two pixels of nothing.
+          const d = base / 140;
+          sailSet.add(trs(_p.x, _p.y, _p.z, yaw0 + (rng() - 0.5) * 0.9, (2.0 + rng() * 1.6) * (0.8 + d * 0.5)), {
+            color: _col.setHSL(0.09, 0.05 + rng() * 0.06, 0.88 + rng() * 0.1).clone(),
+            uv: new THREE.Vector4(1, 1, 0, 0),
+            bob: new THREE.Vector4(0.16 + rng() * 0.1, rng() * 6.28, 0.02 + rng() * 0.02, 0),
+            lod: 0,
+          });
+        }
+      });
+    }
+
+    // --- gulls working the water. Low, in front of the bay rather than above
+    // the skyline, so they cross the sea band instead of the sky — which is
+    // both what gulls do and where they read. Weighted onto the four sections
+    // §1 builds around the view.
+    for (const [t0, t1] of [[0.04, 0.22], [0.38, 0.52], [0.60, 0.74], [0.74, 0.88]] as [number, number][]) {
+      this.walk(t0, t1, 46, (t, s) => {
+        const sea = this.seaSide(t);
+        const off = 40 + rng() * 90;
+        if (!this.isSea(t, sea * (s.halfWidth + off), s)) return;
+        this.at(t, sea * (s.halfWidth + off), _p, s);
+        const base = this.seaLevel + 5 + rng() * 22;
+        const n = 3 + ((rng() * 4) | 0);
+        for (let i = 0; i < n; i++) {
+          this.sets.gull.add(trs(_p.x, base + (rng() - 0.5) * 9, _p.z, 0, 1.3 + rng() * 0.7), {
+            bob: new THREE.Vector4(9 + rng() * 22, (rng() < 0.5 ? -1 : 1) * (0.16 + rng() * 0.22), rng() * 6.28, 5 + rng() * 4),
+            color: _col.setHSL(0.09, 0.06, 0.88 + rng() * 0.1).clone(),
+          });
+        }
+      });
+    }
   }
 
   /**
