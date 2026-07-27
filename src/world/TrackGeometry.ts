@@ -1,0 +1,1705 @@
+/**
+ * ============================================================================
+ *  SUNSET BAY CIRCUIT — geometry
+ * ============================================================================
+ *  Everything here is swept from the same cross-section functions the physics
+ *  probe uses (`Track.crossPoint` / `Track.crossOffset`), so the road you see
+ *  and the road you drive on are the same surface to the millimetre. Nothing
+ *  is hand-placed relative to anything else: move the layout and every mesh
+ *  moves with it.
+ *
+ *  Materials come from the shared library via `getMaterials()`, and every UV
+ *  here is authored in metres divided by that material's `worldScale`, so
+ *  chippings, setts, kerb stripes and ashlar all come out at their authored
+ *  physical size. Two materials are track-owned because the shared library
+ *  enables vertex colours nowhere and they need them: the four-way terrain
+ *  blend and the start-line checker. If the library is unavailable or hands
+ *  back an untextured placeholder, procedural PBR sets baked here take over so
+ *  the circuit never renders as flat grey plastic.
+ * ============================================================================
+ */
+import * as THREE from 'three';
+import type { Ctx } from '../types';
+import { Surface } from '../types';
+import type { Track } from './Track';
+import {
+  BOOST_PADS, BRIDGE_T0, BRIDGE_T1, CROWN, KERB_HS, KERB_QS, KERB_W, SEA_Y,
+  SKIRT_W, TUNNEL_T0, TUNNEL_T1, WALL_GUARDRAIL, Z_BEACH, smoothstep as ss,
+} from './TrackLayout';
+import { createNoise2D } from 'simplex-noise';
+import { getMaterials } from '../render/Materials';
+
+// ---------------------------------------------------------------------------
+//  Palette (art bible §3). THREE.Color is linear working space here.
+// ---------------------------------------------------------------------------
+const C_TARMAC = new THREE.Color('#4a4a52');
+const C_RACE = new THREE.Color('#3e3e48');
+const C_KERB_R = new THREE.Color('#e0453f');
+const C_KERB_W = new THREE.Color('#f2ece0');
+const C_SAND = new THREE.Color('#e3c893');
+const C_GRASS = new THREE.Color('#6f9b47');
+const C_GRASS_T = new THREE.Color('#87b356');
+const C_DIRT = new THREE.Color('#9c7a52');
+const C_STONE = new THREE.Color('#a8927a');
+const C_GRIME = new THREE.Color('#6a6154');
+const C_PAINT = new THREE.Color('#f2ece0');
+
+/**
+ * Vertex-colour multiplier that carries tarmac `#4a4a52` to the racing-line
+ * `#3e3e48` of the palette table. Kept as a ratio rather than a colour because
+ * it rides on top of whichever tarmac map the shared library handed us, and a
+ * ratio survives that where an absolute colour would fight it.
+ */
+const C_RACE_MUL = new THREE.Color(0x3e / 0x4a, 0x3e / 0x4a, 0x48 / 0x52);
+/** warm dusting where the beach blows sand across the outer lane */
+const C_SAND_MUL = new THREE.Color(1.30, 1.16, 0.92);
+/** the dark kiss of rubber and dirt packed into the kerb/tarmac joint */
+const C_JOINT_MUL = new THREE.Color(0.42, 0.40, 0.42);
+
+/** the neutral ground detail map averages this, so hues are pre-divided by it */
+const GROUND_GAIN = 1.5;
+
+const _c = new THREE.Color();
+const _c2 = new THREE.Color();
+const _white = new THREE.Color(1, 1, 1);
+const _p = new THREE.Vector3();
+const _p2 = new THREE.Vector3();
+const _q = new THREE.Quaternion();
+const _sc = new THREE.Vector3(1, 1, 1);
+const _yAxis = new THREE.Vector3(0, 1, 0);
+
+// ===========================================================================
+//  Procedural material fallbacks
+// ===========================================================================
+
+function mulberry32(seed: number) {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let x = Math.imul(a ^ (a >>> 15), 1 | a);
+    x = (x + Math.imul(x ^ (x >>> 7), 61 | x)) ^ x;
+    return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const trnd = mulberry32(20260726);
+const tn1 = createNoise2D(trnd);
+const tn2 = createNoise2D(trnd);
+
+function fbm(x: number, y: number, oct: number, lac = 2.03, gain = 0.5): number {
+  let a = 0.5, f = 1, s = 0, norm = 0;
+  for (let i = 0; i < oct; i++) {
+    s += a * tn1(x * f, y * f);
+    norm += a; a *= gain; f *= lac;
+  }
+  return s / norm;
+}
+
+interface TexSet { map: THREE.Texture; normalMap: THREE.Texture; roughnessMap: THREE.Texture; }
+
+/**
+ * One pass over a tiling height field, from which albedo, roughness and a
+ * derived normal map all fall out. Cheaper than three separate loops, and it
+ * guarantees the three maps describe the same physical surface.
+ */
+function bakeTexSet(
+  size: number,
+  height: (u: number, v: number) => number,
+  shade: (u: number, v: number, h: number, out: THREE.Color) => void,
+  rough: (u: number, v: number, h: number) => number,
+  normalScale: number,
+): TexSet {
+  const H = new Float32Array(size * size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) H[y * size + x] = height(x / size, y / size);
+  }
+  const albedo = new Uint8Array(size * size * 4);
+  const nrm = new Uint8Array(size * size * 4);
+  const rgh = new Uint8Array(size * size * 4);
+  const col = new THREE.Color();
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const k = y * size + x;
+      const h = H[k];
+      const u = x / size, v = y / size;
+      shade(u, v, h, col);
+      // palette colours live in linear space; the albedo texture is sRGB
+      col.convertLinearToSRGB();
+      const o = k * 4;
+      albedo[o] = Math.max(0, Math.min(255, col.r * 255));
+      albedo[o + 1] = Math.max(0, Math.min(255, col.g * 255));
+      albedo[o + 2] = Math.max(0, Math.min(255, col.b * 255));
+      albedo[o + 3] = 255;
+      const hl = H[y * size + ((x - 1 + size) % size)];
+      const hr = H[y * size + ((x + 1) % size)];
+      const hd = H[((y - 1 + size) % size) * size + x];
+      const hu = H[((y + 1) % size) * size + x];
+      const nx = (hl - hr) * normalScale, ny = (hd - hu) * normalScale;
+      const inv = 1 / Math.hypot(nx, ny, 1);
+      nrm[o] = (nx * inv * 0.5 + 0.5) * 255;
+      nrm[o + 1] = (ny * inv * 0.5 + 0.5) * 255;
+      nrm[o + 2] = (inv * 0.5 + 0.5) * 255;
+      nrm[o + 3] = 255;
+      // three samples roughness from the green channel
+      rgh[o + 1] = Math.max(0, Math.min(1, rough(u, v, h))) * 255;
+      rgh[o + 3] = 255;
+    }
+  }
+  const mk = (data: Uint8Array, srgb: boolean) => {
+    const t = new THREE.DataTexture(data, size, size, THREE.RGBAFormat);
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+    t.generateMipmaps = true;
+    t.minFilter = THREE.LinearMipmapLinearFilter;
+    t.magFilter = THREE.LinearFilter;
+    t.needsUpdate = true;
+    return t;
+  };
+  return { map: mk(albedo, true), normalMap: mk(nrm, false), roughnessMap: mk(rgh, false) };
+}
+
+/** Rounded-rect brick lattice, used for cobbles and ashlar masonry. */
+function brickField(u: number, v: number, cols: number, rows: number, stagger: number) {
+  const gy = v * rows;
+  const row = Math.floor(gy);
+  const gx = u * cols + (row & 1 ? stagger : 0);
+  const cx = gx - Math.floor(gx) - 0.5;
+  const cy = gy - row - 0.5;
+  const id = tn2(Math.floor(gx) * 3.3 + 0.5, row * 7.7 + 0.5) * 0.5 + 0.5;
+  const d = Math.max(Math.abs(cx) / (0.5 - 0.045), Math.abs(cy) / (0.5 - 0.07));
+  return { d, id };
+}
+
+class MatLib {
+  private src: any;
+  private cache = new Map<string, THREE.Material>();
+  private aniso = 8;
+  /** clones made by `vc()`; Track keeps their env map in step with the sky */
+  readonly clones: THREE.MeshStandardMaterial[] = [];
+
+  constructor(ctx: Ctx) {
+    // Materials has no slot on Ctx, so it publishes a module-level accessor.
+    try { this.src = getMaterials(); } catch { this.src = null; }
+    const cap = ctx.renderer?.capabilities;
+    if (cap) this.aniso = Math.min(8, cap.getMaxAnisotropy());
+  }
+
+  /** Ask the shared library first; fall back to our own procedural set. */
+  get(name: string, make: () => THREE.Material): THREE.Material {
+    let shared: any = null;
+    try { shared = this.src?.get?.(name); } catch (e) {
+      // One material failing to bake must not take the whole circuit with it.
+      console.warn('[track] shared material "' + name + '" unavailable, using fallback', e);
+    }
+    // A standard material with no albedo map is the boot placeholder;
+    // rendering flat grey would fail the art bible outright, so prefer ours.
+    if (shared && shared.map) return shared;
+    return this.own(name, make);
+  }
+
+  /**
+   * A material the track owns outright. Used only where the shared library
+   * cannot help: anything that needs vertex colours (it enables them nowhere)
+   * — the four-way terrain blend, and the black/white start-line checker.
+   */
+  own(name: string, make: () => THREE.Material): THREE.Material {
+    let m = this.cache.get(name);
+    if (!m) { m = make(); m.name = 'track-' + name; this.cache.set(name, m); }
+    return m;
+  }
+
+  /**
+   * As `get()`, but guaranteed to consume the mesh's vertex colours.
+   *
+   * The shared library enables `vertexColors` nowhere, which is fine for a wall
+   * or a roof but fatal for a road: the racing line, the shoulder grime, the
+   * beach sand drift and the kerb's joint dirt are all *masks the track owns*
+   * and they have nowhere else to live. A per-metre mask cannot be baked into a
+   * 3.5 m tiling texture by definition. So we take a clone — textures are
+   * shared, so this costs one extra program, not one extra texture set — and
+   * flip the flag on the copy rather than mutating a material somebody else may
+   * hold a reference to.
+   *
+   * `Material.copy()` walks a fixed property list that `onBeforeCompile` is not
+   * on, so the library's tiling-breakup and distance-settle injections have to
+   * be carried across by hand or the clone renders with a visible 3.5 m repeat.
+   * Three folds `vertexColors` into the program cache key itself, so the bound
+   * `customProgramCacheKey` cannot collide the two variants onto one program.
+   */
+  vc(name: string, make: () => THREE.Material): THREE.Material {
+    const base = this.get(name, make) as THREE.MeshStandardMaterial;
+    if (base.vertexColors) return base;          // our own fallbacks already do
+    const key = name + '|vc';
+    const hit = this.cache.get(key);
+    if (hit) return hit;
+    const c = base.clone();
+    const before = (base as any).onBeforeCompile;
+    if (before && before !== THREE.Material.prototype.onBeforeCompile) {
+      c.onBeforeCompile = before.bind(base);
+      c.customProgramCacheKey = base.customProgramCacheKey.bind(base);
+    }
+    c.vertexColors = true;
+    c.name = (base.name || name) + '-vc';
+    c.needsUpdate = true;
+    this.cache.set(key, c);
+    this.clones.push(c);
+    return c;
+  }
+
+  /** Metres of world one texture tile of `name` covers. Drives every UV here. */
+  scale(name: string, fallback: number): number {
+    const s = this.src?.worldScale?.(name);
+    return s && s > 0 ? s : fallback;
+  }
+
+  tune(s: TexSet, repeat: number) {
+    for (const t of [s.map, s.normalMap, s.roughnessMap]) {
+      t.repeat.set(repeat, repeat);
+      t.anisotropy = this.aniso;
+    }
+    return s;
+  }
+}
+
+/** DoubleSide variant that never mutates a material somebody else may own. */
+function twoSided(m: THREE.Material): THREE.Material {
+  const c = m.clone();
+  c.side = THREE.DoubleSide;
+  // Material.clone() drops shader injection, and the shared library leans on
+  // it for triplanar projection and tile breakup — carry both across.
+  (c as any).onBeforeCompile = (m as any).onBeforeCompile;
+  (c as any).customProgramCacheKey = (m as any).customProgramCacheKey;
+  return c;
+}
+
+// --- individual fallback material factories --------------------------------
+
+/**
+ * Fallback tarmac. `racingLine` bakes the *worn* variant: base roughness 0.55
+ * against 0.72, flatter relief, and rubber smeared along the direction of
+ * travel. That gloss step is the whole point — the mesh's vertex colours can
+ * darken the line's albedo but they cannot touch its roughness, so if the two
+ * materials were identical (as they were in round 1) the line would come out as
+ * paint rather than as polish.
+ */
+function tarmacMaterial(lib: MatLib, racingLine = false): THREE.Material {
+  const base = racingLine ? 0.55 : 0.72;
+  const s = bakeTexSet(1024,
+    (u, v) => (fbm(u * 46, v * 46, 4) * 0.55 + tn2(u * 128, v * 128) * 0.22
+      + fbm(u * 4.3, v * 4.3, 3) * 0.4) * (racingLine ? 0.62 : 1),
+    (u, v, h, out) => {
+      const patch = fbm(u * 3.1 + 11, v * 3.1 + 11, 3);
+      out.copy(racingLine ? C_RACE : C_TARMAC).multiplyScalar(1 + h * 0.34 + patch * 0.14);
+      // bitumen sheen streaks at a non-integer scale break the tile repeat
+      out.lerp(_c2.copy(C_TARMAC).multiplyScalar(1.5), Math.max(0, tn2(u * 2.1, v * 0.31)) * 0.18);
+      // rubber laid down along V, i.e. along the direction of travel
+      if (racingLine) out.lerp(_c2.setRGB(0.14, 0.135, 0.15), Math.max(0, fbm(u * 14, v * 3, 3)) * 0.3);
+    },
+    (u, v, h) => base - h * 0.14 + fbm(u * 7.7 + 3, v * 7.7 + 3, 2) * 0.09
+      - (racingLine ? Math.max(0, fbm(u * 14, v * 3, 3)) * 0.1 : 0),
+    racingLine ? 16 : 26,
+  );
+  lib.tune(s, 1);
+  return new THREE.MeshStandardMaterial({
+    ...s, color: 0xffffff, roughness: 1, metalness: 0,
+    vertexColors: true,
+    normalScale: new THREE.Vector2(racingLine ? 0.55 : 0.9, racingLine ? 0.55 : 0.9),
+  });
+}
+
+function cobbleMaterial(lib: MatLib): THREE.Material {
+  const s = bakeTexSet(1024,
+    (u, v) => {
+      const b = brickField(u, v, 16, 22, 0.5);
+      return Math.max(0, 1 - b.d * b.d) * (0.85 + b.id * 0.15) + fbm(u * 60, v * 60, 3) * 0.12;
+    },
+    (u, v, h, out) => {
+      const b = brickField(u, v, 16, 22, 0.5);
+      out.setHex(0x9a8f7e).lerp(_c2.setHex(0x7d7466), b.id);
+      out.multiplyScalar(0.82 + h * 0.4);
+      out.lerp(_c2.setHex(0x615b52), ss(0.78, 0.99, b.d));
+    },
+    (u, v, h) => {
+      const b = brickField(u, v, 16, 22, 0.5);
+      // stone tops polish under traffic; the mortar joints stay matte
+      return 0.86 - (1 - ss(0.7, 1.0, b.d)) * 0.28 + h * 0.05;
+    },
+    34,
+  );
+  lib.tune(s, 1);
+  return new THREE.MeshStandardMaterial({
+    ...s, color: 0xffffff, roughness: 1, metalness: 0,
+    vertexColors: true, normalScale: new THREE.Vector2(1.15, 1.15),
+  });
+}
+
+/**
+ * Fallback kerb. The red/white banding is baked into the map along V at four
+ * bands per tile, matching the shared library's pitch — the mesh's vertex
+ * colours now carry joint dirt and rubber wear instead of the stripe, so if the
+ * stripe were not in the texture there would be no stripe at all.
+ *
+ * The band boundary is deliberately softened over ~2 texels. A hard step
+ * between `#e0453f` and `#f2ece0` is a full-contrast edge with nothing for the
+ * mip chain to average, and at the grazing angles a racing camera lives at that
+ * is precisely what crawls.
+ */
+function kerbMaterial(lib: MatLib): THREE.Material {
+  const size = 512;
+  const bands = 4;
+  const soft = 2.5 / (size / bands);   // ≈2 texels of transition
+  /** 0 in the middle of a red band, 1 in a white one, blended at the seams */
+  const bandAt = (v: number) => {
+    const f = v * bands;
+    const i = Math.floor(f), frac = f - i;
+    const t = ss(0, soft, Math.min(frac, 1 - frac));
+    return ((i & 1) ? 1 : 0) * t + 0.5 * (1 - t);
+  };
+  const s = bakeTexSet(size,
+    (u, v) => {
+      const chip = Math.max(0, fbm(u * 26 + 5, v * 26 + 5, 3));
+      return fbm(u * 30, v * 30, 3) * 0.42 + tn2(u * 110, v * 110) * 0.16 - chip * 0.3;
+    },
+    (u, v, h, out) => {
+      const w = bandAt(v);
+      out.copy(C_KERB_R).lerp(C_KERB_W, w);
+      // worn patches where the aggregate under the paint shows through
+      const chip = ss(0.35, 0.72, fbm(u * 26 + 5, v * 26 + 5, 3) + 0.5);
+      out.lerp(_c2.setRGB(0.36, 0.34, 0.31), chip * 0.55);
+      out.multiplyScalar(0.88 + h * 0.24);
+      // rubber scuffs where karts have clipped the kerb
+      out.lerp(_c2.setRGB(0.15, 0.145, 0.16), Math.max(0, tn2(u * 5.5, v * 1.7)) * 0.34);
+    },
+    (u, v, h) => {
+      // fresh paint is smooth; where it has chipped off, bare concrete is not
+      const chip = ss(0.35, 0.72, fbm(u * 26 + 5, v * 26 + 5, 3) + 0.5);
+      return 0.42 + chip * 0.44 + h * 0.16 + Math.max(0, tn2(u * 6, v * 2)) * 0.12;
+    },
+    26,
+  );
+  lib.tune(s, 1);
+  return new THREE.MeshStandardMaterial({
+    ...s, color: 0xffffff, roughness: 1, metalness: 0, vertexColors: true,
+    normalScale: new THREE.Vector2(1.1, 1.1),
+  });
+}
+
+function groundMaterial(lib: MatLib): THREE.Material {
+  // Neutral detail: hue arrives on vertex colours, so grass, sand, dirt and
+  // rock all share one draw call while still reading as different surfaces.
+  const s = bakeTexSet(512,
+    (u, v) => fbm(u * 22, v * 22, 5) * 0.6 + fbm(u * 96, v * 96, 2) * 0.25,
+    (u, v, h, out) => {
+      const t = (1 / GROUND_GAIN) * (1 + h * 0.62);
+      out.setRGB(t, t * 1.02, t * 0.95);
+      out.multiplyScalar(1 + fbm(u * 6.1 + 40, v * 6.1 + 40, 3) * 0.18);
+    },
+    (u, v, h) => 0.88 - h * 0.16 + fbm(u * 12 + 9, v * 12 + 9, 2) * 0.08,
+    30,
+  );
+  lib.tune(s, 1);
+  return new THREE.MeshStandardMaterial({
+    ...s, color: 0xffffff, roughness: 1, metalness: 0, vertexColors: true,
+  });
+}
+
+function rockMaterial(lib: MatLib): THREE.Material {
+  const s = bakeTexSet(512,
+    (u, v) => {
+      const r = 1 - Math.abs(tn1(u * 9, v * 9));
+      const strata = Math.sin(v * Math.PI * 14 + fbm(u * 3, v * 3, 3) * 3) * 0.12;
+      return r * r * 0.7 + fbm(u * 34, v * 34, 4) * 0.35 + strata;
+    },
+    (u, v, h, out) => {
+      out.copy(C_STONE).multiplyScalar(0.78 + h * 0.5);
+      out.lerp(_c2.setHex(0x7d6f5d), ss(0.1, 0.7, fbm(u * 5 + 21, v * 5 + 21, 3) + 0.5) * 0.35);
+    },
+    (u, v, h) => 0.80 - h * 0.18 + fbm(u * 16 + 5, v * 16 + 5, 2) * 0.1,
+    42,
+  );
+  lib.tune(s, 1);
+  return new THREE.MeshStandardMaterial({
+    ...s, color: 0xffffff, roughness: 1, metalness: 0,
+    vertexColors: true, normalScale: new THREE.Vector2(1.3, 1.3),
+  });
+}
+
+function stoneMaterial(lib: MatLib): THREE.Material {
+  const s = bakeTexSet(512,
+    (u, v) => {
+      const b = brickField(u, v, 8, 14, 0.5);
+      return (1 - ss(0.86, 1.0, b.d)) * (0.6 + b.id * 0.25) + fbm(u * 48, v * 48, 4) * 0.3;
+    },
+    (u, v, h, out) => {
+      const b = brickField(u, v, 8, 14, 0.5);
+      out.copy(C_STONE).multiplyScalar(0.84 + b.id * 0.18 + h * 0.28);
+      out.lerp(_c2.setHex(0x87796a), ss(0.86, 1.0, b.d) * 0.7);
+    },
+    (u, v, h) => 0.74 + h * 0.12 + fbm(u * 20 + 7, v * 20 + 7, 2) * 0.1,
+    36,
+  );
+  lib.tune(s, 1);
+  return new THREE.MeshStandardMaterial({
+    ...s, color: 0xffffff, roughness: 1, metalness: 0,
+    vertexColors: true, normalScale: new THREE.Vector2(1.2, 1.2),
+  });
+}
+
+function metalMaterial(lib: MatLib): THREE.Material {
+  const s = bakeTexSet(256,
+    (u, v) => fbm(u * 4, v * 90, 3) * 0.5 + tn2(u * 40, v * 40) * 0.15,
+    (u, v, h, out) => {
+      out.setRGB(0.60, 0.62, 0.65).multiplyScalar(0.85 + h * 0.3);
+      out.lerp(_c2.setHex(0x8a5a3a), Math.max(0, fbm(u * 7 + 60, v * 7 + 60, 3)) * 0.4);
+    },
+    (u, v, h) => 0.32 + Math.max(0, fbm(u * 7 + 60, v * 7 + 60, 3)) * 0.42 + h * 0.08,
+    18,
+  );
+  lib.tune(s, 1);
+  return new THREE.MeshStandardMaterial({
+    ...s, color: 0xffffff, roughness: 1, metalness: 0.8, vertexColors: true,
+  });
+}
+
+/**
+ * Road paint — edge lines, the start/finish checker, grid boxes and the worn
+ * asphalt decals, all one draw call driven by vertex colour and vertex alpha.
+ *
+ * Three things the round-1 checker was missing, in order of how loudly they
+ * read:
+ *
+ *  • It is `#f2ece0`, never `#ffffff`. The bible forbids the latter outright
+ *    and a tone-mapped `1.0` albedo under a 4.2 key clips to a flat white slab
+ *    with no shading information left in it at all.
+ *  • Alpha. Real line paint is 200 µm of thermoplastic over a 36 mm chipping,
+ *    so the aggregate reads *through* it. Vertex alpha lets each quad choose
+ *    how thick its paint is, which is what makes wheel-track wear possible.
+ *  • Roughness 0.44 against the tarmac's 0.72. Under a 14° key that gloss step
+ *    is what separates the paint from the road at a glance, and it is one of
+ *    the five distinct surface responses the frame has to show.
+ */
+function paintMaterial(lib: MatLib): THREE.Material {
+  const s = bakeTexSet(256,
+    (u, v) => fbm(u * 40, v * 40, 3) * 0.4 + fbm(u * 150, v * 150, 2) * 0.2,
+    (u, v, h, out) => {
+      out.copy(C_PAINT).multiplyScalar(0.9 + h * 0.18);
+      // aggregate showing through thin paint: the same chipping scale the
+      // tarmac uses, so the two surfaces agree about the stone underneath
+      const agg = Math.max(0, tn2(u * 96, v * 96));
+      out.lerp(_c2.copy(C_TARMAC).multiplyScalar(1.35), agg * 0.22);
+      // scuff and road film, so no two squares of the checker are the same
+      out.multiplyScalar(1 - Math.max(0, fbm(u * 9 + 23, v * 9 + 23, 3)) * 0.14);
+    },
+    (u, v, h) => 0.44 + h * 0.20 + Math.max(0, fbm(u * 11 + 4, v * 11 + 4, 2)) * 0.14,
+    18,
+  );
+  lib.tune(s, 1);
+  return new THREE.MeshStandardMaterial({
+    ...s, color: 0xffffff, roughness: 1, metalness: 0, vertexColors: true,
+    transparent: true, depthWrite: true,
+    polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4,
+  });
+}
+
+function boostMaterial(): THREE.Material {
+  const size = 256;
+  const data = new Uint8Array(size * size * 4);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const u = x / size, v = y / size;
+      const f = (v * 3) % 1;                       // three chevrons per tile
+      const chev = 1 - ss(0.0, 0.15, Math.abs(Math.abs(u - 0.5) * 1.5 - f + 0.32));
+      const edge = 1 - ss(0.40, 0.5, Math.abs(u - 0.5));
+      const a = chev * edge;
+      const o = (y * size + x) * 4;
+      data[o] = 255; data[o + 1] = 168 + a * 78; data[o + 2] = 70 + a * 90;
+      data[o + 3] = Math.min(255, a * 235 + 30);
+    }
+  }
+  const t = new THREE.DataTexture(data, size, size, THREE.RGBAFormat);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.generateMipmaps = true;
+  t.minFilter = THREE.LinearMipmapLinearFilter;
+  t.needsUpdate = true;
+  return new THREE.MeshStandardMaterial({
+    map: t, emissiveMap: t, emissive: 0xffa03c, emissiveIntensity: 2.4,
+    transparent: true, roughness: 0.4, metalness: 0, depthWrite: false,
+    polygonOffset: true, polygonOffsetFactor: -6, polygonOffsetUnits: -6,
+  });
+}
+
+function seaMaterial(lib: MatLib): THREE.Material {
+  const s = bakeTexSet(256,
+    (u, v) => fbm(u * 8, v * 8, 4) * 0.5 + fbm(u * 26, v * 26, 3) * 0.3,
+    (u, v, h, out) => { out.setHex(0x0d5a7a).lerp(_c2.setHex(0x2f9fae), ss(-0.2, 0.35, h)); },
+    () => 0.05,
+    9,
+  );
+  lib.tune(s, 200);
+  return new THREE.MeshStandardMaterial({
+    ...s, color: 0xffffff, roughness: 1, metalness: 0.2,
+    normalScale: new THREE.Vector2(0.32, 0.32),
+  });
+}
+
+function lightMaterial(): THREE.Material {
+  return new THREE.MeshStandardMaterial({
+    color: 0x2a2016, emissive: 0xffb35a, emissiveIntensity: 7, roughness: 0.5, metalness: 0,
+  });
+}
+
+// ===========================================================================
+//  Buffer helpers
+// ===========================================================================
+
+interface Buf {
+  pos: number[]; nor: number[]; uv: number[]; col: number[]; idx: number[];
+  tan?: number[];
+  /** when present the colour attribute goes out as RGBA and drives paint opacity */
+  alpha?: number[];
+}
+function newBuf(withTangents = false, withAlpha = false): Buf {
+  return {
+    pos: [], nor: [], uv: [], col: [], idx: [],
+    tan: withTangents ? [] : undefined,
+    alpha: withAlpha ? [] : undefined,
+  };
+}
+function finish(b: Buf): THREE.BufferGeometry {
+  const g = new THREE.BufferGeometry();
+  const n = b.pos.length / 3;
+  g.setAttribute('position', new THREE.Float32BufferAttribute(b.pos, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(b.nor, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(b.uv, 2));
+  if (b.alpha) {
+    // three switches the vColor varying to vec4 when the colour attribute has
+    // four components, which is how the paint gets a per-vertex opacity without
+    // a second attribute or a custom shader.
+    const rgba = new Float32Array(n * 4);
+    for (let i = 0; i < n; i++) {
+      rgba[i * 4] = b.col[i * 3];
+      rgba[i * 4 + 1] = b.col[i * 3 + 1];
+      rgba[i * 4 + 2] = b.col[i * 3 + 2];
+      rgba[i * 4 + 3] = b.alpha[i];
+    }
+    g.setAttribute('color', new THREE.BufferAttribute(rgba, 4));
+  } else {
+    g.setAttribute('color', new THREE.Float32BufferAttribute(b.col, 3));
+  }
+  if (b.tan && b.tan.length) g.setAttribute('tangent', new THREE.Float32BufferAttribute(b.tan, 4));
+  g.setIndex(n > 65000 ? new THREE.Uint32BufferAttribute(b.idx, 1) : new THREE.Uint16BufferAttribute(b.idx, 1));
+  g.computeBoundingSphere();
+  return g;
+}
+function pushV(b: Buf, x: number, y: number, z: number, nx: number, ny: number, nz: number,
+  u: number, v: number, c: THREE.Color, a = 1) {
+  b.pos.push(x, y, z); b.nor.push(nx, ny, nz); b.uv.push(u, v); b.col.push(c.r, c.g, c.b);
+  if (b.alpha) b.alpha.push(a);
+}
+/** counter-clockwise quad v0→v1→v2→v3 */
+function quad(b: Buf, v0: number, v1: number, v2: number, v3: number) {
+  b.idx.push(v0, v1, v2, v0, v2, v3);
+}
+
+// ===========================================================================
+//  Entry point
+// ===========================================================================
+
+export function buildTrackGeometry(track: Track, ctx: Ctx) {
+  const lib = new MatLib(ctx);
+  const g = track.group;
+  g.name = 'circuit';
+  buildRoad(track, lib, g);
+  buildKerbs(track, lib, g);
+  buildMarkings(track, lib, g);
+  buildBoostPads(track, lib, g);
+  buildSkirt(track, lib, g);
+  buildTerrain(track, lib, g);
+  buildSea(track, lib, g);
+  buildBarriers(track, lib, g);
+  buildTunnel(track, lib, g);
+  buildBridge(track, lib, g);
+  // anything we cloned out of the shared library is invisible to its own
+  // update(), so Track has to hand those copies the env map itself
+  track.registerEnvClones(lib.clones);
+}
+
+// ---------------------------------------------------------------------------
+//  Road ribbon
+// ---------------------------------------------------------------------------
+
+/**
+ * Lateral sample plan for a road ring.
+ *
+ * Nine of the seventeen samples are pinned to fixed offsets from the idealised
+ * racing line, so the worn strip is a real feature of the mesh that follows the
+ * spline rather than a staircase across fixed lateral bands. Two things ride on
+ * that block of columns:
+ *
+ *  • Columns `RACE_A..RACE_B` (±1.15 m, so 2.3 m wide) are their own material
+ *    group and get `tarmac-racing-line` — roughness 0.55 against the tarmac's
+ *    0.72. That is a genuine *gloss* break, and it is the only part of this that
+ *    can be one: a vertex colour multiplies albedo and nothing else.
+ *  • The mask in `LINE_MASK` feathers out to zero by ±2.6 m and rides on the
+ *    vertex colour, pulling albedo from `#4a4a52` down to `#3e3e48`.
+ *
+ * Deliberately the albedo footprint (5.2 m) is wider than the gloss core
+ * (2.3 m). A racing line has no edge to its staining but a fairly defined edge
+ * to its polish, and building it that way round means the hard material seam
+ * lands where the two albedos already agree — so it shows up as a hotter,
+ * narrower highlight inside a soft dark band, and not as a seam.
+ */
+const ROAD_NL = 17;
+const LINE_K0 = 4;   // first column pinned to the racing line
+const RACE_A = 6;    // first vertex of the polished core
+const RACE_B = 10;   // last vertex of the polished core
+/** offsets from the ideal line for columns LINE_K0 … LINE_K0+8 */
+const LINE_OFFS = [-2.6, -1.9, -1.15, -0.55, 0, 0.55, 1.15, 1.9, 2.6];
+const LINE_SPAN = 2.6;
+const roadLats = new Float64Array(ROAD_NL);
+const roadMask = new Float64Array(ROAD_NL);
+
+function planRoadLats(hw: number, race: number) {
+  // keep the whole line block clear of the kerbs even where the cliff narrows
+  const lim = Math.max(0, hw - LINE_SPAN - 1.4);
+  const r = race < -lim ? -lim : race > lim ? lim : race;
+  for (let k = 0; k < LINE_OFFS.length; k++) {
+    roadLats[LINE_K0 + k] = r + LINE_OFFS[k];
+    roadMask[LINE_K0 + k] = 1 - ss(1.05, LINE_SPAN, Math.abs(LINE_OFFS[k]));
+  }
+  const lo = roadLats[LINE_K0], hi = roadLats[LINE_K0 + LINE_OFFS.length - 1];
+  const kHi = LINE_K0 + LINE_OFFS.length - 1;
+  for (let k = 0; k < LINE_K0; k++) {
+    roadLats[k] = -hw + (lo + hw) * (k / LINE_K0);
+    roadMask[k] = 0;
+  }
+  for (let k = kHi + 1; k < ROAD_NL; k++) {
+    roadLats[k] = hi + (hw - hi) * ((k - kHi) / (ROAD_NL - 1 - kHi));
+    roadMask[k] = 0;
+  }
+}
+
+/** In-place circular box blur over a per-station signal. */
+function blurStations(src: Float32Array, halfCells: number, passes: number) {
+  const n = src.length;
+  const tmp = new Float32Array(n);
+  const w = 2 * halfCells + 1;
+  for (let p = 0; p < passes; p++) {
+    let sum = 0;
+    for (let k = -halfCells; k <= halfCells; k++) sum += src[((k % n) + n) % n];
+    for (let i = 0; i < n; i++) {
+      tmp[i] = sum / w;
+      sum += src[(i + halfCells + 1) % n] - src[((i - halfCells) % n + n) % n];
+    }
+    src.set(tmp);
+  }
+}
+
+/**
+ * How hard the racing line is worn in at each station.
+ *
+ * Curvature, blurred over ~60 m of arc. The blur is what makes this read as a
+ * racing line rather than as a stripe painted on the corners: it ramps the
+ * staining up through the braking zone before the geometry starts turning and
+ * lets it bleed out down the exit, which is where the rubber actually goes. The
+ * 0.40 floor keeps a faint line down the straights — traffic does not stop
+ * using one lane just because the road is straight.
+ */
+function raceWear(cl: Track['cl']): Float32Array {
+  const w = new Float32Array(cl.count);
+  for (let i = 0; i < cl.count; i++) w[i] = Math.min(1, Math.abs(cl.curv[i]) * 115);
+  blurStations(w, Math.max(1, Math.round(30 / cl.ds)), 2);
+  for (let i = 0; i < cl.count; i++) w[i] = 0.40 + 0.60 * Math.min(1, w[i] * 1.35);
+  return w;
+}
+
+function buildRoad(track: Track, lib: MatLib, root: THREE.Group) {
+  const cl = track.cl;
+  const rings = Math.round(cl.count / 3); // ~1.5 m rings
+  const b = newBuf(true);
+  const idxT: number[] = [];   // tarmac
+  const idxR: number[] = [];   // worn racing line
+  const idxC: number[] = [];   // cobblestone
+  const dP = new THREE.Vector3(), T = new THREE.Vector3(), N = new THREE.Vector3();
+
+  const sTar = lib.scale('tarmac', 3.5);
+  const sCob = lib.scale('cobblestone', 2.4);
+  const wear = raceWear(cl);
+
+  const emitRing = (si: number, dist: number, uvScale: number) => {
+    const hw = cl.half[si];
+    planRoadLats(hw, cl.race[si]);
+    const base = b.pos.length / 3;
+    // sand blows across the seaward lane through the beach descent only
+    const sand = cl.zone[si] === Z_BEACH ? 1 : 0;
+    for (let k = 0; k < ROAD_NL; k++) {
+      const L = roadLats[k];
+      track.crossPoint(si, L, _p);
+      // analytic normal: lateral surface direction crossed with the tangent
+      const slope = -2 * CROWN * L / (hw * hw);
+      dP.set(cl.bx[si], cl.by[si] + slope, cl.bz[si]).normalize();
+      T.set(cl.tx[si], cl.ty[si], cl.tz[si]);
+      N.crossVectors(dP, T).normalize();
+
+      _c.copy(_white);
+      // --- worn racing line: darker toward the palette's #3e3e48 -----------
+      _c.lerp(C_RACE_MUL, roadMask[k] * wear[si]);
+      // --- grime gradient off the shoulders --------------------------------
+      const edge = ss(0.70, 1.0, Math.abs(L) / hw);
+      _c.lerp(C_GRIME, edge * 0.30);
+      // --- sand drift on the seaward edge of the beach section -------------
+      if (sand) {
+        const drift = ss(0.34, 0.98, L / hw) * (0.55 + tn2(_p.x * 0.05, _p.z * 0.05) * 0.45);
+        _c.lerp(C_SAND_MUL, Math.max(0, drift) * 0.75);
+      }
+      // metre-scale patch variation, at a scale the tiling breakup cannot reach
+      _c.multiplyScalar(1 + tn2(_p.x * 0.021, _p.z * 0.021) * 0.07
+        + tn2(_p.x * 0.0067 + 31, _p.z * 0.0067 + 31) * 0.05);
+      pushV(b, _p.x, _p.y, _p.z, N.x, N.y, N.z, L / uvScale, dist / uvScale, _c);
+      b.tan!.push(dP.x, dP.y, dP.z, 1);
+    }
+    return base;
+  };
+  const stitch = (a0: number, a1: number, k0: number, k1: number, into: number[]) => {
+    for (let k = k0; k < k1; k++) into.push(a0 + k, a0 + k + 1, a1 + k + 1, a0 + k, a1 + k + 1, a1 + k);
+  };
+
+  // --- tarmac pass: every ring, but only the non-cobble quad rows ---
+  let prev = -1;
+  for (let r = 0; r <= rings; r++) {
+    const raw = Math.round((r * cl.count) / rings);
+    const si = raw % cl.count;
+    const ring = emitRing(si, raw * cl.ds, sTar);
+    if (prev >= 0) {
+      const prevSi = Math.round(((r - 1) * cl.count) / rings) % cl.count;
+      if (cl.cobble[prevSi] < 0.5) {
+        stitch(prev, ring, 0, RACE_A, idxT);
+        stitch(prev, ring, RACE_A, RACE_B, idxR);
+        stitch(prev, ring, RACE_B, ROAD_NL - 1, idxT);
+      }
+    }
+    prev = ring;
+  }
+  // --- cobble pass: its own vertices so the setts get their own texel scale ---
+  prev = -1;
+  for (let r = 0; r <= rings; r++) {
+    const raw = Math.round((r * cl.count) / rings);
+    const si = raw % cl.count;
+    const prevSi = r > 0 ? Math.round(((r - 1) * cl.count) / rings) % cl.count : si;
+    const needs = cl.cobble[si] >= 0.5 || (r > 0 && cl.cobble[prevSi] >= 0.5);
+    if (!needs) { prev = -1; continue; }
+    const ring = emitRing(si, raw * cl.ds, sCob);
+    if (prev >= 0 && cl.cobble[prevSi] >= 0.5) stitch(prev, ring, 0, ROAD_NL - 1, idxC);
+    prev = ring;
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(b.pos, 3));
+  geo.setAttribute('normal', new THREE.Float32BufferAttribute(b.nor, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(b.uv, 2));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(b.col, 3));
+  geo.setAttribute('tangent', new THREE.Float32BufferAttribute(b.tan!, 4));
+  geo.setIndex(new THREE.Uint32BufferAttribute(idxT.concat(idxR, idxC), 1));
+  geo.addGroup(0, idxT.length, 0);
+  geo.addGroup(idxT.length, idxR.length, 1);
+  geo.addGroup(idxT.length + idxR.length, idxC.length, 2);
+  geo.computeBoundingSphere();
+
+  const mesh = new THREE.Mesh(geo, [
+    lib.vc('tarmac', () => tarmacMaterial(lib)),
+    lib.vc('tarmac-racing-line', () => tarmacMaterial(lib, true)),
+    lib.vc('cobblestone', () => cobbleMaterial(lib)),
+  ]);
+  mesh.name = 'road';
+  mesh.receiveShadow = true;
+  root.add(mesh);
+}
+
+// ---------------------------------------------------------------------------
+//  Kerbs — a real 3D profile with chamfers, not a painted stripe
+// ---------------------------------------------------------------------------
+
+/**
+ * Kerb wear at a point on the profile, as an albedo multiplier.
+ *
+ * Everything here is a *mask*, never a stripe: the red/white banding lives in
+ * the kerb texture along V, and a second banding on the vertex colour would
+ * beat against it. What the mesh contributes is the part a 2 m tiling texture
+ * structurally cannot — where on the cross-section the dirt sits, and how the
+ * rubber varies along a 1600 m run.
+ */
+function kerbWear(q: number, dist: number, out: THREE.Color) {
+  out.copy(_white);
+  // dirt and rubber packed into the joint where the kerb meets the tarmac
+  out.lerp(C_JOINT_MUL, (1 - ss(0.0, 0.14, q)) * 0.72);
+  // grime gradient up the outer face — the bottom 15% is where it collects
+  out.lerp(C_GRIME, ss(1.40, KERB_W, q) * 0.55);
+  // the bevel and the crown edge get scuffed pale by wheels riding over
+  const polish = ss(0.20, 0.30, q) * (1 - ss(0.34, 0.44, q));
+  out.multiplyScalar(1 + polish * 0.10);
+  // black rubber laid on in patches along the run, heavier on the crown
+  const smear = Math.max(0, tn2(dist * 0.031, q * 0.4)) * Math.max(0, tn2(dist * 0.0083 + 17, 5.5));
+  out.multiplyScalar(1 - smear * 0.42 * ss(0.16, 0.30, q) * (1 - ss(1.30, 1.50, q)));
+  // paint sun-bleached in slow patches, so no two kerb runs read identical
+  out.multiplyScalar(1 + tn2(dist * 0.014 + 61, 2.2) * 0.07);
+}
+
+/**
+ * Wear for the flush *apron* — the same 1.6 m corridor, at the stations where
+ * `cl.kerb` is zero and there is therefore no kerb at all (the bridge deck runs
+ * flush between its parapets). No stripe wear and no bevel polish, because the
+ * profile there is flat: all that is left to say is that the edge of a deck
+ * collects more dirt than the middle of the road.
+ */
+function apronWear(q: number, dist: number, out: THREE.Color) {
+  out.copy(_white);
+  out.lerp(C_JOINT_MUL, (1 - ss(0.0, 0.20, q)) * 0.40);
+  out.lerp(C_GRIME, ss(0.45, KERB_W, q) * 0.44);
+  out.multiplyScalar(1 + tn2(dist * 0.019 + 13, 4.4) * 0.06);
+}
+
+/**
+ * `cl.kerb` at or above this draws the corridor as a kerb; below it, as a flush
+ * apron in the deck's own surface. It is a *material* threshold, not a geometric
+ * one — the profile itself is scaled continuously by `cl.kerb` either way, so the
+ * ribbon keeps following the physics surface straight through the crossover.
+ */
+const KERB_MIN = 0.5;
+
+/**
+ * The kerb corridor, from the road edge out to `hw + KERB_W`.
+ *
+ * `crossOffset` defines a surface over that whole corridor at *every* station —
+ * it just scales the profile by `cl.kerb`, which the bridge zone sets to zero so
+ * its deck can run flush between the parapets. Round 1 dropped the ring whenever
+ * that scale fell below a half and nothing else picked the corridor up (the
+ * shoulder skirt starts at `hw + KERB_W` by construction), so ~69 m of bridge
+ * had a 1.6 m see-through slot down each side, of which the 1.28 m inboard of
+ * the parapet was in plain view. The physics probe was quite happy to drive on
+ * it, which is exactly the class of hole that survives a screenshot review.
+ *
+ * So the corridor is now always meshed, and what changes with `cl.kerb` is which
+ * material it is drawn with: the striped kerb where there is a kerb, and the
+ * deck's own tarmac or setts where there is not. Three passes over one buffer,
+ * partitioned so every quad row is owned by exactly one of them — the row
+ * between stations r-1 and r belongs to whichever pass owns r-1, and each pass
+ * emits a ring wherever it owns either end. Same rule `buildRoad` uses for the
+ * cobble transition, and it is what keeps the seams welded instead of leaving a
+ * 1.5 m gap ring wherever the material changes.
+ *
+ * The apron takes its U from `side * (hw + q) / worldScale`, continuing the
+ * road's own lateral parameterisation, so the setts run straight off the deck
+ * and into the corridor with no seam. The kerb keeps U relative to `q`, because
+ * its stripes are pitched against the profile and not against the road.
+ */
+function buildKerbs(track: Track, lib: MatLib, root: THREE.Group) {
+  const cl = track.cl;
+  const rings = Math.round(cl.count / 3); // 1.5 m; resolves the 3.2 m ripple
+  const nk = KERB_QS.length;
+  const b = newBuf();
+  const T = new THREE.Vector3(), D = new THREE.Vector3(), N = new THREE.Vector3();
+
+  // Facet normal for band k, from the two breakpoints that bound it. The old
+  // code took a ±30 mm finite difference of `crossOffset`, which straddles
+  // every crease on a 60–160 mm profile and rounds all of them off — that is
+  // why round 1 had a kerb with no top edge on it anywhere. Vertices are
+  // duplicated per band so the creases survive into the shading.
+  const facetN = (si: number, side: number, k: number, out: THREE.Vector3) => {
+    const slope = (KERB_HS[k + 1] - KERB_HS[k]) / (KERB_QS[k + 1] - KERB_QS[k]);
+    // `crossPoint` adds the profile in world Y, and q grows outward, i.e. along
+    // `side * binormal`. The old code dropped that `side` and tilted the left
+    // kerb's facets the wrong way — the second reason it had no readable edge.
+    D.set(cl.bx[si] * side, cl.by[si] * side + slope, cl.bz[si] * side).normalize();
+    T.set(cl.tx[si], cl.ty[si], cl.tz[si]);
+    out.crossVectors(D, T).normalize();
+    if (out.y < 0) out.negate();
+    return out;
+  };
+
+  /**
+   * One material's worth of the corridor. `uvS` is the tile size in metres, and
+   * both U and V divide by it so the two can never be wired up inconsistently.
+   * `edgeU` continues the road's lateral parameterisation (apron); otherwise U is
+   * relative to `q` so the kerb's stripes stay pitched against the profile.
+   */
+  interface Pass {
+    owns: (si: number) => boolean;
+    uvS: number;
+    edgeU: boolean;
+    wear: (q: number, dist: number, out: THREE.Color) => void;
+    idx: number[];
+  }
+
+  const emitRing = (si: number, side: number, dist: number, p: Pass) => {
+    const hw = cl.half[si];
+    const ring = b.pos.length / 3;
+    // two vertices per breakpoint per band: the crease is the point
+    for (let k = 0; k < nk - 1; k++) {
+      facetN(si, side, k, N);
+      for (let e = 0; e < 2; e++) {
+        const q = KERB_QS[k + e];
+        track.crossPoint(si, side * (hw + q), _p);
+        p.wear(q, dist, _c);
+        const u = (p.edgeU ? side * (hw + q) : q) / p.uvS;
+        pushV(b, _p.x, _p.y, _p.z, N.x, N.y, N.z, u, dist / p.uvS, _c);
+      }
+    }
+    return ring;
+  };
+
+  const stitch = (prev: number, ring: number, side: number, into: number[]) => {
+    for (let k = 0; k < nk - 1; k++) {
+      const a = prev + k * 2, c = ring + k * 2;
+      if (side < 0) into.push(a, c, c + 1, a, c + 1, a + 1);
+      else into.push(a, a + 1, c + 1, a, c + 1, c);
+    }
+  };
+
+  const run = (p: Pass) => {
+    for (let side = -1; side <= 1; side += 2) {
+      let prev = -1, prevSi = -1;
+      for (let r = 0; r <= rings; r++) {
+        const raw = Math.round((r * cl.count) / rings);
+        const si = raw % cl.count;
+        // emit wherever this pass owns either end of the row, so the ring the
+        // neighbouring pass needs to weld against is always there
+        if (!(p.owns(si) || (prevSi >= 0 && p.owns(prevSi)))) { prev = -1; prevSi = si; continue; }
+        const ring = emitRing(si, side, raw * cl.ds, p);
+        if (prev >= 0 && p.owns(prevSi)) stitch(prev, ring, side, p.idx);
+        prev = ring; prevSi = si;
+      }
+    }
+  };
+
+  const hasKerb = (si: number) => cl.kerb[si] >= KERB_MIN;
+  const passes: { p: Pass; mat: () => THREE.Material }[] = [
+    {
+      // the shared kerb map bands red/white along V at 4 stripes per tile, so V
+      // must be real arc length over the tile size or the stripes stretch
+      p: { owns: hasKerb, uvS: lib.scale('kerb', 2.0), edgeU: false, wear: kerbWear, idx: [] },
+      mat: () => lib.vc('kerb', () => kerbMaterial(lib)),
+    },
+    {
+      p: {
+        owns: (si) => !hasKerb(si) && cl.cobble[si] < 0.5,
+        uvS: lib.scale('tarmac', 3.5), edgeU: true, wear: apronWear, idx: [],
+      },
+      mat: () => lib.vc('tarmac', () => tarmacMaterial(lib)),
+    },
+    {
+      p: {
+        owns: (si) => !hasKerb(si) && cl.cobble[si] >= 0.5,
+        uvS: lib.scale('cobblestone', 2.4), edgeU: true, wear: apronWear, idx: [],
+      },
+      mat: () => lib.vc('cobblestone', () => cobbleMaterial(lib)),
+    },
+  ];
+  for (const { p } of passes) run(p);
+
+  // one geometry, one buffer, a group per material — and no empty groups, which
+  // would cost a draw call apiece for nothing on a layout that never uses them
+  b.idx = [];
+  for (const { p } of passes) for (const i of p.idx) b.idx.push(i);
+  const geo = finish(b);
+  const mats: THREE.Material[] = [];
+  let off = 0;
+  for (const { p, mat } of passes) {
+    if (!p.idx.length) continue;
+    geo.addGroup(off, p.idx.length, mats.length);
+    off += p.idx.length;
+    mats.push(mat());
+  }
+
+  const mesh = new THREE.Mesh(geo, mats.length === 1 ? mats[0] : mats);
+  mesh.name = 'kerbs';
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  root.add(mesh);
+}
+
+// ---------------------------------------------------------------------------
+//  Painted markings and road decals
+// ---------------------------------------------------------------------------
+//  Edge lines, the start/finish checker, grid boxes, tar seams, patch repairs
+//  and corner arrows all share one buffer and one material, so the whole layer
+//  is a single draw call. What separates them is vertex colour (how dark) and
+//  vertex alpha (how thick the paint is), plus a per-family lift so coplanar
+//  families resolve in a fixed order instead of z-fighting.
+// ---------------------------------------------------------------------------
+
+/** paint-thickness ordering, metres above the road; larger wins */
+const LIFT_PATCH = 0.008;
+const LIFT_SEAM = 0.011;
+const LIFT_PAINT = 0.014;
+const LIFT_ARROW = 0.017;
+
+function buildMarkings(track: Track, lib: MatLib, root: THREE.Group) {
+  const cl = track.cl;
+  const b = newBuf(false, true);
+  const T = new THREE.Vector3(), D = new THREE.Vector3(), N = new THREE.Vector3();
+  let lift = LIFT_PAINT;
+
+  const put = (si: number, L: number, u: number, v: number, col: THREE.Color, a = 1, sOff = 0) => {
+    track.crossPoint(si, L, _p);
+    const slope = -2 * CROWN * L / (cl.half[si] * cl.half[si]);
+    D.set(cl.bx[si], cl.by[si] + slope, cl.bz[si]).normalize();
+    T.set(cl.tx[si], cl.ty[si], cl.tz[si]);
+    N.crossVectors(D, T).normalize();
+    const i = b.pos.length / 3;
+    pushV(b,
+      _p.x + N.x * lift + T.x * sOff,
+      _p.y + N.y * lift + T.y * sOff,
+      _p.z + N.z * lift + T.z * sOff,
+      N.x, N.y, N.z, u, v, col, a);
+    return i;
+  };
+  /**
+   * Place a vertex at an arbitrary *arc length*, not at a station.
+   *
+   * The station table is 0.5 m coarse, so the old `Math.round(d / ds)` collapsed
+   * anything thinner than half a metre onto a single station — which silently
+   * ate the 0.15 m transverse sides of all eight grid boxes, and quantised the
+   * 0.85 m checker rows to alternating 0.5 m and 1.0 m. Carrying the remainder
+   * along the tangent costs one vector add and makes every decal here exactly
+   * the size it is written as.
+   */
+  const putD = (d: number, L: number, u: number, v: number, col: THREE.Color, a = 1) => {
+    const raw = d / cl.ds;
+    const fl = Math.floor(raw);
+    const si = ((fl % cl.count) + cl.count) % cl.count;
+    return put(si, L, u, v, col, a, (raw - fl) * cl.ds);
+  };
+  /** axis-aligned patch in (arc length, lateral), subdivided to follow the crown */
+  const strip = (s0: number, s1: number, l0: number, l1: number,
+    col: THREE.Color, a: number, segs = 4) => {
+    for (let k = 0; k < segs; k++) {
+      const t0 = l0 + (l1 - l0) * (k / segs), t1 = l0 + (l1 - l0) * ((k + 1) / segs);
+      const v = putD(s0, t0, 0, 0, col, a);
+      putD(s0, t1, 1, 0, col, a);
+      putD(s1, t1, 1, 1, col, a);
+      putD(s1, t0, 0, 1, col, a);
+      quad(b, v, v + 1, v + 2, v + 3);
+    }
+  };
+
+  // --- continuous edge lines just inside the kerb ---
+  const rings = Math.round(cl.count / 4);
+  for (let side = -1; side <= 1; side += 2) {
+    let prev = -1;
+    for (let r = 0; r <= rings; r++) {
+      const raw = Math.round((r * cl.count) / rings);
+      const si = raw % cl.count;
+      if (cl.kerb[si] < 0.5) { prev = -1; continue; }
+      const hw = cl.half[si];
+      const dist = raw * cl.ds;
+      const v = dist / 3;
+      // the line is scrubbed thin where karts run wide onto the kerb
+      const wear = 0.62 + Math.max(0, tn2(dist * 0.021, side * 3.7)) * 0.32;
+      // emit in ascending lateral order on both sides, so a single winding
+      // keeps every painted quad facing up
+      const lo = Math.min(side * hw - side * 0.62, side * hw - side * 0.28);
+      const a = put(si, lo, 0, v, _white, wear);
+      put(si, lo + 0.34, 1, v, _white, wear);
+      if (prev >= 0) quad(b, prev, prev + 1, a + 1, a);
+      prev = a;
+    }
+  }
+
+  // --- start / finish checker, three rows across the full road width ---
+  //  Whites are `#f2ece0` per the palette table and the dark squares are dark
+  //  *asphalt*, not black — a real checker is paint on a road, and both colours
+  //  sit thin enough that the aggregate reads through. The wheel tracks the
+  //  grid launches from get thinner paint again, which is the only part of this
+  //  that is not symmetric and therefore the part that sells it as worn.
+  const sq = 0.85;
+  const hw0 = cl.half[0];
+  const cols = Math.floor((hw0 * 2) / sq);
+  const dark = new THREE.Color(0x30303a);
+  for (let rr = 0; rr < 3; rr++) {
+    for (let cc = 0; cc < cols; cc++) {
+      const white = ((rr + cc) & 1) === 0;
+      const col = white ? C_PAINT : dark;
+      const l0 = -hw0 + cc * sq, l1 = l0 + sq;
+      const lc = (l0 + l1) * 0.5;
+      // two launch corridors at ±5 m, matching the grid slots
+      const track1 = 1 - ss(0.0, 1.5, Math.abs(Math.abs(lc) - 5.0));
+      const scrub = track1 * 0.42 + Math.max(0, tn2(lc * 0.5, rr * 2.3 + 9)) * 0.22;
+      const a = (white ? 0.88 : 0.70) * (1 - scrub);
+      _c.copy(col).multiplyScalar(1 - scrub * 0.18);
+      strip(-1.4 + rr * sq, -1.4 + (rr + 1) * sq, l0, l1, _c, a, 1);
+    }
+  }
+
+  // --- grid slot outlines, so the standing start reads before lights out ---
+  for (let k = 0; k < 8; k++) {
+    const row = k >> 1, col = k & 1;
+    const dC = -(11 + row * 8.5 + col * 4.2);
+    const lat = (col === 0 ? -1 : 1) * 5.0;
+    const hl = 1.6, hw = 1.2, th = 0.15;
+    // [sMin, sMax, latMin, latMax] for the four sides of the box
+    const edges = [
+      [dC - hl, dC + hl, lat - hw, lat - hw + th],
+      [dC - hl, dC + hl, lat + hw - th, lat + hw],
+      [dC - hl, dC - hl + th, lat - hw, lat + hw],
+      [dC + hl - th, dC + hl, lat - hw, lat + hw],
+    ];
+    for (const [s0, s1, t0, t1] of edges) strip(s0, s1, t0, t1, C_PAINT, 0.82, 1);
+  }
+
+  buildRoadDecals(track, strip, (v) => { lift = v; });
+  lift = LIFT_PAINT;
+
+  const mesh = new THREE.Mesh(finish(b), lib.own('road-paint', () => paintMaterial(lib)));
+  mesh.name = 'markings';
+  mesh.receiveShadow = true;
+  root.add(mesh);
+}
+
+type StripFn = (s0: number, s1: number, l0: number, l1: number,
+  col: THREE.Color, a: number, segs?: number) => void;
+
+/**
+ * The decal layer: tar seams, patch repairs and faded corner arrows.
+ *
+ * Round 1's road was 50–60% of frame with nothing on it but a kerb, which is
+ * both a composition failure and a readability one — a corner you cannot see
+ * the shape of until you are in it. These are the cheapest possible answer:
+ * they cost no draw call (same buffer, same material), they are man-made hard
+ * shapes against an organic aggregate so the eye catches them immediately, and
+ * the transverse seams double as a speed reference at 160 km/h.
+ *
+ * All of it stays inside the edge lines and clear of the start/finish, so no
+ * two families of decal ever fight for the same square metre of z-buffer.
+ */
+function buildRoadDecals(track: Track, strip: StripFn, setLift: (v: number) => void) {
+  const cl = track.cl;
+  const len = cl.length;
+  const rnd = mulberry32(70726);
+  const C_TAR = new THREE.Color(0.30, 0.29, 0.32);
+  const C_PATCH = new THREE.Color(0.46, 0.45, 0.49);
+
+  const clear = (d: number) => {
+    // keep off the start/finish furniture and out of the cobbled village
+    const dd = ((d % len) + len) % len;
+    if (dd < 34 || dd > len - 34) return false;
+    const si = Math.floor(dd / cl.ds) % cl.count;
+    return cl.cobble[si] < 0.5 && cl.kerb[si] > 0.5;
+  };
+  const halfAt = (d: number) => cl.half[Math.floor((((d % len) + len) % len) / cl.ds) % cl.count];
+
+  // --- transverse construction joints, one every ~31 m ---------------------
+  setLift(LIFT_SEAM);
+  for (let d = 40; d < len - 40; d += 31 + rnd() * 9) {
+    if (!clear(d)) continue;
+    const hw = halfAt(d) - 1.1;
+    // a joint is never dead square to the road, and never dead straight
+    const skew = (rnd() - 0.5) * 1.6;
+    const th = 0.07 + rnd() * 0.05;
+    const segs = 7;
+    for (let k = 0; k < segs; k++) {
+      const l0 = -hw + (2 * hw) * (k / segs), l1 = -hw + (2 * hw) * ((k + 1) / segs);
+      const s = d + skew * ((l0 + l1) * 0.5) / hw + (rnd() - 0.5) * 0.06;
+      strip(s, s + th, l0, l1, C_TAR, 0.34 + rnd() * 0.16, 1);
+    }
+  }
+
+  // --- patch repairs: darker, smoother rectangles of fresh binder ----------
+  setLift(LIFT_PATCH);
+  for (let n = 0; n < 16; n++) {
+    const d = 40 + rnd() * (len - 90);
+    if (!clear(d)) continue;
+    const hw = halfAt(d) - 1.6;
+    const lenP = 2.6 + rnd() * 5.5;
+    const wP = 1.4 + rnd() * 2.8;
+    const lat = (rnd() * 2 - 1) * Math.max(0, hw - wP * 0.5);
+    _c.copy(C_PATCH).multiplyScalar(0.82 + rnd() * 0.3);
+    strip(d, d + lenP, lat - wP * 0.5, lat + wP * 0.5, _c, 0.46 + rnd() * 0.16, 3);
+    // the seam of hot tar poured around the edge of the cut
+    strip(d - 0.08, d, lat - wP * 0.5, lat + wP * 0.5, C_TAR, 0.5, 2);
+    strip(d + lenP, d + lenP + 0.08, lat - wP * 0.5, lat + wP * 0.5, C_TAR, 0.5, 2);
+  }
+
+  // --- faded direction arrows on the approach to the hardest corners -------
+  setLift(LIFT_ARROW);
+  const curvy: { d: number; sign: number }[] = [];
+  for (let i = 0; i < cl.count; i += 8) {
+    if (Math.abs(cl.curv[i]) > 0.0135) curvy.push({ d: i * cl.ds, sign: Math.sign(cl.curv[i]) });
+  }
+  let lastD = -1e9;
+  for (const c of curvy) {
+    if (c.d - lastD < 150) continue;
+    const d = c.d - 46;                       // out at the braking board
+    if (!clear(d)) continue;
+    lastD = c.d;
+    // on the outside of the corner, where a kart on the ideal line is aimed
+    const lat = -c.sign * (halfAt(d) - 3.4);
+    const a = 0.30;
+    // shaft
+    strip(d, d + 3.2, lat - 0.28, lat + 0.28, C_PAINT, a, 1);
+    // head, as a stack of narrowing bands: a chevron without an alpha map
+    for (let k = 0; k < 5; k++) {
+      const u = k / 5, u1 = (k + 1) / 5;
+      const w = 1.15 * (1 - u1);
+      strip(d + 3.2 + u * 1.5, d + 3.2 + u1 * 1.5, lat - w, lat + w, C_PAINT, a, 1);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  Boost strips
+// ---------------------------------------------------------------------------
+
+function buildBoostPads(track: Track, lib: MatLib, root: THREE.Group) {
+  const cl = track.cl;
+  const b = newBuf();
+  const T = new THREE.Vector3(), D = new THREE.Vector3(), N = new THREE.Vector3();
+  const uvS = lib.scale('boost-pad', 6);
+  for (const pad of BOOST_PADS) {
+    const i0 = Math.floor(pad.t0 * cl.count), i1 = Math.floor(pad.t1 * cl.count);
+    const segs = Math.max(4, Math.round((i1 - i0) / 4));
+    const lenM = (i1 - i0) * cl.ds;
+    let prev = -1;
+    for (let s = 0; s <= segs; s++) {
+      const si = (i0 + Math.round(((i1 - i0) * s) / segs)) % cl.count;
+      const v = (s / segs) * (lenM / uvS);
+      const ring = b.pos.length / 3;
+      for (let k = 0; k < 2; k++) {
+        const L = pad.lat + (k ? pad.hw : -pad.hw);
+        track.crossPoint(si, L, _p);
+        const slope = -2 * CROWN * L / (cl.half[si] * cl.half[si]);
+        D.set(cl.bx[si], cl.by[si] + slope, cl.bz[si]).normalize();
+        T.set(cl.tx[si], cl.ty[si], cl.tz[si]);
+        N.crossVectors(D, T).normalize();
+        pushV(b, _p.x + N.x * 0.02, _p.y + N.y * 0.02, _p.z + N.z * 0.02, N.x, N.y, N.z, k, v, _white);
+      }
+      if (prev >= 0) quad(b, prev, prev + 1, ring + 1, ring);
+      prev = ring;
+    }
+  }
+  const mesh = new THREE.Mesh(finish(b), lib.get('boost-pad', () => boostMaterial()));
+  mesh.name = 'boost-pads';
+  mesh.renderOrder = 2;
+  root.add(mesh);
+}
+
+// ---------------------------------------------------------------------------
+//  Shoulder skirt — blends the road into the landscape, vertex coloured
+// ---------------------------------------------------------------------------
+
+const SKIRT_QS = [0, 0.45, 1.1, 2.0, 3.2, 4.8, 6.8, 9.2, 12, 15.4, 19.2, 22.6, SKIRT_W];
+
+function surfaceColor(surf: Surface, rock: number, y: number, x: number, z: number, out: THREE.Color) {
+  if (surf === Surface.Sand) out.copy(C_SAND);
+  else if (surf === Surface.Dirt) out.copy(C_DIRT);
+  else out.copy(C_GRASS).lerp(C_GRASS_T, 0.35 + tn2(x * 0.09, z * 0.09) * 0.3);
+  out.lerp(C_STONE, Math.min(0.92, rock));
+  // shorelines bleach out to sand whatever the zone says
+  out.lerp(C_SAND, (1 - ss(0.6, 3.4, y)) * 0.75);
+  out.multiplyScalar((1 + tn2(x * 0.013, z * 0.013) * 0.13) * GROUND_GAIN);
+}
+
+function buildSkirt(track: Track, lib: MatLib, root: THREE.Group) {
+  const cl = track.cl;
+  const rings = Math.round(cl.count / 6); // 3 m
+  const nq = SKIRT_QS.length;
+  const b = newBuf();
+
+  for (let side = -1; side <= 1; side += 2) {
+    const first = b.pos.length / 3;
+    // no duplicate closing ring: the loop is welded, so normals are seamless
+    for (let r = 0; r < rings; r++) {
+      const si = Math.round((r * cl.count) / rings) % cl.count;
+      const edge = cl.half[si] + KERB_W;
+      const rock = side < 0 ? cl.rockL[si] : cl.rockR[si];
+      const surf = (side < 0 ? cl.surfL[si] : cl.surfR[si]) as Surface;
+      for (let k = 0; k < nq; k++) {
+        const q = SKIRT_QS[k];
+        const L = side * (edge + q);
+        track.crossPoint(si, L, _p);
+        _p.y += track.detailAt(si, L, _p.x, _p.z);
+        surfaceColor(surf, rock, _p.y, _p.x, _p.z, _c);
+        // contact darkening where the shoulder meets the kerb: cheap AO that
+        // stops the road looking pasted on top of the terrain
+        _c.multiplyScalar(1 - (1 - ss(0, 3.5, q)) * 0.30);
+        pushV(b, _p.x, _p.y, _p.z, 0, 1, 0, _p.x / 9, _p.z / 9, _c);
+      }
+    }
+    for (let r = 0; r < rings; r++) {
+      const a0 = first + r * nq;
+      const a1 = first + ((r + 1) % rings) * nq;
+      for (let k = 0; k < nq - 1; k++) {
+        if (side < 0) quad(b, a0 + k, a1 + k, a1 + k + 1, a0 + k + 1);
+        else quad(b, a0 + k, a0 + k + 1, a1 + k + 1, a1 + k);
+      }
+    }
+  }
+
+  const geo = finish(b);
+  geo.computeVertexNormals();
+  const mesh = new THREE.Mesh(geo, lib.own('ground-blend', () => groundMaterial(lib)));
+  mesh.name = 'shoulders';
+  mesh.receiveShadow = true;
+  root.add(mesh);
+}
+
+// ---------------------------------------------------------------------------
+//  Terrain: cliffs, headland, beach and the sea basin
+// ---------------------------------------------------------------------------
+
+function buildTerrain(track: Track, lib: MatLib, root: THREE.Group) {
+  const cl = track.cl;
+  const cell = 8;
+  const x0 = track.hmX0, z0 = track.hmZ0;
+  const spanX = (track.hmW - 1) * track.hmCell, spanZ = (track.hmH - 1) * track.hmCell;
+  const w = Math.ceil(spanX / cell) + 1, h = Math.ceil(spanZ / cell) + 1;
+
+  const ys = new Float32Array(w * h);
+  const pxs = new Float32Array(w * h);
+  const pzs = new Float32Array(w * h);
+  const snapped = new Uint8Array(w * h);
+
+  for (let j = 0; j < h; j++) {
+    for (let i = 0; i < w; i++) {
+      const k = j * w + i;
+      const x = x0 + i * cell, z = z0 + j * cell;
+      const si = track.nearestStation(x, z);
+      const L = (x - cl.px[si]) * cl.hx[si] + (z - cl.pz[si]) * cl.hz[si];
+      const corridor = cl.half[si] + KERB_W + SKIRT_W;
+      if (Math.abs(L) < corridor) {
+        // Snap onto the skirt's outer edge, biased inward and down so the
+        // grid tucks *under* the ribbon: no gaps, no z-fighting.
+        const target = (L < 0 ? -1 : 1) * (corridor - 1.4);
+        track.crossPoint(si, target, _p);
+        _p.y += track.detailAt(si, target, _p.x, _p.z) - 0.3;
+        pxs[k] = _p.x; pzs[k] = _p.z; ys[k] = _p.y; snapped[k] = 1;
+      } else {
+        pxs[k] = x; pzs[k] = z; ys[k] = track.groundAt(x, z);
+      }
+    }
+  }
+
+  const b = newBuf();
+  for (let j = 0; j < h; j++) {
+    for (let i = 0; i < w; i++) {
+      const k = j * w + i;
+      const x = pxs[k], z = pzs[k], y = ys[k];
+      const kl = j * w + Math.max(0, i - 1), kr = j * w + Math.min(w - 1, i + 1);
+      const kd = Math.max(0, j - 1) * w + i, ku = Math.min(h - 1, j + 1) * w + i;
+      const grad = Math.hypot((ys[kl] - ys[kr]) / (2 * cell), (ys[kd] - ys[ku]) / (2 * cell));
+      const rock = Math.max(track.rockAt(x, z) * 0.55, ss(0.34, 0.85, grad));
+      surfaceColor(y < 2.6 ? Surface.Sand : Surface.Grass, rock, y, x, z, _c);
+      pushV(b, x, y, z, 0, 1, 0, x / 14, z / 14, _c);
+    }
+  }
+  for (let j = 0; j < h - 1; j++) {
+    for (let i = 0; i < w - 1; i++) {
+      const a = j * w + i, c = a + 1, d = a + w + 1, e = a + w;
+      // drop quads wholly under the sea, and those wholly hidden by the skirt
+      if (ys[a] < -5 && ys[c] < -5 && ys[d] < -5 && ys[e] < -5) continue;
+      if (snapped[a] && snapped[c] && snapped[d] && snapped[e]) continue;
+      quad(b, a, e, d, c);
+    }
+  }
+
+  const geo = finish(b);
+  geo.computeVertexNormals();
+  const mesh = new THREE.Mesh(geo, lib.own('ground-blend', () => groundMaterial(lib)));
+  mesh.name = 'terrain';
+  mesh.receiveShadow = true;
+  mesh.castShadow = true;
+  root.add(mesh);
+}
+
+function buildSea(track: Track, lib: MatLib, root: THREE.Group) {
+  const c = track.bounds.getCenter(new THREE.Vector3());
+  const geo = new THREE.PlaneGeometry(6000, 6000, 72, 72);
+  geo.rotateX(-Math.PI / 2);
+  const uvS = lib.scale('water-surface', 16);
+  const uv = geo.attributes.uv as THREE.BufferAttribute;
+  for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i) * 6000 / uvS, uv.getY(i) * 6000 / uvS);
+  const mesh = new THREE.Mesh(geo, lib.get('water-surface', () => seaMaterial(lib)));
+  mesh.position.set(c.x, SEA_Y, c.z);
+  // deliberately not called 'sea': the dedupe in Track.update looks for one
+  mesh.name = 'track-sea-fallback';
+  mesh.renderOrder = -1;
+  root.add(mesh);
+  track.registerSea(mesh);
+}
+
+// ---------------------------------------------------------------------------
+//  Guardrails: closed-profile Armco beam plus instanced posts
+// ---------------------------------------------------------------------------
+
+/** closed cross-section, [outward, up]; outward points away from the track */
+const ARMCO: [number, number][] = [
+  [-0.02, 0.00], [-0.09, 0.075], [-0.01, 0.15], [-0.09, 0.225], [-0.02, 0.30],
+  [0.06, 0.30], [0.06, 0.00],
+];
+
+function buildBarriers(track: Track, lib: MatLib, root: THREE.Group) {
+  const cl = track.cl;
+  const rings = Math.round(cl.count / 4); // 2 m
+  const rail = newBuf();
+  const posts: THREE.Matrix4[] = [];
+  const np = ARMCO.length;
+  const uvS = lib.scale('metal-painted', 1.5);
+
+  for (let side = -1; side <= 1; side += 2) {
+    let prev = -1;
+    let sinceLastPost = 1e9;
+    for (let r = 0; r <= rings; r++) {
+      const raw = Math.round((r * cl.count) / rings);
+      const si = raw % cl.count;
+      const type = side < 0 ? cl.wallL[si] : cl.wallR[si];
+      if (type !== WALL_GUARDRAIL) { prev = -1; continue; }
+      const off = side < 0 ? cl.wallOffL[si] : cl.wallOffR[si];
+      track.crossPoint(si, side * (cl.half[si] + off), _p);
+      const outX = side * cl.hx[si], outZ = side * cl.hz[si];
+      const ring = rail.pos.length / 3;
+      const dist = raw * cl.ds;
+      for (let k = 0; k < np; k++) {
+        const [dOut, dy] = ARMCO[k];
+        pushV(rail, _p.x + outX * dOut, _p.y + 0.5 + dy, _p.z + outZ * dOut,
+          0, 1, 0, dy / uvS, dist / uvS, _white);
+      }
+      if (prev >= 0) {
+        for (let k = 0; k < np; k++) {
+          const k2 = (k + 1) % np;
+          if (side < 0) quad(rail, prev + k, ring + k, ring + k2, prev + k2);
+          else quad(rail, prev + k, prev + k2, ring + k2, ring + k);
+        }
+      }
+      prev = ring;
+
+      sinceLastPost += cl.length / rings;
+      if (sinceLastPost >= 4.5) {
+        sinceLastPost = 0;
+        _q.setFromAxisAngle(_yAxis, Math.atan2(cl.tx[si], cl.tz[si]));
+        _p2.set(_p.x + outX * 0.03, _p.y + 0.34, _p.z + outZ * 0.03);
+        posts.push(new THREE.Matrix4().compose(_p2, _q, _sc));
+      }
+    }
+  }
+
+  const metal = lib.get('metal-painted', () => metalMaterial(lib));
+  if (rail.idx.length) {
+    const geo = finish(rail);
+    geo.computeVertexNormals();
+    const m = new THREE.Mesh(geo, metal);
+    m.name = 'guardrail';
+    m.castShadow = true; m.receiveShadow = true;
+    root.add(m);
+  }
+  if (posts.length) {
+    // an eight-sided post has no hard 90° edge to go black under the low sun
+    const pg = new THREE.CylinderGeometry(0.085, 0.105, 0.98, 8, 1);
+    const inst = new THREE.InstancedMesh(pg, metal, posts.length);
+    for (let i = 0; i < posts.length; i++) inst.setMatrixAt(i, posts[i]);
+    inst.instanceMatrix.needsUpdate = true;
+    inst.castShadow = true; inst.receiveShadow = true;
+    inst.name = 'guardrail-posts';
+    inst.frustumCulled = false;
+    root.add(inst);
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  Tunnel bore
+// ---------------------------------------------------------------------------
+
+function tunnelProfile(p: number, W: number, H: number): [number, number] {
+  if (p < 0.18) return [-W, -1.4 + 4.0 * (p / 0.18)];
+  if (p > 0.82) return [W, 2.6 - 4.0 * ((p - 0.82) / 0.18)];
+  const a = ((p - 0.18) / 0.64) * Math.PI;
+  return [-W * Math.cos(a), 2.6 + (H - 2.6) * Math.sin(a)];
+}
+
+function buildTunnel(track: Track, lib: MatLib, root: THREE.Group) {
+  const cl = track.cl;
+  const i0 = Math.floor((TUNNEL_T0 - 0.005) * cl.count);
+  const i1 = Math.floor((TUNNEL_T1 + 0.005) * cl.count);
+  const step = 4;
+  const NP = 22;
+  const b = newBuf();
+  const uvS = lib.scale('cliff-rock', 5);
+  const lights: THREE.Matrix4[] = [];
+  let prev = -1;
+  let sinceLight = 1e9;
+
+  for (let i = i0; i <= i1; i += step) {
+    const si = ((i % cl.count) + cl.count) % cl.count;
+    const W = cl.half[si] + 3.2, H = 8.6;
+    const dist = i * cl.ds;
+    const ring = b.pos.length / 3;
+    track.crossPoint(si, 0, _p2);
+    let arc = 0;
+    for (let k = 0; k < NP; k++) {
+      const [lat, up] = tunnelProfile(k / (NP - 1), W, H);
+      if (k > 0) {
+        const [pl, pu] = tunnelProfile((k - 1) / (NP - 1), W, H);
+        arc += Math.hypot(lat - pl, up - pu);
+      }
+      const x = _p2.x + cl.bx[si] * lat + cl.nx[si] * up;
+      const y = _p2.y + cl.by[si] * lat + cl.ny[si] * up;
+      const z = _p2.z + cl.bz[si] * lat + cl.nz[si] * up;
+      // normal points back toward the bore axis
+      const ax = -(cl.bx[si] * lat + cl.nx[si] * (up - H * 0.42));
+      const ay = -(cl.by[si] * lat + cl.ny[si] * (up - H * 0.42));
+      const az = -(cl.bz[si] * lat + cl.nz[si] * (up - H * 0.42));
+      const inv = 1 / Math.hypot(ax, ay, az);
+      pushV(b, x, y, z, ax * inv, ay * inv, az * inv, arc / uvS, dist / uvS, _white);
+    }
+    // wound so the front face is the one you see from inside the bore
+    if (prev >= 0) {
+      for (let k = 0; k < NP - 1; k++) quad(b, prev + k, ring + k, ring + k + 1, prev + k + 1);
+    }
+    prev = ring;
+
+    sinceLight += step * cl.ds;
+    if (sinceLight >= 9 && i > i0 + step * 2 && i < i1 - step * 2) {
+      sinceLight = 0;
+      _p2.set(_p2.x + cl.nx[si] * (H - 0.5), _p2.y + cl.ny[si] * (H - 0.5), _p2.z + cl.nz[si] * (H - 0.5));
+      _q.setFromAxisAngle(_yAxis, Math.atan2(cl.tx[si], cl.tz[si]));
+      lights.push(new THREE.Matrix4().compose(_p2, _q, _sc));
+    }
+  }
+
+  // wound to face inward, so plain front-face culling is exactly right here
+  const bore = new THREE.Mesh(finish(b), lib.get('cliff-rock', () => rockMaterial(lib)));
+  bore.name = 'tunnel-bore';
+  bore.castShadow = true;
+  bore.receiveShadow = true;
+  root.add(bore);
+
+  if (lights.length) {
+    const lg = new THREE.BoxGeometry(0.42, 0.14, 3.4);
+    const inst = new THREE.InstancedMesh(lg, lib.get('tunnel-light', () => lightMaterial()), lights.length);
+    for (let i = 0; i < lights.length; i++) inst.setMatrixAt(i, lights[i]);
+    inst.instanceMatrix.needsUpdate = true;
+    inst.name = 'tunnel-lights';
+    inst.frustumCulled = false;
+    root.add(inst);
+    // A rock tube with nothing in it is a black hole on screen. Five short-
+    // range warm point lights is the minimum that makes the section readable.
+    const every = Math.max(1, Math.floor(lights.length / 5));
+    for (let i = 0; i < lights.length; i += every) {
+      const l = new THREE.PointLight(0xffb35a, 260, 42, 2);
+      l.position.setFromMatrixPosition(lights[i]);
+      l.position.y -= 1.4;
+      l.name = 'tunnel-light';
+      root.add(l);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  Arched stone bridge over the inlet
+// ---------------------------------------------------------------------------
+
+/** closed parapet section, [outward, up]; the coping chamfers back inward */
+const PARAPET: [number, number][] = [
+  [0.0, 0.0], [0.0, 0.92], [-0.14, 1.04], [-0.34, 1.14], [-0.56, 1.04], [-0.62, 0.92], [-0.62, 0.0],
+];
+
+function buildBridge(track: Track, lib: MatLib, root: THREE.Group) {
+  const cl = track.cl;
+  const i0 = Math.floor(BRIDGE_T0 * cl.count), i1 = Math.floor(BRIDGE_T1 * cl.count);
+  const K = 56;
+  const spanM = (i1 - i0) * cl.ds;
+  const b = newBuf();
+  const uvS = lib.scale('stone-wall', 3);
+  const SPRING = 2.0;         // height the arch springs from
+  const FLOOR = -9.0;         // abutments run down into the gorge
+  const U0 = 0.11, U1 = 0.89; // springing points along the span
+
+  const stations: number[] = [];
+  const deckBottom: number[] = [];
+  for (let k = 0; k <= K; k++) {
+    const si = (i0 + Math.round(((i1 - i0) * k) / K)) % cl.count;
+    stations.push(si);
+    track.crossPoint(si, cl.half[si] + 2.3, _p);
+    deckBottom.push(_p.y - 1.6);
+  }
+  let crown = Infinity;
+  for (let k = 0; k <= K; k++) crown = Math.min(crown, deckBottom[k]);
+  const rise = crown - 0.9 - SPRING;
+  const soffit = (u: number) => {
+    if (u <= U0 || u >= U1) return FLOOR;
+    return SPRING + rise * Math.sin(Math.PI * (u - U0) / (U1 - U0));
+  };
+
+  // --- spandrel walls: deck fascia down to the arch extrados ---
+  for (let side = -1; side <= 1; side += 2) {
+    let prev = -1;
+    for (let k = 0; k <= K; k++) {
+      const si = stations[k];
+      const u = k / K;
+      track.crossPoint(si, side * (cl.half[si] + 2.3), _p);
+      const outX = side * cl.hx[si], outZ = side * cl.hz[si];
+      const top = _p.y + 0.15, bot = soffit(u);
+      const ring = b.pos.length / 3;
+      const v = u * spanM / uvS;
+      pushV(b, _p.x, top, _p.z, outX, 0, outZ, v, 0, _white);
+      pushV(b, _p.x, bot, _p.z, outX, 0, outZ, v, (top - bot) / uvS, _white);
+      // vertex 0 is up, vertex 1 is down; +T is prev→ring
+      if (prev >= 0) {
+        if (side < 0) quad(b, prev, prev + 1, ring + 1, ring);
+        else quad(b, prev, ring, ring + 1, prev + 1);
+      }
+      prev = ring;
+    }
+  }
+
+  // --- arch barrel (curved underside between the spandrels) ---
+  {
+    let prev = -1;
+    for (let k = 0; k <= K; k++) {
+      const si = stations[k];
+      const u = k / K;
+      const y = soffit(u);
+      const ring = b.pos.length / 3;
+      const v = u * spanM / uvS;
+      for (let s = -1; s <= 1; s += 2) {
+        track.crossPoint(si, s * (cl.half[si] + 2.3), _p);
+        pushV(b, _p.x, y, _p.z, 0, -1, 0, v, (s + 1) / 2, _white);
+      }
+      // seen from below, so wind the opposite way to a road surface
+      if (prev >= 0) quad(b, prev, ring, ring + 1, prev + 1);
+      prev = ring;
+    }
+  }
+
+  // --- parapets ---
+  const npar = PARAPET.length;
+  for (let side = -1; side <= 1; side += 2) {
+    let prev = -1;
+    for (let k = 0; k <= K; k++) {
+      const si = stations[k];
+      track.crossPoint(si, side * (cl.half[si] + 1.9), _p);
+      const outX = side * cl.hx[si], outZ = side * cl.hz[si];
+      const ring = b.pos.length / 3;
+      const dist = (k / K) * spanM;
+      for (let s = 0; s < npar; s++) {
+        const [dOut, dy] = PARAPET[s];
+        pushV(b, _p.x + outX * dOut, _p.y + dy, _p.z + outZ * dOut,
+          0, 1, 0, dy / uvS, dist / uvS, _white);
+      }
+      if (prev >= 0) {
+        for (let s = 0; s < npar; s++) {
+          const s2 = (s + 1) % npar;
+          if (side < 0) quad(b, prev + s, ring + s, ring + s2, prev + s2);
+          else quad(b, prev + s, prev + s2, ring + s2, ring + s);
+        }
+      }
+      prev = ring;
+    }
+  }
+
+  const geo = finish(b);
+  geo.computeVertexNormals();
+  const mesh = new THREE.Mesh(geo, twoSided(lib.get('stone-wall', () => stoneMaterial(lib))));
+  mesh.name = 'bridge';
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  root.add(mesh);
+}

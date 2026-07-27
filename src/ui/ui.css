@@ -1,0 +1,1134 @@
+/* ==========================================================================
+   Kart Royale — UI layer.
+   Everything is scoped under .kr so nothing here can leak into the canvas host.
+   Sizing is vmin-driven with clamps at both ends: readable at 1280x720, still
+   proportionate at 2560x1440, and never larger than it needs to be.
+   ========================================================================== */
+
+.kr {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+  isolation: isolate;
+
+  /* --- ink & paper: never pure black, never pure white --- */
+  --ink-2: #060a16;
+  --paper: #f8f2e6;
+  --gold: #ffcf6b;
+  /* Mini-turbo tier tint. The HUD overwrites this per frame from TIER_COLORS;
+     the value here is the "charging, no tier yet" grey. */
+  --tier: #a8b6cc;
+
+  /* Title-safe frame. The vertical margin can be tight (nothing important
+     lives at the top/bottom edge of a 16:9 frame) but the horizontal one has
+     to clear a proper 3.5-4% safe area, so it is driven by vw, not vmin. */
+  --pad-y: clamp(12px, 2.6vmin, 40px);
+  --pad-x: clamp(18px, 3.6vw, 76px);
+
+  /* --- one radius scale, two steps ------------------------------------- */
+  --r: clamp(7px, 1.5vmin, 22px);        /* chips, toasts, small plates */
+  --r-lg: calc(var(--r) * 1.55);         /* the big plates: map, item, dial */
+
+  /* --- one plate recipe. Every container in the HUD consumes this. ------ */
+  --plate-bg:
+    linear-gradient(155deg, rgba(255, 255, 255, 0.18), rgba(255, 255, 255, 0.02) 42%,
+                    rgba(8, 12, 24, 0.30) 100%),
+    linear-gradient(180deg, rgba(20, 27, 50, 0.80), rgba(6, 10, 22, 0.92));
+  --plate-border: rgba(255, 240, 214, 0.22);
+  --plate-shadow:
+    0 0.2vmin 0.5vmin rgba(4, 7, 15, 0.50),
+    0 1.6vmin 3.4vmin rgba(4, 7, 15, 0.42),
+    inset 0 0.14vmin 0 rgba(255, 246, 228, 0.32),
+    inset 0 -0.14vmin 0 rgba(4, 7, 15, 0.60);
+
+  /* The single gold ramp in the system. Variants retint it by overriding
+     this custom property rather than by declaring a second gradient. */
+  --gold-ramp: linear-gradient(180deg, #fffdf6 5%, #ffe7ae 45%, #f7ae3c 84%, #e07c14 100%);
+  /* Optional extra glow appended to the .kr-gold filter chain. */
+  --gold-glow: drop-shadow(0 0 0 rgba(0, 0, 0, 0));
+
+  --f: "SF Pro Display", "Segoe UI Variable Display", "Segoe UI", system-ui,
+       -apple-system, "Helvetica Neue", Arial, sans-serif;
+
+  /* Real easing. Nothing in here is allowed to be linear. */
+  --e-out: cubic-bezier(0.16, 0.84, 0.44, 1);
+  --e-soft: cubic-bezier(0.33, 0, 0.16, 1);
+  --e-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  font-family: var(--f);
+  color: var(--paper);
+  font-variant-numeric: tabular-nums lining-nums;
+  font-feature-settings: "tnum" 1, "lnum" 1, "case" 1, "ss01" 1;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* --- shared surfaces ------------------------------------------------------ */
+
+/* The one container idiom. Minimap, item box, speedometer scrim, toast and
+   lap-split pill are all this plate at one of two radii — nothing in the HUD
+   is allowed to invent its own border weight, shadow recipe or corner. */
+.kr-plate {
+  background: var(--plate-bg);
+  border: 1px solid var(--plate-border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--plate-shadow);
+}
+/* small-format plate: same recipe, tighter corner */
+.kr-plate-sm { border-radius: var(--r); }
+
+
+/* Outline + drop shadow so type survives a blown-out golden-hour sky. */
+.kr-ink {
+  paint-order: stroke fill;
+  -webkit-text-stroke: 0.052em var(--ink-2);
+  text-shadow:
+    0 0.035em 0 rgba(6, 10, 22, 0.55),
+    0 0.09em 0.26em rgba(4, 7, 16, 0.55),
+    0 0 0.9em rgba(4, 7, 16, 0.35);
+}
+
+.kr-ink-thin {
+  paint-order: stroke fill;
+  -webkit-text-stroke: 0.035em var(--ink-2);
+  text-shadow: 0 0.06em 0.22em rgba(4, 7, 16, 0.6);
+}
+
+/* Gradient-filled headline type.
+   `-webkit-text-stroke` must NOT be used together with `background-clip: text`
+   — Chromium clips the stroke against the fill geometry and leaves ghost
+   contours inside counters and diagonals (P, A, R are the obvious victims).
+   Chained zero-blur drop-shadows give a genuine outline that composes with the
+   clipped gradient instead. */
+.kr-gold {
+  background-image: var(--gold-ramp);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  filter:
+    drop-shadow(0.024em 0 0 var(--ink-2))
+    drop-shadow(-0.024em 0 0 var(--ink-2))
+    drop-shadow(0 0.024em 0 var(--ink-2))
+    drop-shadow(0 -0.024em 0 var(--ink-2))
+    drop-shadow(0 0.05em 0.015em rgba(6, 10, 22, 0.8))
+    drop-shadow(0 0.09em 0.28em rgba(4, 7, 16, 0.5))
+    var(--gold-glow);
+  transition: filter 0.26s var(--e-out);
+}
+
+/* Secondary type. Opaque fills, never alpha: `paint-order: stroke fill` puts a
+   dark casing behind the glyph, and a translucent fill lets that casing bleed
+   through and turns the glyph to mud. Hierarchy comes from the colour value,
+   not from the alpha. */
+.kr-label {
+  font-size: clamp(11px, 1.7vmin, 22px);
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: #ece4d4;
+  paint-order: stroke fill;
+  -webkit-text-stroke: 0.035em var(--ink-2);
+  text-shadow: 0 0.07em 0.24em rgba(4, 7, 16, 0.75);
+}
+
+/* ==========================================================================
+   Full-screen atmospherics
+   ========================================================================== */
+
+.kr-vig,
+.kr-boost,
+.kr-drift,
+.kr-flash {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  will-change: opacity;
+}
+
+.kr-vig {
+  background: radial-gradient(ellipse 74% 64% at 50% 52%,
+              rgba(4, 7, 18, 0) 42%, rgba(4, 7, 18, 0.42) 78%, rgba(3, 5, 14, 0.82) 100%);
+  opacity: 0;
+}
+
+/* A warm rim, not a wash: the frame must still read at the horizon when this
+   is at full strength stacked on top of the speed vignette. */
+.kr-boost {
+  background:
+    radial-gradient(ellipse 62% 56% at 50% 50%,
+      rgba(255, 176, 80, 0) 68%, rgba(255, 152, 62, 0.16) 88%, rgba(255, 116, 44, 0.34) 100%),
+    radial-gradient(ellipse 130% 26% at 50% 112%,
+      rgba(255, 206, 130, 0.22), rgba(255, 206, 130, 0) 70%);
+  mix-blend-mode: screen;
+  opacity: 0;
+}
+
+/* Edge tint only. The precise charge read lives on the speedometer ring; this
+   is peripheral-vision confirmation and must never colour-cast the scene. */
+.kr-drift {
+  background: radial-gradient(ellipse 72% 64% at 50% 54%,
+              transparent 64%, var(--tier) 116%);
+  mix-blend-mode: screen;
+  opacity: 0;
+  transition: background 0.22s var(--e-out);
+}
+
+.kr-flash {
+  background: radial-gradient(circle at 50% 48%, #fffdf4 0%, #ffe9c0 45%, rgba(255, 220, 160, 0) 78%);
+  opacity: 0;
+}
+.kr-flash.on { animation: kr-flash 0.62s var(--e-out) both; }
+@keyframes kr-flash {
+  0%   { opacity: 0; transform: scale(1.25); }
+  9%   { opacity: 0.92; transform: scale(1); }
+  100% { opacity: 0; transform: scale(1.06); }
+}
+
+/* ==========================================================================
+   HUD frame
+   ========================================================================== */
+
+.kr-hud {
+  position: absolute;
+  top: calc(var(--pad-y) + env(safe-area-inset-top, 0px));
+  right: calc(var(--pad-x) + env(safe-area-inset-right, 0px));
+  bottom: calc(var(--pad-y) + env(safe-area-inset-bottom, 0px));
+  left: calc(var(--pad-x) + env(safe-area-inset-left, 0px));
+  transition: opacity 0.42s var(--e-soft), transform 0.42s var(--e-soft), filter 0.42s var(--e-soft);
+}
+.kr.is-blocked .kr-hud {
+  opacity: 0;
+  transform: scale(0.965);
+  filter: blur(8px);
+}
+.kr.is-dimmed .kr-hud {
+  opacity: 0.28;
+  filter: blur(3px) saturate(0.5);
+}
+
+/* --- lap counter (top-left) ---------------------------------------------- */
+
+.kr-lap { position: absolute; top: 0; left: 0; }
+.kr-lap-in {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  transform-origin: 0% 50%;
+}
+.kr-lap-in.punch { animation: kr-punch 0.62s var(--e-spring) both; }
+
+.kr-lap-nums {
+  display: flex;
+  align-items: baseline;
+  line-height: 0.86;
+  margin-top: 0.2vmin;
+}
+.kr-lap-cur {
+  font-size: clamp(38px, 8.2vmin, 112px);
+  font-weight: 900;
+  letter-spacing: -0.03em;
+  color: var(--paper);
+}
+/* Opaque tints rather than alpha — see .kr-label. Both of these carry their own
+   casing at their own size, so the "/3" survives a blown-out sky exactly like
+   the "1" beside it does. */
+.kr-lap-sep {
+  font-size: clamp(20px, 4vmin, 54px);
+  font-weight: 800;
+  color: #b9ae99;
+  margin: 0 0.1em 0 0.14em;
+  transform: translateY(-0.06em);
+  -webkit-text-stroke: 0.05em var(--ink-2);
+}
+.kr-lap-tot {
+  font-size: clamp(20px, 4.1vmin, 56px);
+  font-weight: 800;
+  color: #ded4c1;
+  -webkit-text-stroke: 0.05em var(--ink-2);
+}
+.kr-lap.final .kr-lap-cur { color: var(--gold); }
+
+/* lap-split flash */
+.kr-split {
+  position: absolute;
+  top: clamp(58px, 11vmin, 150px);
+  left: 0;
+  opacity: 0;
+  transform-origin: 0% 50%;
+}
+.kr-split.on { animation: kr-split 2.5s var(--e-out) both; }
+.kr-split-pill {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.7em;
+  padding: 0.42em 0.9em 0.46em;
+  border-radius: var(--r);
+  background: var(--plate-bg);
+  border: 1px solid var(--plate-border);
+  box-shadow: var(--plate-shadow);
+  font-size: clamp(11px, 1.7vmin, 22px);
+}
+.kr-split-k { font-weight: 800; letter-spacing: 0.18em; text-transform: uppercase; color: var(--gold); }
+.kr-split-v { font-weight: 800; letter-spacing: 0.01em; font-size: 1.5em; }
+.kr-split.best .kr-split-pill {
+  border-color: rgba(255, 214, 110, 0.85);
+  box-shadow: 0 0 2.2vmin rgba(255, 200, 100, 0.5), var(--plate-shadow);
+}
+@keyframes kr-split {
+  0%   { opacity: 0; transform: translateX(-2.4vmin) scale(0.9); }
+  9%   { opacity: 1; transform: translateX(0) scale(1.04); }
+  16%  { transform: translateX(0) scale(1); }
+  82%  { opacity: 1; transform: translateX(0) scale(1); }
+  100% { opacity: 0; transform: translateX(-1.6vmin) scale(0.96); }
+}
+
+/* --- timer (top-right) ---------------------------------------------------- */
+
+.kr-timer { position: absolute; top: 0; right: 0; text-align: right; }
+.kr-timer-v {
+  font-size: clamp(26px, 5.4vmin, 74px);
+  font-weight: 800;
+  letter-spacing: 0.005em;
+  line-height: 0.94;
+  margin-top: 0.24vmin;
+  font-variant-numeric: tabular-nums;
+}
+.kr-timer .kr-label { display: block; margin-right: 0.12em; }
+
+/* --- position (left, vertically centred) ---------------------------------- */
+
+.kr-pos {
+  position: absolute;
+  left: 0;
+  top: 52%;
+  transform: translateY(-50%) scale(1);
+  transform-origin: 0% 50%;
+  transition: transform 0.5s var(--e-spring);
+}
+/* A shaped scrim so the lockup is *placed* rather than dropped on whatever the
+   world happens to be showing. Left-anchored radial, sized to the glyph box —
+   it fades out to nothing on the right so it never reads as a box. */
+.kr-pos::before {
+  content: "";
+  position: absolute;
+  /* generous box so the falloff completes inside it — a radial that reaches
+     the edge with alpha left on it clips into a visible rectangle */
+  inset: -4vmin -10vmin -4vmin -7vmin;
+  z-index: -1;
+  background: radial-gradient(ellipse 40% 44% at 42% 50%,
+              rgba(6, 10, 22, 0.52) 0%, rgba(6, 10, 22, 0.30) 46%, rgba(6, 10, 22, 0) 100%);
+  pointer-events: none;
+  transition: background 0.4s var(--e-out);
+}
+.kr-pos-in {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  transform-origin: 12% 60%;
+  line-height: 0.8;
+}
+.kr-pos-in.punch { animation: kr-posPunch 0.72s var(--e-spring) both; }
+.kr-pos-n {
+  font-size: clamp(56px, 13vmin, 178px);
+  font-weight: 900;
+  letter-spacing: -0.045em;
+}
+/* The suffix is the same word as the numeral, so it takes the same fill and the
+   same outline (.kr-gold). `margin-top` is the cap-height correction: both
+   spans top-align in the flex row, and because half-leading scales with each
+   font-size the small span's cap already sits ~0.14em (of its own size) above
+   the numeral's — this puts the two cap lines level. */
+.kr-pos-s {
+  font-size: clamp(22px, 4.6vmin, 62px);
+  font-weight: 900;
+  letter-spacing: 0.01em;
+  margin-top: 0.155em;
+  margin-left: 0.16em;
+}
+/* Direction of the last change, held ~600 ms: the one gold ramp is retinted
+   and a chevron rides out with the punch. No second position readout exists. */
+.kr-pos.gain {
+  --gold-ramp: linear-gradient(180deg, #f6fff8 5%, #cdf7d8 42%, #57d287 82%, #16904c 100%);
+  --gold-glow: drop-shadow(0 0 0.09em rgba(110, 240, 160, 0.85));
+}
+.kr-pos.loss {
+  --gold-ramp: linear-gradient(180deg, #fff6f3 5%, #ffcfc4 42%, #ff7a63 82%, #c22d1c 100%);
+  --gold-glow: drop-shadow(0 0 0.09em rgba(255, 120, 92, 0.8));
+}
+.kr-pos-arrow {
+  position: absolute;
+  left: 100%;
+  top: 0.1em;
+  margin-left: 0.22em;
+  font-size: clamp(16px, 3vmin, 40px);
+  font-weight: 900;
+  line-height: 1;
+  opacity: 0;
+  color: var(--paper);
+  text-shadow: 0 0.05em 0.16em rgba(4, 7, 16, 0.8);
+}
+.kr-pos.gain .kr-pos-arrow { color: #7ef0a4; }
+.kr-pos.loss .kr-pos-arrow { color: #ff8a7a; }
+.kr-pos-arrow.run { animation: kr-posArrow 0.68s var(--e-out) both; }
+@keyframes kr-posArrow {
+  0%   { opacity: 0; transform: translateY(0.5em) scale(0.7); }
+  22%  { opacity: 1; transform: translateY(0) scale(1.12); }
+  34%  { transform: translateY(0) scale(1); }
+  68%  { opacity: 1; transform: translateY(0) scale(1); }
+  100% { opacity: 0; transform: translateY(-0.35em) scale(0.95); }
+}
+
+/* Leading is categorical, not a second gradient: a held scale step, a warm
+   glow behind the numeral and a hotter scrim. It is the only persistent state
+   change in the HUD, and it looks like one. */
+.kr-pos.lead { transform: translateY(-50%) scale(1.08); }
+.kr-pos.lead:not(.gain):not(.loss) {
+  --gold-glow: drop-shadow(0 0 0.10em rgba(255, 208, 110, 0.9))
+               drop-shadow(0 0 0.30em rgba(255, 176, 60, 0.55));
+}
+.kr-pos.lead::before {
+  background:
+    radial-gradient(ellipse 30% 34% at 42% 50%, rgba(255, 176, 60, 0.26), rgba(255, 176, 60, 0) 100%),
+    radial-gradient(ellipse 40% 44% at 42% 50%,
+      rgba(12, 8, 3, 0.64) 0%, rgba(10, 8, 8, 0.38) 46%, rgba(6, 10, 22, 0) 100%);
+}
+
+/* --- minimap (top-centre) / toast slot (bottom-centre) -------------------- */
+
+/* Bottom-centre column, transient content only. The chase camera keeps the
+   player's kart at bottom-centre, so anything permanent parked here lands on
+   top of the kart; the toast slot gets away with it because it is empty most
+   of the time and never lasts more than a couple of seconds. */
+.kr-bottom {
+  position: absolute;
+  left: 50%;
+  bottom: 0;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1.1vmin;
+  width: clamp(140px, 23vmin, 320px);
+}
+
+/* Top-centre, which in a chase-cam racer is sky above the horizon in almost
+   every frame — clear of both the kart and the road ahead. ART_DIRECTION §7
+   sanctions either end of the centre column; this is the end that does not
+   occlude the subject. */
+.kr-topmid {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  transform: translateX(-50%);
+  width: clamp(140px, 23vmin, 320px);
+}
+
+.kr-map {
+  position: relative;
+  width: 100%;
+  padding: 0.9vmin;
+  /* Near-opaque, and no backdrop blur: world geometry bleeding through the
+     track ribbon destroys the one thing this panel exists to show. Losing the
+     blur is also a free frame-time win. */
+  background:
+    linear-gradient(155deg, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0.02) 42%,
+                    rgba(8, 12, 24, 0.30) 100%),
+    linear-gradient(180deg, rgba(17, 23, 44, 0.94), rgba(5, 8, 18, 0.97));
+}
+.kr-map canvas { display: block; width: 100%; height: auto; }
+.kr-map::after {
+  /* a soft top sheen keeps the panel from reading as a flat rectangle */
+  content: "";
+  position: absolute;
+  inset: 1px 1px auto 1px;
+  height: 42%;
+  border-radius: var(--r-lg) var(--r-lg) 40% 40% / var(--r-lg) var(--r-lg) 12% 12%;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.09), rgba(255, 255, 255, 0));
+  pointer-events: none;
+}
+
+/* --- item box (bottom-left) ----------------------------------------------- */
+
+.kr-item {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: clamp(84px, 15.5vmin, 210px);
+  height: clamp(84px, 15.5vmin, 210px);
+}
+/* The plate never changes identity between empty and full: same border colour,
+   same recipe. Holding an item is expressed by the --item-tint glow and the
+   sheen alone, so the widget always reads as one component. */
+.kr-item-frame {
+  position: absolute;
+  inset: 0;
+  border-radius: var(--r-lg);
+  background: var(--plate-bg);
+  border: 1px solid var(--plate-border);
+  box-shadow: var(--plate-shadow), inset 0 0 3vmin rgba(0, 0, 0, 0.35);
+  transition: box-shadow 0.3s var(--e-out);
+  overflow: hidden;
+}
+.kr-item-frame::before {
+  /* slow diagonal sheen sweeping the plate */
+  content: "";
+  position: absolute;
+  inset: -40%;
+  background: linear-gradient(115deg, transparent 38%, rgba(255, 248, 225, 0.14) 48%,
+              transparent 58%);
+  animation: kr-sheen 6.5s var(--e-soft) infinite;
+}
+/* Empty state: a recessed well with an embossed item-box diamond struck into
+   the floor. No dashed stroke, no "?" — this is a slot with nothing in it, not
+   a missing asset. */
+.kr-item-frame::after {
+  content: "";
+  position: absolute;
+  inset: 11%;
+  border-radius: calc(var(--r-lg) * 0.5);
+  background: rgba(4, 7, 16, 0.28);
+  box-shadow:
+    inset 0 0.5vmin 1.4vmin rgba(3, 5, 13, 0.72),
+    inset 0 -0.14vmin 0 rgba(255, 246, 228, 0.10);
+  opacity: 1;
+  transition: opacity 0.26s var(--e-out);
+}
+.kr-item.has-item .kr-item-frame::after,
+.kr-item.spinning .kr-item-frame::after { opacity: 0; }
+
+.kr-item-motif {
+  position: absolute;
+  inset: 24%;
+  opacity: 0.12;
+  transition: opacity 0.26s var(--e-out);
+  animation: kr-motif 5.2s var(--e-soft) infinite;
+}
+.kr-item-motif svg { width: 100%; height: 100%; display: block; }
+.kr-item.has-item .kr-item-motif,
+.kr-item.spinning .kr-item-motif { opacity: 0; animation: none; }
+@keyframes kr-motif {
+  0%, 100% { opacity: 0.10; transform: scale(0.985); }
+  50%      { opacity: 0.16; transform: scale(1.015); }
+}
+
+.kr-item.has-item .kr-item-frame {
+  box-shadow:
+    0 0 2.6vmin color-mix(in srgb, var(--item-tint, #fff) 46%, transparent),
+    var(--plate-shadow);
+}
+.kr-item.spinning .kr-item-frame {
+  box-shadow:
+    0 0 3.6vmin rgba(255, 214, 130, 0.65),
+    inset 0 0 2.6vmin rgba(255, 214, 130, 0.28),
+    var(--plate-shadow);
+}
+.kr-item-icon {
+  position: absolute;
+  inset: 8%;
+  transform-origin: 50% 58%;
+  transition: transform 0.12s var(--e-out), opacity 0.12s linear;
+}
+.kr-item-icon canvas { width: 100%; height: 100%; display: block; }
+.kr-item.spinning .kr-item-icon { transform: scaleY(1.10) scaleX(0.96); opacity: 0.88; }
+.kr-item-icon.land { animation: kr-itemLand 0.72s var(--e-spring) both; }
+
+.kr-item-count {
+  position: absolute;
+  right: -3%;
+  bottom: -3%;
+  min-width: 2.1em;
+  padding: 0.12em 0.34em 0.16em;
+  text-align: center;
+  border-radius: 999px;
+  font-size: clamp(11px, 2vmin, 26px);
+  font-weight: 900;
+  letter-spacing: 0.01em;
+  color: var(--ink-2);
+  background: linear-gradient(180deg, #fff3c8, #ffc84e 55%, #ee9a18);
+  border: 1px solid rgba(60, 34, 8, 0.5);
+  box-shadow: 0 0.4vmin 1.2vmin rgba(4, 7, 16, 0.6), inset 0 0.12vmin 0 rgba(255, 255, 255, 0.7);
+  opacity: 0;
+  transform: scale(0.5);
+  transition: opacity 0.24s var(--e-out), transform 0.34s var(--e-spring);
+}
+.kr-item.multi .kr-item-count { opacity: 1; transform: scale(1); }
+
+@keyframes kr-sheen {
+  0%, 62% { transform: translateX(-58%); }
+  86%, 100% { transform: translateX(58%); }
+}
+@keyframes kr-itemLand {
+  0%   { transform: scale(1.42) rotate(-5deg); }
+  38%  { transform: scale(0.90) rotate(2.5deg); }
+  66%  { transform: scale(1.08) rotate(-1deg); }
+  100% { transform: scale(1) rotate(0deg); }
+}
+
+/* --- speedometer (bottom-right) ------------------------------------------- */
+
+.kr-speed {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: clamp(140px, 26.5vmin, 360px);
+  aspect-ratio: 1 / 0.95;
+  transform-origin: 100% 100%;
+}
+/* The dial gets the same plate as the item box and the map — it was the one
+   widget with no container at all, which is why it dissolved into the grass.
+   The radial scrim on top darkens the centre where the ticks and needle live. */
+.kr-speed::before {
+  content: "";
+  position: absolute;
+  inset: 7% 0 2% 0;
+  border-radius: var(--r-lg);
+  background:
+    radial-gradient(circle at 50% 55%, rgba(4, 7, 16, 0.62) 0%,
+                    rgba(4, 7, 16, 0.42) 56%, rgba(4, 7, 16, 0.10) 82%,
+                    rgba(4, 7, 16, 0) 100%),
+    var(--plate-bg);
+  border: 1px solid var(--plate-border);
+  box-shadow: var(--plate-shadow);
+}
+.kr-speed canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+/* mini-turbo tier lock-in: one spring pop on the whole instrument */
+.kr-speed.tier { animation: kr-dialPop 0.52s var(--e-spring) both; }
+@keyframes kr-dialPop {
+  0%   { transform: scale(1); }
+  26%  { transform: scale(1.15); }
+  100% { transform: scale(1); }
+}
+.kr-speed-read {
+  /* sits in the open wedge between the arc ends — the needle never reaches it */
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 65.5%;
+  text-align: center;
+  line-height: 0.88;
+}
+.kr-speed-n {
+  font-size: clamp(24px, 4.7vmin, 63px);
+  font-weight: 900;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+  color: var(--paper);
+  transition: color 0.2s var(--e-out);
+}
+.kr-speed.red .kr-speed-n { color: #ffd9a0; }
+.kr-speed.boosting .kr-speed-n {
+  color: #fff4d2;
+  text-shadow: 0 0 1.4vmin rgba(255, 180, 90, 0.9), 0 0.09em 0.26em rgba(4, 7, 16, 0.55);
+}
+/* 0.3em tracking is a caps device; on a lowercase label with a slash it just
+   shatters the word into "k m / h". Uppercase, near-normal tracking. */
+.kr-speed-u {
+  display: block;
+  margin-top: 0.4em;
+  font-size: clamp(9px, 1.35vmin, 18px);
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #d8cfbe;
+  paint-order: stroke fill;
+  -webkit-text-stroke: 0.035em var(--ink-2);
+  text-shadow: 0 0.08em 0.26em rgba(4, 7, 16, 0.8);
+}
+
+/* --- toast: ONE slot, transient events only -------------------------------- */
+
+/* A single-slot channel. Every toast occupies the same grid cell, so two can
+   never coexist as a stack — an incoming one crossfades the outgoing one out
+   in place. Nothing that the HUD already displays permanently (position, lap,
+   speed) is ever allowed in here; this is for item pickup, hits, taking the
+   lead and finishing. */
+.kr-toasts {
+  position: relative;
+  display: grid;
+  justify-items: center;
+  align-items: end;
+  width: 100%;
+  height: clamp(28px, 4.6vmin, 60px);
+  pointer-events: none;
+}
+.kr-toast {
+  grid-area: 1 / 1;
+  display: flex;
+  align-items: center;
+  gap: 0.7em;
+  padding: 0.5em 1.1em 0.55em;
+  border-radius: var(--r);
+  white-space: nowrap;
+  font-size: clamp(11px, 1.85vmin, 24px);
+  font-weight: 800;
+  letter-spacing: 0.10em;
+  text-transform: uppercase;
+  color: var(--paper);
+  background: var(--plate-bg);
+  border: 1px solid var(--tc, var(--plate-border));
+  box-shadow: var(--plate-shadow),
+              0 0 1.6vmin color-mix(in srgb, var(--tc, #fff) 30%, transparent);
+  animation: kr-toast 2.4s var(--e-out) both;
+  text-shadow: 0 0.08em 0.22em rgba(4, 7, 16, 0.7);
+}
+.kr-toast.out { animation: kr-toastOut 0.18s var(--e-soft) both; }
+.kr-toast i {
+  font-style: normal;
+  font-size: 1.15em;
+  line-height: 1;
+  color: var(--tc, var(--gold));
+}
+@keyframes kr-toast {
+  0%   { opacity: 0; transform: translateY(2.2vmin) scale(0.88); }
+  8%   { opacity: 1; transform: translateY(0) scale(1.03); }
+  14%  { transform: translateY(0) scale(1); }
+  80%  { opacity: 1; transform: translateY(0) scale(1); }
+  100% { opacity: 0; transform: translateY(-1.4vmin) scale(0.97); }
+}
+@keyframes kr-toastOut {
+  0%   { opacity: 1; transform: translateY(0) scale(1); }
+  100% { opacity: 0; transform: translateY(-0.9vmin) scale(0.94); }
+}
+
+/* --- countdown ------------------------------------------------------------ */
+
+.kr-count {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+}
+.kr-count-n {
+  position: relative;
+  font-size: clamp(96px, 26vmin, 400px);
+  font-weight: 900;
+  letter-spacing: -0.04em;
+  line-height: 1;
+  opacity: 0;
+}
+.kr-count-n.go {
+  font-size: clamp(76px, 21vmin, 320px);
+  letter-spacing: -0.02em;
+  background: linear-gradient(180deg, #fdfff6 4%, #d6ffd0 36%, #6fe06a 72%, #1d9c38 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+}
+.kr-count-n.run { animation: kr-countIn 1.02s var(--e-out) both; }
+.kr-count-n.go.run { animation: kr-goIn 1.1s var(--e-spring) both; }
+
+/* No `filter` in these keyframes — .kr-gold owns the filter chain that draws
+   the outline, and animating filter here would wipe it out mid-flight. */
+@keyframes kr-countIn {
+  0%   { opacity: 0; transform: scale(2.6); }
+  20%  { opacity: 1; transform: scale(1.02); }
+  30%  { transform: scale(1); }
+  70%  { opacity: 1; transform: scale(0.97); }
+  100% { opacity: 0; transform: scale(1.34); }
+}
+@keyframes kr-goIn {
+  0%   { opacity: 0; transform: scale(0.4) rotate(-7deg); }
+  26%  { opacity: 1; transform: scale(1.16) rotate(2deg); }
+  40%  { transform: scale(1) rotate(0deg); }
+  72%  { opacity: 1; transform: scale(1.02); }
+  100% { opacity: 0; transform: scale(1.5); }
+}
+
+.kr-count-ring {
+  position: absolute;
+  width: clamp(120px, 30vmin, 460px);
+  aspect-ratio: 1;
+  border-radius: 50%;
+  border: 0.5vmin solid rgba(255, 226, 160, 0.85);
+  opacity: 0;
+}
+.kr-count-ring.run { animation: kr-ring 0.9s var(--e-out) both; }
+@keyframes kr-ring {
+  0%   { opacity: 0.9; transform: scale(0.28); border-width: 1.2vmin; }
+  100% { opacity: 0; transform: scale(1.9); border-width: 0.1vmin; }
+}
+
+/* ==========================================================================
+   Menus
+   ========================================================================== */
+
+.kr-screens { position: absolute; inset: 0; }
+
+.kr-screen {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  opacity: 0;
+  visibility: hidden;
+  transform: scale(1.03);
+  transition: opacity 0.42s var(--e-soft), transform 0.55s var(--e-out), visibility 0s linear 0.5s;
+}
+.kr-screen.on {
+  opacity: 1;
+  visibility: visible;
+  transform: scale(1);
+  transition: opacity 0.4s var(--e-out), transform 0.6s var(--e-out), visibility 0s;
+}
+.kr-screen::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(ellipse 90% 80% at 50% 42%, rgba(8, 12, 26, 0.30), rgba(4, 6, 16, 0.80) 82%),
+    linear-gradient(200deg, rgba(30, 22, 48, 0.42), rgba(6, 10, 22, 0.62));
+  backdrop-filter: blur(14px) saturate(1.25) brightness(0.82);
+  -webkit-backdrop-filter: blur(14px) saturate(1.25) brightness(0.82);
+}
+.kr-screen > .kr-screen-in {
+  position: relative;
+  width: min(150vmin, 94vw);
+  padding: calc(var(--pad-y) + env(safe-area-inset-top, 0px))
+           calc(var(--pad-x) + env(safe-area-inset-right, 0px))
+           calc(var(--pad-y) + env(safe-area-inset-bottom, 0px))
+           calc(var(--pad-x) + env(safe-area-inset-left, 0px));
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+/* staged entrance for the children of an active screen */
+.kr-screen.on .kr-stage { animation: kr-stage 0.72s var(--e-out) both; }
+@keyframes kr-stage {
+  0%   { opacity: 0; transform: translateY(3.2vmin) scale(0.97); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* --- title ---------------------------------------------------------------- */
+
+.kr-logo { width: min(112vmin, 88vw); max-height: 52vh; display: block; }
+.kr-logo .kr-logo-rays { animation: kr-rays 42s linear infinite; transform-origin: 450px 200px; }
+@keyframes kr-rays { to { transform: rotate(360deg); } }
+.kr-logo-wm { font-family: var(--f); font-weight: 900; }
+
+.kr-sub {
+  margin-top: -1vmin;
+  font-size: clamp(11px, 1.9vmin, 26px);
+  font-weight: 700;
+  letter-spacing: 0.52em;
+  text-indent: 0.52em;
+  text-transform: uppercase;
+  color: rgba(255, 226, 174, 0.86);
+  text-shadow: 0 0.1em 0.4em rgba(4, 7, 16, 0.9);
+}
+
+.kr-prompt {
+  margin-top: 4.5vmin;
+  font-size: clamp(12px, 2.1vmin, 28px);
+  font-weight: 800;
+  letter-spacing: 0.3em;
+  text-indent: 0.3em;
+  text-transform: uppercase;
+  color: var(--paper);
+  animation: kr-breathe 2.4s var(--e-soft) infinite;
+  text-shadow: 0 0.1em 0.35em rgba(4, 7, 16, 0.9);
+}
+@keyframes kr-breathe {
+  0%, 100% { opacity: 0.42; transform: scale(0.99); }
+  50%      { opacity: 1; transform: scale(1.01); }
+}
+
+.kr-hint {
+  margin-top: 2.4vmin;
+  font-size: clamp(9px, 1.4vmin, 18px);
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  color: rgba(248, 242, 230, 0.44);
+  text-transform: uppercase;
+}
+.kr-hint b {
+  display: inline-block;
+  margin: 0 0.25em;
+  padding: 0.18em 0.5em;
+  border-radius: 0.4em;
+  background: rgba(255, 246, 228, 0.10);
+  border: 1px solid rgba(255, 246, 228, 0.2);
+  color: rgba(255, 236, 200, 0.9);
+  font-weight: 800;
+}
+
+/* --- headline used by select / pause / results ----------------------------- */
+
+.kr-title {
+  font-size: clamp(24px, 5.4vmin, 74px);
+  font-weight: 900;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  text-align: center;
+}
+
+/* --- roster --------------------------------------------------------------- */
+
+.kr-roster {
+  margin-top: 3vmin;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: clamp(8px, 1.6vmin, 22px);
+  width: 100%;
+}
+@media (max-aspect-ratio: 1/1) { .kr-roster { grid-template-columns: repeat(2, 1fr); } }
+
+.kr-card {
+  position: relative;
+  pointer-events: auto;
+  cursor: pointer;
+  padding: clamp(8px, 1.5vmin, 20px);
+  border-radius: calc(var(--r) * 1.2);
+  background: linear-gradient(180deg, rgba(24, 31, 56, 0.66), rgba(7, 11, 24, 0.84));
+  border: 1px solid rgba(255, 240, 214, 0.16);
+  box-shadow: 0 0.8vmin 2.4vmin rgba(4, 7, 16, 0.5), inset 0 0.12vmin 0 rgba(255, 246, 228, 0.2);
+  transform-origin: 50% 100%;
+  transition: transform 0.42s var(--e-spring), box-shadow 0.34s var(--e-out),
+              border-color 0.34s var(--e-out), filter 0.34s var(--e-out);
+  filter: saturate(0.55) brightness(0.8);
+  overflow: hidden;
+}
+.kr-card:hover { filter: saturate(0.85) brightness(0.95); transform: translateY(-0.5vmin); }
+.kr-card.sel {
+  filter: none;
+  transform: translateY(-1.4vmin) scale(1.045);
+  border-color: color-mix(in srgb, var(--c) 70%, rgba(255, 240, 214, 0.4));
+  box-shadow: 0 0 3vmin color-mix(in srgb, var(--c) 45%, transparent),
+              0 1.4vmin 3.4vmin rgba(4, 7, 16, 0.6),
+              inset 0 0.12vmin 0 rgba(255, 246, 228, 0.3);
+}
+.kr-card-chip {
+  position: relative;
+  height: clamp(38px, 7vmin, 96px);
+  border-radius: calc(var(--r) * 0.9);
+  background:
+    linear-gradient(120deg, rgba(255, 255, 255, 0.34), rgba(255, 255, 255, 0) 46%),
+    repeating-linear-gradient(118deg, rgba(255, 255, 255, 0.11) 0 6%, rgba(0, 0, 0, 0) 6% 13%),
+    linear-gradient(170deg, color-mix(in srgb, var(--c) 88%, #ffffff),
+                    var(--c) 46%, color-mix(in srgb, var(--c) 62%, #0a0e1c));
+  box-shadow: inset 0 0 2vmin rgba(0, 0, 0, 0.35), inset 0 0.12vmin 0 rgba(255, 255, 255, 0.45);
+  overflow: hidden;
+}
+.kr-card-chip::after {
+  /* soft floor shade — a radial here leaves a hard seam where it starts */
+  content: "";
+  position: absolute;
+  inset: 30% 0 0 0;
+  background: linear-gradient(180deg, rgba(6, 9, 20, 0), rgba(6, 9, 20, 0.34));
+}
+.kr-card-init {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: clamp(24px, 4.6vmin, 62px);
+  font-weight: 900;
+  letter-spacing: 0.02em;
+  color: rgba(255, 252, 244, 0.34);
+  text-shadow: 0 0.05em 0.12em rgba(6, 9, 20, 0.45);
+  mix-blend-mode: overlay;
+  z-index: 1;
+}
+.kr-card-name {
+  margin-top: 1vmin;
+  font-size: clamp(12px, 2.1vmin, 28px);
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--paper);
+}
+.kr-card-you {
+  position: absolute;
+  top: clamp(8px, 1.5vmin, 20px);
+  right: clamp(8px, 1.5vmin, 20px);
+  padding: 0.2em 0.55em 0.24em;
+  border-radius: 0.5em;
+  font-size: clamp(8px, 1.15vmin, 15px);
+  font-weight: 900;
+  letter-spacing: 0.2em;
+  color: var(--ink-2);
+  background: linear-gradient(180deg, #fff2c4, #ffc247);
+}
+
+.kr-stats { margin-top: 1vmin; display: flex; flex-direction: column; gap: 0.55vmin; }
+.kr-stat { display: grid; grid-template-columns: 4.6em 1fr; align-items: center; gap: 0.6em; }
+.kr-stat span {
+  font-size: clamp(7px, 1.05vmin, 14px);
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: rgba(248, 242, 230, 0.5);
+}
+.kr-bar {
+  position: relative;
+  height: clamp(4px, 0.75vmin, 10px);
+  border-radius: 999px;
+  background: rgba(255, 246, 228, 0.10);
+  box-shadow: inset 0 0.1vmin 0.2vmin rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+.kr-bar i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  border-radius: 999px;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--c) 70%, #ffffff), var(--c));
+  box-shadow: 0 0 0.8vmin color-mix(in srgb, var(--c) 60%, transparent);
+  transition: width 0.7s var(--e-out);
+}
+.kr-screen.on .kr-bar i { width: var(--v); }
+
+/* --- buttons -------------------------------------------------------------- */
+
+.kr-menu-list { margin-top: 3.2vmin; display: flex; flex-direction: column; gap: 1.1vmin; width: min(46vmin, 80vw); }
+.kr-btn {
+  pointer-events: auto;
+  cursor: pointer;
+  position: relative;
+  padding: 0.72em 1.4em 0.78em;
+  border-radius: 999px;
+  font-size: clamp(13px, 2.3vmin, 30px);
+  font-weight: 800;
+  letter-spacing: 0.2em;
+  text-indent: 0.2em;
+  text-transform: uppercase;
+  text-align: center;
+  color: rgba(248, 242, 230, 0.82);
+  background: linear-gradient(180deg, rgba(28, 36, 66, 0.7), rgba(8, 12, 26, 0.88));
+  border: 1px solid rgba(255, 240, 214, 0.2);
+  box-shadow: 0 0.6vmin 1.8vmin rgba(4, 7, 16, 0.5), inset 0 0.12vmin 0 rgba(255, 246, 228, 0.22);
+  transition: transform 0.3s var(--e-spring), color 0.24s var(--e-out),
+              background 0.24s var(--e-out), box-shadow 0.24s var(--e-out), border-color 0.24s var(--e-out);
+  overflow: hidden;
+}
+.kr-btn:hover, .kr-btn.sel {
+  color: var(--ink-2);
+  background: linear-gradient(180deg, #fff3cc, #ffc84e 58%, #f09a1c);
+  border-color: rgba(255, 236, 190, 0.9);
+  box-shadow: 0 0 2.6vmin rgba(255, 196, 90, 0.5), 0 0.8vmin 2vmin rgba(4, 7, 16, 0.5),
+              inset 0 0.14vmin 0 rgba(255, 255, 255, 0.7);
+  transform: scale(1.035);
+}
+.kr-btn:active { transform: scale(0.985); }
+
+/* --- results -------------------------------------------------------------- */
+
+.kr-results-grid {
+  margin-top: 2.4vmin;
+  display: grid;
+  grid-template-columns: 1.6fr 1fr;
+  gap: clamp(10px, 2.4vmin, 34px);
+  width: 100%;
+  align-items: start;
+}
+@media (max-aspect-ratio: 1/1) { .kr-results-grid { grid-template-columns: 1fr; } }
+
+.kr-standings { display: flex; flex-direction: column; gap: 0.55vmin; }
+.kr-row {
+  display: grid;
+  grid-template-columns: 3.1em 0.9em 1fr auto;
+  align-items: center;
+  gap: 0.9em;
+  padding: 0.5em 1em 0.55em;
+  border-radius: 999px;
+  background: linear-gradient(180deg, rgba(24, 31, 56, 0.55), rgba(7, 11, 24, 0.72));
+  border: 1px solid rgba(255, 240, 214, 0.12);
+  opacity: 0;
+}
+.kr-screen.on .kr-row { animation: kr-rowIn 0.6s var(--e-out) both; animation-delay: var(--d); }
+@keyframes kr-rowIn {
+  0%   { opacity: 0; transform: translateX(-3vmin) scale(0.97); }
+  100% { opacity: 1; transform: translateX(0) scale(1); }
+}
+.kr-row.you {
+  background: linear-gradient(180deg, rgba(72, 56, 22, 0.7), rgba(28, 20, 8, 0.82));
+  border-color: rgba(255, 214, 120, 0.62);
+  box-shadow: 0 0 2vmin rgba(255, 196, 90, 0.28), inset 0 0.12vmin 0 rgba(255, 246, 228, 0.3);
+}
+.kr-row-p {
+  font-size: clamp(14px, 2.6vmin, 34px);
+  font-weight: 900;
+  letter-spacing: -0.02em;
+  color: var(--gold);
+}
+.kr-row-p sup { font-size: 0.52em; font-weight: 800; margin-left: 0.08em; }
+.kr-row-c { width: 0.9em; height: 0.9em; border-radius: 50%; background: var(--c);
+            box-shadow: 0 0 0.8vmin color-mix(in srgb, var(--c) 70%, transparent),
+                        inset 0 0.1em 0 rgba(255, 255, 255, 0.45); }
+.kr-row-n {
+  font-size: clamp(12px, 2.1vmin, 27px);
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.kr-row-t {
+  font-size: clamp(11px, 1.85vmin, 24px);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: rgba(248, 242, 230, 0.7);
+}
+
+.kr-laps { display: flex; flex-direction: column; gap: 0.6vmin; }
+.kr-lapline {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 0.5em 0.9em 0.55em;
+  border-radius: calc(var(--r) * 0.8);
+  background: linear-gradient(180deg, rgba(24, 31, 56, 0.5), rgba(7, 11, 24, 0.68));
+  border: 1px solid rgba(255, 240, 214, 0.1);
+}
+.kr-lapline b { font-size: clamp(9px, 1.35vmin, 18px); font-weight: 800; letter-spacing: 0.2em;
+                text-transform: uppercase; color: rgba(248, 242, 230, 0.55); }
+.kr-lapline em { font-style: normal; font-size: clamp(13px, 2.2vmin, 29px); font-weight: 800;
+                 font-variant-numeric: tabular-nums; }
+.kr-lapline.best { border-color: rgba(255, 214, 120, 0.65); }
+.kr-lapline.best em { color: var(--gold); }
+.kr-lapline-total {
+  margin-top: 0.6vmin;
+  background: linear-gradient(180deg, rgba(34, 44, 78, 0.62), rgba(10, 15, 30, 0.8));
+  border-color: rgba(255, 240, 214, 0.24);
+}
+.kr-lapline-total b { color: rgba(255, 226, 174, 0.8); }
+
+.kr-best {
+  margin-bottom: 0.4vmin;
+  padding: 0.9em 1.1em 1em;
+  border-radius: calc(var(--r) * 1.1);
+  text-align: center;
+  background: linear-gradient(180deg, rgba(78, 60, 22, 0.72), rgba(26, 19, 8, 0.86));
+  border: 1px solid rgba(255, 214, 120, 0.6);
+  box-shadow: 0 0 2.6vmin rgba(255, 196, 90, 0.28), inset 0 0.12vmin 0 rgba(255, 246, 228, 0.32);
+}
+.kr-best b { display: block; font-size: clamp(9px, 1.3vmin, 17px); font-weight: 800;
+             letter-spacing: 0.3em; text-indent: 0.3em; text-transform: uppercase;
+             color: rgba(255, 226, 170, 0.85); }
+.kr-best em { display: block; margin-top: 0.18em; font-style: normal;
+              font-size: clamp(22px, 4.4vmin, 58px); font-weight: 900; letter-spacing: -0.01em;
+              font-variant-numeric: tabular-nums; color: #fff3d0;
+              text-shadow: 0 0 1.6vmin rgba(255, 190, 90, 0.6), 0 0.06em 0.2em rgba(4, 7, 16, 0.7); }
+
+/* --- pause ---------------------------------------------------------------- */
+
+.kr-pause-badge {
+  font-size: clamp(9px, 1.4vmin, 18px);
+  font-weight: 800;
+  letter-spacing: 0.42em;
+  text-indent: 0.42em;
+  text-transform: uppercase;
+  color: rgba(255, 226, 174, 0.7);
+  margin-bottom: 1vmin;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .kr *, .kr *::before, .kr *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

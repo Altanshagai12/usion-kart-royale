@@ -1,0 +1,25 @@
+{
+  "name": "kart-game",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "n8ao": "^2.0.0",
+    "postprocessing": "^6.39.3",
+    "simplex-noise": "^4.0.3",
+    "three": "^0.185.1"
+  },
+  "devDependencies": {
+    "@types/three": "^0.185.1",
+    "puppeteer": "^25.3.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.1.5"
+  }
+}
