@@ -825,6 +825,127 @@ export class TexLib {
     });
   }
 
+  /**
+   * ==========================================================================
+   *  crowdCloth — the spectators' clothing atlas.
+   * ==========================================================================
+   *  BLOCKER FROM ROUND 1. The crowd material was
+   *      new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.78 })
+   *  — no map, no normal, no roughness map. §4 names a flat untextured
+   *  MeshStandardMaterial as an automatic fail, and in hud.png a band of these
+   *  sits fifteen metres from the lens, so it is the one place in the game where
+   *  that fail is unmissable.
+   *
+   *  A 3x3 grid of 256² garment cards. Each card is a whole figure's worth of
+   *  clothing read bottom-to-top — trousers / skirt, then the shirt, then a
+   *  collar — because the body UV runs 0..1 up the figure, so a card that only
+   *  painted a shirt would leave the legs untextured. Nine designs across
+   *  stripes, hoops, block, plain and a sash, and the existing per-instance
+   *  `vertexColors` tint still multiplies over the top, so nine cards times ten
+   *  roster colours is ninety distinct spectators before the pose variants.
+   *
+   *  Patterns are authored to be SEAMLESS IN U, because u is the angle around
+   *  the body: vertical stripes come in whole counts across the cell and hoops
+   *  are horizontal, so nothing shows a seam down the spectator's back.
+   *
+   *  Roughness runs 0.62 on the synthetics (the blocks and the sash, which read
+   *  as a sports shirt) to 0.90 on the cottons — two visibly different surface
+   *  responses inside one crowd, which is what stops several hundred figures
+   *  from sharing one plastic sheen.
+   */
+  crowdCloth(size = 768): MatMaps {
+    return this.memo('crowdcloth', () => {
+      const [c, g] = cv(size);
+      const cell = size / 3;
+      // [trouser, shirt base, shirt accent, pattern kind, synthetic-ness]
+      const cards: [string, string, string, number, number][] = [
+        ['#3c4356', '#f2ece0', '#2f6ba0', 0, 0.15], // plain cotton tee
+        ['#4a4034', '#e8e2d2', '#e0453f', 1, 0.55], // vertical stripes
+        ['#2f3340', '#4fc3ff', '#f5f9ff', 2, 0.95], // hoops, synthetic
+        ['#5a4a38', '#f5e2b0', '#8f5a2f', 3, 0.20], // check
+        ['#37404e', '#e0453f', '#f9f4ea', 4, 0.85], // block + sash
+        ['#4d4238', '#9fc0a8', '#40614c', 1, 0.30], // fine stripe, linen
+        ['#2e3542', '#dcb8d8', '#7a4f76', 5, 0.25], // speckled weave
+        ['#514436', '#ff9d2e', '#2b2b34', 4, 0.90], // hi-vis block
+        ['#39404c', '#a9c8d4', '#f2ece0', 2, 0.45], // wide hoop
+      ];
+      const rough = new Float32Array(size * size);
+      for (let k = 0; k < 9; k++) {
+        const cx = (k % 3) * cell;
+        const cy = ((k / 3) | 0) * cell;
+        const [trouser, base, accent, kind, synth] = cards[k];
+        // bottom 44% trousers, top 56% shirt, with a collar band at the very top
+        g.fillStyle = trouser;
+        g.fillRect(cx, cy + cell * 0.56, cell, cell * 0.44);
+        g.fillStyle = base;
+        g.fillRect(cx, cy, cell, cell * 0.56);
+        g.save();
+        g.beginPath();
+        g.rect(cx, cy, cell, cell * 0.56);
+        g.clip();
+        g.fillStyle = accent;
+        if (kind === 1) {
+          // vertical stripes — 8 across the cell, so they close round the body
+          for (let i = 0; i < 8; i += 2) g.fillRect(cx + (i / 8) * cell, cy, cell / 16, cell);
+        } else if (kind === 2) {
+          for (let i = 0; i < 5; i++) g.fillRect(cx, cy + cell * (0.05 + i * 0.11), cell, cell * 0.052);
+        } else if (kind === 3) {
+          g.globalAlpha = 0.55;
+          for (let i = 0; i < 6; i += 2) g.fillRect(cx + (i / 6) * cell, cy, cell / 12, cell);
+          for (let i = 0; i < 5; i += 2) g.fillRect(cx, cy + (i / 9) * cell, cell, cell / 18);
+          g.globalAlpha = 1;
+        } else if (kind === 4) {
+          // block panel plus a diagonal sash
+          g.fillRect(cx, cy + cell * 0.34, cell, cell * 0.22);
+          g.beginPath();
+          g.moveTo(cx, cy + cell * 0.10);
+          g.lineTo(cx + cell, cy + cell * 0.30);
+          g.lineTo(cx + cell, cy + cell * 0.38);
+          g.lineTo(cx, cy + cell * 0.18);
+          g.closePath();
+          g.fill();
+        } else if (kind === 5) {
+          g.globalAlpha = 0.5;
+          for (let i = 0; i < 320; i++) {
+            const rx = cx + ((i * 61) % cell);
+            const ry = cy + ((i * 137) % (cell * 0.56));
+            g.fillRect(rx, ry, 3, 3);
+          }
+          g.globalAlpha = 1;
+        }
+        g.restore();
+        // collar band: a value break at the neck so the head separates
+        g.fillStyle = 'rgba(20,16,20,0.30)';
+        g.fillRect(cx, cy, cell, cell * 0.035);
+        // roughness for this card, with a spatial wobble so it is never constant
+        const r0 = lerp(0.90, 0.62, synth);
+        for (let y = 0; y < cell; y++)
+          for (let x = 0; x < cell; x++) {
+            const gx = (cx + x) | 0;
+            const gy = (cy + y) | 0;
+            rough[gy * size + gx] = r0;
+          }
+      }
+      // ---- woven-cloth normal + the roughness wobble, one pass over the sheet
+      const h = new Float32Array(size * size);
+      for (let y = 0; y < size; y++)
+        for (let x = 0; x < size; x++) {
+          const i = y * size + x;
+          // weave at ~7 px so it survives the mip chain instead of dithering,
+          // plus a slack-fold octave at cloth scale
+          const weave = (Math.sin(x * 0.9) * Math.sin(y * 0.9)) * 0.4;
+          const fold = fbm(317, x / size, y / size, 9, 9, 2, 0.5, size);
+          h[i] = weave * 0.45 + fold * 0.55;
+          rough[i] = clamp(rough[i] + fold * 0.14 + weave * 0.05, 0.30, 0.99);
+        }
+      return {
+        map: finish(c, true, this.aniso, false),
+        normalMap: normalFromHeight(h, size, 5.0, this.aniso),
+        roughnessMap: greyFromField(rough, size, this.aniso),
+      };
+    });
+  }
+
   sponsorAtlas(size = 2048): MatMaps {
     return this.memo('sponsor', () => {
       const [c, g] = cv(size);
@@ -922,7 +1043,75 @@ export class TexLib {
       // is a third of what it was so the glyph edges — which are the thing the
       // player is actually meant to read — stay the highest-contrast feature on
       // the panel rather than competing with the substrate.
-      const ns = 512;
+      // ------------------------------------------------------------------
+      // ROUND 2: THE TYPE HAS TO EXIST IN THE NORMAL AND ROUGHNESS MAPS TOO
+      // ------------------------------------------------------------------
+      // corner.png's barrier is a metre from the lens and its lettering reads as
+      // a brown smear on a brown board. The albedo is not the problem — it is
+      // 1024 x 512 per panel, which is 4 mm/texel. The problem is that it is the
+      // ONLY channel the type exists in: the normal map carried weathering noise
+      // and nothing else, and the roughness map ran one continuous weathering
+      // field across ink and field alike. So a screen-printed sign, at one metre,
+      // under a 14° key, produced exactly one surface response and no relief at
+      // any glyph edge — and with no specular break at the letterform there is
+      // nothing for the eye to lock onto but a flat colour difference that the
+      // haze then halves.
+      //
+      // A silkscreened board genuinely has two surfaces: the ink sits a few
+      // tenths of a millimetre proud and dries MATTE (0.72), the varnished field
+      // around it stays glossy (0.35). That single split is worth more at close
+      // range than another doubling of the albedo, because it puts a moving
+      // highlight along every letter edge as the kart goes past.
+      //
+      // The fields are also raised 512 -> 1024 so the glyph mask can be sampled
+      // without turning the type into mush before it ever reaches the map.
+      const ns = 1024;
+      const [mc, mg] = cv(ns);
+      const mw = ns / 2,
+        mh = ns / 4;
+      mg.fillStyle = '#000';
+      mg.fillRect(0, 0, ns, ns);
+      for (let i = 0; i < 8; i++) {
+        const cx = (i % 2) * mw,
+          cy = ((i / 2) | 0) * mh;
+        mg.save();
+        mg.beginPath();
+        mg.rect(cx, cy, mw, mh);
+        mg.clip();
+        // the ink itself — same metrics as the albedo pass above
+        mg.font = `900 ${mh * 0.52}px "Helvetica Neue", Helvetica, Arial, sans-serif`;
+        mg.textAlign = 'center';
+        mg.textBaseline = 'middle';
+        mg.letterSpacing = `${Math.round(mh * 0.035)}px`;
+        mg.fillStyle = '#fff';
+        mg.fillText(boards[i][2], cx + mw / 2, cy + mh / 2, mw * 0.9);
+        // printed keyline frame, also proud
+        mg.strokeStyle = '#c8c8c8';
+        mg.lineWidth = mh * 0.035;
+        mg.strokeRect(cx + mh * 0.018, cy + mh * 0.018, mw - mh * 0.036, mh - mh * 0.036);
+        mg.restore();
+        // an 8 mm bevel round the board edge: dark ramp in, so the normal turns
+        // over at the rim and the low sun catches a line along the whole panel
+        const bev = mh * 0.045;
+        const grd = mg.createLinearGradient(cx, cy, cx, cy + bev);
+        grd.addColorStop(0, '#4a4a4a');
+        grd.addColorStop(1, '#000');
+        mg.fillStyle = grd;
+        mg.fillRect(cx, cy, mw, bev);
+        mg.fillStyle = '#2a2a2a';
+        mg.fillRect(cx, cy + mh - bev, mw, bev);
+        mg.fillRect(cx, cy, bev, mh);
+        mg.fillRect(cx + mw - bev, cy, bev, mh);
+        // panel screws, one at each corner and two on the centre line
+        mg.fillStyle = '#e8e8e8';
+        for (const sx of [0.045, 0.5, 0.955])
+          for (const sy of [0.11, 0.89]) {
+            mg.beginPath();
+            mg.arc(cx + mw * sx, cy + mh * sy, mh * 0.022, 0, Math.PI * 2);
+            mg.fill();
+          }
+      }
+      const mpx = mg.getImageData(0, 0, ns, ns).data;
       const hf = new Float32Array(ns * ns);
       const rf = new Float32Array(ns * ns);
       for (let y = 0; y < ns; y++)
@@ -935,18 +1124,25 @@ export class TexLib {
           const streak = fbm(113, u, v, 26, 3, 2, 0.5, ns);
           // the vinyl's own weave, right at the resolution limit and no finer
           const weave = fbm(127, u, v, 96, 96, 1, 0.5, ns);
-          hf[i] = patch * 0.55 + streak * 0.3 + weave * 0.15;
-          // Roughness carries most of the weathering read: a scuffed board is a
-          // ROUGHNESS story, not a bump story, and roughness does not alias into
-          // sparkle the way a normal does.
-          rf[i] = clamp(0.36 + patch * 0.22 + streak * 0.12 + weave * 0.05, 0.1, 0.95);
+          const ink = mpx[i * 4] / 255;
+          // Relief: the weathering substrate, plus the ink standing proud of it.
+          hf[i] = patch * 0.34 + streak * 0.18 + weave * 0.09 + ink * 0.62;
+          // MATTE INK ON A VARNISHED FIELD. This is the whole point: two
+          // surface responses per sign, which §4 asks for and one roughness
+          // value can never give.
+          const base = lerp(0.35, 0.72, ink);
+          // Ink chips off at the edges of a weathered board, so where the fade
+          // patch is worst the ink's own roughness creeps back toward the field.
+          rf[i] = clamp(base + patch * 0.16 + streak * 0.10 + weave * 0.04, 0.1, 0.95);
         }
+      void mc;
       return {
         map: finish(c, true, this.aniso, false),
-        // 5 -> 2.2: the panel is flat printed vinyl on a flat board. Relief on
-        // it is a lie, and at 40 m a lie with a high-frequency component is a
-        // shimmer.
-        normalMap: normalFromHeight(hf, ns, 2.2, this.aniso),
+        // 2.2 -> 3.4. The substrate is still flat printed vinyl, but the ink and
+        // the bevel are real relief now and they are low frequency, so raising
+        // this sharpens the letterform without reintroducing the high-frequency
+        // shimmer the old value was pulled down to avoid.
+        normalMap: normalFromHeight(hf, ns, 3.4, this.aniso),
         roughnessMap: greyFromField(rf, ns, this.aniso),
       };
     });
@@ -2248,7 +2444,14 @@ export function ridgeGeo(o: RidgeOpts): THREE.BufferGeometry {
       // low down, where water actually collects, so the flank reads as drained.
       const gul = Math.max(0, -n(u * gulF + 77.0, v * 4.2));
       y -= o.height * 0.075 * jag * gul * shape * (1.35 - 0.65 * shape) * rib;
-      z += o.depth * (0.15 * spur + 0.06 * gul * chDir) * (1 - Math.abs(2 * v - 1));
+      // 0.15 -> 0.24 in Z. `patchBackdropForm` now runs a per-pixel terminator
+      // off the real world normal, which is strictly better modelling than any
+      // baked gradient — but it can only separate a lit face from a shaded one
+      // if the flank HAS faces. A rib that displaces only in Y is a brightness
+      // pattern; one that swings in Z as well turns the normal, which is what
+      // gives the new term something to bite on and what finally puts a lit
+      // side and a shadowed side on a distant hill.
+      z += o.depth * (0.24 * spur + 0.06 * gul * chDir) * (1 - Math.abs(2 * v - 1));
       if (toe) y = -skirt;
       if (y > bestY[i]) {
         bestY[i] = y;
@@ -3098,7 +3301,7 @@ export function patchWind(mat: THREE.Material, u: Shared, flutterAxis = 0) {
  * less in the yellow-green, so a backlit leaf is never just a brighter version
  * of its own albedo.
  */
-const SAP = new THREE.Color(0xa8c85a).convertSRGBToLinear();
+const SAP = new THREE.Color(0x9ad46a).convertSRGBToLinear();
 
 export function patchTranslucency(mat: THREE.Material, u: Shared, strength = 1.0) {
   patch(mat, 'trans', (sh) => {
@@ -3120,7 +3323,14 @@ export function patchTranslucency(mat: THREE.Material, u: Shared, strength = 1.0
            // view direction and dot(-V, L) fires only when the leaf sits between
            // the camera and the sun — which is exactly the backlit-palm case.
            vec3 V = normalize(vViewPosition);
-           float wrap = clamp((dot(normal, uSunView) + 0.55) / 1.55, 0.0, 1.0);
+           // Wrap widened 0.55 -> 0.60 of a hemisphere. This is the term that
+           // decides whether a canopy has any light in it at all when the sun is
+           // not directly behind it, and the umbrella pine in scenery.png — lit
+           // from three-quarter rear, silhouetted against a pale sky — came back
+           // as a flat dark cut-out. Wrap lighting is what a leaf actually does:
+           // light entering the far side scatters through and leaves the near
+           // side, so the terminator on a leaf sits well past 90°.
+           float wrap = clamp((dot(normal, uSunView) + 0.60) / 1.60, 0.0, 1.0);
            float back = pow(clamp(dot(-V, uSunView), 0.0, 1.0), 3.0);
            // clamped so solid-geometry foliage (uv tiles past 1) stays neutral
            float lu = clamp(vLeafUv.x, 0.0, 1.0);
@@ -3129,8 +3339,13 @@ export function patchTranslucency(mat: THREE.Material, u: Shared, strength = 1.0
            // part of a palm that actually goes translucent
            float thin = mix(0.42, 1.0, lu) * mix(0.5, 1.0, abs(lv - 0.5) * 2.0);
            vec3 sap = mix(diffuseColor.rgb, uSap, 0.62);
-           reflectedLight.directDiffuse += uSunCol * sap * back * 3.4 * thin * uTransStrength;
-           reflectedLight.directDiffuse += uSunCol * mix(diffuseColor.rgb, uSap, 0.25) * wrap * 0.42 * uTransStrength;
+           reflectedLight.directDiffuse += uSunCol * sap * back * 3.8 * thin * uTransStrength;
+           // 0.42 -> 0.80. §4 calls a backlit palm at golden hour "a hero
+           // moment — do not waste it", and at 0.42 the wrap was contributing
+           // roughly a tenth of a stop against a 4.2-intensity key: arithmetically
+           // present, visually absent. This is the whole difference between a
+           // canopy that glows and a green sticker.
+           reflectedLight.directDiffuse += uSunCol * mix(diffuseColor.rgb, uSap, 0.34) * wrap * 0.80 * uTransStrength;
          }`
       );
   });
@@ -3211,6 +3426,61 @@ export function patchRoughVary(mat: THREE.Material, lo = 0.72, hi = 1.22, scale 
            roughnessFactor = clamp(roughnessFactor * mix(uRvRange.x, uRvRange.y, rn), 0.05, 1.0);
          }
          #include <metalnessmap_fragment>`
+      );
+  });
+}
+
+/**
+ * Low-frequency albedo break-up in world space.
+ *
+ * §4 forbids a visible tiling repeat inside one camera frame, and wide.png has
+ * two: the roof tiles run a regular corduroy stripe that moirés along every
+ * ridge, and the same tile pattern is plainly identical from one roof to the
+ * next. `patchRoughVary` already breaks the ROUGHNESS with a world-space field
+ * and it is what stops the walls reading as one plastic sheet — but roughness
+ * cannot hide a repeat that is visible in albedo, and a tiled clay roof is
+ * mostly an albedo pattern.
+ *
+ * Two octaves at a non-integer ratio, sampled in world space so they cannot
+ * line up with the texture repeat by construction, and applied as a multiply so
+ * nothing shifts hue. Costs two hashes per fragment.
+ */
+export function patchMacroBreak(mat: THREE.Material, scale = 9.0, amount = 0.16) {
+  patch(mat, 'macrobrk' + scale.toFixed(1) + amount.toFixed(2), (sh) => {
+    sh.uniforms.uMbScale = { value: 1 / scale };
+    sh.uniforms.uMbAmt = { value: amount };
+    sh.vertexShader =
+      'varying vec3 vMbPos;\n' +
+      sh.vertexShader.replace(
+        '#include <begin_vertex>',
+        `#include <begin_vertex>
+         {
+           vec4 mbW = vec4(transformed, 1.0);
+           #ifdef USE_INSTANCING
+             mbW = instanceMatrix * mbW;
+           #endif
+           vMbPos = (modelMatrix * mbW).xyz;
+         }`
+      );
+    sh.fragmentShader =
+      `varying vec3 vMbPos; uniform float uMbScale; uniform float uMbAmt;
+       float mbH(vec2 p){ p = fract(p * vec2(127.1, 311.7)); p += dot(p, p + 29.1); return fract(p.x * p.y); }
+       float mbN(vec2 p){
+         vec2 i = floor(p), f = fract(p);
+         f = f * f * (3.0 - 2.0 * f);
+         return mix(mix(mbH(i), mbH(i + vec2(1.0, 0.0)), f.x),
+                    mix(mbH(i + vec2(0.0, 1.0)), mbH(i + vec2(1.0, 1.0)), f.x), f.y);
+       }\n` +
+      sh.fragmentShader.replace(
+        '#include <color_fragment>',
+        `#include <color_fragment>
+         {
+           vec2 mp = vMbPos.xz * uMbScale + vMbPos.y * uMbScale * 0.53;
+           // 1 : 2.71 — deliberately irrational-ish, so the two octaves never
+           // beat against each other or against the map's own tile
+           float mn = mbN(mp) * 0.63 + mbN(mp * 2.71 + 7.9) * 0.37;
+           diffuseColor.rgb *= 1.0 + (mn - 0.5) * 2.0 * uMbAmt;
+         }`
       );
   });
 }
@@ -3378,6 +3648,122 @@ export function patchAerial(mat: THREE.Material, u: Shared, near = 220, far = 44
 }
 
 /**
+ * ============================================================================
+ *  patchBackdropForm — ROUND 2 ROOT FIX FOR "EVERY LANDFORM IS A FLAT ORANGE
+ *  FILL AND ALL FOUR BANDS COLLAPSE INTO ONE PLANE".
+ * ============================================================================
+ *  The band table was authored as a HUE ladder — warm stone, neutral, blue-grey,
+ *  violet-blue — on the assumption that hue is the one thing distance cannot
+ *  take away. That assumption is false in this renderer, and measurably so.
+ *  `src/render/Sky.ts` fog rotates every fragment onto the haze's own
+ *  chromaticity at 1.85x the Beer rate, capped at 0.96:
+ *
+ *      krDrained = krHazeCol * ( krOwnL / krHazeL )
+ *
+ *  i.e. it KEEPS THE FRAGMENT'S LUMINANCE AND THROWS ITS HUE AWAY. At the near
+ *  band (~580 m) that is already 79% of the way there; from the range band out
+ *  it is saturated. So by the time a ridge reaches the frame, the only channel
+ *  that has survived is VALUE — and the four bands were authored at luminances
+ *  of 0.66 / 0.61 / 0.62 / 0.68. Four ranges at four distances, all the same
+ *  brightness, all painted the same orange by the haze. Cut paper, exactly as
+ *  reported, and no amount of hue authoring could ever have fixed it.
+ *
+ *  Two things follow, and both live here:
+ *
+ *  (1) THE LADDER HAS TO BE A VALUE LADDER. Aerial perspective in paint is a
+ *      value ramp: the nearest headland is the darkest thing on the horizon and
+ *      each successive ridge steps up toward the sky. This applies that ramp to
+ *      the SHADED result, per pixel, keyed off camera distance — so it is one
+ *      continuous ramp rather than four steps, and two ridges of the same band
+ *      at different depths still separate from each other.
+ *
+ *  (2) THE BACKDROP WAS ALSO SIMPLY TOO BRIGHT. Lit by a 4.2-intensity key on a
+ *      pale albedo, every ridge was landing in the top of the ACES shoulder,
+ *      where the grade's own highlight-desaturation rolloff (§2) crushes both
+ *      contrast AND chroma. All of `ridgeGeo`'s strata, scrub patches, spur
+ *      ribs, toe AO and sun-catch rim were being computed and then flattened by
+ *      the tone curve. Pulling the near end of the ladder down to ~0.42 moves
+ *      the whole horizon back onto the straight part of the curve, and every one
+ *      of those terms becomes visible again for free.
+ *
+ *  On top of that it adds what a single 12–160 m-per-tile rock map cannot: three
+ *  macro octaves at 70 / 22 / 6 m, a vertical strata gradient, and an explicit
+ *  sunlit-face vs shaded-face albedo split. The split is deliberately an ALBEDO
+ *  term, not a light term: at this triangle density the real key has almost no
+ *  normal variation to model with, which is the literal reason the faces read as
+ *  one value. Per-pixel form colour is what fills that in.
+ */
+export function patchBackdropForm(mat: THREE.Material, u: Shared, nearD = 260, farD = 2400, nearV = 0.42, farV = 0.78) {
+  patch(mat, 'bdform', (sh) => {
+    sh.uniforms.uCamF = u.uCam;
+    sh.uniforms.uSunF = u.uSunWorld;
+    sh.uniforms.uBdVal = { value: new THREE.Vector4(nearD, farD, nearV, farV) };
+    // Deliberately plain multipliers rather than THREE.Colors: these are a
+    // RATIO applied to whatever albedo the band already has, and a hex colour
+    // would drag every band toward one hue and undo the ladder. -25% toward the
+    // shadow teal on the away-flanks, +16% warm on the sun-facing ones, which is
+    // the terminator contrast the note asks for and is balanced about 1.0 so it
+    // does not change the band's overall exposure.
+    sh.uniforms.uBdShade = { value: new THREE.Vector3(0.70, 0.76, 0.90) };
+    sh.uniforms.uBdSun = { value: new THREE.Vector3(1.18, 1.12, 0.99) };
+    sh.vertexShader =
+      'varying vec3 vBdW; varying vec3 vBdN;\n' +
+      sh.vertexShader
+        .replace('#include <beginnormal_vertex>', '#include <beginnormal_vertex>\n  vBdN = normalize(mat3(modelMatrix) * objectNormal);')
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\n  vBdW = (modelMatrix * vec4(transformed, 1.0)).xyz;');
+    sh.fragmentShader =
+      `varying vec3 vBdW; varying vec3 vBdN;
+       uniform vec3 uCamF; uniform vec3 uSunF; uniform vec4 uBdVal;
+       uniform vec3 uBdShade; uniform vec3 uBdSun;
+       float bdH(vec2 p){ p = fract(p * vec2(127.1, 311.7)); p += dot(p, p + 41.3); return fract(p.x * p.y); }
+       float bdN2(vec2 p){
+         vec2 i = floor(p), f = fract(p);
+         f = f * f * (3.0 - 2.0 * f);
+         return mix(mix(bdH(i), bdH(i + vec2(1.0, 0.0)), f.x),
+                    mix(bdH(i + vec2(0.0, 1.0)), bdH(i + vec2(1.0, 1.0)), f.x), f.y);
+       }\n` +
+      sh.fragmentShader
+        .replace(
+          '#include <map_fragment>',
+          `#include <map_fragment>
+           {
+             // Three macro octaves. Sampled on the world XZ plane plus altitude,
+             // so a flank reads as bedded rock rather than as a projected
+             // wallpaper, and none of them is finer than 6 m — anything smaller
+             // than that is below a pixel at 600 m and can only alias.
+             vec2 q = vBdW.xz + vBdW.y * 0.42;
+             float o1 = bdN2(q / 70.0);
+             float o2 = bdN2(q / 22.0 + 13.7);
+             float o3 = bdN2(q / 6.0 - 41.1);
+             float macro = o1 * 0.54 + o2 * 0.31 + o3 * 0.15;
+             // Strata: horizontal bedding, warped by the coarse octave so the
+             // bands wander with the rock instead of ruling round the landform.
+             float bed = sin((vBdW.y + o1 * 26.0) * 0.19) * 0.5 + 0.5;
+             diffuseColor.rgb *= 0.78 + macro * 0.44 + bed * 0.10;
+             // SUNLIT FACE vs SHADED FACE. An albedo-space terminator, because
+             // the real key has almost no normal variation to work with out here.
+             float sf = dot(normalize(vBdN), uSunF);
+             float lit = smoothstep(-0.30, 0.55, sf);
+             diffuseColor.rgb *= mix(uBdShade, uBdSun, lit);
+             // and a warm rim on the faces that actually turn into the sun
+             diffuseColor.rgb *= 1.0 + vec3(0.16, 0.11, 0.03) * smoothstep(0.58, 0.95, sf);
+           }`
+        )
+        .replace(
+          '#include <fog_fragment>',
+          `{
+             // THE VALUE LADDER. Applied to the shaded result and before any fog,
+             // so the haze's luminance-preserving chroma drain carries it intact.
+             float bdD = distance(vBdW, uCamF);
+             float bdT = smoothstep(uBdVal.x, uBdVal.y, bdD);
+             gl_FragColor.rgb *= mix(uBdVal.z, uBdVal.w, bdT);
+           }
+           #include <fog_fragment>`
+        );
+  });
+}
+
+/**
  * Strip the hue out of a material's albedo map, keeping its luminance detail.
  *
  * The backdrop is one merged mesh sharing one rock texture, and every layer of
@@ -3512,6 +3898,14 @@ export class MatLib {
     //             runs a sheen down every pan
     patchRoughVary(this.wall, 0.78, 1.3, 8.5);
     patchRoughVary(this.roof, 0.5, 0.86, 6.0);
+    // Albedo break-up too, not just roughness. The roof is the worse offender by
+    // far — a terracotta pan tile is a strong regular stripe, so a whole village
+    // of them at one scale and one tint moirés along every ridge and repeats
+    // visibly within a single frame (wide.png). 5 m puts the variation at
+    // roughly one roof plane, which is the "per-building vertex-colour tint"
+    // read for the cost of two hashes and without a per-building attribute.
+    patchMacroBreak(this.roof, 5.0, 0.19);
+    patchMacroBreak(this.wall, 7.5, 0.11);
     this.wall.envMapIntensity = 0.25;
     this.roof.envMapIntensity = 0.9;
 
@@ -3535,18 +3929,27 @@ export class MatLib {
     // painted rectangle. Slight metalness keeps the reflection crisp.
     this.glass =
       (this.shared('glass', 'scenery-glass', (m: any) => {
-        // Recessed panes read as near-black mirrors under a low sun.
+        // Recessed panes read as near-black mirrors under a low sun. 0.08 ->
+        // 0.05 with a clearcoat on top: at 0.08 the specular lobe is narrow
+        // enough that a pane has to be aimed almost exactly at the sun to
+        // return anything, which is why the whole village rendered at one matte
+        // roughness with the glass indistinguishable from the stucco. A
+        // clearcoat gives it a second, wider sky term that fires at every angle.
         m.color.set(0x1b2b33);
-        m.roughness = 0.08;
-        m.envMapIntensity = 2.2;
+        m.roughness = 0.05;
+        m.envMapIntensity = 2.6;
+        if ('clearcoat' in m) {
+          m.clearcoat = 1;
+          m.clearcoatRoughness = 0.05;
+        }
       }) as unknown as THREE.MeshPhysicalMaterial) ??
       new THREE.MeshPhysicalMaterial({
         color: 0x1b2b33,
-        roughness: 0.08,
+        roughness: 0.05,
         metalness: 0.25,
-        envMapIntensity: 2.2,
+        envMapIntensity: 2.6,
         clearcoat: 1,
-        clearcoatRoughness: 0.04,
+        clearcoatRoughness: 0.05,
       });
     if (this.all.indexOf(this.glass) < 0) this.all.push(this.glass);
     patchLod(this.glass, this.u);
@@ -3555,17 +3958,65 @@ export class MatLib {
     patchInstUv(this.fabric);
     patchLod(this.fabric, this.u);
 
-    this.sponsor = this.std(T.sponsorAtlas(), { side: THREE.FrontSide, vertexColors: true }, 0.4);
+    // 0.4 -> 1.05. The atlas normal now carries proud letterforms, panel screws
+    // and an 8 mm board bevel rather than weathering dither, so there is real
+    // relief to show and holding it at 0.4 was throwing it away. envMapIntensity
+    // lifted so the varnished field (roughness 0.35) actually returns a sky
+    // sheen against the matte ink at 0.72 — two responses per board, which is
+    // what the close range in corner.png is asking for.
+    this.sponsor = this.std(T.sponsorAtlas(), { side: THREE.FrontSide, vertexColors: true, envMapIntensity: 1.15 }, 1.05);
     patchInstUv(this.sponsor);
     patchLod(this.sponsor, this.u);
 
     this.rubber = this.shared('rubber', 'scenery-rubber') ?? this.std(T.paintedMetal(), { color: 0x2b2b30 }, 1.4);
+    // THE BLACK HOLE IN scenery.png. It was reported as "a pure-black void in
+    // the terrain, probably a missing tunnel-bore cap". It is not: zoomed, it is
+    // a tyre stack, sunlit and reading as brown on its lower half and clamped
+    // flat to #000000 on the half that is in its own shadow. Rubber albedo is
+    // genuinely dark, the shared map is darker still, and the per-instance tint
+    // multiplies it down again — so once the key is off it, there is nothing
+    // left. §3 forbids pure #000 in albedo and §9.6 forbids pure-black shadows,
+    // and a black hole in the middle of a golden-hour frame is the most
+    // conspicuous possible way to break both.
+    //
+    // Two lifts, both physical rather than a paint-over: rubber does return a
+    // little sky (it is a dielectric, not a light sink), and the emissive is a
+    // warm ambient floor a stop and a half below anything else in the scene, so
+    // the shaded side bottoms out around #17120f instead of at zero.
+    this.rubber.envMapIntensity = 0.55;
+    this.rubber.emissive = new THREE.Color(0x17120f);
+    this.rubber.emissiveIntensity = 1;
     patchInstUv(this.rubber);
     patchTint(this.rubber);
     patchLod(this.rubber, this.u);
 
-    this.crowd = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.78, metalness: 0 });
+    // ---- crowd ------------------------------------------------------------
+    // The round-1 material was `{ vertexColors: true, roughness: 0.78 }` and
+    // nothing else — the flat-untextured-standard case §4 calls an automatic
+    // fail, on the asset that appears in more frames than any other.
+    //
+    // The maps ride on UV CHANNEL 1, not 0. Channel 0 on a spectator is not a
+    // texture coordinate at all: `patchTint(mask)` reads uv.x as "is this vertex
+    // clothing or skin" and `patchCrowd` reads uv.y > 0.92 as "is this vertex an
+    // arm", both of which are constant per sub-mesh. Overwriting it to texture
+    // the figure would repaint the skin and freeze the cheer. `spectatorGeo` now
+    // also emits a real cylindrical `uv1`, and `aUv` from `patchInstUv` then
+    // picks which of the nine garment cards this particular spectator wears —
+    // so neighbours in a rank do not sample the same cell.
+    const cm = T.crowdCloth();
+    for (const t of [cm.map, cm.normalMap, cm.roughnessMap]) if (t) t.channel = 1;
+    this.crowd = new THREE.MeshStandardMaterial({
+      map: cm.map,
+      normalMap: cm.normalMap,
+      roughnessMap: cm.roughnessMap,
+      vertexColors: true,
+      roughness: 1,
+      metalness: 0,
+      envMapIntensity: 0.35,
+    });
+    this.crowd.normalScale.set(0.7, 0.7);
     this.all.push(this.crowd);
+    patchInstUv(this.crowd);
     patchTint(this.crowd, true);
     patchCrowd(this.crowd, this.u);
     patchLod(this.crowd, this.u);
@@ -3576,7 +4027,12 @@ export class MatLib {
     patchLod(this.cloth, this.u);
 
     // Start-line banner: its own printed sheet, not a stripe from the atlas.
-    this.banner = this.std(T.bannerCloth(), { side: THREE.DoubleSide }, 1.1);
+    // Channel 1, because channel 0 on a hanging banner is the cloth patch's
+    // root->free coordinate and not a texture coordinate at all — see
+    // `bannerUvs` for why the print was arriving rotated ninety degrees.
+    const bm = T.bannerCloth();
+    for (const t of [bm.map, bm.normalMap, bm.roughnessMap]) if (t) t.channel = 1;
+    this.banner = this.std(bm, { side: THREE.DoubleSide }, 1.1);
     patchCloth(this.banner, this.u, 1.15);
 
     // Bunting: one triangle per flag, tinted per instance, strung on a rope.
@@ -3624,13 +4080,25 @@ export class MatLib {
     // of its own colour break-up to stop a kilometre of hillside reading as a
     // single painted tone.
     patchDesatMap(this.backdrop, 0.7);
+    // Macro form + the value ladder. MUST be registered before `patchAerial`:
+    // both hang off `#include <fog_fragment>` and the ladder has to run on the
+    // shaded colour first, with the aerial tint and then the scene fog on top.
+    // See the note on `patchBackdropForm` for why value, and only value, is the
+    // channel that survives out here.
+    patchBackdropForm(this.backdrop, this.u, 260, 2400, 0.42, 0.80);
     // The ramp is quoted against the frustum the backdrop actually lives in, not
     // against a nominal 4.4 km. `Camera` sets far = 3000 and the outermost band
     // sits at 1.95–2.6 km, so a 4400 m ramp spent only its first 60% on the whole
     // ladder and the deepest layer came out barely more desaturated than the one
     // in front of it. 200–2900 puts the four bands at roughly 2% / 14% / 39% /
     // 75% of the ramp, which is the ordering the band table is built around.
-    patchAerial(this.backdrop, this.u, 200, 2900);
+    // 200 -> 620. With `patchBackdropForm` now carrying the depth separation as
+    // a value ramp, this pass only has to supply the residual azimuth tint, and
+    // opening at 200 m had it at a third strength on the coast band — which is
+    // where the last of the ridge's own modelling still has to survive. Pushed
+    // out so the near two bands keep their N·L, and the mixes below were already
+    // capped at 0.42 / 0.34 so no band can ever reach a full haze wash.
+    patchAerial(this.backdrop, this.u, 620, 2900);
 
     this.shadowDecal = new THREE.MeshBasicMaterial({
       map: T.contactShadow(),
@@ -4053,8 +4521,28 @@ export function buildHouse(out: HouseParts, rng: RNG, xform: THREE.Matrix4, w: n
     // stone sill, with a 8 cm drip lip the low sun catches
     out.trim.add(bevelBox(winW + 0.34, 0.1, 0.3, 0.02, 1.4), _m.multiplyMatrices(xform, trs(wp.x, wp.y - 0.06, z + 0.06, 0)).clone(), new THREE.Color(0xe8dfce));
     out.trim.add(bevelBox(winW + 0.4, 0.06, 0.08, 0.015, 2.2), _m.multiplyMatrices(xform, trs(wp.x, wp.y - 0.13, z + 0.19, 0)).clone(), new THREE.Color(0xdccfba));
-    // recessed glass, sitting at the back of the reveal
-    out.glass.push(_m.multiplyMatrices(xform, trs(wp.x, wp.y + winH / 2, z - 0.20, 0, winW * 0.94, winH * 0.94, 1)).clone());
+    // Recessed glass, sitting at the back of the reveal — with a 1–3° tilt.
+    //
+    // The material is already a proper physical glass (roughness 0.08,
+    // envMapIntensity 2.2), and yet not one pane in wide.png reflects anything.
+    // The reason is that every pane in the village was exactly coplanar with its
+    // wall, so a whole terrace shares one reflection vector: either they ALL
+    // catch the sun disc or, as here, none of them does, and a specular lobe
+    // that narrow will almost never be the lucky one. Real glazing is never
+    // that true — old timber sashes sit a degree or two out and no two the
+    // same. A couple of degrees of scatter is all it takes for a handful of
+    // panes on any given hillside to line up on the sun and flare, and that
+    // scatter of bright hits is most of what sells a Mediterranean village at
+    // golden hour. The pitch is biased UP so a miss samples sky rather than
+    // ground.
+    out.glass.push(
+      _m
+        .multiplyMatrices(
+          xform,
+          trs(wp.x, wp.y + winH / 2, z - 0.20, (rng() - 0.5) * 0.055, winW * 0.94, winH * 0.94, 1, -0.012 - rng() * 0.045, (rng() - 0.5) * 0.03)
+        )
+        .clone()
+    );
     // shutters, one per side, occasionally swung open
     const openA = rng() < 0.4 ? 0.6 + rng() * 0.7 : 0.02;
     for (const s of [-1, 1]) {
@@ -4423,14 +4911,68 @@ export function bannerArchGeo(span: number, height: number): { struct: THREE.Buf
     // diagonal brace
     acc.add(bevelBox(0.16, 2.2, 0.16, 0.03, 3), trs(x - s * 0.7, height - 1.0, 0, 0, 1, 1, 1, 0, s * 0.5), w);
   }
-  acc.add(bevelBox(span + 1.6, 0.42, 0.55, 0.05, 0.35), trs(0, height + 0.4, 0, 0), w);
-  acc.add(bevelBox(span + 1.2, 0.2, 0.4, 0.03, 2), trs(0, height + 1.55, 0, 0), new THREE.Color(0.9, 0.9, 0.9));
-  const banner = new THREE.PlaneGeometry(span + 1.2, 1.05, 12, 2);
-  banner.translate(0, height + 1.0, 0.05);
-  // banner uv.x must run 0..1 from the top rail for the cloth patch
-  const uvB = banner.getAttribute('uv') as THREE.BufferAttribute;
-  for (let i = 0; i < uvB.count; i++) uvB.setXY(i, 1 - uvB.getY(i), uvB.getX(i));
+  // ------------------------------------------------------------------------
+  //  THE BEAM IS A TRUSS, AND THE BANNER IS A BANNER.
+  // ------------------------------------------------------------------------
+  //  Round 1's beam was a single 0.42 m box with a 1.05 m ribbon of cloth under
+  //  it. Over a 28 m span that ribbon is 27:1, which is why wide.png's arch
+  //  reads as a bare telegraph crossbar ruling a hard horizontal line through
+  //  the middle of the frame rather than as start-line dressing, and why the
+  //  start straight has no readable banner at all.
+  //
+  //  A real gantry has depth: a top and a bottom chord with diagonal webbing
+  //  between them. That breaks the silhouette into a lattice instead of one
+  //  solid bar, gives the low sun several edges to catch, and is what stops it
+  //  reading as an untextured box (§9.6, hard unchamfered edges — every member
+  //  here is a bevelBox). And the banner itself goes to 2.8 m, which at 28 m of
+  //  span is a 10:1 sheet: a printed banner, not a tape.
+  const chord = 0.34;
+  for (const y of [height + 0.28, height + 1.42]) acc.add(bevelBox(span + 1.6, chord, 0.5, 0.05, 0.35), trs(0, y, 0, 0), w);
+  const webN = Math.max(6, Math.round(span / 2.2));
+  for (let i = 0; i <= webN; i++) {
+    const x = -((span + 1.0) / 2) + (i / webN) * (span + 1.0);
+    acc.add(bevelBox(0.14, 1.34, 0.34, 0.03, 2.4), trs(x, height + 0.85, 0, 0, 1, 1, 1, 0, (i % 2 ? 1 : -1) * 0.62), new THREE.Color(0.92, 0.92, 0.92));
+  }
+  acc.add(bevelBox(span + 1.2, 0.2, 0.4, 0.03, 2), trs(0, height + 2.2, 0, 0), new THREE.Color(0.9, 0.9, 0.9));
+  const banner = new THREE.PlaneGeometry(span + 1.2, 2.8, 14, 3);
+  banner.translate(0, height + 0.78, 0.34);
+  bannerUvs(banner);
   return { struct: acc.build()!, banner };
+}
+
+/**
+ * Wire a hanging-banner plane's two UV channels.
+ *
+ * THE BANNER PRINT WAS ROTATED 90° AND NOBODY COULD SEE IT. `patchCloth` needs
+ * uv.x to run 0 at the rooted edge to 1 at the free edge, and for a sheet hung
+ * from a top rail that edge is VERTICAL — so the original code swapped the
+ * plane's u and v wholesale and then sampled the albedo through the same
+ * swapped coordinate. Canvas X therefore mapped to the banner's height and
+ * canvas Y to its width: "SUNSET BAY" was being drawn sideways, crushed into a
+ * strip a tenth of the banner wide, on a ribbon 1.05 m tall over a 28 m span.
+ * Which is why there is no readable banner anywhere in the round-1 set, and why
+ * the arch reads as a bare telegraph crossbar.
+ *
+ * Two channels fixes it without touching either the texture or the cloth patch:
+ *   uv  — the cloth coordinate, vertical, as `patchCloth` requires
+ *   uv1 — the real texture coordinate, upright, and mapped onto the printed top
+ *         quarter of `bannerCloth` so the print fills the whole sheet
+ */
+export function bannerUvs(g: THREE.BufferGeometry) {
+  const uv = g.getAttribute('uv') as THREE.BufferAttribute;
+  const n = uv.count;
+  const uv1 = new Float32Array(n * 2);
+  for (let i = 0; i < n; i++) {
+    const u = uv.getX(i);
+    const v = uv.getY(i);
+    uv1[i * 2] = u;
+    // the printed band is the top quarter of the sheet (canvas rows 0..size/4),
+    // which after flipY is v = 0.75..1
+    uv1[i * 2 + 1] = 0.752 + v * 0.246;
+    uv.setXY(i, 1 - v, u);
+  }
+  uv.needsUpdate = true;
+  g.setAttribute('uv1', new THREE.BufferAttribute(uv1, 2));
 }
 
 /** Tiered grandstand with a canopy; returns structure + the crowd row anchors. */
@@ -4727,7 +5269,33 @@ export function spectatorGeo(variant = 0): THREE.BufferGeometry {
     setUv(cap, 1, 0.5);
     acc.add(cap, trs(0, 0, 0, 0), white);
   }
-  return acc.build()!;
+  const g = acc.build()!;
+  // ---- uv1: the real texture coordinate ----------------------------------
+  // Channel 0 is a flag channel here (see `MatLib.crowd`), so the garment atlas
+  // needs its own. Cylindrical: u is the bearing around the figure, v runs 0 at
+  // the feet to 1 just above the head, which is the layout `crowdCloth` cards
+  // are painted for — trousers low, shirt high. Derived from the built
+  // positions rather than threaded through `GeoAccum`, which would mean an
+  // extra stream on every prop in the game for the benefit of one of them.
+  const pa = g.getAttribute('position') as THREE.BufferAttribute;
+  const uv1 = new Float32Array(pa.count * 2);
+  for (let i = 0; i < pa.count; i++) {
+    const x = pa.getX(i),
+      y = pa.getY(i),
+      z = pa.getZ(i);
+    // MIRRORED bearing, not a raw wrap. A raw atan2 jumps from 1 back to 0 down
+    // the figure's back, and that one column of triangles would smear the whole
+    // atlas cell across itself. |2a-1| is continuous at the wrap (both ends land
+    // on 1), and since every card's pattern is stripes, hoops or blocks, the
+    // mirror is invisible.
+    const a = Math.atan2(z, x) / (Math.PI * 2) + 0.5;
+    uv1[i * 2] = Math.abs(a * 2 - 1);
+    // v = 0 at the feet. The canvas is uploaded flipY, so v = 0 is the BOTTOM of
+    // the card, which is where `crowdCloth` paints the trousers.
+    uv1[i * 2 + 1] = clamp(y / 1.62, 0, 1);
+  }
+  g.setAttribute('uv1', new THREE.BufferAttribute(uv1, 2));
+  return g;
 }
 
 function setUv(g: THREE.BufferGeometry, x: number, y: number) {

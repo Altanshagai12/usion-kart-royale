@@ -2,15 +2,18 @@
  * Minimap — the real centreline from ITrack.minimapPath(), normalised by
  * ITrack.bounds.
  *
- * ROUND 7 REBUILD. The review's words: "the minimap in the middle of that
- * stack is genuinely unreadable in all ten frames" and "a photoreal-bead
- * minimap parked on the vanishing point". Four separate faults, four fixes:
+ * ROUND 8. The round-1 review's words: "the minimap does not read instantly …
+ * at 247 px it reads as a shoelace or a zipper rather than a circuit", and
+ * "'ring = you' means nothing". Four faults, four fixes:
  *
- *  1. IT WAS A WIRE, NOT A ROAD. Round 6 over-corrected round 5's rope into a
- *     3 px hairline with a 1 px casing on a 150 px panel. At that weight the
- *     circuit read as a thread and the eye had nothing to lock onto. It is now
- *     a real ribbon — a light road body with a dark casing and a dashed centre
- *     line, which is what makes a shape read as *track* rather than as *line*.
+ *  1. IT HAD TWO VALUES, NOT THREE. Round 7's ribbon was a light body with a
+ *     near-black casing on a near-black plate: the casing and the ground were
+ *     the same value, so the road had no edge and read as a soft noodle with a
+ *     dashed line through it — a shoelace, in the review's words. The well now
+ *     carries a deep TEAL ground, the casing is the dark, the core is the
+ *     light, and the dashed centreline (which is what made it read as a zipper
+ *     at 247 px) is gone. Each §1 section shifts the core's value, so the loop
+ *     has landmarks instead of being a generic kidney.
  *
  *  2. IT WAS ARBITRARILY ORIENTED. The path went straight from world XZ to
  *     canvas XY, so the circuit sat at whatever angle the level designer
@@ -21,11 +24,13 @@
  *     start line runs left-to-right. Fixed orientation, north-up-equivalent,
  *     baked once.
  *
- *  3. THE MARKERS WERE BEADS. Eight ~3.4 px discs, all the same size, in
- *     liveries that at that radius were three or four grey-ish pixels. The
- *     player is now a bright heading CHEVRON with a dark casing and a halo —
- *     a different SHAPE from the field, not just a bigger dot — and rivals are
- *     larger livery discs with a casing sized to survive a 1 px stroke.
+ *  3. "RING = YOU" MEANT NOTHING. Round 7 ringed the player AND both rivals
+ *     adjacent in the order, so three of nine markers were ringed and the one
+ *     affordance for finding yourself was destroyed. There is exactly one ring
+ *     in this system and it is the player's. The player is 1.8x the rival
+ *     diameter (§7's "larger dot"), filled with their own livery colour, with
+ *     a heading chevron struck into it in ink; rivals are told apart by livery
+ *     colour alone.
  *
  *  4. IT WAS ON THE KART. It lived bottom-centre; the chase camera parks the
  *     player's kart and the road's vanishing point in exactly that column.
@@ -41,23 +46,43 @@ import { el, clamp, cssColor } from './uiUtil';
 /** Dense enough that the village esses and the banked 180 survive. */
 const SAMPLES = 720;
 /** fraction of the panel reserved as margin, after rotation */
-const PAD = 0.075;
+const PAD = 0.085;
 
 /**
  * Ribbon and marker weights, in CSS px at the reference panel height, scaled
  * by `this.u` so a 720p and a 1440p frame get the same PROPORTIONS rather than
  * the same pixels.
  */
-const REF_H = 150;
-const TRACK_W = 6.4;      // road body
-const TRACK_CASE = 3.4;   // total casing, 1.7 px each side
-const TRACK_COL = '#f2ece0';           // §3 kerb white — never #ffffff
-const TRACK_MID = 'rgba(60, 66, 88, 0.6)';
-const CASE_COL = '#05080f';
+const REF_H = 132;
+const TRACK_W = 3.4;      // the bright core
+const TRACK_CASE = 5.2;   // the dark casing the core sits inside
+const TRACK_COL = '#f6f0e2';           // §3 kerb white, lifted — never #ffffff
+const CASE_COL = '#04070d';
+/** the well's own ground — a deep teal, NOT near-black. See `bake`. */
+const WELL_A = '#123047';
+const WELL_B = '#081726';
 
-/** Marker radii. The player is a chevron, not a disc, so it has no radius. */
-const RIVAL_R = 4.6;
-const PLAYER_R = 7.4;
+/**
+ * SECTION TINT — ART_DIRECTION §1's lap table, as value.
+ *
+ * The round-1 map was a generic kidney with no landmark identity, so you could
+ * not tell where on the course you were. Each named section now shifts the
+ * ribbon's core value a little: the tunnel goes dark, the bridge and the
+ * banked coastal curve go bright, the harbour straight is the base. It is a
+ * dozen pixels of contrast and it turns the loop into a place.
+ */
+const SECTIONS: { t0: number; t1: number; col: string }[] = [
+  { t0: 0.00, t1: 0.10, col: '#fffaf0' },  // start straight / harbour front
+  { t0: 0.10, t1: 0.52, col: TRACK_COL },  // harbour sweep -> cliff traverse
+  { t0: 0.52, t1: 0.60, col: '#7e8ba0' },  // tunnel — the one dark run
+  { t0: 0.60, t1: 0.74, col: '#f0dfbd' },  // beach descent, sand-lined
+  { t0: 0.74, t1: 0.86, col: '#fffaf0' },  // banked coastal curve, the money shot
+  { t0: 0.86, t1: 1.00, col: '#dfe9ee' },  // bridge & return, cool stone
+];
+
+/** Marker radii. §7 asks for the player as a larger dot; this is 1.8x. */
+const RIVAL_R = 4.4;
+const PLAYER_R = 7.9;
 /** minimum centre-to-centre separation as a multiple of the summed radii */
 const SEPARATION = 1.35;
 
@@ -193,7 +218,7 @@ export class Minimap {
     out.y = this.oy + (dx * this.rs + dz * this.rc) * this.sx;
   }
 
-  /** Bake the static ribbon. Called on build and on resize. */
+  /** Bake the static ground + ribbon + start line. Called on build and resize. */
   private bake() {
     const g = this.baseG;
     const W = this.w, H = this.h;
@@ -212,60 +237,94 @@ export class Minimap {
     const s = this.scratch;
     const d = this.u;
 
-    const trace = () => {
+    // --- THE GROUND --------------------------------------------------------
+    // Round 1's ribbon had "no edge contrast against the near-black plate",
+    // and that is a value problem, not a weight problem: the casing and the
+    // plate were the same near-black, so the road had no defined edge and
+    // dissolved into a soft noodle. Three values are needed and there were
+    // two. The well now carries a deep TEAL ground (§3's sea family, lit from
+    // the top like everything else), the casing is the dark, and the core is
+    // the light — so the ribbon has a real edge on both sides.
+    const bg = g.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, WELL_A);
+    bg.addColorStop(1, WELL_B);
+    g.fillStyle = bg;
+    g.fillRect(0, 0, W, H);
+
+    const trace = (from: number, to: number, close: boolean) => {
       g.beginPath();
-      this.project(p[0].x, p[0].z, s);
+      this.project(p[from].x, p[from].z, s);
       g.moveTo(s.x, s.y);
-      for (let i = 1; i < n; i++) {
-        this.project(p[i].x, p[i].z, s);
+      for (let i = from + 1; i <= to; i++) {
+        this.project(p[i % n].x, p[i % n].z, s);
         g.lineTo(s.x, s.y);
       }
-      g.closePath();
+      if (close) g.closePath();
     };
 
     g.lineJoin = 'round';
     g.lineCap = 'round';
 
-    // A road, not a wire: dark casing, light body, dashed centre line. Three
-    // strokes of one shape — no bevel, no gradient, no glow, no value bands.
-    trace();
+    // --- casing, one closed pass -------------------------------------------
+    trace(0, n, true);
     g.strokeStyle = CASE_COL;
     g.lineWidth = (TRACK_W + TRACK_CASE) * d;
     g.stroke();
 
-    trace();
-    g.strokeStyle = TRACK_COL;
-    g.lineWidth = TRACK_W * d;
-    g.stroke();
+    // --- core, one pass PER SECTION ----------------------------------------
+    // The dashed centreline is gone. At this panel size it was the thing that
+    // made the circuit read as a zipper; the ribbon's own casing is what makes
+    // it read as a carriageway. Section runs overlap by a sample so the joins
+    // are invisible.
+    for (let k = 0; k < SECTIONS.length; k++) {
+      const sec = SECTIONS[k];
+      const i0 = Math.floor(sec.t0 * n);
+      const i1 = Math.min(n, Math.ceil(sec.t1 * n) + 1);
+      if (i1 - i0 < 2) continue;
+      trace(i0, i1, false);
+      g.strokeStyle = sec.col;
+      g.lineWidth = TRACK_W * d;
+      g.stroke();
+    }
 
-    // The centre line is what makes the shape read as a carriageway at 6 px.
-    // It is also the cheapest possible sense of direction along the ribbon.
-    trace();
-    g.setLineDash([4.6 * d, 5.4 * d]);
-    g.strokeStyle = TRACK_MID;
-    g.lineWidth = Math.max(1, 1.0 * d);
-    g.stroke();
-    g.setLineDash([]);
-
-    // Start/finish: a tick across the ribbon. One idiom per widget.
+    // --- START / FINISH ----------------------------------------------------
+    // A 4 px gold tick was invisible at real size. It is now a chequered bar
+    // laid across the full width of the ribbon with a warm glow behind it —
+    // the one landmark on the map that must be findable in a glance.
     this.project(p[0].x, p[0].z, s);
     const ax = s.x, ay = s.y;
     this.project(p[3 % n].x, p[3 % n].z, s);
     let tx = s.x - ax, ty = s.y - ay;
     const tl = Math.hypot(tx, ty) || 1;
     tx /= tl; ty /= tl;
-    const half = (TRACK_W + TRACK_CASE) * 0.5 * d;
+    const half = (TRACK_W + TRACK_CASE) * 0.95 * d;
     const nx = -ty * half, ny = tx * half;
+
+    g.save();
+    g.shadowColor = 'rgba(255, 190, 88, 0.95)';
+    g.shadowBlur = 8 * d;
     g.lineCap = 'butt';
     g.beginPath();
     g.moveTo(ax - nx, ay - ny);
     g.lineTo(ax + nx, ay + ny);
-    g.lineWidth = 3.2 * d;
-    g.strokeStyle = CASE_COL;
+    g.lineWidth = 8.5 * d;
+    g.strokeStyle = 'rgba(255, 200, 108, 0.9)';
     g.stroke();
-    g.lineWidth = 1.8 * d;
-    g.strokeStyle = '#ffcf6b';
-    g.stroke();
+    g.restore();
+
+    // four chequers across the bar, drawn along the ribbon normal
+    g.lineCap = 'butt';
+    const CH = 4;
+    for (let i = 0; i < CH; i++) {
+      const a0 = -1 + (2 * i) / CH;
+      const a1 = -1 + (2 * (i + 1)) / CH;
+      g.beginPath();
+      g.moveTo(ax + nx * a0, ay + ny * a0);
+      g.lineTo(ax + nx * a1, ay + ny * a1);
+      g.lineWidth = 6.4 * d;
+      g.strokeStyle = i % 2 ? '#0a0f18' : '#fff6e4';
+      g.stroke();
+    }
     g.lineCap = 'round';
   }
 
@@ -359,25 +418,32 @@ export class Minimap {
       order[j + 1] = v;
     }
 
-    const pp = player ? player.place : 0;
     for (let oi = 0; oi < n; oi++) {
       const i = order[oi];
       const k = karts[i];
       if (k === player) continue;
-      const battle = pp > 0 && (k.place === pp - 1 || k.place === pp + 1);
-      this.dot(g, px[i], py[i], rivalR, this.colors[i] || '#f2ece0', k.starTime > 0, battle, d);
+      this.dot(g, px[i], py[i], rivalR, this.colors[i] || '#f2ece0', k.starTime > 0, d);
     }
 
     if (player) {
       const i = karts.indexOf(player);
-      this.playerMark(g, px[i], py[i], playerR, player, d);
+      this.playerMark(g, px[i], py[i], playerR, player, this.colors[i] || '#ff3b5c', d);
     }
   }
 
-  /** Rivals: a flat livery disc with a dark casing. One idiom, one weight. */
+  /**
+   * Rivals: a flat livery disc with a dark casing, and NOTHING ELSE.
+   *
+   * Round 1 also drew a gold ring around whichever rivals were adjacent in the
+   * order. Three of nine markers in wide.png therefore carried a ring while
+   * the player carried one too, so "ring = you" meant nothing and the one
+   * affordance the map has for finding yourself was destroyed. Rivals are told
+   * apart by livery colour, which is what livery colours are for. The ring
+   * belongs to the player and to no one else.
+   */
   private dot(
     g: CanvasRenderingContext2D, x: number, y: number, r: number,
-    color: string, glow: boolean, battle: boolean, d: number,
+    color: string, glow: boolean, d: number,
   ) {
     if (glow) {
       g.beginPath();
@@ -392,30 +458,17 @@ export class Minimap {
     g.lineWidth = 1.6 * d;
     g.strokeStyle = CASE_COL;
     g.stroke();
-    if (battle) {
-      g.beginPath();
-      g.arc(x, y, r + 2.4 * d, 0, Math.PI * 2);
-      g.lineWidth = 1.4 * d;
-      g.strokeStyle = '#ffcf6b';
-      g.stroke();
-    }
   }
 
   /**
-   * The player is a different SHAPE on a different GROUND: a gold heading
-   * chevron struck into an opaque near-black disc. Two things matter here and
-   * round 6 got both wrong.
-   *
-   *  - The ribbon is LIGHT. A cream player dot on a cream ribbon is invisible
-   *    exactly where the player always is, which is on the ribbon. The disc
-   *    inverts the local value so the marker always has its own ground, and
-   *    the chevron is the HUD's one accent (`--gold`), the same colour that
-   *    means "you" on the standings board.
-   *  - A radius difference does not survive at panel scale. A shape difference
-   *    does, and it carries heading for free.
+   * The player: §7's "larger dot", at 1.8x the rival diameter, filled with the
+   * player's own livery colour, carrying the ONE ring in the system — and with
+   * a heading chevron struck into it in ink, because a marker that carries
+   * heading is worth more than one that does not and it costs one path.
    */
   private playerMark(
-    g: CanvasRenderingContext2D, x: number, y: number, r: number, k: IKart, d: number,
+    g: CanvasRenderingContext2D, x: number, y: number, r: number, k: IKart,
+    col: string, d: number,
   ) {
     const f = k.forward;
     // heading, rotated by the same fit the ribbon was baked with
@@ -423,26 +476,38 @@ export class Minimap {
     const hy = f.x * this.rs + f.z * this.rc;
     const a = Math.atan2(hy, hx);
 
-    // ground: opaque, so the marker never blends into the ribbon under it
+    // a soft halo so the marker survives on the bright core of the ribbon,
+    // which is exactly where the player always is
     g.beginPath();
-    g.arc(x, y, r * 1.34, 0, Math.PI * 2);
-    g.fillStyle = '#080c18';
+    g.arc(x, y, r * 1.62, 0, Math.PI * 2);
+    g.fillStyle = 'rgba(4, 8, 14, 0.55)';
     g.fill();
-    g.lineWidth = 1.6 * d;
-    g.strokeStyle = 'rgba(255, 244, 226, 0.85)';
+
+    g.beginPath();
+    g.arc(x, y, r, 0, Math.PI * 2);
+    g.fillStyle = col;
+    g.fill();
+    // THE ring. Cream, heavier than the rivals' casing, and unique.
+    g.lineWidth = 2.4 * d;
+    g.strokeStyle = '#fff4e2';
+    g.stroke();
+    g.lineWidth = 1.2 * d;
+    g.strokeStyle = CASE_COL;
+    g.beginPath();
+    g.arc(x, y, r + 1.8 * d, 0, Math.PI * 2);
     g.stroke();
 
     g.save();
     g.translate(x, y);
     g.rotate(a);
     g.beginPath();
-    g.moveTo(r * 1.0, 0);
-    g.lineTo(-r * 0.66, -r * 0.8);
-    g.lineTo(-r * 0.28, 0);
-    g.lineTo(-r * 0.66, r * 0.8);
+    g.moveTo(r * 0.72, 0);
+    g.lineTo(-r * 0.34, -r * 0.5);
+    g.lineTo(-r * 0.10, 0);
+    g.lineTo(-r * 0.34, r * 0.5);
     g.closePath();
     g.lineJoin = 'round';
-    g.fillStyle = '#ffcf6b';
+    g.fillStyle = 'rgba(6, 12, 20, 0.86)';
     g.fill();
     g.restore();
   }

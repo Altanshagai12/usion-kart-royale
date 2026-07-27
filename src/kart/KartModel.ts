@@ -310,7 +310,7 @@ function buildChassis(): ChassisGeo {
     mesher.addLoft(secs, role, mat(0, 0, 1.03, 0, Math.PI / 2, 0), { corner, capStart: 0.05, capEnd: 0.05 });
   };
   bumper(0.085, 0.075, 0.30, Role.Base, P, 0, 3);
-  // Rub strip, corner 3 and not 1.
+  // Rub strip, corner 3 and not 1, and 72 x 44 mm rather than 60 x 60.
   //
   // At corner 1 the ring is an octagon, and an octagon swept along a gentle bow
   // gives ONE flat facet aimed at the sky for the strip's whole 1 m length. A
@@ -322,7 +322,20 @@ function buildChassis(): ChassisGeo {
   // 16-gon: the normal now turns continuously across the top, the reflection
   // sweeps through the env instead of sampling one point of it, and the bar
   // becomes a rolled highlight with a dark shoulder either side. 96 triangles.
-  bumper(0.030, 0.030, 0.30, Role.Steel, C, -0.085, 3);
+  //
+  // ROUND 7 — IT IS STILL A LIGHTSABER, AND THE REMAINING HALF IS THE SECTION.
+  // corner 3 made the ring a 16-gon, but the ring was SQUARE (hw = hh = 0.030
+  // with r = 0.8 x min = 0.024), which is a circle to within 6 mm. A circular
+  // section swept along a bow has no preferred direction: every one of those 16
+  // normals finds some part of the bright horizon band, so the "gradient" is a
+  // gradient between two clipped values and the bar is uniform white over its
+  // whole 1 m. 0.036 x 0.022 with r = 0.0176 is a flattened section: a narrow
+  // crown that takes the sun, and shoulders that fall away fast enough to sit a
+  // stop and a half darker. That is what makes a highlight read as a highlight —
+  // it needs somewhere to stop. Same triangle count, and it is paired with the
+  // chrome roughness and `ENV_TARGET.chrome` changes in Liveries; all three are
+  // needed, none of them is sufficient.
+  bumper(0.036, 0.022, 0.298, Role.Steel, C, -0.083, 3);
   // splitter under the bumper
   M.addLoft(
     [
@@ -337,8 +350,17 @@ function buildChassis(): ChassisGeo {
   // --- roll bar + rear wing ------------------------------------------------
   // Swept along a smoothed curve: the nine control points below are a polyline
   // with real corners in it, and a mitred chrome hoop is the §5 hard-edge tell
-  // in tube form. 26 path samples x 10 radial keeps the bends continuous all
-  // the way round, which is what lets the highlight run along the hoop.
+  // in tube form. 22 path samples keep the bends continuous all the way round,
+  // which is what lets the highlight run along the hoop.
+  //
+  // 13 radial, not 10 — the closeup note's "coarsely tessellated torus". At
+  // 36 mm radius the hoop is ~45 px across at the 1 m closeup framing, so 10
+  // radial puts a 36-degree facet on it: a 14 px flat, which on a mirror is a
+  // visible band of constant reflection with a hard edge either side. 13 takes
+  // that to 27.7 degrees / 10 px and the facet stops being readable as one.
+  // (Odd on purpose: with an even count the top and bottom facets are parallel
+  // and the hoop shows one continuous flat along its whole crown, which is the
+  // same defect the rub strip above has.)
   C.addTube(
     smoothPath([
       new THREE.Vector3(-0.40, 0.55, -0.42),
@@ -351,7 +373,7 @@ function buildChassis(): ChassisGeo {
       new THREE.Vector3(0.425, 0.86, -0.47),
       new THREE.Vector3(0.40, 0.55, -0.42),
     ], 22),
-    0.036, 10, Role.Steel,
+    0.036, 13, Role.Steel,
   );
   // Hoop cross brace and the wing stays. 8 radial, not 6: a hexagonal chrome
   // tube shows three facets across a 20 px silhouette and every one of them is
@@ -362,9 +384,11 @@ function buildChassis(): ChassisGeo {
     0.024, 8, Role.Steel,
   );
   for (const s of [-1, 1]) {
+    // 6 radial: a 22 mm strut 190 mm long, behind the engine block, never more
+    // than a dozen pixels wide. Part of the roll hoop's bill.
     C.addTube(
       [new THREE.Vector3(s * 0.30, 0.80, -0.90), new THREE.Vector3(s * 0.30, 0.99, -1.00)],
-      0.022, 8, Role.Steel,
+      0.022, 6, Role.Steel,
     );
   }
   P.addLoft(
@@ -387,6 +411,12 @@ function buildChassis(): ChassisGeo {
         new THREE.Vector3(s * 0.235, 0.845, -1.09),
       ], 6),
       (t) => 0.046 + t * t * 0.018,
+      // Held at 9. It was raised to 11 alongside the roll hoop and put the kart
+      // 70 triangles over §5's 12 k ceiling; measured against the shots, the
+      // stacks are 15-25 px across in every framing that shows them and the
+      // review did not flag them. The hoop is 45 px at the closeup and WAS
+      // flagged. When there is no budget left, the note wins and the guess does
+      // not.
       9, Role.Steel,
     );
   }
@@ -448,7 +478,11 @@ function buildChassis(): ChassisGeo {
     [new THREE.Vector3(0, 0.53, 0.46), new THREE.Vector3(0, 0.84, 0.29)],
     0.028, 8, Role.Steel,
   );
-  C.addGeometry(new THREE.TorusGeometry(0.045, 0.012, 4, 9), Role.Steel, mat(0.13, 0.565, 0.455, 0.35), 1.5);
+  // Ignition ring on the dash. (4, 9) -> (3, 7): a 45 mm torus behind the
+  // steering wheel, below the driver's forearms, at the one place on the kart
+  // the chase camera never sees past the wheel boss. 30 triangles toward the
+  // roll hoop.
+  C.addGeometry(new THREE.TorusGeometry(0.045, 0.012, 3, 7), Role.Steel, mat(0.13, 0.565, 0.455, 0.35), 1.5);
   // (the pedal box that used to live here is fully enclosed by the nose and the
   // dash shroud — it never reached a pixel in any of the ten review shots, so
   // its 128 triangles now pay for the roll bar's continuous bends instead)
@@ -556,19 +590,29 @@ function buildWheel(): Built {
   // what pays for the radial density above.
   const hw = WHEEL_HW;
   const profile = [
-    -hw * 0.80, 0.200, 0.300,
-    -hw * 0.95, 0.330, 0.545,
-    -hw * 0.78, 0.366, 0.620,
+    // The inboard flank really is one taper now. The comment above has claimed
+    // that since round 3 while the profile still carried a bead, a bulge AND a
+    // shoulder on a face that looks into the floor pan and is in the kart's own
+    // shadow at every camera the game has. Dropping the inboard bulge ring is
+    // 60 triangles a wheel, 240 a kart, and it is what pays for the rim
+    // revolve below going from 12 radial to 20 — the note's "visible flat
+    // faceting around the circle", on a surface that IS on the silhouette.
+    -hw * 0.86, 0.210, 0.310,
+    -hw * 0.80, 0.366, 0.620,
     0.000, 0.374, 0.800,
     hw * 0.78, 0.366, 0.980,
     hw * 0.92, 0.350, 0.575,
     hw * 0.99, 0.292, 0.470,
     hw * 0.80, 0.200, 0.300,
   ];
-  // Scallop the shoulders: rings 2 and 4 are the tread edges, ring 3 the crown.
+  // Scallop the shoulders: rings 1 and 3 are the tread edges, ring 2 the crown.
+  // (These indices moved when the inboard bulge ring came out above. They are
+  // the reason that edit is not a one-line deletion: a scallop applied to the
+  // wrong ring puts a 4 mm ten-lobe ripple on the tyre's BEAD, which reads as a
+  // buckled wheel and would be a new note rather than a fixed one.)
   W.addRevolve(profile, RAD, Role.Rubber, undefined, 1, 0, (i, a) =>
-    i === 2 || i === 4 ? Math.sin(a * TREAD_BLOCKS) * 0.004
-      : i === 3 ? Math.sin(a * TREAD_BLOCKS) * 0.0018 : 0,
+    i === 1 || i === 3 ? Math.sin(a * TREAD_BLOCKS) * 0.004
+      : i === 2 ? Math.sin(a * TREAD_BLOCKS) * 0.0018 : 0,
   );
 
   // Rim: a closed back plate (so you never see through the spokes into the
@@ -576,7 +620,20 @@ function buildWheel(): Built {
   // DOWN the atlas's baked AO ramp as the surface goes deeper into the wheel:
   // 0.06 on the outboard lip, 0.16-0.19 on the barrel wall, 0.24 on the back
   // plate you see between the spokes. That is the occlusion term the spoke
-  // recesses were missing. 12 radial, not 40 — the whole revolve lives inside
+  // recesses were missing.
+  //
+  // 20 RADIAL, NOT 12, and the round-3 justification below is simply wrong. The
+  // BARREL never reaches a silhouette. The LIP does: it sits at r = 0.203
+  // against a 0.200 bead, it is the outermost ring of metal on the wheel, and
+  // it is what you look straight down at when the camera is alongside — which
+  // is the closeup framing. A 12-gon there is a 30-degree chord, and that is
+  // exactly the review's "low-poly star with visible flat faceting around the
+  // circle": the star is the five spokes, which is the design; the faceting is
+  // this ring. 20 takes the chord to 18 degrees, under two pixels of sagitta at
+  // 1 m. Paid for by the tyre's inboard flank above, one for one.
+  //
+  // (Superseded, kept because it explains what the V ramp is for:) 12 radial,
+  // not 40 — the whole revolve lives inside
   // the tyre bead, so it never reaches a silhouette; all it ever has to do is
   // be a continuous surface behind five spoke gaps. (Round 2 spent its budget
   // on the driver's hands, which are on the hero silhouette. This is where it
@@ -589,7 +646,7 @@ function buildWheel(): Built {
       hw * 0.78, 0.203, 0.150,
       hw * 0.68, 0.174, 0.060,
     ],
-    12, Role.Rim, undefined, RF[2], RF[0],
+    20, Role.Rim, undefined, RF[2], RF[0],
   );
   // Spokes: five chunky blades from the hub out to the lip. corner 2 rounds the
   // blade's long edges and a 2-segment cap chamfers the outboard END, which was
@@ -687,6 +744,10 @@ const IMPOSTOR_SKIP = new Set(['shadowBlob']);
 const _im = new THREE.Matrix3();
 const _iv = new THREE.Vector3();
 const _ic = new THREE.Color();
+/** World matrix of the part (or instance) currently being baked. */
+const _iw = new THREE.Matrix4();
+/** Scratch for the per-frame tyre instance matrices. */
+const _tw = new THREE.Matrix4();
 
 /**
  * Downsampled, linear-space copy of a base-colour map, for baking into the
@@ -799,28 +860,46 @@ function mergeToImpostor(root: THREE.Object3D): THREE.BufferGeometry | null {
     const baseCol = src?.color;
     const baseMap = src?.map ?? null;
     const samples = baseMap ? mapSamples(baseMap) : null;
-    _im.getNormalMatrix(m.matrixWorld);
-    for (let i = 0; i < p.count; i++) {
-      _iv.fromBufferAttribute(p, i).applyMatrix4(m.matrixWorld);
-      pos.push(_iv.x, _iv.y, _iv.z);
-      if (n) {
-        _iv.fromBufferAttribute(n, i).applyMatrix3(_im).normalize();
-        nrm.push(_iv.x, _iv.y, _iv.z);
-      } else nrm.push(0, 1, 0);
-      const tu = u ? u.getX(i) : 0;
-      const tv = u ? u.getY(i) : 0;
-      uv.push(tu, tv);
 
-      if (c) _ic.setRGB(c.getX(i), c.getY(i), c.getZ(i));
-      else _ic.setRGB(1, 1, 1);
-      if (baseCol) _ic.multiply(baseCol);
-      if (samples && baseMap) sampleMap(samples, baseMap, tu, tv, _ic);
-      col.push(_ic.r, _ic.g, _ic.b);
+    // An InstancedMesh contributes once PER INSTANCE, each at its own matrix.
+    // The four tyres are one instanced draw (see the wheel loop in `buildKart`),
+    // and baking only the base geometry would put a single wheel at the kart's
+    // origin — a far kart on one centre wheel, and a shadow to match, because
+    // this bake is also the kart's only shadow caster.
+    const inst = m as unknown as { isInstancedMesh?: boolean; count?: number;
+      instanceMatrix?: THREE.InstancedBufferAttribute };
+    const reps = inst.isInstancedMesh === true ? inst.count ?? 0 : 1;
+
+    for (let r = 0; r < reps; r++) {
+      if (inst.isInstancedMesh === true && inst.instanceMatrix) {
+        _iw.fromArray(inst.instanceMatrix.array as ArrayLike<number>, r * 16);
+        _iw.premultiply(m.matrixWorld);
+      } else {
+        _iw.copy(m.matrixWorld);
+      }
+      _im.getNormalMatrix(_iw);
+      for (let i = 0; i < p.count; i++) {
+        _iv.fromBufferAttribute(p, i).applyMatrix4(_iw);
+        pos.push(_iv.x, _iv.y, _iv.z);
+        if (n) {
+          _iv.fromBufferAttribute(n, i).applyMatrix3(_im).normalize();
+          nrm.push(_iv.x, _iv.y, _iv.z);
+        } else nrm.push(0, 1, 0);
+        const tu = u ? u.getX(i) : 0;
+        const tv = u ? u.getY(i) : 0;
+        uv.push(tu, tv);
+
+        if (c) _ic.setRGB(c.getX(i), c.getY(i), c.getZ(i));
+        else _ic.setRGB(1, 1, 1);
+        if (baseCol) _ic.multiply(baseCol);
+        if (samples && baseMap) sampleMap(samples, baseMap, tu, tv, _ic);
+        col.push(_ic.r, _ic.g, _ic.b);
+      }
+      const index = g.getIndex();
+      if (index) for (let i = 0; i < index.count; i++) idx.push(base + index.getX(i));
+      else for (let i = 0; i < p.count; i++) idx.push(base + i);
+      base += p.count;
     }
-    const index = g.getIndex();
-    if (index) for (let i = 0; i < index.count; i++) idx.push(base + index.getX(i));
-    else for (let i = 0; i < p.count; i++) idx.push(base + i);
-    base += p.count;
   });
 
   if (!base) return null;
@@ -971,6 +1050,8 @@ export function buildKart(
   // --- wheels: FL, FR, RL, RR (index 0/2 are the -X side) -----------------
   const wheels: THREE.Object3D[] = [];
   const wheelContacts: THREE.Object3D[] = [];
+  /** Hub node per corner, holding the outboard flip. Posed into `tyres` below. */
+  const hubs: THREE.Object3D[] = [];
   const layout: [number, number, string][] = [
     [-TRACK_X, FRONT_Z, 'FL'],
     [TRACK_X, FRONT_Z, 'FR'],
@@ -990,18 +1071,56 @@ export function buildKart(
 
     const hub = new THREE.Group();
     hub.rotation.y = x > 0 ? 0 : Math.PI; // rim face always points outboard
-    const wm = new THREE.Mesh(geos.wheel, mats.wheel);
-    wm.name = `tyre${label}`;
-    wm.castShadow = true;
-    hub.add(wm);
     pivot.add(hub);
     root.add(pivot);
     wheels.push(pivot);
+    hubs.push(hub);
 
     const contact = anchor(`contact${label}`, x, 0.01, z);
     root.add(contact);
     wheelContacts.push(contact);
   }
+
+  // --- the four tyres, as one instanced draw -------------------------------
+  // Same geometry, same material, four different matrices: the textbook case
+  // for instancing, and it was costing four draw calls per near kart — 20 of
+  // them in a mid-pack frame, out of a 250 budget.
+  //
+  // The corner nodes stay exactly as they were. `wheelFL`..`wheelRR` are what
+  // the suspension steers, spins and lifts, and what the VFX hang off; all this
+  // does is stop each of them carrying its own mesh and read their poses into
+  // one instance buffer instead. Instance i is corner i, so `wheels[i]` and
+  // instance i never disagree about which tyre is which.
+  const tyres = new THREE.InstancedMesh(geos.wheel, mats.wheel, 4);
+  tyres.name = 'tyres';
+  tyres.castShadow = true;
+  tyres.receiveShadow = true;
+  tyres.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  const poseTyres = () => {
+    for (let i = 0; i < 4; i++) {
+      const pivot = wheels[i];
+      const hub = hubs[i];
+      // Both are driven by physics every frame; three has already refreshed
+      // them by render time, but updating here costs two compositions and
+      // removes any dependence on that ordering.
+      pivot.updateMatrix();
+      hub.updateMatrix();
+      _tw.multiplyMatrices(pivot.matrix, hub.matrix);
+      tyres.setMatrixAt(i, _tw);
+    }
+    tyres.instanceMatrix.needsUpdate = true;
+  };
+  poseTyres();
+  // Culled as one object. The bounds are computed from the rest pose and then
+  // padded by the suspension's travel, because three caches an InstancedMesh's
+  // bounding sphere and will not see the wheels move afterwards.
+  tyres.computeBoundingSphere();
+  if (tyres.boundingSphere) tyres.boundingSphere.radius += 0.35;
+  // onBeforeRender is the same hook the fenders and the contact shadow use, and
+  // for the same reason: it is the only one that runs after physics has posed
+  // the corners for the frame being drawn.
+  tyres.onBeforeRender = poseTyres;
+  root.add(tyres);
 
   // --- rear fenders ride with the rear axle --------------------------------
   // A guard bolted to the bodywork, over a wheel with up to 0.18 m of visual
@@ -1096,7 +1215,7 @@ export function buildKart(
   root.userData.impostorMat = impostorMaterial();
   root.userData.shadowOnlyMat = shadowOnlyMaterial();
   /** everything DrawBudget hides when the kart collapses to its impostor */
-  root.userData.detailNodes = [body, ...wheels];
+  root.userData.detailNodes = [body, ...wheels, tyres];
   root.userData.body = body;
   root.userData.driver = driver;
   root.userData.exhausts = exhausts;

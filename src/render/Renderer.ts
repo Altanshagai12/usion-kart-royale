@@ -234,15 +234,46 @@ export class RenderPipeline implements System {
 
   // -------------------------------------------------------------------------
 
+  /**
+   * The pixel ratio the internal buffers are actually allocated at, which is
+   * what every per-sample cost in the chain scales with. Not the same thing as
+   * `devicePixelRatio`: `maxPixelRatio` caps it, `renderScale` scales it, and a
+   * software rasteriser is pinned to 1.
+   */
+  private effectivePixelRatio(): number {
+    const s = this.ctx.settings;
+    const cap = this.device.software ? 1 : Math.max(0.5, s.maxPixelRatio);
+    const scale = THREE.MathUtils.clamp(s.renderScale, 0.25, 2);
+    const dpr = THREE.MathUtils.clamp(globalThis.devicePixelRatio || 1, 0.5, 4);
+    return Math.min(dpr, cap) * scale;
+  }
+
   private msaaSamples(): number {
     if (!this.device.webgl2) return 0;
     const q = this.ctx.settings.quality;
     // A software rasteriser pays for every sample of every fragment, so SMAA
     // carries the edges there. Quality.Low relies on SMAA alone by design.
     if (this.device.software) return q >= Quality.High ? 2 : 0;
-    if (q >= Quality.High) return 4;
+    if (q < Quality.Medium) return 0;
     if (q === Quality.Medium) return 2;
-    return 0;
+
+    // MSAA SAMPLES AND RENDER RESOLUTION BUY THE SAME THING, AND WE WERE PAYING
+    // FOR BOTH AT FULL PRICE. §8's budget is 60 fps at 1080p, but `High` and
+    // `Ultra` both ship `maxPixelRatio: 2`, so on the retina Mac the budget is
+    // written against the composer's input buffer is 3840x2160 — and it is
+    // RGBA16F, because the whole grade depends on a half-float HDR buffer. At
+    // 4x MSAA that single attachment is 3840 * 2160 * 8 bytes * 4 samples =
+    // 265 MB, and every fragment of every opaque draw is resolved out of it.
+    // Dropping to 2x halves that bandwidth for the entire scene pass, which is
+    // the largest single line item in the frame, and it is very close to free
+    // visually: at an effective ratio of 1.5 or more each CSS pixel already
+    // receives at least 2.25 geometric samples before MSAA is applied at all,
+    // and SMAA still runs last on top of the resolve.
+    //
+    // Below 1.5 there is no supersampling to lean on and the 4 samples are
+    // doing real work on the kerb stripes, the railings and the fence posts —
+    // §9.6's "aliasing crawl on thin geometry" — so they stay.
+    return this.effectivePixelRatio() >= 1.5 ? 2 : 4;
   }
 
   /**
@@ -253,13 +284,14 @@ export class RenderPipeline implements System {
    */
   private applyResolution(): void {
     if (this.renderer === undefined) return;
-    const s = this.ctx.settings;
-    const cap = this.device.software ? 1 : Math.max(0.5, s.maxPixelRatio);
-    const scale = THREE.MathUtils.clamp(s.renderScale, 0.25, 2);
-    const dpr = THREE.MathUtils.clamp(globalThis.devicePixelRatio || 1, 0.5, 4);
 
-    this.renderer.setPixelRatio(Math.min(dpr, cap) * scale);
+    this.renderer.setPixelRatio(this.effectivePixelRatio());
     if (this.composer !== null) {
+      // Re-evaluated here, not only in `rebuild`, because the sample count is a
+      // function of the effective pixel ratio and `devicePixelRatio` can change
+      // under us — dragging the window to a non-retina display fires a resize
+      // and nothing else. The setter is a no-op when the value is unchanged.
+      this.composer.multisampling = this.msaaSamples();
       // The composer resizes its own buffers and every registered pass from
       // the drawing buffer size, which already folds in the pixel ratio.
       this.composer.setSize(this.width, this.height, true);

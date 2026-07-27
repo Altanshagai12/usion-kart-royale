@@ -58,7 +58,25 @@ const SHOTS = [
   { name: 'grid',        t: 0.995, speed: 0, settle: 1.1,  desc: 'Full grid at the start line during countdown' },
   { name: 'drift',       t: 0.74, speed: 26, drift: 1, desc: 'Mid-drift with sparks at tier 2' },
   { name: 'boost',       t: 0.40, speed: 32, boost: 1, desc: 'Boost active — speed lines, bloom, FOV punch' },
-  { name: 'corner',      t: 0.58, speed: 22, desc: 'Hard banked corner showing track geometry' },
+  // 0.78, not 0.58. The old mark was authored as "the hard banked corner" and
+  // was nothing of the kind: measured over 400 stations, curvature at 0.58 is
+  // 0.0028 rad/m — the fifth-straightest part of the lap — and it sits inside
+  // the tunnel bore (TUNNEL_T0 0.521 .. TUNNEL_T1 0.599) directly on top of the
+  // centre boost pad (BOOST_PADS 0.572 .. 0.5895). So the shot fired at 28.5
+  // m/s on a boost the script never asked for, with the arm pulled in twice
+  // over — once by the bore sweep, once by BOOST_DIST — and the boost flame
+  // blooming off wet rock in a 7.6 m bore. The frame came back as two karts
+  // filling the lens at bumper range in a white-out, on a straight, labelled a
+  // banked corner. Nothing in the report said so: it reached its mark, it was
+  // on the circuit, and darkFrac was 0.
+  //
+  // The circuit has exactly one hard banked corner and this is it: curvature
+  // 0.0153 rad/m (the lap maximum, five times the old mark) and 0.36 rad of
+  // bank, climbing 9.5 m to 13 m through the turn. `pack` sits at 0.74 on the
+  // entry to the same corner, which is not a duplicate — it is four metres
+  // lower, two thirds of the bank, and its subject is the traffic rather than
+  // the road.
+  { name: 'corner',      t: 0.78, speed: 22, desc: 'Hard banked corner showing track geometry' },
   { name: 'pack',        t: 0.74, speed: 25, ahead: 4, desc: 'Mid-pack traffic, several karts in frame' },
   { name: 'scenery',     t: 0.86, speed: 20, desc: 'Environment-dense section' },
   { name: 'wide',        t: 0.30, speed: 18, cam: 'wide', desc: 'High wide establishing shot of the circuit' },
@@ -89,8 +107,19 @@ const APPROACH_TIMEOUT = 75;
  * charge a tier 2 come round once a lap between them. Thirty seconds bought
  * three attempts, and a slide that ends up off the road is correctly refused,
  * so the hunt could fail with the mechanism working perfectly.
+ *
+ * Raised from 120 to 240 when the sightline gate went in. Every filter added to
+ * the accept test lowers the acceptance rate, and 120 was already sized against
+ * the *old* rate — the run that added `__losClear` failed with "10 slides, best
+ * tier 1", i.e. it ran out of road before it ran out of standards. The tier-1
+ * ceiling is the AI's, not the gate's (the override needs a corner long enough
+ * to hold 2.0 s of charge, and only two here are), so the remedy is more
+ * corners, which is more seconds. This is still a ceiling and not a cost: three
+ * consecutive isolated runs of the gated hunt landed a tier-2 slide in 14, 21
+ * and 81 seconds, two of them on the wide banked corner the gate now steers it
+ * toward.
  */
-const DRIFT_TIMEOUT = 120;
+const DRIFT_TIMEOUT = 240;
 /**
  * Upper bound on the pace the AI actually holds, m/s, used to size the run-up.
  *
@@ -249,6 +278,17 @@ const main = async () => {
 
   const browser = await puppeteer.launch({
     headless: 'shell',
+    // Must exceed the longest page-side wait, or the transport gives up before
+    // the thing it is waiting on does. Puppeteer's default is 180 s, which used
+    // to be comfortably above every budget here — until DRIFT_TIMEOUT went to
+    // 240 s to pay for the sightline gate. The result was not a slow hunt but a
+    // broken one: `Runtime.callFunctionOn timed out` at exactly 180 s, sixty
+    // seconds of budget still unspent, and the run dying on shot three of ten
+    // with no report written. The hunt could never have used the budget it was
+    // given. Sized off DRIFT_TIMEOUT rather than hardcoded so the two cannot
+    // drift apart again; the margin covers the settle, the hold beat and the
+    // capture that follow the wait inside the same call.
+    protocolTimeout: (DRIFT_TIMEOUT + 60) * 1000,
     args: [
       '--no-sandbox',
       '--enable-unsafe-swiftshader',
@@ -366,6 +406,69 @@ const main = async () => {
           (k.position.y - _laneSmp.pos.y) * _laneSmp.binormal.y +
           (k.position.z - _laneSmp.pos.z) * _laneSmp.binormal.z;
         return c / Math.max(1, _laneSmp.halfWidth);
+      };
+
+      /**
+       * Is the lens actually looking AT the kart, or at something in front of
+       * it?
+       *
+       * Every gate up to now has asked where the subject is — on the road, on
+       * its mark, inside the frame — and none of them asked whether it can be
+       * SEEN. Those are different questions, and the drift shot kept answering
+       * the first one correctly while failing the second: two consecutive runs
+       * came back with the kart pinned against the village guardrail, tier 2,
+       * on the circuit, at NDC (-0.2, -0.1) — squarely inside the framing
+       * window — and a steel barrier running across the middle of it. The rig
+       * puts the eye on the outside of a slide by design (DRIFT_RIG_LAT), the
+       * village road has a guardrail 2.7 m outboard of a 6-7 m half-width, so
+       * on that corner "outside of the slide" is "behind the barrier". The
+       * frame is the failure the whole gate exists to refuse, arriving through
+       * the one door nobody was watching.
+       *
+       * The camera itself will not help here. `ChaseCamera.occluded()` exists
+       * and does exactly this, but it is deliberately wide-mode only — a chase
+       * frame pays for no ray casts, and a guardrail flashing past the lens is
+       * normal driving, not a bug. It is only a bug in a *photograph*.
+       *
+       * So march the sightline and ask the track. This needs no ray and no
+       * access to three.js: the things that occlude the subject on this circuit
+       * are the guardrails, parapets and rock walls, and `collideWalls` answers
+       * for all of them analytically — the same query `sweepArm` uses to keep
+       * the arm out of them. A sample inside a wall slab means the wall is
+       * between the lens and the kart.
+       *
+       * The step is 0.6 m against a 0.35 m probe radius, so a barrier plane
+       * landing exactly midway between two samples still reads 0.05 m of
+       * penetration on both. Nothing thin enough to slip through that gap is
+       * thick enough to hide a kart.
+       *
+       * The march starts 1.6 m out from the kart and stops 0.6 m short of the
+       * lens: the near end skips the kart's own bodywork, and the far end keeps
+       * a rig that has legitimately been shoved up against a barrier by
+       * `collideWalls`' own push from failing on the barrier it is resting on.
+       */
+      const _los = track.sample(0).pos.clone();
+      window.__losClear = (k) => {
+        const eye = ctx.camera.position;
+        const len = Math.hypot(
+          eye.x - k.position.x, eye.y - k.position.y, eye.z - k.position.z);
+        if (len < 2.6) return true;              // nothing fits in the gap
+        const near = 1.6 / len, far = 1 - 0.6 / len;
+        const steps = Math.max(1, Math.ceil((far - near) * len / 0.6));
+        for (let i = 0; i <= steps; i++) {
+          const s = near + (far - near) * (i / steps);
+          _los.lerpVectors(k.position, eye, s);
+          if (track.collideWalls(_los, 0.35, k.t)) return false;
+          // ...and the ground, which occludes just as well as a barrier. This
+          // is the "behind the kerb and the verge grass" frame: the eye drops
+          // below the road plane on the outside of a banked corner and shoots
+          // the subject through the shoulder. Clearance is small and the near
+          // end is skipped because a chase sightline legitimately runs low and
+          // flat over the road — the case being caught is the one that goes
+          // through a metre of dirt, not one that grazes a crest.
+          if (_los.y < track.probe(_los, k.t).y + 0.18) return false;
+        }
+        return true;
       };
 
       // A drift cannot be set from out here: `updateDriftState` releases any
@@ -658,7 +761,9 @@ const main = async () => {
 
       // A failed hunt used to report only where it gave up, which says nothing
       // about why. Track what the kart actually managed so the warning can.
-      const seen = { slides: 0, maxTier: 0, offRoadRejects: 0, markPassesOffRoad: 0 };
+      const seen = {
+        slides: 0, maxTier: 0, offRoadRejects: 0, markPassesOffRoad: 0, occludedRejects: 0,
+      };
       let sliding = false;
       let closest = 1;
 
@@ -709,7 +814,12 @@ const main = async () => {
               // reached, forty-four rejections, no shot. Past the kerb is a
               // different matter, and that is all this now excludes.
               const margin = Math.abs(window.__laneOffset(k)) < 1.35;
-              if (onCircuit() && margin && framed()) {
+              // `framed()` says the subject is inside the picture; `__losClear`
+              // says nothing is standing in front of it. Both, or keep hunting
+              // — the budget is there to be spent, and a hunt that logs eighty
+              // framed tier-2 frames can afford to throw away the ones shot
+              // through a guardrail.
+              if (onCircuit() && margin && framed() && window.__losClear(k)) {
                 // Stop the world here rather than at the start of the capture.
                 // Everything between this instant and the shutter is latency —
                 // the gate's own resolve, the hold beat's round-trip, then the
@@ -718,7 +828,8 @@ const main = async () => {
                 window.__freeze = true;
                 return done({ ok: true, why: 'tier-2 slide' });
               }
-              seen.offRoadRejects++;
+              if (onCircuit() && margin && framed()) seen.occludedRejects++;
+              else seen.offRoadRejects++;
             }
           } else {
             const d = gap(k.t, mark);
@@ -732,7 +843,8 @@ const main = async () => {
         }
         if (elapsed > timeout) {
           const detail = s.drift
-            ? ` (${seen.slides} slides, best tier ${seen.maxTier}, ${seen.offRoadRejects} rejected off-road)`
+            ? ` (${seen.slides} slides, best tier ${seen.maxTier}, ${seen.offRoadRejects}` +
+              ` rejected off-road/unframed, ${seen.occludedRejects} rejected occluded)`
             : ` (mark ${mark.toFixed(3)}, closest approach ${closest.toFixed(4)} lap` +
               `, ${seen.markPassesOffRoad} mark passes rejected off-road)`;
           return done({ ok: false, why: `gave up after ${timeout}s at t=${k.t.toFixed(3)}${detail}` });
@@ -803,6 +915,12 @@ const main = async () => {
           // them produces a frame no gate ever saw. Recorded rather than
           // enforced so it shows up in the report either way.
           onCircuit: window.__onCircuit(k),
+          // Only the drift shot *gates* on this — the mark-based shots cannot
+          // re-hunt, they have one mark per lap and it is where it is. But a
+          // frame shot through a barrier is worth knowing about however it was
+          // aimed, and recording it costs one query: the last two rounds each
+          // shipped an occluded plate that nothing in report.json mentioned.
+          losClear: window.__losClear(k),
         });
       };
       requestAnimationFrame(tick);
@@ -833,6 +951,7 @@ const main = async () => {
       slipRad: arrived && arrived.beta !== null ? +arrived.beta.toFixed(3) : null,
       speed: arrived ? +arrived.speed.toFixed(1) : null,
       onCircuit: arrived ? arrived.onCircuit : null,
+      losClear: arrived ? arrived.losClear : null,
       reachedMark: waited.ok,
     });
     process.stdout.write(
@@ -884,6 +1003,17 @@ const main = async () => {
       console.log(`  - ${s.name}: wanted t=${s.targetT ?? '(slide)'}, fired at t=${s.actualT}`);
     }
     process.exitCode = 1;
+  }
+
+  // Reported, not fatal. The drift shot gates on this and can re-hunt; a
+  // mark-based shot gets one crossing of its mark per lap and has to take the
+  // sightline that comes with it, so failing the run would only trade a frame
+  // shot through a barrier for no frame at all. Saying so out loud is the point
+  // — the last two rounds each shipped one of these silently.
+  const blocked = report.shots.filter((s) => s.losClear === false);
+  if (blocked.length) {
+    console.log(`\n!! ${blocked.length} shot(s) with something between the lens and the kart: ` +
+      blocked.map((s) => s.name).join(', '));
   }
 
   const torn = report.shots.filter((s) => s.darkFrac > TORN_DARK_FRAC);

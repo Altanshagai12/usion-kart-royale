@@ -23,7 +23,7 @@ import type { Ctx } from '../types';
 import { Surface } from '../types';
 import type { Track } from './Track';
 import {
-  BOOST_PADS, BRIDGE_T0, BRIDGE_T1, CROWN, FASCIA_OFF, GRID_BOX_HL, GRID_BOX_HW,
+  BOOST_PADS, BRIDGE_T0, BRIDGE_T1, FASCIA_OFF, GRID_BOX_HL, GRID_BOX_HW,
   GRID_LAT, KERB_HS, KERB_QS, KERB_W, PARAPET_OFF, SEA_Y,
   SKIRT_W, TUNNEL_CLEAR, TUNNEL_H, TUNNEL_T0, TUNNEL_T1, WALL_GUARDRAIL,
   WALL_PARAPET, WALL_ROCK,
@@ -68,6 +68,14 @@ const C_RACE_MUL = new THREE.Color(0.75, 0.75, 0.90);
 const C_SAND_MUL = new THREE.Color(1.30, 1.16, 0.92);
 /** pale silt and grit washed into the gutter, in patches, everywhere */
 const C_DUST_MUL = new THREE.Color(1.24, 1.14, 0.97);
+/**
+ * Sun-bleached outer lane. Warm and slightly *up* in value: an outer lane that
+ * no wheel polishes keeps its lighter, oxidised binder, and it is the second
+ * albedo the road needs to stop reading as one tone. Kept under 1.3 so the
+ * product with the map cannot clip — `#4a4a52` is only 0.075 linear, so there is
+ * plenty of headroom, but the gutter dust can land on the same vertex.
+ */
+const C_BLEACH_MUL = new THREE.Color(1.34, 1.29, 1.18);
 /** the dark kiss of rubber and dirt packed into the kerb/tarmac joint */
 const C_JOINT_MUL = new THREE.Color(0.42, 0.40, 0.42);
 
@@ -326,6 +334,110 @@ function injectDistanceFlatten(mat: THREE.Material, near: number, far: number, m
   };
   const tag = `|flat${near}_${far}`;
   mat.customProgramCacheKey = () => (prevKey ? prevKey.call(mat) : '') + tag;
+}
+
+/**
+ * Per-vertex roughness offset, from an `aRough` float attribute.
+ *
+ * Bible §4 makes spatially varying roughness mandatory and §9.3 counts distinct
+ * surface responses per frame; a vertex colour reaches albedo and nothing else,
+ * so without this the road's only gloss break in 1.6 km is the single material
+ * seam at the edge of the racing-line group. One attribute, one varying, one
+ * add — no texture, no draw call, no extra state.
+ *
+ * The insertion point is `lights_physical_fragment` rather than the more obvious
+ * `roughnessmap_fragment`, because the shared library's own tarmac injection
+ * already rewrites that chunk (it clamps a roughness floor and settles roughness
+ * with distance) and a `replace` against a chunk somebody else has consumed is a
+ * silent no-op. `lights_physical_fragment` is the chunk that actually *reads*
+ * `roughnessFactor`, so landing immediately before it composes correctly with
+ * whatever the library did upstream, and is the last point at which it can.
+ */
+function injectVertexRoughness(mat: THREE.Material): void {
+  const prev = mat.onBeforeCompile;
+  const prevKey = mat.customProgramCacheKey;
+  mat.onBeforeCompile = (shader, renderer) => {
+    if (prev && prev !== THREE.Material.prototype.onBeforeCompile) prev.call(mat, shader, renderer);
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>',
+        '#include <common>\nattribute float aRough;\nvarying float vRoughAdj;')
+      .replace('#include <begin_vertex>',
+        '#include <begin_vertex>\nvRoughAdj = aRough;');
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nvarying float vRoughAdj;')
+      .replace('#include <lights_physical_fragment>',
+        'roughnessFactor = clamp( roughnessFactor + vRoughAdj, 0.06, 1.0 );\n'
+        + '#include <lights_physical_fragment>');
+  };
+  mat.customProgramCacheKey = () => (prevKey ? prevKey.call(mat) : '') + '|vrough';
+}
+
+/**
+ * Everything the *road* wants on top of a shared tarmac material, on the clone
+ * the track owns.
+ *
+ * The normal-scale lift is a partial answer to the review's "the 36 mm chipping
+ * dissolves by 8 m and leaves a visible transition band". The band itself is the
+ * shared library's distance-settle ramp fading the fine octave into a high mip,
+ * and its schedule lives in Materials — see the report. What the track can do
+ * from here is start the ramp from more relief than it did, which pushes the
+ * distance at which the aggregate stops resolving out by roughly the same
+ * factor. Only the road gets it: 1.2× on a wall or a bridge soffit would just be
+ * a noisier wall.
+ */
+function roadSurfaceExtra(mat: THREE.Material): void {
+  const m = mat as THREE.MeshStandardMaterial;
+  if (m.normalScale) m.normalScale.multiplyScalar(1.2);
+  injectVertexRoughness(mat);
+}
+
+/**
+ * Matte-out mask for the road-decal layer, from an `aMatte` float attribute.
+ *
+ * ROUND-1 BUG, and the cause of the "two crisp reddish-brown lines crossing the
+ * banked corner in a long X" that the review read as a mesh seam. They are not a
+ * seam: they are the two longitudinal paving cold joints, drawn at ±half the
+ * road width, which is exactly the pair of converging lines the frame shows.
+ * They are authored *dark* — `C_TAR` is 0.033 linear — so the mystery was why
+ * they came out bright and chunky.
+ *
+ * They come out bright because the whole decal layer shares `road-paint`, which
+ * carries an aggregate normal map and roughness 0.44. On a 110 mm wide ribbon
+ * the UV derivative across the strip is two orders of magnitude smaller than it
+ * is along it, so the sampler holds the sharpest mip of a full-amplitude normal
+ * map on a two-pixel-wide line — and a 14° key raking across that is a string of
+ * specular glints, at full brightness, added on top of whatever the alpha blend
+ * left of the road. The tint is dark; the *highlight* is not, and on a banked
+ * surface pointed near the sun the highlight is all you see.
+ *
+ * A cold joint is a groove full of old bitumen. It has no relief the camera can
+ * resolve and it is the matte-est thing on the road. So: where `aMatte` is 1,
+ * drop the normal-map perturbation back to the interpolated surface normal and
+ * push roughness to 0.94. Costs one attribute and two mixes, keeps the layer at
+ * one draw call, and it applies to every `C_TAR` family at once — the cold
+ * joints, the transverse construction joints and the patch beads all had it.
+ */
+function injectDecalMatte(mat: THREE.Material): void {
+  const prev = mat.onBeforeCompile;
+  const prevKey = mat.customProgramCacheKey;
+  mat.onBeforeCompile = (shader, renderer) => {
+    if (prev && prev !== THREE.Material.prototype.onBeforeCompile) prev.call(mat, shader, renderer);
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>',
+        '#include <common>\nattribute float aMatte;\nvarying float vMatte;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvMatte = aMatte;');
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nvarying float vMatte;')
+      // `normal` at this point is the interpolated (and side-corrected) surface
+      // normal; normal_fragment_maps is what perturbs it by the map
+      .replace('#include <normal_fragment_maps>',
+        'vec3 mtN = normal;\n#include <normal_fragment_maps>\n'
+        + 'normal = normalize( mix( normal, mtN, vMatte ) );')
+      .replace('#include <lights_physical_fragment>',
+        'roughnessFactor = mix( roughnessFactor, 0.94, vMatte );\n'
+        + '#include <lights_physical_fragment>');
+  };
+  mat.customProgramCacheKey = () => (prevKey ? prevKey.call(mat) : '') + '|matte';
 }
 
 /** DoubleSide variant that never mutates a material somebody else may own. */
@@ -863,12 +975,15 @@ interface Buf {
   tan?: number[];
   /** when present the colour attribute goes out as RGBA and drives paint opacity */
   alpha?: number[];
+  /** when present, goes out as `aMatte` — see `injectDecalMatte` */
+  matte?: number[];
 }
-function newBuf(withTangents = false, withAlpha = false): Buf {
+function newBuf(withTangents = false, withAlpha = false, withMatte = false): Buf {
   return {
     pos: [], nor: [], uv: [], col: [], idx: [],
     tan: withTangents ? [] : undefined,
     alpha: withAlpha ? [] : undefined,
+    matte: withMatte ? [] : undefined,
   };
 }
 function finish(b: Buf): THREE.BufferGeometry {
@@ -893,14 +1008,16 @@ function finish(b: Buf): THREE.BufferGeometry {
     g.setAttribute('color', new THREE.Float32BufferAttribute(b.col, 3));
   }
   if (b.tan && b.tan.length) g.setAttribute('tangent', new THREE.Float32BufferAttribute(b.tan, 4));
+  if (b.matte) g.setAttribute('aMatte', new THREE.Float32BufferAttribute(b.matte, 1));
   g.setIndex(n > 65000 ? new THREE.Uint32BufferAttribute(b.idx, 1) : new THREE.Uint16BufferAttribute(b.idx, 1));
   g.computeBoundingSphere();
   return g;
 }
 function pushV(b: Buf, x: number, y: number, z: number, nx: number, ny: number, nz: number,
-  u: number, v: number, c: THREE.Color, a = 1) {
+  u: number, v: number, c: THREE.Color, a = 1, matte = 0) {
   b.pos.push(x, y, z); b.nor.push(nx, ny, nz); b.uv.push(u, v); b.col.push(c.r, c.g, c.b);
   if (b.alpha) b.alpha.push(a);
+  if (b.matte) b.matte.push(matte);
 }
 /** counter-clockwise quad v0→v1→v2→v3 */
 function quad(b: Buf, v0: number, v1: number, v2: number, v3: number) {
@@ -956,13 +1073,26 @@ export function buildTrackGeometry(track: Track, ctx: Ctx) {
  * lands where the two albedos already agree — so it shows up as a hotter,
  * narrower highlight inside a soft dark band, and not as a seam.
  */
+/*
+ * ROUND-2 WIDTHS. The core was ±1.15 m (2.3 m of polish) against a road that is
+ * now 10.8–17.6 m wide, i.e. 13–21% of the surface, and at that width the gloss
+ * step simply did not survive to the camera in any of the ten round-1 frames —
+ * the review's "that second surface response is not visible in a single frame".
+ * A real racing line on a kart circuit is two karts wide, and the bible asks for
+ * roughly 40% of the road. So: polish core ±2.7 m (5.4 m, 31–50% of width) and
+ * the albedo stain feathering out to ±3.6 m (7.2 m), keeping the round-1 rule
+ * that the stain is wider than the polish so the material seam lands inside the
+ * dark band and reads as a hotter core rather than as an edge.
+ */
 const ROAD_NL = 19;
 const LINE_K0 = 5;   // first column pinned to the racing line
-const RACE_A = 7;    // first vertex of the polished core
-const RACE_B = 11;   // last vertex of the polished core
+const RACE_A = 6;    // first vertex of the polished core
+const RACE_B = 12;   // last vertex of the polished core
 /** offsets from the ideal line for columns LINE_K0 … LINE_K0+8 */
-const LINE_OFFS = [-2.6, -1.9, -1.15, -0.55, 0, 0.55, 1.15, 1.9, 2.6];
-const LINE_SPAN = 2.6;
+const LINE_OFFS = [-3.6, -2.7, -1.9, -1.0, 0, 1.0, 1.9, 2.7, 3.6];
+const LINE_SPAN = 3.6;
+/** where the albedo stain starts feathering out; the polish core ends at 2.7 */
+const LINE_PLATEAU = 2.35;
 
 /**
  * Lateral width of the contact band pinned against the kerb junction.
@@ -997,7 +1127,7 @@ function planRoadLats(hw: number, race: number) {
   const r = lim <= 1e-4 ? 0 : lim * Math.tanh((1.35 * race) / lim);
   for (let k = 0; k < LINE_OFFS.length; k++) {
     roadLats[LINE_K0 + k] = r + LINE_OFFS[k];
-    roadMask[LINE_K0 + k] = 1 - ss(1.05, LINE_SPAN, Math.abs(LINE_OFFS[k]));
+    roadMask[LINE_K0 + k] = 1 - ss(LINE_PLATEAU, LINE_SPAN, Math.abs(LINE_OFFS[k]));
   }
   const lo = roadLats[LINE_K0], hi = roadLats[LINE_K0 + LINE_OFFS.length - 1];
   const kHi = LINE_K0 + LINE_OFFS.length - 1;
@@ -1059,6 +1189,7 @@ function buildRoad(track: Track, lib: MatLib, root: THREE.Group) {
   const idxT: number[] = [];   // tarmac
   const idxR: number[] = [];   // worn racing line
   const idxC: number[] = [];   // cobblestone
+  const rgh: number[] = [];    // per-vertex roughness offset (see below)
   const dP = new THREE.Vector3(), T = new THREE.Vector3(), N = new THREE.Vector3();
 
   const sTar = lib.scale('tarmac', 3.5);
@@ -1074,18 +1205,47 @@ function buildRoad(track: Track, lib: MatLib, root: THREE.Group) {
     for (let k = 0; k < ROAD_NL; k++) {
       const L = roadLats[k];
       track.crossPoint(si, L, _p);
+      /*
+       * MACRO OCTAVE (round 2). The tarmac map tiles at 3.5 m and the only
+       * world-space terms the road carried were a 48 m and a 150 m wobble at ±7%
+       * and ±5% — under a 14° key that is inside the aggregate's own noise floor,
+       * which is why ten frames came back reading as "one flat value with one
+       * constant roughness". These are the missing 18–30 m band, and crucially
+       * one of them is *soft-stepped* rather than sinusoidal, so the road carries
+       * resurfacing slabs with edges rather than a smooth wash that averages back
+       * out to the same grey at any distance.
+       *
+       * `slab` is also what drives the roughness split below: a lane relaid last
+       * season is both darker and smoother than the one beside it, and driving
+       * both from one field is what keeps them describing the same surface.
+       */
+      const m22 = tn2(_p.x * 0.045 + 71, _p.z * 0.045 + 71);          // ~22 m
+      const m31 = tn2(_p.x * 0.032 + 17, _p.z * 0.032 + 17);          // ~31 m
+      const slab = ss(-0.16, 0.16, tn2(_p.x * 0.0155 + 43, _p.z * 0.0155 + 43)
+        + tn2(_p.x * 0.061 + 5, _p.z * 0.061 + 5) * 0.22) * 2 - 1;    // ~64 m, edged
       // analytic normal: lateral surface direction crossed with the tangent
-      const slope = -2 * CROWN * L / (hw * hw);
+      const slope = track.roadSlope(si, L);
       dP.set(cl.bx[si], cl.by[si] + slope, cl.bz[si]).normalize();
       T.set(cl.tx[si], cl.ty[si], cl.tz[si]);
       N.crossVectors(dP, T).normalize();
 
       _c.copy(_white);
       // --- worn racing line: darker toward the palette's #3e3e48 -----------
-      _c.lerp(C_RACE_MUL, roadMask[k] * wear[si]);
+      const line = roadMask[k] * wear[si];
+      _c.lerp(C_RACE_MUL, line);
       // --- grime gradient off the shoulders --------------------------------
       const edge = ss(0.70, 1.0, Math.abs(L) / hw);
       _c.lerp(C_GRIME, edge * 0.30);
+      // --- bleached outer lane ---------------------------------------------
+      // Sun, salt and no traffic. This is the third albedo the review asked for
+      // and it is the one the road most obviously lacked: a *lighter*, coarser
+      // band outboard of the stained line, so the cross-section reads
+      // pale-shoulder / dark-line / pale-shoulder instead of one tone edge to
+      // edge. Deliberately not symmetric with `edge` above — that one is dirt
+      // and sits right at the gutter, this is bleach and starts at 55% of the
+      // half-width, so the two do not stack into one wash.
+      const bleach = ss(0.55, 0.94, Math.abs(L) / hw) * (1 - line * 0.75);
+      _c.lerp(C_BLEACH_MUL, bleach * (0.42 + m22 * 0.22));
       // --- pale silt washed into the gutter, in patches ---------------------
       // The bible asks for dust accumulation near the kerbs, and it earns its
       // place beyond that: a *lighter* term at the edge against the darker
@@ -1100,7 +1260,9 @@ function buildRoad(track: Track, lib: MatLib, root: THREE.Group) {
       }
       // metre-scale patch variation, at a scale the tiling breakup cannot reach
       _c.multiplyScalar(1 + tn2(_p.x * 0.021, _p.z * 0.021) * 0.07
-        + tn2(_p.x * 0.0067 + 31, _p.z * 0.0067 + 31) * 0.05);
+        + tn2(_p.x * 0.0067 + 31, _p.z * 0.0067 + 31) * 0.05
+        // the 18–30 m band, at an amplitude that survives tone mapping
+        + m22 * 0.065 + m31 * 0.048 + slab * 0.070);
       // --- contact AO + dirt in the last 340 mm before the kerb junction -----
       // A hard, narrow term, deliberately much tighter than the `edge` wash
       // above: the wash says "this end of the road is dirtier", this says "the
@@ -1118,6 +1280,31 @@ function buildRoad(track: Track, lib: MatLib, root: THREE.Group) {
       }
       pushV(b, _p.x, _p.y, _p.z, N.x, N.y, N.z, u / uvScale, v / uvScale, _c);
       b.tan!.push(dP.x, dP.y, dP.z, 1);
+      /*
+       * ROUGHNESS, DRIVEN OFF THE SAME MACRO. Bible §4: "roughness must vary
+       * spatially… a constant roughness is the #1 tell of an amateur real-time
+       * scene", and §9.3 wants five distinct surface responses. A vertex colour
+       * multiplies albedo and nothing else, so until now the *only* roughness
+       * break anywhere on 1.6 km of road was the one material seam at the edge
+       * of the polish core. This carries the rest of it: the same masks that
+       * shape the albedo also shape the gloss, which is what makes them read as
+       * one surface with a history rather than as a tint painted over a plane.
+       *
+       * Targets from the bible's material table, relative to the map's own base
+       * (0.72 field, 0.55 inside the racing-line group):
+       *   polished line   0.50   → −0.05 on top of the 0.55 map
+       *   field           0.72   →  0
+       *   coarse shoulder 0.80   → +0.08
+       * plus ±0.035 of slab so no two lanes of the same nominal surface answer
+       * the key light identically.
+       */
+      rgh.push(
+        -line * 0.05
+        + bleach * 0.085
+        + edge * 0.03
+        - contact * 0.06        // packed grime at the kerb joint is smoother
+        + slab * 0.035 + m31 * 0.025,
+      );
     }
     return base;
   };
@@ -1160,15 +1347,20 @@ function buildRoad(track: Track, lib: MatLib, root: THREE.Group) {
   geo.setAttribute('uv', new THREE.Float32BufferAttribute(b.uv, 2));
   geo.setAttribute('color', new THREE.Float32BufferAttribute(b.col, 3));
   geo.setAttribute('tangent', new THREE.Float32BufferAttribute(b.tan!, 4));
+  geo.setAttribute('aRough', new THREE.Float32BufferAttribute(rgh, 1));
   geo.setIndex(new THREE.Uint32BufferAttribute(idxT.concat(idxR, idxC), 1));
   geo.addGroup(0, idxT.length, 0);
   geo.addGroup(idxT.length, idxR.length, 1);
   geo.addGroup(idxT.length + idxR.length, idxC.length, 2);
   geo.computeBoundingSphere();
 
+  // The `extra` argument gives these their own cache key, so the road's two
+  // tarmac groups get the `aRough` program and the kerb apron — which shares the
+  // *name* 'tarmac' but not the attribute — keeps the plain clone. Separate
+  // meshes already, so this costs a program, not a draw call.
   const mesh = new THREE.Mesh(geo, [
-    lib.vc('tarmac', () => tarmacMaterial(lib)),
-    lib.vc('tarmac-racing-line', () => tarmacMaterial(lib, true)),
+    lib.vc('tarmac', () => tarmacMaterial(lib), roadSurfaceExtra),
+    lib.vc('tarmac-racing-line', () => tarmacMaterial(lib, true), roadSurfaceExtra),
     cobbleVc(lib),
   ]);
   mesh.name = 'road';
@@ -1217,6 +1409,14 @@ function kerbWear(q: number, dist: number, hot: number, out: THREE.Color) {
   // Paint bleached in slow patches so no two runs of kerb read the same value.
   // Two octaves at 33 m and 78 m — one alone is a beat you can count.
   out.multiplyScalar(0.97 + tn2(dist * 0.0302 + 61, 2.2) * 0.075 + tn2(dist * 0.0128 + 7, 5.1) * 0.10);
+  // …and a slow *hue* drift on top of the value drift, ±5%, decorrelated from
+  // both of them at 45 m. Paint fades warm on the sun side and goes green-grey
+  // in the shade of the terraces, so a 1600 m run of kerb that is one red and
+  // one white all the way round is the giveaway even once the value varies.
+  // Two channels only: shifting all three is just the value octave again.
+  const hue = tn2(dist * 0.0222 + 131, 8.7);
+  out.r *= 1 + hue * 0.05;
+  out.b *= 1 - hue * 0.045;
   // Ceiling. `#f2ece0` is already 0.89 linear and the map's own grime octave can
   // put it at 0.96; if the bleach and the bevel polish happen to peak on the same
   // vertex the product goes over 1.0, and an albedo over 1.0 under a 4.2 key
@@ -1229,6 +1429,61 @@ function clampMul(c: THREE.Color, lo: number, hi: number) {
   c.r = c.r < lo ? lo : c.r > hi ? hi : c.r;
   c.g = c.g < lo ? lo : c.g > hi ? hi : c.g;
   c.b = c.b < lo ? lo : c.b > hi ? hi : c.b;
+}
+
+/**
+ * Stripe phase along the whole kerb run, in texture tiles, one entry per station
+ * plus a closing entry for the wrap.
+ *
+ * ROUND-1 FAILURE, and the loudest amateur tell in the set: V was `dist / uvS`,
+ * a straight ruled parameterisation, so a 2.6 m tile put *the same* float-face
+ * grain, the same air voids and the same spall chips at the same place on every
+ * fourth stripe for 1600 m. The eye locks onto a repeat at that pitch in about
+ * a third of a second, and the kerb is the highest-contrast object in the near
+ * field, so it locks onto this one first. Bible §4/§9.6: no visible tiling
+ * repeat within a single camera frame.
+ *
+ * The kerb cannot be re-UV'd across its width the way the road can — its red and
+ * white bands live along V and any V trick moves them. So the answer is to make
+ * the pitch itself a function of arc length instead of a constant:
+ *
+ *  • A slow ±13% octave at ~80 m. That alone destroys the 1:1 correspondence:
+ *    two runs of kerb 2.6 m apart no longer sit at the same fractional tile, so
+ *    they no longer show the same grain.
+ *  • +26% through the corners, which is a *gameplay* term as much as a graphics
+ *    one — the review's separate note asks for a wider stripe pitch on corner
+ *    entry so the turn direction reads at distance, and the blurred curvature
+ *    this rides on leads the geometry by ~30 m, i.e. it opens up during the
+ *    braking zone exactly as asked.
+ *
+ * The running total is then normalised to a whole number of tiles so the lap
+ * closes on a band boundary; without that the run would show one hard red/red
+ * seam at the start line.
+ *
+ * Stripes land between 560 and 830 mm. The bottom of that is still comfortably
+ * above the pitch at which a stripe approaches Nyquist at the distance the
+ * distance-flatten ramp takes over.
+ */
+function kerbVTable(cl: Track['cl'], uvS: number): Float32Array {
+  const n = cl.count;
+  const curve = new Float32Array(n);
+  for (let i = 0; i < n; i++) curve[i] = Math.min(1, Math.abs(cl.curv[i]) * 115);
+  blurStations(curve, Math.max(1, Math.round(30 / cl.ds)), 2);
+  const v = new Float32Array(n + 1);
+  let acc = 0;
+  for (let i = 0; i < n; i++) {
+    v[i] = acc;
+    const d = i * cl.ds;
+    const pitch = uvS * (1
+      + 0.26 * Math.min(1, curve[i] * 1.35)
+      + 0.13 * tn2(d * 0.0125, 3.3));
+    acc += cl.ds / pitch;
+  }
+  v[n] = acc;
+  // close the loop on a whole tile, i.e. on a band boundary
+  const k = Math.max(1, Math.round(acc)) / acc;
+  for (let i = 0; i <= n; i++) v[i] *= k;
+  return v;
 }
 
 /**
@@ -1341,27 +1596,46 @@ function buildKerbs(track: Track, lib: MatLib, root: THREE.Group) {
     edgeU: boolean;
     /** setts: carry the road ribbon's course warp across the junction */
     warp?: boolean;
+    /** kerb only: variable stripe pitch + world-space U drift (see `kerbUv`) */
+    jitter?: boolean;
     wear: (q: number, dist: number, hot: number, out: THREE.Color) => void;
     idx: number[];
   }
 
   const hotL = kerbHot(cl, -1), hotR = kerbHot(cl, 1);
+  const kerbUvS = lib.scale('kerb', 2.0) * 1.3;
+  const vTab = kerbVTable(cl, kerbUvS);
+  const vTotal = vTab[cl.count];
 
   const emitRing = (si: number, side: number, dist: number, p: Pass) => {
     const hw = cl.half[si];
     const ring = b.pos.length / 3;
     const hot = side < 0 ? hotL[si] : hotR[si];
+    // Stripe phase. `vTab` is in tiles already, so the pitch it encodes is what
+    // lands; the lap count has to be carried explicitly because the ring loop
+    // runs one station past the end and `si` has wrapped to 0 by then.
+    let vK = 0, uK = 0;
+    if (p.jitter) {
+      const raw = Math.round(dist / cl.ds);
+      vK = vTab[raw % cl.count] + Math.floor(raw / cl.count) * vTotal;
+    }
     // two vertices per breakpoint per band: the crease is the point
     for (let k = 0; k < nk - 1; k++) {
       facetN(si, side, k, N);
       for (let e = 0; e < 2; e++) {
         const q = KERB_QS[k + e];
         track.crossPoint(si, side * (hw + q), _p);
+        if (p.jitter && k === 0 && e === 0) {
+          // one sample per ring, off the world position of its foot, so the
+          // drift is continuous everywhere including across the start/finish
+          uK = tn2(_p.x * 0.021 + 9, _p.z * 0.021 + 9) * 0.62
+            + tn2(_p.x * 0.0074 + 41, _p.z * 0.0074 + 41) * 0.38;
+        }
         p.wear(q, dist, hot, _c);
         const lat = p.edgeU ? side * (hw + q) : q;
         const w = p.warp ? cobbleWarp(dist, lat) : null;
         pushV(b, _p.x, _p.y, _p.z, N.x, N.y, N.z,
-          (w ? w.u : lat) / p.uvS, (w ? w.v : dist) / p.uvS, _c);
+          (w ? w.u : lat) / p.uvS + uK, p.jitter ? vK : (w ? w.v : dist) / p.uvS, _c);
       }
     }
     return ring;
@@ -1399,7 +1673,10 @@ function buildKerbs(track: Track, lib: MatLib, root: THREE.Group) {
       // 2.0 m of tile is four bands, i.e. 500 mm stripes. Stretched to 2.6 m the
       // stripe is 650 mm: chunkier (which is the Nintendo read anyway) and a
       // third of an octave further from Nyquist at the distances that alias.
-      p: { owns: hasKerb, uvS: lib.scale('kerb', 2.0) * 1.3, edgeU: false, wear: kerbWear, idx: [] },
+      p: {
+        owns: hasKerb, uvS: kerbUvS, edgeU: false,
+        jitter: true, wear: kerbWear, idx: [],
+      },
       mat: () => lib.vc('kerb', () => kerbMaterial(lib), (m) => {
         // Tile mean: half red, half white, knocked back by the grime and chip the
         // map averages in — the value a distant kerb resolves to.
@@ -1543,13 +1820,18 @@ function paintTint(hex: number, out: THREE.Color): THREE.Color {
 
 function buildMarkings(track: Track, lib: MatLib, root: THREE.Group) {
   const cl = track.cl;
-  const b = newBuf(false, true);
+  const b = newBuf(false, true, true);
   const T = new THREE.Vector3(), D = new THREE.Vector3(), N = new THREE.Vector3();
   let lift = LIFT_PAINT;
+  /**
+   * 1 while emitting a family that must not carry the paint map's relief or its
+   * gloss — every `C_TAR` bituminous family. See `injectDecalMatte`.
+   */
+  let matte = 0;
 
   const put = (si: number, L: number, u: number, v: number, col: THREE.Color, a = 1, sOff = 0) => {
     track.crossPoint(si, L, _p);
-    const slope = -2 * CROWN * L / (cl.half[si] * cl.half[si]);
+    const slope = track.roadSlope(si, L);
     D.set(cl.bx[si], cl.by[si] + slope, cl.bz[si]).normalize();
     T.set(cl.tx[si], cl.ty[si], cl.tz[si]);
     N.crossVectors(D, T).normalize();
@@ -1558,7 +1840,7 @@ function buildMarkings(track: Track, lib: MatLib, root: THREE.Group) {
       _p.x + N.x * lift + T.x * sOff,
       _p.y + N.y * lift + T.y * sOff,
       _p.z + N.z * lift + T.z * sOff,
-      N.x, N.y, N.z, u, v, col, a);
+      N.x, N.y, N.z, u, v, col, a, matte);
     return i;
   };
   /**
@@ -1699,6 +1981,7 @@ function buildMarkings(track: Track, lib: MatLib, root: THREE.Group) {
   //  step sideways by however much `hw` and the wander had moved — 5 to 20 cm,
   //  every 6 m, for 1.6 km.
   lift = LIFT_SEAM;
+  matte = 1;
   for (let side = -1; side <= 1; side += 2) {
     let prev = -1;
     for (let r = 0; r <= rings; r++) {
@@ -1724,6 +2007,7 @@ function buildMarkings(track: Track, lib: MatLib, root: THREE.Group) {
       prev = q;
     }
   }
+  matte = 0;
   lift = LIFT_PAINT;
 
   // --- start / finish checker, three rows across the full road width ---
@@ -1779,10 +2063,15 @@ function buildMarkings(track: Track, lib: MatLib, root: THREE.Group) {
     }
   }
 
-  buildRoadDecals(track, strip, softPatch, (v) => { lift = v; });
+  buildRoadDecals(track, strip, softPatch, (v) => { lift = v; }, (v) => { matte = v; });
   lift = LIFT_PAINT;
+  matte = 0;
 
-  const mesh = new THREE.Mesh(finish(b), lib.own('road-paint', () => paintMaterial(lib)));
+  const mesh = new THREE.Mesh(finish(b), lib.own('road-paint', () => {
+    const m = paintMaterial(lib);
+    injectDecalMatte(m);
+    return m;
+  }));
   mesh.name = 'markings';
   mesh.receiveShadow = true;
   root.add(mesh);
@@ -1806,7 +2095,8 @@ type PatchFn = (d: number, lenP: number, lat: number, wP: number,
  * All of it stays inside the edge lines and clear of the start/finish, so no
  * two families of decal ever fight for the same square metre of z-buffer.
  */
-function buildRoadDecals(track: Track, strip: StripFn, softPatch: PatchFn, setLift: (v: number) => void) {
+function buildRoadDecals(track: Track, strip: StripFn, softPatch: PatchFn,
+  setLift: (v: number) => void, setMatte: (v: number) => void) {
   const cl = track.cl;
   const len = cl.length;
   const rnd = mulberry32(70726);
@@ -1850,6 +2140,7 @@ function buildRoadDecals(track: Track, strip: StripFn, softPatch: PatchFn, setLi
   //  authored size, so the seam reads as a groove in the road rather than as a
   //  ribbon of something else laid on top of it.
   setLift(LIFT_SEAM);
+  setMatte(1);
   for (let d = 40; d < len - 40; d += 31 + rnd() * 9) {
     if (!clear(d)) continue;
     const hw = halfAt(d) - 1.1;
@@ -1869,6 +2160,7 @@ function buildRoadDecals(track: Track, strip: StripFn, softPatch: PatchFn, setLi
       strip(s, s + th, l0, l1, C_TAR, (0.52 + rnd() * 0.22) * fade, 1, 1.15);
     }
   }
+  setMatte(0);
 
   // --- gully gratings in the gutter ----------------------------------------
   //  Cast-iron covers on the low side of the crown, where the drainage actually
@@ -1891,7 +2183,9 @@ function buildRoadDecals(track: Track, strip: StripFn, softPatch: PatchFn, setLi
     }
     // the silt fan that always sits upstream of a working gully
     _c.copy(C_TAR).multiplyScalar(3.4);
+    setMatte(1);
     strip(d - hl - 1.5, d - hl, lat - hwid - 0.34, lat + hwid + 0.34, _c, 0.20, 2, 1.15);
+    setMatte(0);
   }
 
   // --- patch repairs: darker, smoother, soft-edged cuts of fresh binder -----
@@ -1914,8 +2208,10 @@ function buildRoadDecals(track: Track, strip: StripFn, softPatch: PatchFn, setLi
     // feathered edge — and therefore lifted to the seam plane, because two
     // coplanar alpha-blended quads in the same buffer z-fight.
     setLift(LIFT_SEAM);
+    setMatte(1);
     strip(d + 0.06, d + 0.16, lat - wP * 0.44, lat + wP * 0.44, C_TAR, 0.62, 2, 1.15);
     strip(d + lenP - 0.16, d + lenP - 0.06, lat - wP * 0.44, lat + wP * 0.44, C_TAR, 0.62, 2, 1.15);
+    setMatte(0);
     setLift(LIFT_PATCH);
   }
 
@@ -2076,7 +2372,7 @@ function buildBoostPads(track: Track, lib: MatLib, root: THREE.Group) {
       for (let k = 0; k < 2; k++) {
         const L = pad.lat + (k ? pad.hw : -pad.hw);
         track.crossPoint(si, L, _p);
-        const slope = -2 * CROWN * L / (cl.half[si] * cl.half[si]);
+        const slope = track.roadSlope(si, L);
         D.set(cl.bx[si], cl.by[si] + slope, cl.bz[si]).normalize();
         T.set(cl.tx[si], cl.ty[si], cl.tz[si]);
         N.crossVectors(D, T).normalize();
@@ -2283,11 +2579,36 @@ function buildCornerBoards(track: Track, lib: MatLib, root: THREE.Group) {
     boards.push({ d: c.d - b0, side, kind: 0, bars: 3 });
     boards.push({ d: c.d - b0 * 0.66, side, kind: 0, bars: 2 });
     boards.push({ d: c.d - b0 * 0.36, side, kind: 0, bars: 1 });
-    // chevrons through the bend, from the mark point out to the exit: five of
-    // them, so the run of boards traces the arc rather than marking a point
+    /*
+     * Chevrons through the bend, from the mark point out to the exit.
+     *
+     * ROUND-1: a fixed five, whatever the corner. On the banked coastal 180 —
+     * 192 m of arc — that is one board every 48 m, which is why the review saw
+     * "six matchstick-thin posts" strung along the top of the banking and read
+     * the frame as two shapes, black and pink. One board per ~15 m instead, so
+     * a long bend gets a continuous run that traces the arc and a short village
+     * ess still gets five. This is also the only mid-ground silhouette the
+     * *track* can put on the outside of that corner: the banking crest is the
+     * horizon there, so a run of 3 m boards standing on it is what separates
+     * road from sky.
+     */
     const runEnd = c.d1 > c.d ? c.d1 : c.d1 + cl.length;
-    const span = Math.max(24, Math.min(120, runEnd - c.d + 26));
-    for (let k = 0; k < 5; k++) boards.push({ d: c.d + (span * k) / 4, side, kind: 1, bars: 0 });
+    const span = Math.max(24, Math.min(160, runEnd - c.d + 30));
+    const nch = Math.max(5, Math.min(13, Math.round(span / 15)));
+    for (let k = 0; k < nch; k++) {
+      boards.push({ d: c.d + (span * k) / (nch - 1), side, kind: 1, bars: 0 });
+    }
+    /*
+     * One tall direction pylon on the exit bearing, at the corner's own mark
+     * point. The review asks for "a distinct authored landmark on the exit
+     * bearing of every corner, visible from the braking point"; a lighthouse or
+     * a windmill is Scenery's to place and only fits a few of the nine, but a
+     * 4.2 m striped pylon is track furniture, fits all nine, and is the piece
+     * that survives when the road crests away and the chevrons go below the
+     * skyline. Deliberately much taller than everything else on the shoulder so
+     * it reads as a landmark rather than as one more board.
+     */
+    boards.push({ d: c.d + Math.min(span * 0.5, 34), side, kind: 2, bars: 0 });
   }
 
   for (const bd of boards) {
@@ -2299,9 +2620,28 @@ function buildCornerBoards(track: Track, lib: MatLib, root: THREE.Group) {
     // this is the one placement that fits. Both fallbacks are half the plate's
     // own width plus 0.2 m, so even the tightest board still hangs clear of the
     // kerb's outer lip instead of over the corridor.
-    const offs = bd.kind === 0 ? [2.6, 1.45] : [1.9, 1.05];
+    const offs = bd.kind === 0 ? [2.6, 1.45] : bd.kind === 2 ? [3.2, 2.0, 1.2] : [1.95, 1.12];
     if (!footingAny(bd.d, bd.side, offs)) continue;
-    if (bd.kind === 0) {
+    /*
+     * Extra mast on the banking.
+     *
+     * On a 20° banked corner the outer shoulder *is* the horizon from the racing
+     * line — the review's corner frame is a black wedge, an empty sky, and six
+     * boards on the crest reading as matchsticks. A board tall enough to stand
+     * clear of that crest is the one mid-ground silhouette the track itself can
+     * supply there, so the chevrons and the pylon both grow with the local bank.
+     * Nothing changes on the flat sections, where they would just be tall for no
+     * reason.
+     */
+    const bankAt = Math.abs(cl.bank[stationAt(bd.d)]);
+    const tall = ss(0.14, 0.30, bankAt) * 0.95;
+    if (bd.kind === 2) {
+      // slender tapered mast with a striped head — four bands, so it reads as a
+      // marker and not as a lamp post, and it is the same two palette colours
+      // the kerbs and the count boards use rather than a third scheme
+      post(4.2 + tall, 0.075);
+      plate(0.9, 1.5, 4.15 + tall, 4, (i) => ((i & 1) ? C_BOARD_FACE : C_BOARD_BAR));
+    } else if (bd.kind === 0) {
       post(BOARD_TOP - BOARD_H * 0.5, 0.075);
       // 3 / 2 / 1 red bars on cream, centred — the same count the painted
       // braking boards on the road show at this station
@@ -2310,13 +2650,13 @@ function buildCornerBoards(track: Track, lib: MatLib, root: THREE.Group) {
       const lit = bars === 3 ? [1, 3, 5] : bars === 2 ? [2, 4] : [3];
       plate(2.4, BOARD_H, BOARD_TOP, cols, (i) => (lit.indexOf(i) >= 0 ? C_BOARD_BAR : C_BOARD_FACE));
     } else {
-      post(2.55 - 0.5, 0.062);
+      post(2.98 + tall - 0.52, 0.062);
       // A hard asymmetric silhouette: the plate is split into six cells and the
       // red runs from one end and stops short, so the board is visibly "heavier"
       // on the side the corner turns toward. Direction reads at a distance where
       // an arrow glyph has already collapsed into one pixel of nothing.
       const dirRight = bd.side < 0;   // outside is left ⇒ the corner turns right
-      plate(1.6, 0.86, 2.55, 6, (i) => {
+      plate(1.72, 0.94, 2.98 + tall, 6, (i) => {
         const k = dirRight ? 5 - i : i;
         return k < 4 ? C_BOARD_BAR : C_BOARD_FACE;
       });

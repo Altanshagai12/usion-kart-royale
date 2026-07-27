@@ -97,18 +97,33 @@ export const SKY_FILL_COLOR = 0xa8c8ff;
  * 14° sun elevation the part of the sky an object's shaded side actually sees is
  * the high, blue half away from the sun, so that is where this comes from.
  *
- * The 35° elevation is a tuned compromise, not a guess. Straight down from the
- * zenith the fill lands hardest on UP-facing normals, i.e. on the road, and
- * since it casts no shadow that directly weakens every cast shadow on the
- * tarmac: measured on a 0.18 grey card, a vertical fill took the lit:shadowed
- * ratio on flat road from 2.39:1 to 1.98:1. Tilted to 35° the same fill lands on
- * side-facing normals instead — where the sculpting is needed — and the road
- * ratio comes back to 2.43:1, i.e. slightly BETTER than before the fill existed,
- * while an anti-solar-facing surface goes from red:blue 1.69 (warm) to 0.54
- * (cool). That swing is the entire point of the exercise.
+ * The elevation is a tuned compromise, not a guess, and the tuning ran again
+ * after round 1. Straight down from the zenith the fill lands hardest on
+ * UP-facing normals, i.e. on the road, and since it casts no shadow that
+ * directly weakens every cast shadow on the tarmac. Tilting it toward the
+ * horizontal moves it onto side-facing normals instead — which is where the
+ * sculpting is wanted, and which is the only place a cool fill can produce a
+ * warm/cool split at all.
+ *
+ * 35° (the horizontal weight was 1.45) was still far too steep. It put cos =
+ * 0.58 on flat road against the 14° key's 0.245 — a 2.4x cosine advantage handed
+ * to the ONE light in the rig that cannot be occluded, on the surface the whole
+ * game is played on. Round 1's karts cast no readable shadow for exactly this
+ * reason: the cascade was resolving correctly and the fill was refilling the
+ * result.
+ *
+ * At a horizontal weight of 2.6 the fill arrives at 21.6°:
+ *
+ *                            35° / 1.45   21.6° / 2.6
+ *   cos on flat road         0.580        0.369     (-36%, shadow comes back)
+ *   cos on anti-solar wall   0.815        0.933     (+14%, sculpting improves)
+ *
+ * so this is not a trade at all — it is strictly better placement of the same
+ * light. It stays above the horizon, and well above the key's 14°, so §2's
+ * "cool sky fill from above" still describes it.
  */
 export const SKY_FILL_DIRECTION = new THREE.Vector3(
-  -SUN_DIRECTION.x * 1.45, 1.0, -SUN_DIRECTION.z * 1.45,
+  -SUN_DIRECTION.x * 2.6, 1.0, -SUN_DIRECTION.z * 2.6,
 ).normalize();
 /** Target displayed sky colours after tone mapping. */
 export const SKY_ZENITH_TARGET = 0x3f74c4;
@@ -660,12 +675,45 @@ export class AtmosphereModel {
     // clip, because the forward Mie lobe multiplies this by up to 2.2.
     const warm = new THREE.Color(SUN_LIGHT_COLOR);
     this.cloudSunColor.set(warm.r, warm.g, warm.b).multiplyScalar(1.7);
-    // Shaded cloud, weighted toward the LOW sky rather than the zenith: at 14°
-    // sun elevation a cumulus base is looking almost entirely at the warm half
-    // of the dome, so it reads dusty rose, not lavender-grey. Zenith-dominant
-    // fill was making every cloud core read cold, which fought the key.
-    this.cloudAmbientColor.copy(this.zenithColor).multiplyScalar(0.40)
-      .addScaledVector(this.horizonColor, 0.20);
+    // SHADED CLOUD, and this is the fix for the grey-brown smear that sat
+    // behind the subject in the round-1 closeup and grid frames.
+    //
+    // It was `zenith * 0.40 + horizon * 0.20`, i.e. a saturated BLUE plus a
+    // saturated ORANGE. Superposing the two ends of the compass is exactly the
+    // one operation the sky itself never performs, and the result is not "dusty
+    // rose" — it is (0.460, 0.160, 0.235), a magenta with a collapsed green
+    // channel, at a luminance of 0.23 against a sky sitting at 0.33. Every
+    // thick cloud core in the game was therefore DARKER and MUDDIER than the
+    // sky behind it and tinted a hue no light source in the scene emits. On
+    // screen that is a dirty-lens smudge, not a cumulus.
+    //
+    // A cloud base is a shadowed surface, so §2 says what lights it: the cool
+    // sky fill, and only that. Taking the zenith radiance alone keeps a clean
+    // blue chromaticity that cannot cancel to grey, and 1.55x puts the shaded
+    // side just ABOVE the surrounding sky in luminance rather than below it, so
+    // the mass reads as a lit object instead of a hole. All the warmth now
+    // arrives through the sun term, where it can only ever land on the parts of
+    // the cloud the sun actually reaches — which is what gives a cumulus its
+    // warm top and rim and its cool base.
+    //
+    // Half-desaturated on the way through: the raw zenith is a 0.11 red:blue,
+    // which on a cloud face reads as a painted blue object rather than as white
+    // water lit by a blue sky. Pivoting on its own luminance keeps the level
+    // exactly where it was set. Measured, thick core 90° off the sun, after
+    // tone mapping: sRGB (169,176,209) — blue-grey, no green notch, and
+    // brighter than the zenith it sits in front of. Its sun-facing flank comes
+    // out (227,220,222) and its down-sun rim clips at (249,245,240), so one
+    // cloud now spans a red:blue of 0.72 to 2.2. Round 1's smudge measured
+    // (161,145,171) at every point on the same cloud.
+    {
+      const z = this.zenithColor;
+      const y = 0.2126 * z.x + 0.7152 * z.y + 0.0722 * z.z;
+      this.cloudAmbientColor.set(
+        (z.x + (y - z.x) * 0.50) * 1.75,
+        (z.y + (y - z.y) * 0.50) * 1.75,
+        (z.z + (y - z.z) * 0.50) * 1.75,
+      );
+    }
 
     // Aerial perspective, from the same calibrated horizon the dome uses.
     AtmosphereModel.compressHighlights(this.horizonColor, this.hazeColor);
@@ -1136,13 +1184,26 @@ vec4 cloudLayer(vec3 dir, float gamma, float height, float scale,
   // low-frequency coverage modulation at an incommensurate scale — this is what
   // stops the 256px noise tile from reading as a grid across the sky
   float cov = cover + (w3.z - 0.5) * 0.30;
-  float a = smoothstep(cov, cov + 0.13, d);
+  // THE DENSITY SLICE. The band was 0.13 wide against a coverage modulation of
+  // +/-0.15, which meant most of the sky sat inside the ramp rather than on
+  // either side of it: instead of clouds with edges, the dome carried a
+  // continuous field of 10–40% alpha with no boundary anywhere. That is the
+  // "no defined edge, reads as a render smear" note, and it is a threshold
+  // problem, not a shading one. 0.085 gives the mass a rim to be lit on, and
+  // the extra bias below removes the marginal wisps entirely rather than
+  // rendering them at an alpha too low to read as anything but haze.
+  float a = smoothstep(cov + 0.030, cov + 0.115, d);
+  // ...and a knee on the alpha itself, so what survives the slice is either
+  // clearly a cloud or clearly not one. Costs one multiply.
+  a *= a * (3.0 - 2.0 * a);
 
   // one tap displaced toward the sun approximates the optical depth of the path
   // the sunlight took to reach this pixel. With the sun 14° up that path is
   // mostly horizontal, which is exactly why the rims light and the cores do not.
   float dl = cloudField(p + uSunPlane * 0.13, warp);
-  float al = smoothstep(cov, cov + 0.13, dl);
+  float al = smoothstep(cov + 0.030, cov + 0.115, dl);
+  al *= al * (3.0 - 2.0 * al);   // same knee as 'a': the silver lining below
+                                 // compares the two and needs them shaped alike
   // 0.10 floor: multiple scattering keeps even a thick core off the floor.
   // Without it the shaded side collapses onto pure skylight and goes violet.
   float trans = 0.10 + 0.90 * exp(-(a * 0.45 + al * 1.30) * thick);
@@ -1152,10 +1213,35 @@ vec4 cloudLayer(vec3 dir, float gamma, float height, float scale,
   // every cloud with the sun behind the camera looking like a bruise.
   float forward = miePhase(gamma, 0.62) * 1.5;
   vec3 lit = uCloudSun * (trans * (0.55 + forward));
+
+  // THE SILVER LINING. 'trans' alone gives the whole cloud a uniform response
+  // to its own thickness and has no idea which SIDE of the mass it is on, so a
+  // cumulus lit from 14° came out as a single flat value with a soft falloff —
+  // no top, no rim, nothing to say where the light was. (a - al) is exactly
+  // that missing information and it costs nothing: it is the gradient of the
+  // density field along the sun's own azimuth, already sampled two lines up.
+  // Positive means the sunward neighbour is THINNER than we are, i.e. we are on
+  // the sun-facing flank with a clear path to the disc, which is where the
+  // bright warm edge of a real cloud is. Weighted into the forward lobe so the
+  // effect strengthens down-sun, which is where a silver lining actually
+  // appears, and gated on the fragment being inside the cloud at all so it
+  // cannot draw a halo on empty sky.
+  float sunFace = clamp((a - al) * 2.6, 0.0, 1.0) * smoothstep(0.05, 0.30, a);
+  lit += uCloudSun * (sunFace * (0.28 + forward * 0.90));
+
   float powder = 1.0 - exp(-3.0 * a);
   vec3 amb = uCloudAmbient * (0.42 + 0.58 * powder);
 
   vec3 col = amb + lit;
+  // CHROMA FLOOR, §3 ("nothing in the world is fully desaturated") and §9.6.
+  // The lit and ambient terms now sit at opposite ends of the warm/cool axis by
+  // construction, which is the point, but it also means there is a mixing ratio
+  // somewhere on every cloud where they cross and cancel toward neutral. A
+  // gentle push away from the fragment's own luminance keeps that crossing a
+  // HUE TRANSITION rather than a grey band, and it can never darken or brighten
+  // the cloud because it pivots on luminance.
+  float yc = dot(col, vec3(0.2126, 0.7152, 0.0722));
+  col = max(mix(vec3(yc), col, 1.18), vec3(0.0));
   // Clouds obey the same aerial perspective as everything else. Toward the
   // rolled-off haze, not the clipping horizon constant: at 0.85 toward a
   // superwhite the whole lower cloud deck turned into one featureless cream
@@ -1202,8 +1288,20 @@ void main() {
   // reads hot even when the disc itself is outside the frustum. Both are
   // tinted by uSunDisc, i.e. by the sun's own reddened transmittance, so this
   // can only ever add the key's colour.
+  //
+  // Round 2 widens the OUTER lobe again (0.0055/3.2 -> 0.010/2.4). The review
+  // note was "there is no sun disc anywhere and the frame has no highlight
+  // anchor", and the literal reading — add a disc — is already satisfied: the
+  // disc is drawn eight lines up at 42 linear and clips hard. What is actually
+  // true of all ten round-1 frames is that the camera never points within 60°
+  // of the sun, so the only evidence the sun can leave in those frames is the
+  // GRADIENT across the sky. At 20° off-axis this lobe now contributes 8% of
+  // the horizon radiance instead of 3%, and at 45° it is 3% instead of 0.9%,
+  // so the sun's quarter of the dome is measurably hotter from any heading.
+  // At the 90° calibration probe it is 0.4%, i.e. below the fit's own
+  // residual, so the bible's #ffd0a0 horizon still lands where it landed.
   col += uSunDisc * 0.045 * exp(-ang * 13.0);
-  col += uSunDisc * 0.0055 * exp(-ang * 3.2);
+  col += uSunDisc * 0.010 * exp(-ang * 2.4);
 
   // Composited top-down: the high cirrus is furthest away in every direction,
   // the low deck is nearest, and each plane parallaxes against the others.

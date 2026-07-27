@@ -43,23 +43,92 @@ const A_LAT = 12.6;
 /** braking capability used to build the approach ramps, m/s^2 */
 const A_BRAKE = 11.5;
 /**
- * Curvature at which a corner is worth drifting. Sunset Bay is a fast circuit —
- * the racing line only bends harder than this at the harbour sweep, the tight
- * pair of village esses and the banked 180, which is about the right number of
- * mini-turbos per lap. Lower it and they drift the straights.
+ * ============================================================================
+ *  WHY NO RIVAL EVER DRIFTED — the round-1 "every AI kart is on rails" finding
+ * ============================================================================
+ * The review's read was right and its stated cause was wrong: the AI *was*
+ * entering the drift state, several times a lap. It just never survived long
+ * enough to bank a tier, so `driftTier` stayed 0 for the whole field, and the
+ * entire rival-side effects layer — sparks, tyre smoke, the mini-turbo flame —
+ * keys off `driftTier > 0`. Eight karts hopping at every corner entry and
+ * sliding for a fifth of a second is indistinguishable, in a screenshot, from
+ * eight karts on rails.
+ *
+ * Three faults, compounding, all of them here:
+ *
+ *  1. **Entry and release disagreed about how far ahead to look.** Entry tested
+ *     the peak curvature over `speed * 0.45` metres (up to 22 m at racing
+ *     pace); the hold test re-read it over a fixed 16 m. On a layout whose
+ *     curvature schedule is box-blurred over 30 m to make clothoids, a corner
+ *     that is over the gate at 22 m is routinely under it at 16 — so the entry
+ *     fired and the hold cancelled it on the very next frame. `Kart` takes the
+ *     drift button on a rising edge for the hop and needs it *held* to engage
+ *     the slide, so what that produced was a hop, no slide, a 0.4 s cooldown,
+ *     and then the same thing again 0.4 s later, all the way into the corner.
+ *     Both tests now read the same window (`driftSpan`), with the release gate
+ *     genuinely below the entry gate so the pair is hysteretic instead of
+ *     contradictory.
+ *
+ *  2. **The gate was set above what the racing line contains.** The centreline
+ *     peaks at 0.0153 (the banked 180) and sits in the 0.009-0.012 band through
+ *     the harbour sweep, the esses and the cliff; but the drivers steer at the
+ *     *minimum-curvature* line, which exists precisely to flatten those. Baked
+ *     and measured, the line clears 0.0098 over 264 m of the 1606 m lap and
+ *     clears 0.0072 over 475 m. The old gate handed the field about four
+ *     seconds of drift per lap each, spread over three corners, in slivers too
+ *     short to charge. At 0.0072 the same three corners are long enough to bank
+ *     a real tier, which is what puts sparks on screen.
+ *
+ *  3. **The drift had nowhere to slide to.** A slide costs lateral room — a
+ *     median 3.5 m and up to 4.4 m of wash — and the driver was turning in from
+ *     the racing line, which at corner *entry* is hard against the OUTSIDE edge
+ *     (that is what out-in-out means). So the wash ran straight off the road,
+ *     `wide` fired, and the drift was abandoned before tier 1 at 0.9 s. Real
+ *     drivers pay for a slide by sacrificing entry radius: the driver now
+ *     applies an inside lane bias for as long as it is committed, so the wash
+ *     carries it back onto the apex instead of into the barrier. With somewhere
+ *     to go, `DRIFT_EDGE_KEEP` can be *raised* to a sane margin rather than
+ *     shaved to nothing to buy room the line was never going to give.
+ * ============================================================================
  */
-const DRIFT_MIN_CURV = 0.0098;
+
+/**
+ * Curvature at which a corner is worth drifting, measured on the *racing line*.
+ * See fault 2 above for why this is 0.0072 and not the centreline number it
+ * looks like it should be.
+ */
+const DRIFT_MIN_CURV = 0.0072;
+/**
+ * Curvature at which a committed drift is released. Strictly below
+ * `DRIFT_MIN_CURV` and read over the same window, so the pair is hysteretic:
+ * entering can never immediately satisfy the exit test.
+ */
+const DRIFT_EXIT_CURV = 0.0048;
 /**
  * How much road the driver insists on keeping under the outside wheels before
  * it abandons a drift, metres inside the road edge.
  *
- * A drift is a slide, and a slide costs lateral room: measured over the baked
- * line, an AI drift washes the kart a median 3.5 m and up to 4.4 m wider than
- * where it turned in. The corridor only offers ~2.4 m outside the racing line,
- * so the slide has to be cut short rather than ridden out. Releasing here still
- * banks a mini-turbo — it is simply a shorter one than a 26 m road allowed.
+ * 1.0, not 0.6. The old number was shaved down trying to buy wash room out of
+ * the safety margin, which is the wrong pocket — the room comes from turning in
+ * further inside (`DRIFT_INSIDE_BIAS`), and with that in place a whole metre of
+ * kerb margin is affordable and stops the field kissing the barrier every
+ * corner.
  */
-const DRIFT_EDGE_KEEP = 0.6;
+const DRIFT_EDGE_KEEP = 1.0;
+/**
+ * Metres of inside lane bias held for the duration of a drift, as a fraction of
+ * the road half-width, clamped. This is the road the slide spends: turn in
+ * tighter than the line, let the wash carry you out to it.
+ */
+const DRIFT_INSIDE_FRAC = 0.34;
+const DRIFT_INSIDE_MIN = 1.7;
+const DRIFT_INSIDE_MAX = 3.6;
+/**
+ * Longest a drift may be held, seconds. Purely a backstop — the exit gate ends
+ * every normal drift — but without it a driver that loses its slide inside a
+ * long constant-radius corner can sit on the button indefinitely.
+ */
+const DRIFT_MAX_HOLD = 4.5;
 /**
  * Speed multiplier applied while a drift is committed.
  *
@@ -68,7 +137,13 @@ const DRIFT_EDGE_KEEP = 0.6;
  * the speed profile is solved with; speed scales as its square root.
  */
 const DRIFT_SPEED_FACTOR = 0.88;
-/** steer added on turn-in to load the rack before the drift hop lands */
+/**
+ * Steer added on turn-in to load the rack before the drift hop lands.
+ *
+ * This is not cosmetic: `Kart.updateDriftState` only engages the slide if
+ * `|steerInput| > 0.2` while the hop is in the air, so the flick is what turns
+ * a hop into a drift at all.
+ */
 const DRIFT_FLICK = 0.45;
 /** metres of road on the apex side at which the flick is worth its full value */
 const DRIFT_FLICK_ROOM = 6.0;
@@ -446,6 +521,10 @@ export class AIDriver {
   private driftSide = 0;
   /** seconds left of the deliberate over-steer that engages the slide */
   private driftEntry = 0;
+  /** seconds the current drift has been committed, for the hold backstop */
+  private driftT = 0;
+  /** seconds a spendable item has sat in the slot unspent */
+  private holdT = 0;
   private noisePhase: number;
   private noiseRate: number;
   private mistake = Mistake.None;
@@ -481,6 +560,8 @@ export class AIDriver {
     this.driftCool = 0;
     this.driftSide = 0;
     this.driftEntry = 0;
+    this.driftT = 0;
+    this.holdT = 0;
     this.mistake = Mistake.None;
     this.mistakeT = 0;
     this.itemDelay = 0;
@@ -609,7 +690,7 @@ export class AIDriver {
     cmd.steer = clamp(this.steerSmooth, -1, 1);
 
     // ---- drift -------------------------------------------------------------
-    cmd.drift = this.updateDrift(k, d, speed, cross, lat, halfNow, dt);
+    cmd.drift = this.updateDrift(k, d, speed, lat, halfNow, dt);
     if (this.driftEntry > 0 && k.driftDir === 0) {
       // Flick it in: the chassis needs a loaded rack when the hop lands.
       //
@@ -641,7 +722,19 @@ export class AIDriver {
     // profile and the driver were disagreeing about which kart they were
     // driving; this reconciles them, and because it feeds the ordinary braking
     // logic the backward pass turns it into a real lift *before* turn-in.
-    if (this.driftHold || k.driftDir !== 0) target *= DRIFT_SPEED_FACTOR;
+    //
+    // Applied on APPROACH as well as during the slide. The drift decision is
+    // taken 10-24 m out, which at 33 m/s is a third of a second — far too late
+    // to shed anything, so the kart used to arrive at the flick carrying the
+    // full-grip entry speed and wash straight off the outside. Reading the same
+    // gate over a longer horizon means the lift lands before turn-in, which is
+    // where a lift belongs; it costs almost nothing because on this circuit the
+    // profile is pinned at `vCap` nearly everywhere and 0.88 of it is still
+    // above the karts' actual top speed.
+    const committed = this.driftHold || k.driftDir !== 0;
+    const approaching = !committed
+      && Math.abs(line.peakCurv(d, clamp(Math.abs(speed) * 0.95, 16, 40))) > DRIFT_MIN_CURV;
+    if (committed || approaching) target *= DRIFT_SPEED_FACTOR;
     if (this.mistake === Mistake.LateBrake) target *= 1.16;
     if (k.stunTime > 0) target = 0;
 
@@ -778,13 +871,35 @@ export class AIDriver {
       want += Math.sign(line.curvAt(d) || 1) * 0.6 * this.aggression;
     }
 
+    // ---- the drift's lane budget -------------------------------------------
+    // A slide washes the kart a median 3.5 m wide, and the racing line at
+    // corner ENTRY is hard against the outside edge — out-in-out puts it there
+    // on purpose. Turning in from that point means the wash has to come out of
+    // the safety margin, and it does not fit: that is why every AI drift used
+    // to be abandoned within a fifth of a second (fault 3 in the header).
+    //
+    // So the driver buys the room the way a human does, by giving up entry
+    // radius: while committed to a drift it aims a couple of metres inside the
+    // line and lets the slide carry it back out to the apex. `driftSide` is the
+    // steer that turns INTO the corner and `lane` is measured along +binormal,
+    // which are opposite senses — hence the negation.
+    const drifting = this.driftHold || k.driftDir !== 0;
+    if (drifting) {
+      const room = clamp(half * DRIFT_INSIDE_FRAC, DRIFT_INSIDE_MIN, DRIFT_INSIDE_MAX);
+      want += -this.driftSide * room;
+    }
+
     // The corridor, not a fixed 6 m, is the ceiling: the aim point is clamped
     // to `half - 1.4` anyway, so anything past that is bias the driver can
     // never spend and only serves to pin it against the clamp.
     const laneMax = Math.max(0.8, half - 1.4);
     this.laneTarget = clamp(want, -laneMax, laneMax);
     // Bias moves at a believable rate — a kart cannot teleport across the road.
-    const rate = Math.min(1, dt * 2.6);
+    // Faster while drifting: the entry decision is taken 10-24 m out, which at
+    // racing pace is a third of a second, and a 2.6/s slew delivers barely half
+    // the inside bias inside that window. A turn-in is a deliberate, quick
+    // movement anyway; it is the *cruising* lane changes that must look lazy.
+    const rate = Math.min(1, dt * (drifting ? 6.5 : 2.6));
     this.lane += (this.laneTarget - this.lane) * rate;
     // and it decays back to the racing line when nothing is in the way
     if (Math.abs(this.laneTarget) < 0.05) this.lane *= 1 - Math.min(1, dt * 1.6);
@@ -799,56 +914,102 @@ export class AIDriver {
     k: IKart,
     d: number,
     speed: number,
-    cross: number,
     lat: number,
     half: number,
     dt: number,
   ): boolean {
     if (this.mistake === Mistake.NoDrift || k.stunTime > 0 || speed < 9) {
-      this.driftHold = false;
-      this.driftEntry = 0;
+      this.endDrift(0.25);
       return false;
     }
 
     const line = this.line;
-    const peak = line.peakCurv(d, clamp(speed * 0.45, 8, 22));
-    const tight = Math.abs(peak);
+    // ONE window, used by both the entry test and the release test. See fault 1
+    // in the header: this is the whole reason the field hopped its way round
+    // the circuit instead of drifting it.
+    const span = this.driftSpan(speed);
 
     if (this.driftHold) {
-      if (k.driftDir !== 0) this.driftEntry = 0;
+      this.driftT += dt;
+      const engaged = k.driftDir !== 0;
+      if (engaged) this.driftEntry = 0;
       else this.driftEntry -= dt;
 
-      const exit = Math.abs(line.peakCurv(d, 16));
+      // The slide never took — the hop landed with the rack unloaded, or the
+      // kart was bumped. Give up cleanly and wait a beat rather than mashing
+      // the button, which is what produced the hop-spam.
+      if (!engaged && this.driftEntry <= 0) {
+        this.endDrift(0.6);
+        return false;
+      }
+
       // Running wide is the signal a human reads to straighten up and stop
       // trying to be a hero; without it a missed apex compounds into the grass.
-      //
-      // This MUST be measured against the road edge, not as an absolute number
-      // of metres off the line. A drift washes the kart 3.5-4.5 m wide; the
-      // corridor only leaves ~2.4 m outside the line, so an absolute 4.5 m
-      // threshold does not fire until the kart is already in the barrier. The
-      // road is the thing that ran out, so the road is what the test reads.
-      const wide = Math.abs(lat) > half - DRIFT_EDGE_KEEP || Math.abs(cross) > half;
+      // Measured against the road edge, not as an absolute distance off the
+      // line — the road is the thing that ran out, so the road is what the test
+      // reads. With the inside bias below paying for the wash, this now fires
+      // when the driver genuinely overcooked it rather than on every entry.
+      if (Math.abs(lat) > half - DRIFT_EDGE_KEEP) {
+        this.endDrift(0.45);
+        return false;
+      }
+
+      if (this.driftT > DRIFT_MAX_HOLD) {
+        this.endDrift(0.5);
+        return false;
+      }
+
       // Hold until the corner genuinely opens up, then release to cash the
       // mini-turbo onto the exit — bailing early throws the whole charge away.
-      if (exit < 0.0072 || wide || (this.driftEntry <= 0 && k.driftDir === 0)) {
-        this.driftHold = false;
-        this.driftCool = 0.4;
+      // The one exception is the classic player's beat: if a tier is within
+      // half a charge, hang on through the exit for it. A drift released at
+      // tier 0 is a slide that cost lateral grip and paid nothing, and it is
+      // also, on screen, a rival that slid without ever lighting up.
+      const opened = Math.abs(line.peakCurv(d, span)) < DRIFT_EXIT_CURV;
+      const nearlyThere = k.driftTier === 0 && k.driftCharge > 0.5;
+      if (opened && !nearlyThere) {
+        this.endDrift(0.3);
         return false;
       }
       return true;
     }
 
-    if (this.driftCool <= 0 && tight > DRIFT_MIN_CURV && speed > 12 && k.boostTime <= 0) {
+    const peak = line.peakCurv(d, span);
+    if (
+      this.driftCool <= 0
+      && Math.abs(peak) > DRIFT_MIN_CURV
+      && speed > 12
+      && !k.airborne
+      // Chain out of a mini-turbo instead of being locked out by it. At `<= 0`
+      // a driver that had just cashed a tier-3 was barred from the next corner
+      // for 2.1 s, which on this circuit is most of the gap between the esses.
+      && k.boostTime <= 0.3
+    ) {
       this.driftHold = true;
+      this.driftT = 0;
       // steer sign that turns into this corner: +curvature turns toward -yaw
       this.driftSide = -Math.sign(peak);
       // The chassis only bites if the rack is loaded when the hop lands, so
       // the entry deliberately over-steers for a moment. This is exactly what
-      // a player does — you flick it in, you do not ease it in.
-      this.driftEntry = 0.5;
+      // a player does — you flick it in, you do not ease it in. 0.6 s against
+      // `Kart`'s 0.45 s hop window, so the flick is guaranteed to outlast the
+      // window rather than expiring inside it.
+      this.driftEntry = 0.6;
       return true;
     }
     return false;
+  }
+
+  /** Lookahead the drift decision reads, metres. */
+  private driftSpan(speed: number) {
+    return clamp(Math.abs(speed) * 0.45, 10, 24);
+  }
+
+  private endDrift(cool: number) {
+    this.driftHold = false;
+    this.driftEntry = 0;
+    this.driftT = 0;
+    if (cool > this.driftCool) this.driftCool = cool;
   }
 
   /**
@@ -869,16 +1030,22 @@ export class AIDriver {
     if (held === ItemKind.None && towed === ItemKind.None) {
       this.lastKind = ItemKind.None;
       this.carryT = 0;
+      this.holdT = 0;
       return;
     }
     if (towed !== ItemKind.None) {
       this.carryT += dt;
     } else {
       this.carryT = 0;
+      this.holdT += dt;
       if (held !== this.lastKind) {
         this.lastKind = held;
-        // reaction time — sharper drivers think faster
-        this.itemDelay = 0.35 + (1 - this.skill) * 1.1 + hash01(k.id * 31 + held) * 0.6;
+        this.holdT = 0;
+        // Reaction time — sharper drivers think faster. Halved from a ceiling
+        // of 2.05 s to 1.4 s: at eight racers, a two-second think before every
+        // decision (which then usually declines to fire) is most of the reason
+        // the whole field's item game was invisible.
+        this.itemDelay = 0.25 + (1 - this.skill) * 0.7 + hash01(k.id * 31 + held) * 0.45;
       }
       if (this.itemDelay > 0) { this.itemDelay -= dt; return; }
     }
@@ -904,7 +1071,12 @@ export class AIDriver {
       }
     }
 
-    const straight = Math.abs(this.line.peakCurv(d, 55)) < 0.009;
+    // "Is there road to spend this on." 55 m at a 0.009 gate was answering NO
+    // for most of the lap: the baked line clears 0.009 somewhere inside any 55 m
+    // window over roughly half the circuit, so a high-skill driver holding a
+    // mushroom essentially never found a stretch it approved of and carried it
+    // to the flag. 40 m at 0.011 is the same idea asked honestly.
+    const straight = Math.abs(this.line.peakCurv(d, 40)) < 0.011;
     const leading = k.place === 1;
     let fire = false;
     let back = false;
@@ -959,7 +1131,11 @@ export class AIDriver {
         break;
 
       case ItemKind.GreenShell:
-        if (aheadKart && aheadDist < 34 && aheadAngle < 0.20) fire = true;
+        // Widened from 34 m / 0.20 rad. A green shell is a straight-line weapon
+        // and the old cone was tight enough that the shot was only ever taken
+        // from directly behind at close range, which on a circuit this fast is
+        // a window of about half a second per overtake.
+        if (aheadKart && aheadDist < 44 && aheadAngle < 0.30) fire = true;
         else if (behindDist < 26 || (leading && this.skill > 0.6)) { fire = true; back = true; }
         break;
 
@@ -996,10 +1172,30 @@ export class AIDriver {
         break;
     }
 
+    // --- boredom backstop ---------------------------------------------------
+    // Every branch above can decline forever, and several of them routinely do:
+    // the leader with a star and nobody within 30 m, a mid-pack driver with a
+    // red shell and a 90 m gap, anyone at all holding a mushroom through a
+    // twisty third of the lap. What that produced across a whole race was a
+    // field that collected items and then quietly kept them — and a lap in which
+    // nothing was ever thrown, which is most of the round-1 "nothing is
+    // happening" note.
+    //
+    // A held slot also blocks the next box, so hoarding is not even neutral:
+    // it takes the driver out of the item game entirely. So an unspent item goes
+    // off on a timer — impatient drivers sooner — and droppables go out behind
+    // where they at least become a shield rather than being wasted forward.
+    if (!fire && this.holdT > 5.5 + (1 - this.aggression) * 4.5) {
+      fire = true;
+      back = held === ItemKind.Banana || held === ItemKind.GreenShell
+        || held === ItemKind.RedShell;
+    }
+
     if (fire) {
       cmd.useItem = true;
       cmd.itemBackwards = back;
       this.lastKind = ItemKind.None;
+      this.holdT = 0;
       this.itemDelay = 0.4;
     }
   }

@@ -105,7 +105,28 @@ export interface EmitParams {
    */
   camBias: number;
   count: number;
+  /**
+   * LIVE COLOUR CHANNEL, 1..TIER_SLOTS. 0 = none (the authored colour is used
+   * verbatim).
+   *
+   * A drift particle's colour is not a property of the particle, it is a
+   * property of the *drift* — and a drift changes tier while its own shower is
+   * still in the air. Baking `C_TIER[tier]` in at spawn is why the reviewed
+   * tier-2 frame contained a screen full of tier-1 blue sparks: the promotion
+   * happened on the frame the shutter fired and every grain already in flight
+   * kept the colour it was born with.
+   *
+   * So a particle on a channel stores only its INTENSITY (author the colour as
+   * white * intensity) and multiplies in `uTierCol[channel-1]` in the vertex
+   * shader. Effects rewrites that array every frame from each kart's live drift
+   * tier, so a promotion recolours the entire shower — in flight, instantly,
+   * for free.
+   */
+  channel: number;
 }
+
+/** one live colour channel per racer; see EmitParams.channel */
+export const TIER_SLOTS = 8;
 
 // 8 x vec4 — kept at exactly 32 floats so every attribute is vec4-aligned.
 const STRIDE = 32;
@@ -350,6 +371,8 @@ uniform vec2  uAtlasTiles;
 uniform float uSizeCap;
 /** x: fully faded at this view depth, y: fully opaque from here out */
 uniform vec2  uNearFade;
+/** live per-racer drift colour; see EmitParams.channel */
+uniform vec3  uTierCol[TIER_SLOTS];
 
 attribute vec4 aStart;  // xyz spawn point, w birth time
 attribute vec4 aVel;    // xyz initial velocity, w lifetime
@@ -370,6 +393,8 @@ varying vec4 vPlane;
 varying float vSoft;
 varying float vNear;
 varying float vHot;
+varying float vAge;
+varying float vErode;
 
 void main() {
   float age = uTime - aStart.w;
@@ -383,10 +408,14 @@ void main() {
     vColor = vec4(0.0); vUv = vec2(0.0); vSprite = vec2(0.0);
     vWorld = vec3(0.0); vViewZ = 1.0; vPlane = vec4(0.0, 1.0, 0.0, 0.0);
     vSoft = 0.0; vNear = 0.0;
-    vHot = 0.0;
+    vHot = 0.0; vAge = 0.0; vErode = 0.0;
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
     return;
   }
+  vAge = u;
+  // Only the billowy Smoke tile carries interior density in its RGB, so it is
+  // the only one the erosion dissolve in the fragment shader can key off.
+  vErode = abs(aMisc.x - 2.0) < 0.5 ? 1.0 : 0.0;
 
   // Tiles that represent *incandescent* matter (spark cores and velocity
   // streaks) get a white-hot centre in the fragment shader. A spark that is
@@ -423,9 +452,18 @@ void main() {
 
   float sz = mix(aSize.x, aSize.y, u);
   float alpha = mix(aColA.a, aColB.a, u) * smoothstep(0.0, max(aSize.w, 1e-4), u);
-  vColor = vec4(mix(aColA.rgb, aColB.rgb, u), alpha);
 
-  float ang = aDyn.z * age + aMisc.y * 6.2831853;
+  // aMisc.y packs TWO things: the integer part is the live colour channel
+  // (0 = none), the fraction is the per-particle random phase. Splitting them
+  // costs one floor() and buys a shower that re-hues the instant its drift is
+  // promoted, instead of one that is always a tier behind.
+  float chan = floor(aMisc.y);
+  float seed = aMisc.y - chan;
+  vec3 tint = vec3(1.0);
+  if (chan > 0.5) tint = uTierCol[int(min(chan, float(TIER_SLOTS))) - 1];
+  vColor = vec4(mix(aColA.rgb, aColB.rgb, u) * tint, alpha);
+
+  float ang = aDyn.z * age + seed * 6.2831853;
   float sa = sin(ang), ca = cos(ang);
 
   // Camera basis pulled straight out of the view matrix — no extra uniforms.
@@ -546,10 +584,22 @@ varying vec4 vPlane;
 varying float vSoft;
 varying float vNear;
 varying float vHot;
+varying float vAge;
+varying float vErode;
 
 void main() {
   vec4 tex = texture2D(uAtlas, vUv);
   float a = tex.a * vColor.a * vNear;
+
+  // EROSION. A puff that fades as one disc is a decal fading out; a real one
+  // breaks up — the thin parts of it disappear first and the silhouette rots
+  // inwards. The Smoke tile already carries its interior density in RGB, so a
+  // threshold on that density rising over the particle's life dissolves the
+  // sparse regions and leaves the dense core last, for one smoothstep.
+  if (vErode > 0.5) {
+    float dens = tex.r;
+    a *= smoothstep(0.62 * vAge, 0.62 * vAge + 0.34, dens);
+  }
   if (a < 0.004) discard;
 
   vec3 rgb = tex.rgb * vColor.rgb;
@@ -595,7 +645,15 @@ void main() {
   float fwd = 0.55 * pow(sv, 2.0) + 1.25 * pow(sv, 7.0);
   // Silhouette rim: the edge of a billboarded puff is where the sight line
   // passes through the least vapour, so it is where backlight leaks through.
-  float rim = pow(clamp(dot(vSprite, vSprite), 0.0, 1.0), 1.6) * clamp(0.35 - ndl, 0.0, 1.0);
+  //
+  // Driven by the VIEW-to-SUN angle as well as by N.L. A plume standing between
+  // the camera and a 14-degree sun is the golden-hour hero moment §6 asks for
+  // and the previous form threw it away: it keyed the rim off the sprite's
+  // reconstructed normal alone, which for a billboard facing the camera is
+  // essentially constant across the whole cloud, so every puff got the same
+  // flat amount of edge whatever the sun was doing behind it.
+  float rim = pow(clamp(dot(vSprite, vSprite), 0.0, 1.0), 1.6)
+            * clamp(0.35 - ndl, 0.0, 1.0) * (0.30 + 1.30 * sv);
   vec3 amb = mix(uBounceColor, uSkyColor, N.y * 0.5 + 0.5);
   // KEY AND FILL, NOT KEY PLUS AMBIENT.
   //
@@ -613,9 +671,19 @@ void main() {
   // distinctly warm on the sun side, cool sky-blue in the shadow — with the lit
   // side landing just under clip so the billow keeps its density variation.
   // ART_DIRECTION §6: the smoke must catch the sun; §2: shadows lean cool.
-  vec3 key = uSunColor * (wrapD * 0.95 + fwd * 1.05 + rim * 1.25);
+  vec3 key = uSunColor * (wrapD * 0.95 + fwd * 1.05 + rim * 1.90);
   vec3 fill = amb * (0.30 + 0.34 * (1.0 - wrapD));
   rgb *= key + fill;
+
+  // TRANSMISSION. This is the half of backlighting that brightness alone cannot
+  // fake. Vapour with the sun behind it does not just get lighter, it gets
+  // *thinner* — you start to see the sky through it — and a puff authored at a
+  // fixed alpha instead stays an opaque lump that happens to be a paler grey.
+  // Against a golden-hour sky at 0.9 display that lump is DARKER than its
+  // background, which is exactly the "unlit grey-brown column" note. Backing the
+  // coverage off where the forward-scatter lobe is strong lets the sky through
+  // at the silhouette and turns the plume into a glow instead of a smudge.
+  a *= mix(1.0, 0.55, clamp(fwd * 0.85, 0.0, 1.0));
 #endif
 
   float soft = 1.0;
@@ -638,7 +706,25 @@ void main() {
 
   rgb *= uGain;
 #ifdef ADDITIVE
-  rgb = rgb / (1.0 + rgb * uClip);
+  // CHROMA-PRESERVING SHOULDER — and the word chroma is the whole point.
+  //
+  // The previous form applied the Reinhard shoulder PER CHANNEL. Per-channel
+  // compression squeezes the biggest channel hardest, so as a saturated colour
+  // gets brighter its channels converge: #ff9d2e at 8x arrives as (3.0, 2.5,
+  // 1.3) — visibly desaturated — and by the time three sprites have stacked it
+  // is neutral. That is the mechanism behind "the plume clips to flat pure
+  // white", "the core has no colour in it" and "the sparks read as fireflies
+  // with no hue": the shoulder that exists to stop a white-out was itself
+  // manufacturing the white.
+  //
+  // Compressing the MAX CHANNEL and scaling all three by the same factor is the
+  // same monotonic curve with the same 1/uClip asymptote and the same cost, but
+  // the ratio between the channels is untouched, so a boost core saturates to
+  // an incandescent orange and a tier-3 drift saturates to violet. Where white
+  // is wanted it is authored (see the vHot core term above), not inherited from
+  // an accident of the tone curve.
+  float mxc = max(max(rgb.r, rgb.g), rgb.b);
+  rgb *= mxc > 1e-4 ? 1.0 / (1.0 + mxc * uClip) : 1.0;
 #endif
   gl_FragColor = vec4(rgb, a);
   #include <tonemapping_fragment>
@@ -676,7 +762,8 @@ class Layer {
   /** wall-clock time at which the newest particle expires */
   private liveUntil = -1;
 
-  constructor(readonly capacity: number, atlas: THREE.DataTexture, additive: boolean, lit: boolean) {
+  constructor(readonly capacity: number, atlas: THREE.DataTexture, additive: boolean, lit: boolean,
+              tierCol: Float32Array) {
     this.geo = baseQuad();
     this.data = new Float32Array(capacity * STRIDE);
     this.buffer = new THREE.InstancedInterleavedBuffer(this.data, STRIDE, 1);
@@ -706,10 +793,12 @@ class Layer {
         uDepth: { value: null },
         uInvRes: { value: new THREE.Vector2(1 / 1920, 1 / 1080) },
         uCamPlanes: { value: new THREE.Vector2(0.2, 3000) },
+        uTierCol: { value: tierCol },
       },
       vertexShader: VERT,
       fragmentShader: FRAG,
       defines: {
+        TIER_SLOTS: String(TIER_SLOTS),
         ...(lit ? { LIT: '' } : {}),
         ...(additive ? { ADDITIVE: '' } : {}),
       } as Record<string, string>,
@@ -768,7 +857,9 @@ class Layer {
     d[o + 20] = p.r1; d[o + 21] = p.g1; d[o + 22] = p.b1; d[o + 23] = p.a1;
 
     d[o + 24] = p.tile;
-    d[o + 25] = seed;
+    // integer part = live colour channel, fraction = random phase (see the
+    // `channel` doc on EmitParams). `seed` is always in [0,1).
+    d[o + 25] = p.channel + seed;
     d[o + 26] = p.groundY;
     d[o + 27] = p.softness;
 
@@ -845,12 +936,16 @@ export class Particles {
     gravity: 0, drag: 1, spin: 0,
     tile: PTile.Glow, mode: PMode.Billboard, stretch: 0, fadeIn: 0.08,
     groundY: -1e4, gnx: 0, gny: 1, gnz: 0, softness: 0, camBias: 0, count: 1,
+    channel: 0,
   };
+
+  /** vec3[TIER_SLOTS], shared by both layers; written by `setChannelColor` */
+  private readonly tierCol = new Float32Array(TIER_SLOTS * 3).fill(1);
 
   constructor(additiveCapacity: number, alphaCapacity: number) {
     this.atlas = buildAtlas(particleTiles(), 4, 2, 256);
-    this.additiveLayer = new Layer(additiveCapacity, this.atlas, true, false);
-    this.alphaLayer = new Layer(alphaCapacity, this.atlas, false, true);
+    this.additiveLayer = new Layer(additiveCapacity, this.atlas, true, false, this.tierCol);
+    this.alphaLayer = new Layer(alphaCapacity, this.atlas, false, true, this.tierCol);
     this.layers = [this.alphaLayer, this.additiveLayer];
     this.group.add(this.alphaLayer.mesh, this.additiveLayer.mesh);
     this.group.matrixAutoUpdate = false;
@@ -869,8 +964,21 @@ export class Particles {
     p.gravity = 0; p.drag = 1; p.spin = 0;
     p.tile = PTile.Glow; p.mode = PMode.Billboard; p.stretch = 0; p.fadeIn = 0.08;
     p.groundY = -1e4; p.gnx = 0; p.gny = 1; p.gnz = 0;
-    p.softness = 0; p.camBias = 0; p.count = 1;
+    p.softness = 0; p.camBias = 0; p.count = 1; p.channel = 0;
     return p;
+  }
+
+  /**
+   * Point every live particle on `channel` (1..TIER_SLOTS) at a new colour.
+   * The particles themselves are never rewritten — they hold only their
+   * intensity — so this is O(1) and recolours a shower already in the air.
+   */
+  setChannelColor(channel: number, c: THREE.Color) {
+    if (channel < 1 || channel > TIER_SLOTS) return;
+    const o = (channel - 1) * 3;
+    const t = this.tierCol;
+    if (t[o] === c.r && t[o + 1] === c.g && t[o + 2] === c.b) return;
+    t[o] = c.r; t[o + 1] = c.g; t[o + 2] = c.b;
   }
 
   /**
@@ -960,11 +1068,14 @@ export class Particles {
 
   /**
    * Cut short the newest `count` particles on a layer so they dissolve within
-   * `fade` seconds. Used on a drift-tier change: without it the frame shows the
-   * old tier's colour and the new one at the same time, which contradicts the
-   * one thing drift particles exist to communicate.
+   * `fade` seconds. Bounded work, no allocation, harmless on dead slots.
    *
-   * Bounded work, no allocation, and harmless on slots that are already dead.
+   * NOT the mechanism for a drift-tier change any more — see `setChannelColor`.
+   * Retiring particles to fix a colour is the wrong tool: it can only ever
+   * choose between showing the wrong hue and showing a hole, and a ring buffer
+   * has no way to know which of its newest N slots belonged to the drift. Keep
+   * this for cases where the particles genuinely should stop existing (a race
+   * reset, an effect being cancelled), not for cases where they should change.
    */
   retireRecent(additive: boolean, count: number, fade = 0.07) {
     (additive ? this.additiveLayer : this.alphaLayer).retireRecent(count, this.time, fade);

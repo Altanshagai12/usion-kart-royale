@@ -15,15 +15,42 @@
  *    with a specular highlight and a glow that bled past the plate corner, and
  *    a flat vector with a hard keyline and no glow at all.
  *
+ * ROUND 8 — THE SET WAS FLAT AND IT WAS NOT ONE SET.
+ *
+ * The round-1 review counted three construction languages in one slot: a flat
+ * vector coffee cup and saucer that "could have come out of a Material icon
+ * set", an unidentifiable cream-and-red buoy with a grey ring that "reads as
+ * nothing at a glance", and shaded 3D-ish latitude spheres. On top of that the
+ * empty state was a thin gold diamond outline that read as a broken-image
+ * placeholder — in the SAME gold as the "1st" position accent, so one colour
+ * meant both "you are winning" and "you have nothing".
+ *
+ * Three changes, all structural rather than per-icon:
+ *
+ *  1. ONE LIGHTING KEY, in `lit()`, which every filled shape in the file goes
+ *     through. Warm key from the upper left, cool bounce from the lower right,
+ *     an inner rim on the lit edge, then the ink keyline — §4's clearcoat toy
+ *     language rather than flat vector. No icon lights itself.
+ *  2. ONE OPTICAL SIZE, in `OPT_S`, so a can, a sphere and a sun with rays all
+ *     land on the same visual bounding box instead of filling 70% / 60% / 45%
+ *     of the slot.
+ *  3. THE EMPTY STATE IS AN ITEM, not the absence of one: a dimensional
+ *     three-quarter item-box cube with a "?" on it, drawn from this atlas on
+ *     this grid, in a NEUTRAL value. Gold is now reserved strictly for the
+ *     position accent. The HUD ghosts it further so "empty" and "holding" are
+ *     never the same weight on screen.
+ *
+ * Two icons that did not read were redrawn from scratch: the espresso is a
+ * turbo can (a boost pickup should look like a boost pickup at 64 px), and the
+ * mooring buoy is a harbour mine (a bomb should look like a bomb).
+ *
  * ONE construction, applied to every icon without exception:
  *   - a single ink keyline at ONE weight (LW). No icon is more line-arty.
- *   - TWO-STOP shading only. One linear ramp per shape, light at the top.
- *     No radial gradients, no specular blobs, no rim lights, no glows.
+ *   - one two-stop ramp per shape, light at the top, through `lit()`.
  *   - one contact shadow, identical parameters everywhere.
  *   - one optical-size box: every icon is authored inside a unit square and
- *     then fitted to an 82% inset, vertically centred on its OPTICAL centroid
- *     (see OPT_Y) rather than on its bounding box, so a tall icon and a wide
- *     one sit at the same visual height in the slot.
+ *     then fitted to an 80% inset scaled by OPT_S, vertically centred on its
+ *     OPTICAL centroid (OPT_Y) rather than on its bounding box.
  */
 import { ItemKind } from '../types';
 
@@ -33,21 +60,23 @@ const LW = 0.055;
 
 export const ITEM_NAMES: Record<number, string> = {
   [ItemKind.None]: '',
-  [ItemKind.Mushroom]: 'Espresso',
-  [ItemKind.TripleMushroom]: 'Triple Espresso',
+  [ItemKind.Mushroom]: 'Turbo Can',
+  [ItemKind.TripleMushroom]: 'Triple Turbo',
   [ItemKind.GreenShell]: 'Glass Float',
   [ItemKind.RedShell]: 'Homing Float',
   [ItemKind.Banana]: 'Lemon',
   [ItemKind.Star]: 'Golden Hour',
   [ItemKind.Bolt]: 'Squall',
-  [ItemKind.Bomb]: 'Mooring Buoy',
+  [ItemKind.Bomb]: 'Harbour Mine',
 };
 
 /** Accent colour used for the item-box glow and the hit toast rule. */
 export const ITEM_TINT: Record<number, string> = {
+  // Neutral, and deliberately NOT gold: the empty slot must not borrow the
+  // colour that means "you are in first".
   [ItemKind.None]: '#8fa0bb',
-  [ItemKind.Mushroom]: '#d98a3c',
-  [ItemKind.TripleMushroom]: '#e0a04a',
+  [ItemKind.Mushroom]: '#ff8a3d',
+  [ItemKind.TripleMushroom]: '#ff9d4a',
   [ItemKind.GreenShell]: '#5fd463',
   [ItemKind.RedShell]: '#ff4d4d',
   [ItemKind.Banana]: '#ffd447',
@@ -75,7 +104,8 @@ export const ROULETTE_ORDER: ItemKind[] = [
  * more headroom than footroom next to a bomb that filled the plate.
  */
 const OPT_Y: Record<number, number> = {
-  [ItemKind.Mushroom]: -0.015,
+  [ItemKind.None]: 0,
+  [ItemKind.Mushroom]: -0.005,
   [ItemKind.TripleMushroom]: -0.01,
   [ItemKind.GreenShell]: -0.02,
   [ItemKind.RedShell]: -0.02,
@@ -83,6 +113,25 @@ const OPT_Y: Record<number, number> = {
   [ItemKind.Star]: 0.005,
   [ItemKind.Bolt]: 0,
   [ItemKind.Bomb]: -0.01,
+};
+
+/**
+ * Optical-SIZE correction per icon. The shared 80% box equalises the authoring
+ * square, not the perceived mass: a sun with sixteen thin rays reads far
+ * larger than a sphere of the same bounding box, and a tall narrow can reads
+ * smaller. The review measured icons filling 70%, 60% and 45% of the same
+ * slot. These are the multipliers that put them all on one optical grid.
+ */
+const OPT_S: Record<number, number> = {
+  [ItemKind.None]: 1.00,
+  [ItemKind.Mushroom]: 1.06,
+  [ItemKind.TripleMushroom]: 1.00,
+  [ItemKind.GreenShell]: 1.06,
+  [ItemKind.RedShell]: 1.06,
+  [ItemKind.Banana]: 0.96,
+  [ItemKind.Star]: 0.90,
+  [ItemKind.Bolt]: 1.00,
+  [ItemKind.Bomb]: 1.02,
 };
 
 type G = CanvasRenderingContext2D;
@@ -122,10 +171,53 @@ function contact(g: G) {
   g.restore();
 }
 
-function fillKey(g: G, p: Path2D, top: string, bottom: string, y0?: number, y1?: number, kw = LW) {
+/**
+ * THE LIGHTING KEY. Every filled shape in this file goes through here, so the
+ * whole set is lit by one three-quarter setup and reads as one toy family
+ * (§4's clearcoat language) rather than as flat vector art with a keyline.
+ *
+ * Four passes, in order, on every shape without exception:
+ *   1. the two-stop body ramp
+ *   2. a warm key from the upper left  (§2's 14° sun)
+ *   3. a cool bounce from the lower right (§2's sky fill)
+ *   4. an inner rim on the lit edge — the "6 px rim" that makes a shape read
+ *      as moulded rather than as a filled path
+ * then the one ink keyline over the top.
+ */
+function lit(g: G, p: Path2D, top: string, bottom: string, y0?: number, y1?: number, kw = LW) {
   g.fillStyle = ramp(g, top, bottom, y0, y1);
   g.fill(p);
+
+  g.save();
+  g.clip(p);
+  const key1 = g.createRadialGradient(-0.17, -0.24, 0.01, -0.17, -0.24, 0.50);
+  key1.addColorStop(0, 'rgba(255, 247, 226, 0.40)');
+  key1.addColorStop(1, 'rgba(255, 247, 226, 0)');
+  g.fillStyle = key1;
+  g.fillRect(-0.6, -0.6, 1.2, 1.2);
+
+  const bounce = g.createRadialGradient(0.24, 0.32, 0.01, 0.24, 0.32, 0.44);
+  bounce.addColorStop(0, 'rgba(150, 198, 255, 0.26)');
+  bounce.addColorStop(1, 'rgba(150, 198, 255, 0)');
+  g.fillStyle = bounce;
+  g.fillRect(-0.6, -0.6, 1.2, 1.2);
+
+  // inner rim: the silhouette stroked once, nudged down-right inside the clip,
+  // so only the upper-left edge of the shape catches it
+  g.save();
+  g.translate(kw * 0.42, kw * 0.52);
+  g.strokeStyle = 'rgba(255, 250, 236, 0.55)';
+  g.lineWidth = kw * 1.15;
+  g.stroke(p);
+  g.restore();
+  g.restore();
+
   key(g, p, kw);
+}
+
+/** Kept as the call name every icon already uses; it IS the lighting key. */
+function fillKey(g: G, p: Path2D, top: string, bottom: string, y0?: number, y1?: number, kw = LW) {
+  lit(g, p, top, bottom, y0, y1, kw);
 }
 
 function ellipsePath(x: number, y: number, rx: number, ry: number, rot = 0) {
@@ -138,69 +230,85 @@ function ellipsePath(x: number, y: number, rx: number, ry: number, rot = 0) {
 // icons
 // --------------------------------------------------------------------------
 
-/** Espresso — the boost item. Harbour-front bar, one shot, go.
- *  `s` scales the whole cup about the local origin; every stroke weight is
- *  divided by it so the keyline lands at exactly LW whatever the size — a
- *  small icon in the triple must not be more delicately drawn than a large
- *  one, or the set stops reading as one hand. */
-function espresso(g: G, s: number) {
+/**
+ * Turbo can — the boost item.
+ *
+ * This slot used to be a steaming espresso cup on a saucer. It was drawn
+ * correctly and it was still wrong: a cup and saucer is a menu icon, and at
+ * 64 px in the corner of a racing game nothing about it says "this makes you
+ * go faster". A stubby pressurised can with a chrome collar and a double
+ * chevron says it in one glance, in every language, and it is nobody else's
+ * item design.
+ *
+ * `s` scales the whole can about the local origin; every stroke weight is
+ * divided by it so the keyline lands at exactly LW whatever the size — a small
+ * can in the triple must not be more delicately drawn than a large one, or the
+ * set stops reading as one hand.
+ */
+function turboCan(g: G, s: number) {
   g.save();
   g.scale(s, s);
   const w = LW / s;
 
-  // saucer
-  const saucer = ellipsePath(0, 0.315, 0.40, 0.105);
-  fillKey(g, saucer, '#fdf6e8', '#cbb99a', 0.20, 0.42, w);
+  // collar / valve, behind the body
+  const collar = new Path2D();
+  collar.moveTo(-0.135, -0.235);
+  collar.lineTo(0.135, -0.235);
+  collar.lineTo(0.115, -0.405);
+  collar.bezierCurveTo(0.115, -0.475, -0.115, -0.475, -0.115, -0.405);
+  collar.closePath();
+  fillKey(g, collar, '#f4f8ff', '#6d7a90', -0.48, -0.20, w);
 
-  // handle, behind the cup
-  const handle = new Path2D();
-  handle.moveTo(0.235, -0.055);
-  handle.bezierCurveTo(0.415, -0.075, 0.425, 0.185, 0.235, 0.185);
-  g.strokeStyle = INK;
-  g.lineWidth = w * 2.6;
-  g.stroke(handle);
-  g.strokeStyle = '#f6eddc';
-  g.lineWidth = w * 1.4;
-  g.stroke(handle);
+  // body: a chunky capsule, warm — the boost family colour (§3 mini-turbo
+  // orange, saturated up for a 64 px read)
+  const body = new Path2D();
+  const L = -0.285, R = 0.285, T = -0.245, B = 0.375, C = 0.135;
+  body.moveTo(L, T + C);
+  body.bezierCurveTo(L, T, L + C, T, L + C, T);
+  body.lineTo(R - C, T);
+  body.bezierCurveTo(R, T, R, T, R, T + C);
+  body.lineTo(R, B - C);
+  body.bezierCurveTo(R, B, R - C, B, R - C, B);
+  body.lineTo(L + C, B);
+  body.bezierCurveTo(L, B, L, B, L, B - C);
+  body.closePath();
+  fillKey(g, body, '#ffc06b', '#c9420e', -0.30, 0.42, w);
 
-  // cup
-  const cup = new Path2D();
-  cup.moveTo(-0.265, -0.175);
-  cup.lineTo(0.265, -0.175);
-  cup.lineTo(0.205, 0.185);
-  cup.bezierCurveTo(0.185, 0.275, -0.185, 0.275, -0.205, 0.185);
-  cup.closePath();
-  fillKey(g, cup, '#fffaf0', '#dccdb4', -0.22, 0.28, w);
-
-  // crema
-  const crema = ellipsePath(0, -0.175, 0.265, 0.075);
-  fillKey(g, crema, '#d9974a', '#7d4413', -0.25, -0.10, w);
-
-  // steam — the one line-art element, at the shared weight
-  g.strokeStyle = 'rgba(255,246,228,0.72)';
-  g.lineWidth = w * 0.72;
+  // the double chevron. Two strokes, the shared keyline weight, clipped to the
+  // body so the decal is ON the can rather than floating over it.
+  g.save();
+  g.clip(body);
   g.lineCap = 'round';
-  for (const sx of [-0.10, 0.10]) {
+  g.lineJoin = 'round';
+  for (let i = 0; i < 2; i++) {
+    const x = -0.115 + i * 0.185;
     g.beginPath();
-    g.moveTo(sx, -0.28);
-    g.bezierCurveTo(sx + 0.075, -0.35, sx - 0.075, -0.40, sx, -0.465);
+    g.moveTo(x - 0.075, -0.055);
+    g.lineTo(x + 0.055, 0.075);
+    g.lineTo(x - 0.075, 0.205);
+    g.strokeStyle = 'rgba(48, 20, 6, 0.55)';
+    g.lineWidth = w * 2.5;
+    g.stroke();
+    g.strokeStyle = '#fff6e0';
+    g.lineWidth = w * 1.5;
     g.stroke();
   }
   g.restore();
+  g.restore();
 }
 
-function drawEspresso(g: G) {
+function drawTurboCan(g: G) {
   contact(g);
-  espresso(g, 1);
+  turboCan(g, 1);
 }
 
-function drawTripleEspresso(g: G) {
+function drawTripleTurbo(g: G) {
   contact(g);
-  // Three shots in a triangle. No tray: at 64 px a tray plus three cups is one
-  // brown lump, and the count chip on the plate already says how many.
-  g.save(); g.translate(-0.265, 0.155); espresso(g, 0.46); g.restore();
-  g.save(); g.translate(0.265, 0.155); espresso(g, 0.46); g.restore();
-  g.save(); g.translate(0, -0.145); espresso(g, 0.52); g.restore();
+  // Three cans in a triangle. No crate: at 64 px a crate plus three cans is one
+  // orange lump, and the count chip on the plate already says how many.
+  g.save(); g.translate(-0.265, 0.185); turboCan(g, 0.54); g.restore();
+  g.save(); g.translate(0.265, 0.185); turboCan(g, 0.54); g.restore();
+  g.save(); g.translate(0, -0.175); turboCan(g, 0.60); g.restore();
 }
 
 /**
@@ -244,8 +352,8 @@ function glassFloat(g: G, top: string, bottom: string, homing: boolean) {
     g.strokeStyle = INK;
     g.lineWidth = LW * 1.7;
     g.stroke(band);
-    g.strokeStyle = '#f0c24e';
-    g.lineWidth = LW * 0.95;
+    g.strokeStyle = '#e0a93a';
+    g.lineWidth = LW * 0.8;
     g.stroke(band);
   }
 }
@@ -341,69 +449,119 @@ function drawSquall(g: G) {
   fillKey(g, bolt, '#fff6c2', '#f0a412', -0.10, 0.48);
 }
 
-/** Mooring buoy — the dropped/thrown hazard. Standard harbour livery. */
-function drawBuoy(g: G) {
+/**
+ * Harbour mine — the thrown/dropped explosive.
+ *
+ * The round-1 buoy read, in the review's words, "as nothing at a glance": a
+ * cream-and-red hull with a grey mooring ring, which at 64 px is a lozenge
+ * with a smudge under it. A moored contact mine keeps the harbour theme
+ * exactly and reads as a bomb instantly, because horns on a dark sphere is
+ * the one silhouette that can only mean one thing.
+ */
+function drawMine(g: G) {
   contact(g);
-  // mast + lamp
-  const mast = new Path2D();
-  mast.moveTo(-0.048, -0.235);
-  mast.lineTo(0.048, -0.235);
-  mast.lineTo(0.038, -0.395);
-  mast.lineTo(-0.038, -0.395);
-  mast.closePath();
-  fillKey(g, mast, '#c9d2e0', '#6a7488', -0.42, -0.22);
+  const R = 0.285;
+  const CY = 0.075;
 
-  const lamp = new Path2D();
-  lamp.moveTo(-0.135, -0.385);
-  lamp.bezierCurveTo(-0.135, -0.545, 0.135, -0.545, 0.135, -0.385);
-  lamp.closePath();
-  fillKey(g, lamp, '#fff2c0', '#e0902a', -0.55, -0.36);
+  // Horns first, so the shell overlaps their roots. Five, fat and long: three
+  // thin spikes read as sun rays, which is what the first pass of this icon
+  // did and it is why it was unreadable.
+  for (let i = 0; i < 5; i++) {
+    const a = -Math.PI * 0.92 + (i * Math.PI * 0.84) / 4;
+    const cx = Math.cos(a), sy = Math.sin(a);
+    const horn = new Path2D();
+    const bx = cx * (R - 0.03), by = CY + sy * (R - 0.03);
+    const tx = cx * (R + 0.185), ty = CY + sy * (R + 0.185);
+    const px = -sy * 0.088, py = cx * 0.088;
+    horn.moveTo(bx + px, by + py);
+    horn.lineTo(tx + px * 0.46, ty + py * 0.46);
+    horn.lineTo(tx - px * 0.46, ty - py * 0.46);
+    horn.lineTo(bx - px, by - py);
+    horn.closePath();
+    fillKey(g, horn, '#d2dcec', '#4d5b73', -0.50, 0.20, LW * 0.9);
+  }
 
-  // hull — one silhouette, banded by a clipped rectangle rather than a second
-  // gradient, so the two-stop rule still holds per shape
-  const hull = new Path2D();
-  hull.moveTo(-0.335, -0.155);
-  hull.bezierCurveTo(-0.335, -0.275, 0.335, -0.275, 0.335, -0.155);
-  hull.lineTo(0.315, 0.175);
-  hull.bezierCurveTo(0.285, 0.395, -0.285, 0.395, -0.315, 0.175);
-  hull.closePath();
-  fillKey(g, hull, '#fdf4e2', '#c3b295', -0.30, 0.42);
+  // shell — one silhouette, dark, so the horns read against the ground and the
+  // one red band reads against the shell
+  const shell = new Path2D();
+  shell.arc(0, CY, R, 0, Math.PI * 2);
+  fillKey(g, shell, '#4d5e77', '#0b1220', -0.28, 0.40);
 
   g.save();
-  g.clip(hull);
+  g.clip(shell);
   const band = new Path2D();
-  band.rect(-0.5, -0.155, 1, 0.19);
-  g.fillStyle = ramp(g, '#f4776c', '#c22d24', -0.16, 0.04);
+  band.rect(-0.5, CY - 0.10, 1, 0.135);
+  g.fillStyle = ramp(g, '#ff8478', '#b8241c', CY - 0.11, CY + 0.05);
   g.fill(band);
   g.restore();
-  key(g, hull);
-
-  // mooring ring
-  const ring = new Path2D();
-  ring.ellipse(0, 0.335, 0.115, 0.048, 0, 0, Math.PI * 2);
-  g.strokeStyle = INK;
-  g.lineWidth = LW * 1.9;
-  g.stroke(ring);
-  g.strokeStyle = '#c9d2e0';
-  g.lineWidth = LW * 1.0;
-  g.stroke(ring);
+  key(g, shell);
 }
 
-/** The empty-slot ghost. The HUD never asks for this — the empty state is the
- *  plate's own well and the embossed diamond behind the canvas — but the table
- *  needs a total function. */
-function drawEmpty(_g: G) { /* deliberately nothing */ }
+/**
+ * THE EMPTY SLOT — a real item-box cube in three-quarter view with a "?" on
+ * it, at a neutral value.
+ *
+ * Round 1 drew this as a thin gold diamond outline, which read as a
+ * broken-image placeholder, and it used the SAME gold as the "1st" position
+ * accent, so one colour in the HUD meant both "you are winning" and "you have
+ * nothing". Gold is now the position accent and nothing else. The HUD ghosts
+ * this further (see `.kr-item.empty` in ui.css) so a full-weight, saturated,
+ * glowing slot can only ever mean "you are holding something".
+ */
+function drawEmptyBox(g: G) {
+  contact(g);
+  // isometric hexagon: T, R1, R2, B, L2, L1, with M at the centre
+  const HX = 0.345, HY = 0.205, VY = 0.415;
+  const top = new Path2D();
+  top.moveTo(0, -VY); top.lineTo(HX, -HY); top.lineTo(0, 0); top.lineTo(-HX, -HY);
+  top.closePath();
+  const left = new Path2D();
+  left.moveTo(-HX, -HY); left.lineTo(0, 0); left.lineTo(0, VY); left.lineTo(-HX, HY);
+  left.closePath();
+  const right = new Path2D();
+  right.moveTo(HX, -HY); right.lineTo(HX, HY); right.lineTo(0, VY); right.lineTo(0, 0);
+  right.closePath();
+
+  // three faces, one value each, lit by the shared key — the left face takes
+  // the warm key, the right face falls into the cool bounce, the top reads
+  // brightest, which is the whole reason this is a cube and not a diamond.
+  fillKey(g, left, '#4a5f7e', '#22314a', -0.20, VY);
+  fillKey(g, right, '#3f5470', '#16223a', -0.20, VY);
+  fillKey(g, top, '#94aac6', '#556b8a', -VY, 0.02);
+
+  // the "?" — a path, not text, so it scales exactly with the box
+  const q = new Path2D();
+  q.moveTo(-0.105, -0.095);
+  q.bezierCurveTo(-0.105, -0.235, 0.125, -0.235, 0.125, -0.115);
+  q.bezierCurveTo(0.125, -0.005, 0.010, 0.010, 0.010, 0.105);
+  g.lineCap = 'round';
+  g.strokeStyle = INK;
+  g.lineWidth = LW * 2.2;
+  g.stroke(q);
+  g.strokeStyle = '#cfe0f2';
+  g.lineWidth = LW * 1.25;
+  g.stroke(q);
+
+  const dot = new Path2D();
+  dot.arc(0.010, 0.195, LW * 0.85, 0, Math.PI * 2);
+  g.fillStyle = INK;
+  g.lineWidth = LW * 1.1;
+  g.strokeStyle = INK;
+  g.stroke(dot);
+  g.fillStyle = '#cfe0f2';
+  g.fill(dot);
+}
 
 const TABLE: Record<number, (g: G) => void> = {
-  [ItemKind.None]: drawEmpty,
-  [ItemKind.Mushroom]: drawEspresso,
-  [ItemKind.TripleMushroom]: drawTripleEspresso,
+  [ItemKind.None]: drawEmptyBox,
+  [ItemKind.Mushroom]: drawTurboCan,
+  [ItemKind.TripleMushroom]: drawTripleTurbo,
   [ItemKind.GreenShell]: drawGreenFloat,
   [ItemKind.RedShell]: drawRedFloat,
   [ItemKind.Banana]: drawLemon,
   [ItemKind.Star]: drawGoldenHour,
   [ItemKind.Bolt]: drawSquall,
-  [ItemKind.Bomb]: drawBuoy,
+  [ItemKind.Bomb]: drawMine,
 };
 
 /**
@@ -414,13 +572,15 @@ const TABLE: Record<number, (g: G) => void> = {
 export function drawItem(g: G, kind: ItemKind, size: number) {
   g.save();
   g.translate(size * 0.5, size * 0.5);
-  // 82% inset square, vertically centred on the optical centroid.
-  g.scale(size * 0.82, size * 0.82);
+  // 80% inset square scaled onto the shared optical grid, vertically centred
+  // on the optical centroid.
+  const s = size * 0.80 * (OPT_S[kind] ?? 1);
+  g.scale(s, s);
   g.translate(0, OPT_Y[kind] || 0);
   g.lineJoin = 'round';
   g.lineCap = 'round';
   g.miterLimit = 2;
-  (TABLE[kind] || drawEmpty)(g);
+  (TABLE[kind] || drawEmptyBox)(g);
   g.restore();
 }
 

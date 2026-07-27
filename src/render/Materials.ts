@@ -463,11 +463,26 @@ export interface BreakupOpts {
   /**
    * Specular antialiasing strength, 0..1 (0 = off, compiled out).
    *
-   * Couples the normal map's own slope into roughness (Toksvig-style) and eases
-   * the relief off toward grazing. See the shader block for why a surface with
-   * chip-scale relief needs both.
+   * Couples the normal map's own slope into roughness (Toksvig-style), eases the
+   * relief off toward grazing, and adds a screen-space normal-variance term so a
+   * surface the pixel cannot resolve goes rough instead of going to a pinpoint
+   * mirror. See the shader block for why a surface with chip-scale relief needs
+   * all three.
    */
   specAA?: number;
+
+  /**
+   * How hard the macro band also drives the normal map's amplitude.
+   *
+   * §4 asks for spatially varying roughness; the other half of that ask, and the
+   * one nothing in this library was doing, is spatially varying *relief*. A road
+   * whose aggregate stands exactly as proud on the polished racing line as it
+   * does on the untouched shoulder is one surface with a tint on it, and the eye
+   * reads constant relief the same way it reads constant roughness. Positive
+   * values make the macro layer's bright side (the unworn, coarse-graded side)
+   * the one with deeper relief.
+   */
+  macroNormal?: number;
 }
 
 /**
@@ -529,6 +544,7 @@ function injectBreakup(mat: THREE.Material, o: BreakupOpts): void {
   const uWear = { value: o.wearGloss ?? 0 };
   const uRoughFloor = { value: o.roughFloor ?? 0.025 };
   const uSpecAA = { value: o.specAA ?? 0 };
+  const uMacroNorm = { value: o.macroNormal ?? 0 };
   const ht = o.heightTint ?? [0, 0, 0];
   const htc = tintMul(o.heightTintColor ?? 0x808080);
   const uHeight = { value: new THREE.Vector4(Math.max(1e-3, ht[0]), ht[1], ht[2], 0) };
@@ -629,6 +645,18 @@ function injectBreakup(mat: THREE.Material, o: BreakupOpts): void {
    *     barely at all, so the same map that reads as aggregate on the bonnet-
    *     level midground reads as sparkle in the near field. Facing geometry
    *     keeps its full chip relief; only the grazing end is calmed.
+   *  3. Screen-space normal variance (`SPEC_AA_GEO`, below). 1 and 2 both work
+   *     off the normal the sampler *handed back*, so neither of them can see how
+   *     much surface a pixel actually covers. That is the term that was missing,
+   *     and it is the one the guardrail needed: an Armco rail at 60 m packs
+   *     several centimetres of rolled profile and three mip levels of scratch
+   *     normal into one pixel, and a 0.3-roughness lobe standing on that is a
+   *     sub-pixel mirror. Three already does this for the *geometric* normal
+   *     (`geometryRoughness` in `lights_physical_fragment`), which is why a bare
+   *     cylinder does not strobe and a normal-mapped one does — the perturbed
+   *     normal is excluded from that measurement. This applies the same
+   *     Kaplanyan filtering to the perturbed normal, so it composes with three's
+   *     own term rather than fighting it.
    */
   const SPEC_AA = specAA
     ? /* glsl */ `
@@ -637,6 +665,19 @@ function injectBreakup(mat: THREE.Material, o: BreakupOpts): void {
             mapN.xy *= mix( 1.0 - uSpecAA * 0.55, 1.0, sqrt( kGraze ) );
             roughnessFactor = clamp(
               roughnessFactor + kSlope * uSpecAA * ( 0.55 - 0.30 * kGraze ), 0.0, 1.0 );`
+    : '';
+
+  // Runs OUTSIDE the tangent-space block, on the final shading normal, so it
+  // fires on geometry with no normal map at all — a thin painted rail read
+  // across two pixels aliases on its own curvature. Capped: past ~0.4 of added
+  // roughness the surface has stopped being the material it was authored as.
+  const SPEC_AA_GEO = specAA
+    ? /* glsl */ `
+          {
+            vec3 kNDxy = max( abs( dFdx( normal ) ), abs( dFdy( normal ) ) );
+            gSpecVar = min( max( max( kNDxy.x, kNDxy.y ), kNDxy.z ) * uSpecAA * 1.6, 0.42 );
+            roughnessFactor = min( roughnessFactor + gSpecVar, 1.0 );
+          }`
     : '';
 
   const WEAR_GLOSS = wears
@@ -680,6 +721,7 @@ function injectBreakup(mat: THREE.Material, o: BreakupOpts): void {
     shader.uniforms.uWearGloss = uWear;
     shader.uniforms.uRoughFloor = uRoughFloor;
     shader.uniforms.uSpecAA = uSpecAA;
+    shader.uniforms.uMacroNorm = uMacroNorm;
     shader.uniforms.uMacroA = uMacroA;
     shader.uniforms.uMacroC = uMacroC;
     shader.uniforms.uMacroB = uMacroB;
@@ -706,6 +748,7 @@ function injectBreakup(mat: THREE.Material, o: BreakupOpts): void {
           WORLD_HASH +
           'uniform vec4 uBreak;\nuniform vec2 uInstJit;\nuniform vec3 uSettle;\nuniform vec4 uVariant;\n' +
           'uniform float uWearGloss;\nuniform float uRoughFloor;\nuniform float uSpecAA;\n' +
+          'uniform float uMacroNorm;\nfloat gSpecVar = 0.0;\n' +
           'uniform vec4 uMacroA;\nuniform vec4 uMacroC;\nuniform vec4 uMacroB;\n' +
           'uniform vec4 uStain;\nuniform float uStainRough;\nuniform vec4 uStreak;\n' +
           'uniform sampler2D uMacroTex;\nuniform vec4 uHeightTint;\nuniform vec3 uHeightTintC;\n' +
@@ -777,9 +820,17 @@ ${VARIANT_BLEND}
         roughnessFactor = clamp( roughnessFactor, uRoughFloor, 1.0 );`,
       );
 
-    if (jitters || settles || specAA) {
+    if (jitters || settles || specAA || (o.macroNormal ?? 0) > 0) {
       shader.fragmentShader = shader.fragmentShader
-        .replace('texture2D( aoMap, vAoMapUv )', 'texture2D( aoMap, vAoMapUv + gUvJit )')
+        // `onBeforeCompile` runs BEFORE three resolves `#include`, so a replace
+        // aimed at text that lives inside a chunk never matches and fails
+        // silently. This one was aimed at `texture2D( aoMap, vAoMapUv )`, which
+        // is inside `<aomap_fragment>` — so the per-instance UV jitter has never
+        // reached the AO channel on any instanced surface in the game, and the
+        // AO has been sampling an un-jittered phase while albedo, roughness and
+        // normal sampled a jittered one. Splice the library's own chunk text in
+        // instead: version-proof, and it cannot go quiet again.
+        .replace('#include <aomap_fragment>', THREE.ShaderChunk.aomap_fragment.replace('vAoMapUv', 'vAoMapUv + gUvJit'))
         .replace(
           '#include <normal_fragment_maps>',
           /* glsl */ `
@@ -787,10 +838,36 @@ ${VARIANT_BLEND}
             vec3 mapN = texture2D( normalMap, vNormalMapUv + gUvJit ).xyz * 2.0 - 1.0;
             // relief has to go with the detail it belongs to, or the far road
             // keeps a normal map it has no albedo left to justify
-            mapN.xy *= normalScale * ( 1.0 - gSettle * 0.85 );${SPEC_AA}
+            // ...and it also has to go with the macro layer. Constant relief
+            // across a surface is the same tell as constant roughness: the
+            // aggregate stands equally proud on the polished line and on the
+            // untouched shoulder, which is the one thing worn asphalt never does.
+            mapN.xy *= normalScale * ( 1.0 - gSettle * 0.85 )
+                     * clamp( 1.0 + ( gBreak + gBreak2 ) * uMacroNorm, 0.25, 1.9 );${SPEC_AA}
             normal = normalize( tbn * mapN );
-          #endif`,
+          #endif${SPEC_AA_GEO}`,
         );
+    }
+    if (specAA) {
+      // Clearcoat carries its own, much tighter lobe, and a tight lobe is
+      // exactly the one that aliases first. Three floors it at 0.0525 and adds
+      // `geometryRoughness` — but that is measured on the *unperturbed* normal,
+      // so a coat riding a normal map is invisible to it. Add the perturbed
+      // variance to the same sum.
+      //
+      // Appended AFTER the include rather than edited inside it, for the same
+      // reason as the aoMap patch above: this hook sees `#include` directives,
+      // not chunk bodies, so anything aimed at the chunk's text silently does
+      // nothing. `lights_physical_fragment` runs after `normal_fragment_maps`,
+      // so `gSpecVar` is already set by the time this reads it.
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <lights_physical_fragment>',
+        /* glsl */ `
+        #include <lights_physical_fragment>
+        #ifdef USE_CLEARCOAT
+          material.clearcoatRoughness = min( material.clearcoatRoughness + gSpecVar, 1.0 );
+        #endif`,
+      );
     }
   };
 
@@ -798,7 +875,8 @@ ${VARIANT_BLEND}
     `brk3${o.period}_${o.strength}_${o.instUv ?? 0}_${o.instTint ?? 0}` +
     `_${settles ? settle.join(',') : 'x'}_${o.variantTint ?? 'x'}_${o.wearGloss ?? 0}` +
     `_${heights ? ht.join(',') : 'x'}` +
-    `_${hasMacroB ? 1 : 0}${stains ? 1 : 0}${streaks ? 1 : 0}${tints ? 1 : 0}${specAA ? 1 : 0}`;
+    `_${hasMacroB ? 1 : 0}${stains ? 1 : 0}${streaks ? 1 : 0}${tints ? 1 : 0}${specAA ? 1 : 0}` +
+    `_${o.macroNormal ?? 0}`;
   // Chained, not assigned. Three keys its program cache on the material's
   // parameters plus this string, and it has no way to see an `onBeforeCompile`;
   // so two materials that differ ONLY in which injections they carry — dry
@@ -1239,7 +1317,19 @@ function injectTriplanar(mat: THREE.Material, o: TriplanarOpts): void {
           tnZ = vec3( tnZ.xy + gN.xy, abs( tnZ.z ) * gN.z );
           vec3 triWorldN = normalize( tnX.zyx * gTriW.x + tnY.xzy * gTriW.y + tnZ.xyz * gTriW.z );${STRATA_NORMAL}
           normal = normalize( ( viewMatrix * vec4( triWorldN, 0.0 ) ).xyz );
-        #endif`,
+        #endif
+        {
+          // Specular antialiasing on the assembled normal. Three's own
+          // geometryRoughness only measures the *unperturbed* normal, so a
+          // triplanar surface — where four normal-map bands and a strata term
+          // are summed per pixel — is invisible to it. Nine taps of relief on a
+          // rock face 200 m away is nine taps of sub-pixel facet; measuring the
+          // per-pixel spread of the result and widening the lobe by it is the
+          // difference between a distant headland and a crawling dither.
+          vec3 kTriDxy = max( abs( dFdx( normal ) ), abs( dFdy( normal ) ) );
+          roughnessFactor = min(
+            roughnessFactor + min( max( max( kTriDxy.x, kTriDxy.y ), kTriDxy.z ) * 1.6, 0.40 ), 1.0 );
+        }`,
       );
 
     if (hasBounce) {
@@ -1251,7 +1341,7 @@ function injectTriplanar(mat: THREE.Material, o: TriplanarOpts): void {
     `_${o.mid ?? 'x'}_${o.midRelief ?? 0}_${o.detailRelief ?? 1}_${bore.join(',')}` +
     `_${o.settle ? o.settle.join(',') : 'x'}_${settleD.join(',')}_${bands.join(',')}` +
     `_${hasBounce ? o.bounce!.join(',') : 'x'}` +
-    `_${hasStrata ? st!.thickness : 'x'}_${hasTriTint ? 1 : 0}`;
+    `_${hasStrata ? st!.thickness : 'x'}_${hasTriTint ? 1 : 0}_saa1`;
 }
 
 export interface EnvGroundOpts {
@@ -1526,7 +1616,15 @@ function injectBoostPad(mat: THREE.Material): void {
 function injectFoliageSSS(mat: THREE.Material, color: THREE.Color, strength: number): void {
   const uCol = { value: color };
   const uStr = { value: strength };
-  mat.onBeforeCompile = (shader) => {
+  // Chained, not assigned. This used to overwrite `onBeforeCompile` outright,
+  // so a leaf card that also wanted tiling breakup or a wind patch silently
+  // lost whichever injection ran first — the same class of bug the note above
+  // `injectBreakup`'s cache key describes, and it is worth fixing even while
+  // this library's own leaf cards are the only consumers.
+  const prev = mat.onBeforeCompile;
+  const prevKey = mat.customProgramCacheKey;
+  mat.onBeforeCompile = (shader, renderer) => {
+    prev?.call(mat, shader, renderer);
     shader.uniforms.uSSSColor = uCol;
     shader.uniforms.uSSSStrength = uStr;
     shader.fragmentShader = shader.fragmentShader
@@ -1552,10 +1650,26 @@ function injectFoliageSSS(mat: THREE.Material, color: THREE.Color, strength: num
           float sssThru = sssBack * max( 0.0, 0.25 - sssND * 0.75 ) * 2.4;
           reflectedLight.indirectDiffuse += directionalLights[ 0 ].color * uSSSColor * diffuseColor.rgb *
             ( sssThru + sssBack * 0.55 + sssWrap * 0.30 ) * uSSSStrength;
+          // Leaf-edge glow. The transmitted term above lights the BODY of the
+          // blade; what separates a backlit canopy from a dark blob against a
+          // bright sky is the rim — the millimetre of blade at the silhouette
+          // where the path length through the leaf goes to nothing and the sun
+          // comes through almost unattenuated. On a card that edge is exactly
+          // where the geometric normal turns perpendicular to the eye, so a
+          // Fresnel-shaped term keyed on the same back-lobe puts light precisely
+          // there and nowhere else. Without it the palm is a flat opaque
+          // dark-green shape against a bright sky, which is the round-1 note.
+          float sssRim = pow( 1.0 - max( 0.0, dot( normal, sssV ) ), 3.0 );
+          reflectedLight.indirectDiffuse += directionalLights[ 0 ].color * uSSSColor *
+            sssRim * sssBack * 1.1 * uSSSStrength;
         #endif`,
       );
   };
-  mat.customProgramCacheKey = () => `foliagesss2_${strength}`;
+  const key = `foliagesss3_${strength}`;
+  mat.customProgramCacheKey =
+    prevKey && prevKey !== THREE.Material.prototype.customProgramCacheKey
+      ? () => prevKey.call(mat) + key
+      : () => key;
 }
 
 // ---------------------------------------------------------------------------
@@ -1668,13 +1782,25 @@ export class Materials implements System {
     return m;
   }
 
-  /** Lacquered kart bodywork in a roster colour. Shares the painted-metal texture set. */
+  /**
+   * Lacquered bodywork in a roster colour, sharing the painted-metal texture set.
+   *
+   * The kart subsystem builds its own two-lobe lacquer in `Liveries.ts` and does
+   * not come through here; this is the fallback for anything else that wants a
+   * painted panel (boat hulls, stalls). Since `metal-painted` is now authored as
+   * galvanised guardrail steel, this has to put the dielectric paint back: kill
+   * the metalness the ORM's B channel carries, and re-enable the coat.
+   */
   livery(color: THREE.ColorRepresentation, key?: string): THREE.MeshPhysicalMaterial {
     const c = new THREE.Color(color);
-    return this.variant('metal-painted', {
+    const m = this.variant('metal-painted', {
       color: c,
+      metalness: 0,
+      clearcoat: 1,
       key: key ?? `livery${c.getHexString()}`,
     }) as THREE.MeshPhysicalMaterial;
+    m.clearcoatRoughness = 0.14;
+    return m;
   }
 
   /** One of the village pastels (index wraps). */
@@ -1878,6 +2004,25 @@ export class Materials implements System {
   private buildTarmac(size: number, racingLine: boolean, wet = false): Entry {
     const f = new Fields(size);
     const agg = voronoiField(size, 96, 96, 1.0, racingLine ? 71 : 11);
+    // A SECOND aggregate grading, at a non-integer ratio (96/41 = 2.34).
+    //
+    // The round-1 note is right and it is a different complaint from the macro
+    // one: the road had metre-scale colour and roughness variation, but the
+    // *aggregate itself* was one cell size at one amplitude from the kart's nose
+    // to the horizon. A real road is not laid in one pass — the surface course
+    // over a trench reinstatement is a coarser mix than the one beside it, and
+    // that grading change is legible from a car because the chip size changes.
+    // One cell size everywhere is what reads as sandpaper (fine) or lizard skin
+    // (coarse); having two, in irregular zones, is what reads as tarmac.
+    // resDiv 2: 41 cells over a half-res tile is still 12 texels per cell, which
+    // is well inside the "features are wide" case the parameter documents, and
+    // it keeps the whole change inside a third of one existing voronoi's build
+    // cost across all three tarmac variants.
+    const aggC = voronoiField(size, 41, 41, 1.0, racingLine ? 74 : 14, 2);
+    // ...and the ~1.2 m zones that decide which grading is on show where. Its
+    // own field, decorrelated from `wear` and `patch`, so a coarse zone is not
+    // automatically also a worn one.
+    const grade = fbmField(size, { freq: 3, octaves: 3, seed: 26, warp: 0.08, normalize: 0.03 });
     const crack = voronoiField(size, 4, 4, 0.85, 21, 4);
     const grit = fbmField(size, { freq: Math.round(size / 5), octaves: 2, seed: 12 });
     // 50 cm wear zones. Un-normalised this ran 0.24–0.81 at sd 0.099, so the
@@ -1962,14 +2107,19 @@ export class Materials implements System {
     const baseRough = wet ? 0.35 : racingLine ? 0.55 : 0.72;
 
     for (let i = 0; i < size * size; i++) {
-      const cellId = agg.id[i];
+      // Which grading is on show here. Deliberately a soft ramp rather than a
+      // hard switch: real reinstatement joints are hard-edged, but a hard edge
+      // inside a 3.5 m tile is a feature that repeats every 3.5 m, which is the
+      // thing this library keeps in the macro layer and out of the tile.
+      const coarse = smoothstep(0.44, 0.82, grade[i]);
+      const cellId = coarse > 0.5 ? aggC.id[i] : agg.id[i];
       const cv = hash2(cellId, 7, 3);
       // Aggregate crown: close to the site AND in a worn patch. The patch gate
       // has to stay tight — widen it and the 36 mm chippings clot into 20 cm
       // blotches, which is what reads as confetti rather than as exposed stone.
       // The distance term is the *smeared* one, so each chipping's exposed face
       // is drawn out down the track instead of being a circle.
-      const aggD = agg.f1[i] * 0.55 + drag[i] * 0.45;
+      const aggD = lerp(agg.f1[i] * 0.55 + drag[i] * 0.45, aggC.f1[i], coarse);
       const stone = smoothstep(0.42, 0.14, aggD) * smoothstep(0.46, 0.68, patch[i]);
       // cracks are rare and shallow: a full crack net over every square metre
       // is a texture-artist tell, not a road
@@ -2010,7 +2160,12 @@ export class Materials implements System {
       // The chip crown carries most of the relief: with the albedo contrast
       // pulled down to a value break, the normal is now what has to make a
       // 36 mm chipping legible at 1 m under a 14° key.
-      const h = grit[i] * 0.09 + stone * 0.5 + (1 - clamp01(aggD * 1.6)) * 0.04 - edge * 0.4;
+      // A 14 mm chipping stands proud of its binder by more than a 6 mm one
+      // does, so the coarse grading gets its relief AND its roughness scaled
+      // with it. This is the sub-metre half of "vary the aggregate scale"; the
+      // metre-and-up half is `macroNormal` in the breakup options below.
+      const h = grit[i] * 0.09 + stone * (0.5 + coarse * 0.40) +
+        (1 - clamp01(aggD * 1.6)) * 0.04 - edge * 0.4;
       // Every term here lives below half a metre, which is exactly right now
       // that it is no longer the only layer: it averages out the moment the road
       // is a few metres away, and what carries the surface from there to the
@@ -2029,7 +2184,8 @@ export class Materials implements System {
       // not just the variance — polish belongs on what traffic can reach.
       const rough = clamp(
         baseRough + (grit[i] - 0.5) * 0.2 + (wear[i] - 0.5) * 0.22 - stone * 0.20 - tarBleed * 0.24 -
-          rub * 0.14 + (patch[i] - 0.5) * 0.12 - polish * 0.20 + (1 - stone) * 0.09,
+          rub * 0.14 + (patch[i] - 0.5) * 0.12 - polish * 0.20 + (1 - stone) * 0.09 +
+          coarse * 0.07,
         0.34,
         0.97,
       );
@@ -2151,6 +2307,15 @@ export class Materials implements System {
       // ...and the term that stops the chip-scale normal map from aliasing into
       // that same sparkle at the grazing angles a chase camera lives at.
       specAA: 1.0,
+      // The other half of the round-1 "one uniform crackle at constant
+      // roughness" note, and the half nothing was addressing. Roughness varied
+      // with the macro band already; RELIEF did not, so the aggregate stood
+      // exactly as proud on the polished line as on the untouched shoulder and
+      // the surface read as one embossed sheet with a tint drifting over it.
+      // Tied to the same band as the roughness and the albedo, so the coarse,
+      // matte, dark zones are also the deep ones — which is the correlation
+      // that makes a road look worn rather than noisy.
+      macroNormal: wet ? 0.30 : racingLine ? 0.34 : 0.55,
     });
     this.envConsumers.push(mat);
     return { mat, textures: [...m.all, macroTex] };
@@ -2249,6 +2414,12 @@ export class Materials implements System {
       // the village's cobbles carry a wear mask on the mesh too, and a polished
       // sett crown is glossier as well as lighter
       wearGloss: 1.1,
+      // A polished sett crown at roughness 0.22 is a 4 cm mirror, and there are
+      // roughly nine hundred of them per screen at the top of the village
+      // climb. Both terms exist to stop that being nine hundred pinpoints.
+      roughFloor: 0.34,
+      specAA: 1.0,
+      macroNormal: 0.35,
     });
     this.envConsumers.push(mat);
     return { mat, textures: [...m.all, macroTex] };
@@ -2261,8 +2432,30 @@ export class Materials implements System {
    */
   private buildKerb(size: number): Entry {
     const f = new Fields(size);
-    const chip = fbmField(size, { freq: 26, octaves: 4, seed: 51, mode: 'turbulence' });
-    const pit = fbmField(size, { freq: Math.round(size / 12), octaves: 2, seed: 52 });
+    // --- what this used to be, and why it was wrong -------------------------
+    // A `turbulence` fbm at freq 26 with four octaves, on a 2 m tile, put a
+    // sharp crease every centimetre across the whole kerb and then drove BOTH
+    // the albedo chipping and the height field off it. Turbulence is |noise|:
+    // its defining feature is a hard V-shaped valley at every zero crossing, so
+    // what it produces is faceted, and a field of centimetre facets at
+    // normalStrength 0.65 on a 50 cm painted band is crushed glass — which is
+    // exactly what the review saw and exactly what a cast kerb is not.
+    //
+    // A precast kerb has a *floated* face: cement paste screeded over the
+    // aggregate, so the surface is smooth-ish with a fine sand grain, punctured
+    // by a scatter of air voids, and broken only where a wheel has spalled a
+    // corner off it. Four fields instead of one, each doing its own job:
+    //
+    //   float — the trowelled paste, gentle and low-frequency
+    //   voids — entrained air bubbles, small, round, and RARE
+    //   agg   — the aggregate under the skin, visible only in the spalls
+    //   spall — the ~10 cm impact chips, the only real relief on the surface
+    const floatT = fbmField(size, { freq: 22, octaves: 3, seed: 51, warp: 0.05 });
+    const voidV = voronoiField(size, 44, 44, 0.95, 52);
+    // Half-res: this one is only ever read inside a spall, which is about 2% of
+    // the surface, so paying full resolution for it buys nothing.
+    const agg = voronoiField(size, 26, 26, 1.0, 59, 2);
+    const spall = voronoiField(size, 7, 7, 0.9, 60, 2);
     const scuff = fbmField(size, { freq: 12, octaves: 3, seed: 53, stretchY: 0.3 });
     const dirtN = fbmField(size, { freq: 5, octaves: 3, seed: 54, warp: 0.04 });
     const grain = grainField(size, 56);
@@ -2293,41 +2486,70 @@ export class Materials implements System {
       for (let x = 0; x < size; x++) {
         const i = y * size + x;
         const paint = isRed ? red : white;
-        // chips cluster on the boundaries
-        const chipMask = smoothstep(0.5, 0.72, chip[i] + (1 - bevel) * 0.3) * smoothstep(0.25, 0.55, dirtN[i] + 0.2);
+        // Spall: a wheel has knocked the corner off the block. Gated per-cell so
+        // only about one cell in seven is one — a chip on every 30 cm of a kerb
+        // run is a texture-artist tell, not a kerb — and biased toward the band
+        // boundaries, because that is where the arris is.
+        const spallCell = hash2(spall.id[i], 31, 17);
+        const spallD = smoothstep(0.42, 0.06, spall.f1[i]);
+        const chipMask = spallCell > 0.74
+          ? spallD * (0.55 + (1 - bevel) * 0.45) * smoothstep(0.2, 0.5, dirtN[i] + 0.25)
+          : 0;
+        // Entrained air voids in the float: round, 4–5 mm, and sparse. These are
+        // the only high-frequency feature left in the height field and their
+        // amplitude is a tenth of what the old crease field carried.
+        const airV = hash2(voidV.id[i], 5, 41) > 0.86 ? smoothstep(0.30, 0.05, voidV.f1[i]) : 0;
         const sc = smoothstep(0.5, 0.82, scuff[i]) * (isRed ? 0.45 : 0.75);
 
+        // Exposed aggregate shows ONLY inside a spall — a floated face has paste
+        // over the stone everywhere else, and that is the difference between
+        // cast concrete and a granite worktop.
+        const aggV = 0.86 + hash2(agg.id[i], 11, 23) * 0.34;
         mixRGB(paint, concreteC, chipMask, _a);
+        if (chipMask > 0) {
+          _a.r *= lerp(1, aggV, chipMask);
+          _a.g *= lerp(1, aggV, chipMask);
+          _a.b *= lerp(1, aggV, chipMask);
+        }
         mixRGB(_a, rubberC, sc * 0.5, _b);
         const grime = 0.9 + dirtN[i] * 0.18 + (grain[i] - 0.5) * 0.05;
-        const tone = grime * (0.94 + bevel * 0.06);
+        const tone = grime * (0.94 + bevel * 0.06) * (1 - airV * 0.10);
         f.set(i, _b.r * tone, _b.g * tone, _b.b * tone);
 
-        const h = bevel * 0.5 + pit[i] * 0.1 - chipMask * 0.35;
-        // Two materials, not one surface with noise on it. Road-marking enamel
-        // over concrete is a *lacquer*: fresh white thermoplastic is around 0.30
-        // and the red about 0.40, and where it has chipped through you are
-        // looking at bare 0.90 concrete. The old model started every texel at
-        // 0.42 and added, so the whole kerb lived in a 0.48–0.55 band — one of
-        // the six surfaces the review counted as answering the sun with the same
-        // matte lobe. The interpolation is the point: paint and substrate are
-        // now separated by 0.6 of roughness with a hard-ish edge between them.
-        const paintRough = isRed ? 0.40 : 0.30;
+        // The float mark is the dominant term and it is a *smooth* one; the
+        // spalls carry the only real depth; the voids are pinpricks. Sum runs
+        // about a fifth of the old field's slope, which is the ~4x drop the
+        // review asked for, taken out of the crease frequency rather than out
+        // of the paint bevel — the bevel is the one edge on a kerb that should
+        // catch a 14° key.
+        const h = bevel * 0.5 + floatT[i] * 0.13 - chipMask * 0.42 - airV * 0.10;
+        // Road-marking paint on a kerb is not lacquer on a car. It is a thick
+        // chlorinated-rubber or thermoplastic film laid outdoors, walked on and
+        // rained on: it sits in the mid-forties, not the low thirties, and the
+        // white is only slightly glossier than the red because it is repainted
+        // more often. The old 0.30/0.40 pair put a 50 cm painted band at a GGX
+        // alpha of 0.09 — a satin sheet, and a satin sheet with a crease field
+        // under it is a strobe. Bare spalled concrete stays where it was.
+        const paintRough = isRed ? 0.52 : 0.46;
         // Wet-look sheen, on the painted crown of the stripe only. Kerb paint is
         // laid thick and it ponds slightly in the middle of a band.
-        const sheen = bevel * (1 - smoothstep(0.15, 0.5, chipMask)) * (isRed ? 0.05 : 0.09);
+        const sheen = bevel * (1 - smoothstep(0.15, 0.5, chipMask)) * (isRed ? 0.04 : 0.07);
         const rough = clamp(
-          lerp(paintRough, 0.90, chipMask) + (pit[i] - 0.5) * 0.10 + sc * 0.14 +
-            dirtN[i] * 0.10 - bevel * 0.02 - sheen,
-          0.22,
-          0.96,
+          lerp(paintRough, 0.91, chipMask) + (floatT[i] - 0.5) * 0.08 + sc * 0.14 +
+            dirtN[i] * 0.10 - bevel * 0.02 - sheen + airV * 0.12,
+          0.36,
+          0.97,
         );
-        const ao = 1 - (1 - bevel) * 0.2 - chipMask * 0.12;
+        const ao = 1 - (1 - bevel) * 0.2 - chipMask * 0.30 - airV * 0.22;
         f.surf(i, h, ao, rough);
       }
     }
 
-    const m = this.maps(f, { normalStrength: 0.65 });
+    // 0.65 → 0.17. The review's "drop it by roughly 4x" was the right call and
+    // this is that number; what makes it safe is that the field it is scaling is
+    // no longer a crease network, so 0.17 still delivers a legible float texture
+    // and a spall that reads as a hole rather than as a facet.
+    const m = this.maps(f, { normalStrength: 0.17 });
     const mat = this.std(m, { envMapIntensity: 0.9 });
     injectBreakup(mat, {
       macroTex,
@@ -2355,8 +2577,15 @@ export class Materials implements System {
       // The far kerb converges on painted-concrete gloss, not on matte. This is
       // the one long, continuous, mid-gloss ribbon in the frame and it is what
       // gives a 14° key a highlight to run down.
-      settleRough: 0.46,
-      roughFloor: 0.20,
+      settleRough: 0.56,
+      // 0.20 was a mirror floor on the one surface in the frame that runs from
+      // 2 m to the horizon at a grazing angle. Painted concrete never gets
+      // there, and a kerb that does is a dotted line of white pinpoints.
+      roughFloor: 0.38,
+      // Weathered zones keep the float texture; the freshly repainted ones are
+      // flatter, because the paint film fills it.
+      macroNormal: 0.45,
+      specAA: 1.0,
     });
     // A polished stripe with nothing to reflect is a matte stripe. Same reason
     // the chrome needs it: the probe is baked from the sky dome, so its lower
@@ -3099,6 +3328,14 @@ export class Materials implements System {
       stainRange: [0.64, 0.96],
       instUv: 0.8,
       instTint: 0.07,
+      // Props raises this material's normalScale to 2.6 on its own clones, so
+      // the 2.6 cm pitting in the height field arrives on a balcony or a bridge
+      // parapet at nearly three times the amplitude authored here. That is the
+      // glittery high-frequency sparkle the review measured; without a floor and
+      // a variance term the ×2.6 clone is a field of sub-pixel mirrors.
+      roughFloor: 0.52,
+      specAA: 0.9,
+      macroNormal: 0.30,
     });
     this.envConsumers.push(mat);
     return { mat, textures: [...m.all, macroTex] };
@@ -3258,6 +3495,13 @@ export class Materials implements System {
       stainRange: [0.66, 0.97],
       instUv: 0.85,
       instTint: 0.13,
+      // A hundred instanced roofs at 300 m, each a corduroy of 22 cm barrel pans
+      // at normalStrength 1.2 (and ×1.9 on Props' own clone) is the single
+      // densest normal-map crawl in the establishing shot.
+      roughFloor: 0.44,
+      specAA: 1.0,
+      settle: [70, 200],
+      settleRough: 0.72,
     });
     this.envConsumers.push(mat);
     return { mat, textures: [...m.all, macroTex] };
@@ -3371,6 +3615,14 @@ export class Materials implements System {
       stainRange: [0.68, 0.97],
       instUv: 0.9,
       instTint: 0.09,
+      // Weathered timber is the third of §4's five surface responses that the
+      // scenery was spending on `stone-wall` instead — fence posts and marshal
+      // posts are sawn softwood, not ashlar. Silvered timber is matte and it
+      // must stay matte at every distance; the ×2.2 normalScale Props puts on
+      // its own clone is what needs the variance term.
+      roughFloor: weathered ? 0.62 : 0.44,
+      specAA: 0.9,
+      macroNormal: 0.35,
     });
     this.envConsumers.push(mat);
     return { mat, textures: [...m.all, macroTex] };
@@ -3381,101 +3633,139 @@ export class Materials implements System {
   // =========================================================================
 
   /**
-   * Lacquered painted metal — kart bodywork, signs, boat hulls. Near-white
-   * albedo so `livery()` tints it; the clearcoat is what makes it read as a
-   * toy with real lacquer rather than coloured plastic.
+   * Galvanised, part-painted steel — the Armco guardrail and its posts, marker
+   * posts, lamp columns, the tunnel's light housings.
+   *
+   * This used to be authored as lacquered kart bodywork, on the theory that
+   * `livery()` would tint it into eight liveries. It never did: the kart
+   * subsystem builds its own two-lobe lacquer in `Liveries.ts`, and every actual
+   * consumer of this material is roadside steel. Authoring a guardrail as car
+   * paint cost it twice —
+   *
+   *  • a `clearcoat 1 / clearcoatRoughness 0.155` lobe riding on a
+   *    `clearcoatNormalMap`, i.e. a near-mirror second specular lobe standing on
+   *    a normal map with 2.5 cm ridged creases in it. On a rail two pixels tall
+   *    at 60 m that is a sub-pixel mirror per pixel, which is the "sparkling line
+   *    of white speckle" down the rail's top edge in hud.png, verbatim; and
+   *  • a `ridged` scratch field at freq 60 — a crease every 2.5 cm on a 1.5 m
+   *    tile — which is where the "speckled granite" read came from. A rail is
+   *    rolled, not crushed: its structure runs one way, along its length, and it
+   *    is shallow.
+   *
+   * So: no clearcoat, a rolled longitudinal grain instead of a crease field, a
+   * real metalness split between bare galv and the paint film over it, and a
+   * roughness floor that keeps the whole thing out of mirror territory.
+   * `livery()` re-enables the coat for anyone still asking for lacquer.
    */
   private buildPaintedMetal(size: number): Entry {
     const f = new Fields(size);
     const peel = fbmField(size, { freq: Math.round(size / 14), octaves: 3, seed: 141 });
-    const scratch = fbmField(size, { freq: 60, octaves: 3, seed: 142, stretchY: 0.14, mode: 'ridged' });
-    const wear = voronoiField(size, 40, 40, 1.0, 143);
+    // Rolled longitudinal grain. V runs down the rail (TrackGeometry lays the
+    // guardrail's V along its arc length), so `stretchY 0.16` draws this out
+    // along the rail — the direction a section of Armco was actually formed in.
+    // freq 8 rather than 60: 19 cm of waviness, not a 2.5 cm crease, and plain
+    // fbm rather than ridged so it has no hard valleys to facet on.
+    const roll = fbmField(size, { freq: 8, octaves: 3, seed: 142, stretchY: 0.16, normalize: 0.03 });
+    // Longitudinal scuffs from whatever last slid along it. Fine, but shallow
+    // and directional, and they reach ROUGHNESS far more than they reach height.
+    const scuffL = fbmField(size, { freq: 26, octaves: 2, seed: 152, stretchY: 0.07 });
+    // The galvanising spangle — the crystal pattern zinc freezes in. It is a
+    // real feature of the surface but it is an ALBEDO/roughness feature at 2 cm,
+    // not a relief one, which is the distinction the old material missed.
+    const spangle = voronoiField(size, 34, 34, 1.0, 143);
+    // Impact dents: a guardrail's job is to be hit. 25 cm dishes, rare.
+    const dent = voronoiField(size, 6, 6, 0.9, 153, 2);
     const dust = fbmField(size, { freq: 5, octaves: 3, seed: 144, warp: 0.05 });
     const grain = grainField(size, 146);
-    // Panel-scale, not micron-scale: which parts of a body have been polished by
-    // hands and which have gone dusty and flat. On a 1.5 m tile that is the
-    // difference between one panel and the next.
+    // Which runs of rail were repainted last season and which have chalked back
+    // to bare zinc. On a 1.5 m tile that is a whole section of barrier.
     const macroTex = this.macroMaps({
       r: macroField(MACRO_RES, { freq: 3, octaves: 3, warp: 0.12, warpFreq: 2, seed: 145, clip: 0.04 }),
       g: macroField(MACRO_RES, { freq: 4, octaves: 3, warp: 0.18, warpFreq: 3, seed: 148, clip: 0.06 }),
       b: macroField(MACRO_RES, { freq: 3, octaves: 2, warp: 0.10, seed: 149, clip: 0.05 }),
     });
-    /**
-     * The lacquer wave — ~17 cm of long, shallow flow across the panel.
-     *
-     * This is what a clearcoat lobe actually looks like on a real painted body,
-     * and its absence is the whole of the "no clearcoat on the paint" note. A
-     * mathematically flat panel under a mathematically smooth sky probe returns
-     * one broad diffuse falloff no matter how low `clearcoatRoughness` goes:
-     * there is no *curvature variation* for a sharp reflection to be sharp
-     * about, so the second specular lobe has nothing to draw. Give the coat a
-     * few tenths of a degree of long-wave wobble and the same lobe immediately
-     * paints a highlight that bends and pinches as it crosses a panel, which is
-     * the single most recognisable thing lacquer does.
-     *
-     * Deliberately long-wave, not the sub-millimetre orange peel of the real
-     * process: at 1.5 m per tile, real orange peel is finer than a texel, and a
-     * per-texel normal cannot be mip-filtered — it would come back as specular
-     * crawl on the one object the camera never looks away from.
-     */
-    const flow = fbmField(size, { freq: 9, octaves: 3, seed: 147, warp: 0.06, normalize: 0.03 });
 
+    // Near-white so `variant()` can tint it to anything — a white guardrail, a
+    // grey lamp column, a red marker post — off one texture set.
     const paint = rgb(0xeceded);
-    const primer = rgb(0x8b8f95);
+    // Bare hot-dip zinc: a cool, slightly blue-grey metal, well off white.
+    const zinc = rgb(0xa9b0b4);
+    const rust = rgb(0x8a5a3c);
 
     for (let i = 0; i < size * size; i++) {
-      const scr = smoothstep(0.86, 0.99, scratch[i]);
-      const chip = smoothstep(0.13, 0.05, wear.f1[i]) * (hash2(wear.id[i], 23, 12) > 0.93 ? 1 : 0);
-      mixRGB(paint, primer, chip * 0.7, _a);
-      const tone = 0.97 + (peel[i] - 0.5) * 0.05 + scr * 0.03 - dust[i] * 0.04 + (grain[i] - 0.5) * 0.02;
-      f.set(i, _a.r * tone, _a.g * tone, _a.b * tone);
+      const scr = smoothstep(0.62, 0.95, scuffL[i]);
+      // An Armco barrier is galvanised FIRST and painted second, and after a
+      // season on a coastal road it is mostly the former: bare zinc over most of
+      // the section with the paint film surviving in the rolled recesses and on
+      // the sheltered face. So this runs 0.31–1.0 with a mean near 0.6, and the
+      // dielectric paint is the minority phase rather than the other way round.
+      // That split is what makes it answer the low sun as steel instead of as a
+      // white-painted board, and it is the §4 "metals must sample the
+      // environment" line finally being spent on the roadside metal.
+      const bare = clamp01(0.45 + scr * 0.45 + (peel[i] - 0.5) * 0.9);
+      // Spangle only reads on the bare zinc; under paint it is buried.
+      const spg = (hash2(spangle.id[i], 17, 29) - 0.5) * bare;
+      const dnt = hash2(dent.id[i], 7, 51) > 0.84 ? smoothstep(0.5, 0.1, dent.f1[i]) : 0;
+      const rst = smoothstep(0.90, 0.99, dust[i]) * bare * 0.7;
 
-      // The lacquer wave is now the dominant term in the height field, an order
-      // above the 4 cm peel it replaced at the top of the ladder. That is on
-      // purpose: the coat is what the highlight rides on, and the panel's own
-      // long curvature is the only frequency in the material a *sharp* lobe can
-      // resolve into a shape rather than into a wash.
-      const h = flow[i] * 0.5 + peel[i] * 0.12 + scr * 0.05 - chip * 0.3;
+      mixRGB(paint, zinc, bare, _a);
+      mixRGB(_a, rust, rst, _b);
+      const tone = 0.97 + (peel[i] - 0.5) * 0.05 + spg * 0.10 - dust[i] * 0.04 +
+        (grain[i] - 0.5) * 0.02 - dnt * 0.06;
+      f.set(i, _b.r * tone, _b.g * tone, _b.b * tone);
+
+      // Total relief is a third of what it was and all of it is long-wave. The
+      // roll carries the form, the dent carries the story, and the scuff is
+      // barely in the height field at all — it lives in roughness, where a
+      // scratch on steel actually lives.
+      const h = roll[i] * 0.42 + peel[i] * 0.08 + scr * 0.02 - dnt * 0.34;
+      // Genuinely bimodal and genuinely metal, centred around 0.44.
+      //
+      // The review asked for 0.32 on the galvanised rail. That is the number for
+      // clean rolled sheet, and taking it would have put the one long thin
+      // grazing-angle object in the frame back at a GGX alpha of 0.10 — i.e.
+      // straight back into the sparkle this rebuild exists to remove. Hot-dip
+      // galvanising is not polished steel: it freezes with a crystalline spangle
+      // and oxidises to a matte grey within a season, which is a genuinely
+      // rougher surface. 0.38–0.60 across the zinc still reads unmistakably as
+      // metal under a 14° key — it gives a broad warm sheen running the length
+      // of the barrier rather than a dotted line of pinpoints — and it is the
+      // sheen, not the pinpoints, that the note was actually asking for.
       const rough = clamp(
-        0.28 + (peel[i] - 0.5) * 0.08 + scr * 0.28 + chip * 0.34 + dust[i] * 0.1 +
-          (flow[i] - 0.5) * 0.10,
-        0.14,
-        0.85,
+        0.34 + bare * 0.22 + scr * 0.18 + rst * 0.30 + dust[i] * 0.14 +
+          (peel[i] - 0.5) * 0.14 - spg * 0.10,
+        0.34,
+        0.92,
       );
-      const ao = 1 - chip * 0.25;
-      f.surf(i, h, ao, rough, 0);
+      // The metalness split §4 asks for and the material never had: paint is a
+      // dielectric, zinc is not, and the boundary between them is most of what
+      // makes part-worn galvanising recognisable. Rust is a dielectric again.
+      const metal = clamp(bare * 0.88 - rst * 0.7, 0, 0.9);
+      const ao = 1 - dnt * 0.22 - rst * 0.10;
+      f.surf(i, h, ao, rough, metal);
     }
 
-    const m = this.maps(f, { normalStrength: 0.35 });
+    const m = this.maps(f, { normalStrength: 0.22 });
     const mat = this.phys(m, {
-      metalness: 0,
-      // The base roughness map runs 0.14–0.85; three multiplies clearcoatRoughness
-      // by clearcoatRoughnessMap.g, so binding the same ORM here lands the lacquer
-      // at ~0.03 on clean panel centres and ~0.10 where the paint has scratched,
-      // dusted or chipped. One uniform clearcoat roughness over a whole kart gives
-      // one uniform highlight; this is the breakup that makes it read as lacquer
-      // over metal rather than as a shiny decal, and it costs no extra texture.
-      clearcoatRoughnessMap: m.ormMap,
-      clearcoat: 1,
-      // The bible asks for 0.06. Against a map averaging ~0.35 this lands there,
-      // where 0.19 was putting the mean nearer 0.07–0.16 — a satin coat, and a
-      // satin coat over a flat panel is indistinguishable from no coat at all.
-      clearcoatRoughness: 0.155,
-      // Lacquer follows the panel it is sprayed onto, so the coat takes the same
-      // normal as the base — at reduced amplitude, because a coat fills a chip
-      // rather than following it down. Without this the clearcoat is perfectly
-      // flat and its lobe is one smeared blob per panel however low its
-      // roughness goes; this is the other half of the missing clearcoat.
-      clearcoatNormalMap: m.normalMap,
-      clearcoatNormalScale: new THREE.Vector2(0.62, 0.62),
-      // The lacquer lobe is only as tight as the environment it samples; at 1.15
-      // against a 0.40 scene intensity the second specular lobe never appears and
-      // the paint reads as matte plastic.
-      envMapIntensity: 1.6,
+      // The ORM's B channel now carries a real 0 → 0.9 metalness split, so the
+      // factor has to be 1 for the map to mean anything. It was 0 — which is
+      // how a material whose whole subject is galvanised steel rendered as a
+      // dielectric everywhere.
+      metalness: 1,
+      // NO CLEARCOAT. There is no lacquer on an Armco barrier, and a
+      // 0.155-roughness second lobe with the base normal map bound to it is the
+      // single biggest specular aliaser in the frame — see the class comment.
+      // `livery()` turns it back on for the one caller that wants car paint.
+      clearcoat: 0,
+      // Steel answers the sky far harder than paint does, but the probe is a
+      // baked sky dome and 1.6 on a metal at a grazing angle is where the rail
+      // starts clipping to white along its entire length. 0.95 keeps the warm
+      // horizon line running down the top flange without blowing it out.
+      envMapIntensity: 0.95,
     });
-    // Macro layer on the paint too, and mostly in roughness: real bodywork is
-    // dustier and duller where it faces up and where it has been handled. A
-    // panel that is one roughness everywhere is a decal.
+    // Which sections were repainted and which have chalked back to zinc — and
+    // mostly in roughness, because that is the difference the eye reads at
+    // 40 m. A barrier that is one roughness for a hundred metres is a decal.
     injectBreakup(mat, {
       macroTex,
       period: 4.7,
@@ -3485,19 +3775,25 @@ export class Materials implements System {
       macroWarm: 0xfff4e8,
       macroCool: 0xe4ecff,
       macroTint: 0.16,
-      // The roughness swing has to be the loud half here. A clearcoat lobe whose
-      // width is identical over a whole body is the tell that there is no coat;
-      // varying it across half a metre is what makes the highlight pinch and
-      // spread as it travels along a panel.
       macroRough: 0.30,
       macroB: true,
       periodMacroB: 2.3,
       macroRoughB: 0.22,
+      // The rail runs from 3 m to the horizon and spends most of that at a
+      // grazing angle across two or three pixels. Both of these exist for that:
+      // the floor stops the six gloss multipliers reaching mirror, and specAA
+      // widens the lobe wherever a pixel cannot resolve the surface under it.
+      roughFloor: 0.34,
+      specAA: 1.0,
+      // ...and the rolled grain fades out with the same signal, so a distant
+      // barrier settles to plain steel rather than keeping full relief.
+      settle: [40, 110],
+      settleRough: 0.52,
+      macroNormal: 0.35,
     });
-    // Without a ground half in the probe the bonnet has no horizon line to carry
-    // and the clearcoat lobe has nothing but a smooth gradient to sharpen — which
-    // is exactly what closeup.png shows. Injected AFTER the breakup so it chains
-    // that injection's compile hook and cache key instead of replacing them.
+    // A part-metal surface with no lower hemisphere in its probe returns sky
+    // from every downward-facing facet, which on the underside of a rail is a
+    // band of blue where there should be warm bounce off the tarmac.
     injectEnvGround(mat, ENV_GROUND);
     this.envConsumers.push(mat as unknown as THREE.MeshStandardMaterial);
     return { mat, textures: [...m.all, macroTex] };
@@ -3727,6 +4023,15 @@ export class Materials implements System {
       stainRange: [0.66, 0.96],
       instUv: 0.6,
       instTint: 0.05,
+      // Cast concrete is the one of §4's five surface responses this library
+      // was never actually spending — the fence rails, sign frames and barrier
+      // trim all came through as ashlar `stone-wall` instead, so four objects
+      // presented as one material. This is the repoint target for all of them;
+      // it stays matte, warm-grey and floored well clear of gloss so it can
+      // never be confused with the galvanised rail beside it.
+      roughFloor: 0.55,
+      specAA: 0.8,
+      macroNormal: 0.30,
     });
     this.envConsumers.push(mat);
     return { mat, textures: [...m.all, macroTex] };
@@ -3783,6 +4088,12 @@ export class Materials implements System {
       macroRough: 0.30,
       instUv: 0.7,
       instTint: 0.06,
+      // Polished stone at a 0.1 clearcoat roughness is the second-tightest lobe
+      // in the library after chrome, and the marina railing is a thin horizontal
+      // run at a grazing angle — the same geometry that made the guardrail
+      // strobe. specAA reaches the coat as well as the base here.
+      specAA: 0.7,
+      roughFloor: 0.12,
     });
     // The marina railing and the bridge copings are the only polished stone in
     // the game and they were reflecting a bare sky gradient, which on a 0.16

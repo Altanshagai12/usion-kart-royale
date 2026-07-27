@@ -28,6 +28,11 @@ import { buildTrackGeometry } from './TrackGeometry';
 const _v = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
 
+/** fraction of half-width over which the banked outer apron eases off */
+const APRON_T0 = 0.60;
+/** fraction of the outer lip's rise the apron gives back */
+const APRON_FRAC = 0.20;
+
 function makeSample(): TrackSample {
   return {
     pos: new THREE.Vector3(), tangent: new THREE.Vector3(),
@@ -208,19 +213,81 @@ export class Track implements ITrack {
   //  road, the kerbs, the skirt and the physics surface cannot disagree.
   // =======================================================================
 
+  /**
+   * Flattened outer apron on the steeply banked corners, in metres of drop.
+   *
+   * A 20° banked 180 with an 8.8 m half-width puts its outer lip 3.0 m above the
+   * centreline, and a chase camera on the inside line sits *below* that lip — so
+   * everything outboard of the corner (the bay, the coast band, the sky under the
+   * horizon) is occluded by the road's own outer edge. That is a property of
+   * banking and not a bug; no amount of shoulder-lowering will let a camera at
+   * 2.2 m see over a lip 4.3 m above the inside line.
+   *
+   * What a real banked oval does have, and this one did not, is a *flattened
+   * apron*: the outer fifth of the roadway eases off the full cross-slope. It
+   * buys about 0.6 m of lip height back, it makes the outer lane a genuinely
+   * different surface from the racing line rather than more of the same plane,
+   * and it gives the outside of the corner somewhere to run wide onto.
+   *
+   * Gated at 12° so it fires on the banked coastal 180 (t 0.735–0.848) and on
+   * nothing else on this layout — the next-steepest section is 9.5°. Both ends
+   * of the ramp are `smoothstep`, so the surface stays C1: there is no crease for
+   * the physics to catch on and no slope break for the gloss strip to kink over.
+   *
+   * `t` clamps at 1, so the kerb and the shoulder inherit the full lip drop and
+   * ride down with the road edge instead of leaving a 0.6 m step at the joint.
+   */
+  private apronDrop(i: number, L: number): number {
+    const cl = this.cl;
+    const bank = cl.bank[i];
+    const amt = ss(0.209, 0.314, Math.abs(bank));      // 12° … 18°
+    if (amt <= 0) return 0;
+    const hw = cl.half[i];
+    // the raised side is the one the bank sign points at
+    const t = Math.min(1, (bank >= 0 ? L : -L) / hw);
+    if (t <= APRON_T0) return 0;
+    const f = ss(APRON_T0, 1, t);
+    return amt * f * f * hw * Math.abs(Math.sin(bank)) * APRON_FRAC;
+  }
+
+  /**
+   * d(crossOffset)/dL on the roadway, i.e. the extra lateral slope the surface
+   * carries on top of the banked plane.
+   *
+   * TrackGeometry used to compute this analytically as the derivative of the
+   * crown parabola, which was exact while the crown was the only thing in
+   * `crossOffset` inside the edges. It no longer is: the banked apron adds up to
+   * 14° of its own over the outer fifth of the coastal 180, and a mesh that
+   * *bends* while its shading normal does not is a flat-looking dent. Taking it
+   * off the same function the vertices come from is the only way the two cannot
+   * drift apart again.
+   *
+   * Clamped to the roadway at both ends so the difference never straddles the
+   * kerb junction and reports the kerb's 31° face as road slope.
+   */
+  roadSlope(i: number, L: number): number {
+    const hw = this.cl.half[i];
+    const h = 0.2;
+    const a = Math.max(-hw, Math.min(hw, L - h));
+    const b = Math.max(-hw, Math.min(hw, L + h));
+    if (b - a < 1e-6) return 0;
+    return (this.crossOffset(i, b) - this.crossOffset(i, a)) / (b - a);
+  }
+
   /** Vertical offset of the ground from the banked road plane, at lateral L. */
   crossOffset(i: number, L: number): number {
     const cl = this.cl;
     const a = Math.abs(L);
     const hw = cl.half[i];
+    const apron = this.apronDrop(i, L);
     if (a <= hw) {
       const r = a / hw;
-      return -CROWN * r * r;
+      return -CROWN * r * r - apron;
     }
     const kerbAmt = cl.kerb[i];
     const q0 = a - hw;
-    if (q0 <= KERB_W) return -CROWN + this.kerbProfile(q0, i) * kerbAmt;
-    return -CROWN + KERB_END * kerbAmt + this.shoulderOffset(i, L < 0, q0 - KERB_W);
+    if (q0 <= KERB_W) return -CROWN - apron + this.kerbProfile(q0, i) * kerbAmt;
+    return -CROWN - apron + KERB_END * kerbAmt + this.shoulderOffset(i, L < 0, q0 - KERB_W);
   }
 
   /**

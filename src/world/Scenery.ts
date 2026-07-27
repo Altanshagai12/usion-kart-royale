@@ -29,6 +29,7 @@ import {
   awningGeo,
   balconyGeo,
   bannerArchGeo,
+  bannerUvs,
   barrelGeo,
   bellTowerGeo,
   bevelBox,
@@ -241,15 +242,48 @@ interface BackdropBand {
  *  climbs with distance: the far band's crest columns were 27 m apart, which at
  *  2 km is 26 screen pixels, i.e. a visibly polygonal outline (finding #7).
  */
+/**
+ * ---------------------------------------------------------------------------
+ *  ROUND 2 (this review): THE LADDER IS NOW A **VALUE** LADDER, NOT A HUE ONE.
+ * ---------------------------------------------------------------------------
+ *  The previous revision of this table was built on the belief that "separation
+ *  now comes from hue, which fog cannot collapse". Measured against the shipped
+ *  fog, that is exactly backwards. `src/render/Sky.ts` rotates every fragment
+ *  onto the haze chromaticity while PRESERVING ITS LUMINANCE, at 1.85x the Beer
+ *  rate and capped at 0.96 — 79% done by the near band, saturated past it. Hue
+ *  is the one channel that provably does NOT survive out here; value is the one
+ *  that does.
+ *
+ *  And the old keys were, in luminance: 0.66 / 0.61 / 0.62 / 0.68. Four ranges
+ *  at four distances authored at effectively ONE brightness, then all painted
+ *  the same orange by the haze. That is the whole of "all four backdrop bands
+ *  converge to the same warm value and collapse into one plane".
+ *
+ *  So the keys below step in VALUE — nearest darkest, each layer lighter toward
+ *  the sky — which is how a landscape painter has stacked ridges for four
+ *  hundred years and the only ladder this pipeline can actually deliver. The
+ *  hues are kept (warm stone in front, cool violet behind) because at the coast
+ *  and near bands enough chroma does survive to be worth having; they are simply
+ *  no longer being asked to carry the depth read on their own.
+ *
+ *  `patchBackdropForm` then applies the continuous half of the same ramp per
+ *  pixel, so two ridges of the SAME band at different depths separate too.
+ *
+ *  `haze` (the pre-fade toward `tint`) is cut back hard on the far two bands:
+ *  it was pulling them toward a mid grey, which is precisely the value the
+ *  ladder now wants them ABOVE.
+ */
 const BACKDROP_BANDS: BackdropBand[] = [
-  // coast — headlands FLANKING the bay; never across it
-  { offset: 120, slots: 20, jitter: 0.14, height: [26, 62], depth: [150, 250], jag: 1.15, shoulder: 0.1, segs: 64, rings: 9, crest: 0xbcab88, foot: 0x74804f, haze: 0.04, tint: 0xd9cbb8, seaClear: 0.61, seaChance: 0.0, seaH: 1.0, dress: true, terraces: true },
+  // coast — headlands FLANKING the bay; never across it. The darkest thing on
+  // the horizon: it is the nearest, and the near end of an aerial ramp is where
+  // the contrast lives.
+  { offset: 120, slots: 20, jitter: 0.14, height: [26, 62], depth: [150, 250], jag: 1.15, shoulder: 0.1, segs: 64, rings: 9, crest: 0x7d6f52, foot: 0x3f4a2c, haze: 0.03, tint: 0xa89a80, seaClear: 0.61, seaChance: 0.0, seaH: 1.0, dress: true, terraces: true },
   // near — the cypress-crested hills the village climbs into
-  { offset: 380, slots: 18, jitter: 0.12, height: [80, 175], depth: [300, 460], jag: 1.05, shoulder: 0.28, segs: 68, rings: 9, crest: 0xa89e83, foot: 0x62714d, haze: 0.14, tint: 0xc7c2c0, seaClear: 0.20, seaChance: 0.5, seaH: 0.85, dress: true, terraces: true },
+  { offset: 380, slots: 18, jitter: 0.12, height: [80, 175], depth: [300, 460], jag: 1.05, shoulder: 0.28, segs: 68, rings: 9, crest: 0x94866a, foot: 0x50593a, haze: 0.08, tint: 0xb0a894, seaClear: 0.20, seaChance: 0.5, seaH: 0.85, dress: true, terraces: true },
   // range — a real mountain range across the bay
-  { offset: 950, slots: 16, jitter: 0.10, height: [190, 330], depth: [520, 760], jag: 1.3, shoulder: 0.4, segs: 80, rings: 8, crest: 0x93a2ae, foot: 0x66757f, haze: 0.30, tint: 0xb2bccd, seaClear: 0.0, seaChance: 0.38, seaH: 0.55, dress: true, terraces: true },
+  { offset: 950, slots: 16, jitter: 0.10, height: [190, 330], depth: [520, 760], jag: 1.3, shoulder: 0.4, segs: 80, rings: 8, crest: 0xa8adb4, foot: 0x77808c, haze: 0.16, tint: 0xb8bfcb, seaClear: 0.0, seaChance: 0.38, seaH: 0.55, dress: true, terraces: true },
   // far — the last silhouette before the sky
-  { offset: 1750, slots: 14, jitter: 0.08, height: [430, 740], depth: [660, 980], jag: 1.4, shoulder: 0.6, segs: 96, rings: 7, crest: 0x9fb1cc, foot: 0x7b8bab, haze: 0.48, tint: 0xa6b2d2, seaClear: 0.0, seaChance: 0.28, seaH: 0.42, dress: true, terraces: false },
+  { offset: 1750, slots: 14, jitter: 0.08, height: [430, 740], depth: [660, 980], jag: 1.4, shoulder: 0.6, segs: 96, rings: 7, crest: 0xc6cbdb, foot: 0x9aa3bc, haze: 0.22, tint: 0xc2c8dc, seaClear: 0.0, seaChance: 0.28, seaH: 0.42, dress: true, terraces: false },
 ];
 
 export class Scenery implements System {
@@ -982,8 +1016,13 @@ export class Scenery implements System {
     // Round 1 had a small open shed at the frame edge with a flat purple smear
     // in it. This is 1.5x taller, 1.7x longer and pulled inboard so it anchors
     // the left third of the establishing shot instead of leaving it.
+    // 0.05 of the lap is ~80 m up the road on a 1600 m circuit, which on this
+    // layout is over the crest and out of the grid camera's frame entirely —
+    // hence "no grandstand, no crowd of any density" in the one shot the stand
+    // exists for. It is 58 m long, so centring it at ~28 m puts its near end
+    // ON the start line and its far end at 57 m, i.e. it flanks the whole grid.
     const gs = grandstandGeo(58, 11);
-    const st = track.sampleByDistance(track.length * 0.05);
+    const st = track.sampleByDistance(28);
     this.at(st.t, land * (st.halfWidth + 13.5), _p, st);
     this.settle(_p, st.t, _n);
     const yaw = Math.atan2(-st.binormal.x * land, -st.binormal.z * land);
@@ -1089,13 +1128,49 @@ export class Scenery implements System {
       this.barrierCrowd(0.01, 0.1, sea, 0.5);
     }
 
-    // sponsor boards + tyre stacks on the land side
-    this.walk(0.012, 0.095, 11, (t, s) => {
+    // Sponsor boards + tyre stacks on the land side, but NOT across the first
+    // 45 m. A hoarding beside the grid is the largest object in the most
+    // screenshotted frame in the game and it was occluding two of the eight
+    // karts; boards belong down the straight where they are read at speed, not
+    // standing over the line.
+    const boardStart = Math.min(0.09, 45 / (track.length || 1600));
+    this.walk(boardStart, 0.095, 11, (t, s) => {
       this.sponsorBoard(t, s, land, rng);
       if (rng() < 0.4) this.tyreStack(t, s, land, rng);
     });
-    // spectators lining the land-side barrier
-    this.barrierCrowd(0.01, 0.1, land, 0.55);
+    // spectators lining the land-side barrier. 0.55 -> 0.95: this is the start
+    // straight, the one place on any circuit where the crowd is genuinely
+    // continuous, and `barrierCrowd` now spends that budget as packed banks
+    // rather than as a sprinkle.
+    this.barrierCrowd(0.004, 0.1, land, 0.95, 3.0);
+
+    // --- SEA SIDE MASS. §1 wants moored boats here and grid.png's left third
+    // is empty pale water. The quay walk above only fires where the shoreline
+    // happens to sit within 24 m of the kerb; where it does not, walk out to
+    // find the actual waterline and moor a line of hulls against it. Masts are
+    // the read — a row of 5–8 m verticals over flat water is the one silhouette
+    // that says "harbour" at a glance, and it costs two instanced sets.
+    let moored = 0;
+    this.walk(0.002, 0.10, 13, (t, s) => {
+      if (moored >= 7) return;
+      const seaSide = this.seaSide(t) || sea;
+      const w = this.findWaterline(t, s, seaSide);
+      if (w === null) return;
+      moored++;
+      const rr = mulberry32(0x5100 + moored);
+      // a stone quay edge where the land stops, so the boats moor against
+      // something rather than floating off a soft bank
+      this.at(t, seaSide * (w - 1.4), _p2, s);
+      this.settle(_p2, t);
+      const yq = Math.atan2(s.tangent.x, s.tangent.z);
+      const dropQ = Math.max(2.0, _p2.y - this.seaLevel + 1.6);
+      this.acc.stone.add(bevelBox(2.2, dropQ, 13.0, 0.05, 0.3), trs(_p2.x, _p2.y - dropQ / 2 + 0.35, _p2.z, yq), new THREE.Color(0xdcceb4), (_x, y) => lerp(0.4, 1, smoothstep(-dropQ, 0, y)));
+      for (let k = 0; k < 3; k++) {
+        this.at(t + (k - 1) * (4.2 / (track.length || 1)), seaSide * (w + 3.4 + rr() * 4.5), _p, s);
+        _p.y = this.seaLevel;
+        this.boatAt(trs(_p.x, _p.y, _p.z, Math.atan2(s.tangent.x, s.tangent.z) + (rr() - 0.5) * 0.5), rr, 1.0 + rr() * 0.5);
+      }
+    });
   }
 
   /** 0.10–0.22: harbour sweep — the marina. */
@@ -1124,11 +1199,105 @@ export class Scenery implements System {
       if (!this.isSea(t, sea * (s.halfWidth + 30), s)) return;
       this.jetty(t, s, sea, 16 + rng() * 10);
     });
-    this.barrierCrowd(0.11, 0.22, land, 0.32);
+    this.barrierCrowd(0.11, 0.22, land, 0.55);
     this.walk(0.10, 0.225, 16, (t, s) => {
       this.sponsorBoard(t, s, land, rng);
     });
     this.dressMarina();
+    this.harbourMass();
+  }
+
+  /**
+   * ==========================================================================
+   *  harbourMass — the three scales the harbour sweep did not have.
+   * ==========================================================================
+   *  hero.png's note: the harbour "reads as a line of ~1 m coloured pills strung
+   *  along the left kerb like confetti", with no quay volume, no hull above the
+   *  kerb line, no masts and no water visible. Every one of those props is
+   *  correctly scaled and correctly placed — bollards, crates, barrels, nets are
+   *  all 0.6–1.4 m objects, which is exactly what a quay edge carries. The fault
+   *  is that they are the ONLY scale present. A harbour reads at three:
+   *
+   *    quay      3–4 m of continuous stone with bollards and steps, which is the
+   *              horizontal that everything else sits on;
+   *    boat      5–8 m masts, which are the verticals that break the horizon and
+   *              the single most recognisable thing a Mediterranean port has;
+   *    building  a 3–4 storey warehouse block at the sweep apex, which is the
+   *              mass that stops the far side being sky.
+   *
+   *  All three are built from geometry that already exists; none of them is a
+   *  new draw call — quay and warehouse fold into the shared stone/wall/roof
+   *  accumulators, the boats into the existing hull/rig instance sets.
+   */
+  private harbourMass() {
+    const rng = mulberry32(0x8bce41);
+    const track = this.ctx.track;
+    const L = track.length || 1;
+    let apex: { t: number; s: TrackSample; sea: number; w: number } | null = null;
+    let bestC = -1;
+    let runs = 0;
+
+    this.walk(0.10, 0.225, 11, (t, s) => {
+      const sea = this.seaSide(t);
+      const w = this.findWaterline(t, s, sea);
+      if (w === null) return;
+      runs++;
+      const yaw = Math.atan2(s.tangent.x, s.tangent.z);
+      // --- quay wall: a continuous 3.4 m coping run down to below the waterline
+      this.at(t, sea * (w - 1.7), _p, s);
+      this.settle(_p, t);
+      const drop = Math.max(3.4, _p.y - this.seaLevel + 2.4);
+      this.acc.stone.add(
+        bevelBox(3.0, drop, 11.6, 0.05, 0.3),
+        trs(_p.x, _p.y - drop / 2 + 0.42, _p.z, yaw),
+        new THREE.Color(0xe2d4ba),
+        (_x, y) => lerp(0.38, 1, smoothstep(-drop, -drop * 0.15, y))
+      );
+      // coping course, so the top edge has its own value and catches the key
+      this.acc.stone.add(bevelBox(3.3, 0.34, 11.6, 0.05, 0.55), trs(_p.x, _p.y + 0.5, _p.z, yaw), new THREE.Color(0xf2e7d2));
+      // bollards along it, and one flight of steps down to the water
+      for (let k = 0; k < 3; k++) {
+        this.at(t + (k - 1) * (3.6 / L), sea * (w - 2.6), _p2, s);
+        this.settle(_p2, t);
+        _p2.y += 0.62;
+        this.sets.bollard.add(trs(_p2.x, _p2.y, _p2.z, rng() * 6.28, 1.15), { color: _col.set(0x3a4046).clone(), uv: new THREE.Vector4(1, 1, 0, 0), lod: 150 });
+      }
+      if (runs % 3 === 1) {
+        this.at(t, sea * (w - 0.6), _p2, s);
+        this.settle(_p2, t);
+        for (let k = 0; k < 6; k++) {
+          const yk = _p2.y + 0.5 - (k + 1) * ((_p2.y + 0.5 - this.seaLevel) / 6);
+          this.acc.stone.add(bevelBox(1.5, 0.26, 1.5 + k * 0.1, 0.03, 0.9), trs(_p2.x, yk, _p2.z, yaw), new THREE.Color(0xdfd0b6));
+        }
+      }
+      // --- boats, moored beam-on so the RIG is what you see over the coping
+      const n = 2 + ((rng() * 2) | 0);
+      for (let k = 0; k < n; k++) {
+        this.at(t + (k - (n - 1) / 2) * (4.6 / L), sea * (w + 3.6 + rng() * 6), _p2, s);
+        _p2.y = this.seaLevel;
+        this.boatAt(trs(_p2.x, _p2.y, _p2.z, yaw + (rng() < 0.5 ? 0.18 : Math.PI - 0.18) + (rng() - 0.5) * 0.3), rng, 1.15 + rng() * 0.55);
+      }
+      const c = Math.abs(this.curvature(t));
+      if (c > bestC) {
+        bestC = c;
+        apex = { t, s, sea, w };
+      }
+    });
+
+    // --- the harbourmaster / warehouse block at the sweep apex ---------------
+    if (apex) {
+      const a = apex as { t: number; s: TrackSample; sea: number; w: number };
+      this.at(a.t, a.sea * (a.w + 2.5), _p, a.s);
+      this.settle(_p, a.t);
+      if (!this.blocked(_p, 9)) {
+        const yaw = Math.atan2(-a.s.binormal.x * a.sea, -a.s.binormal.z * a.sea);
+        const parts = newHouseParts(this.acc.wall, this.acc.roof, this.acc.trim);
+        buildHouse(parts, rng, trs(_p.x, _p.y, _p.z, yaw), 13.5, 9.5, 4, this.facadeTint());
+        this.absorbHouse(parts, []);
+        this.claim(_p, 10);
+        this.dropShadow(_p, 9, a.t, 0.5);
+      }
+    }
   }
 
   /**
@@ -1261,8 +1430,101 @@ export class Scenery implements System {
         }
       }
     });
-    this.barrierCrowd(0.24, 0.37, 1, 0.22);
-    this.barrierCrowd(0.24, 0.37, -1, 0.22);
+    this.barrierCrowd(0.24, 0.37, 1, 0.34);
+    this.barrierCrowd(0.24, 0.37, -1, 0.34);
+    this.villagePlaza();
+  }
+
+  /**
+   * ==========================================================================
+   *  villagePlaza — fill the run-off on the outside of the village hairpin.
+   * ==========================================================================
+   *  wide.png's note: the upper-right quarter is "a large empty cobbled plaza
+   *  with nothing in it — no market stalls, no parked vehicles, no crowd, no
+   *  shadows — a visible dead zone in the frame's brightest area", and it is
+   *  exactly the area the camera looks into on that corner.
+   *
+   *  Every scatter pass in this file works from a lateral offset off the
+   *  centreline, so it dresses a BAND either side of the road and cannot see
+   *  that the outside of a hairpin opens into a wedge thirty metres deep. That
+   *  wedge is the plaza, and nothing was ever going to reach into it.
+   *
+   *  So this finds the tightest corner in the village and fills it as a place
+   *  rather than as a verge: a market row facing the road, a stone fountain on
+   *  the desire line, crates and barrels stacked against the far edge, and a
+   *  crowd watching from behind them. All instanced sets that already exist.
+   */
+  private villagePlaza() {
+    const rng = mulberry32(0x41ce07);
+    const track = this.ctx.track;
+    let bt = -1;
+    let bc = 0;
+    this.walk(0.235, 0.375, 6, (t) => {
+      const c = Math.abs(this.curvature(t));
+      if (c > bc) {
+        bc = c;
+        bt = t;
+      }
+    });
+    if (bt < 0) return;
+    const s = track.sample(bt);
+    const out = this.outsideSide(bt) || 1;
+    const inward = Math.atan2(-s.binormal.x * out, -s.binormal.z * out);
+    // A polar sweep over the wedge rather than a lateral band: `u` runs along
+    // the road through the corner, `r` out into the run-off.
+    let placed = 0;
+    for (let a = 0; a < 30; a++) {
+      const u = bt + (rng() - 0.5) * 0.02;
+      const r = s.halfWidth + 5.5 + rng() * 22;
+      const su = track.sample(((u % 1) + 1) % 1);
+      this.at(((u % 1) + 1) % 1, out * r, _p, su);
+      this.settle(_p, u, _n);
+      if (this.blocked(_p, 2.6)) continue;
+      if (!this.flatWorld) {
+        const surf = this.surfaceAt(_p, u);
+        if (surf === Surface.Road || surf === Surface.Boost || _n.y < 0.9) continue;
+      }
+      const k = rng();
+      if (k < 0.30) {
+        // market stall, canopy square to the road
+        const kk = a & 1;
+        const m = trs(_p.x, _p.y, _p.z, inward + (rng() - 0.5) * 0.6);
+        this.sets['stallFrame' + kk].add(m, { color: _col.set(0xefe4cf).clone(), uv: new THREE.Vector4(1, 1, 0, 0), lod: 220 });
+        this.sets['stallCanopy' + kk].add(m, { uv: new THREE.Vector4(0.25, 0.25, ((rng() * 4) | 0) * 0.25, ((rng() * 4) | 0) * 0.25), lod: 220 });
+        this.dropShadow(_p, 2.4, u, 0.85);
+        this.claim(_p, 3.0);
+      } else if (k < 0.5) {
+        this.kitCrateStack(_p, u, inward, rng);
+      } else if (k < 0.62) {
+        this.parasol(_p.clone(), u, rng);
+        for (let q = 0; q < 2; q++) {
+          _p2.set(_p.x + (rng() - 0.5) * 2.4, _p.y, _p.z + (rng() - 0.5) * 2.4);
+          this.settle(_p2, u);
+          this.deckchair(_p2, u, rng);
+        }
+        this.claim(_p, 2.4);
+      } else if (k < 0.70 && placed === 0) {
+        // one fountain, and only one: a plaza has a centre
+        placed = 1;
+        const yq = rng() * 6.28;
+        this.acc.stone.add(bevelBox(3.6, 0.9, 3.6, 0.10, 0.5), trs(_p.x, _p.y + 0.45, _p.z, yq), new THREE.Color(0xe6dac2), (_x, y) => lerp(0.5, 1, smoothstep(0, 0.7, y)));
+        this.acc.stone.add(bevelBox(2.9, 0.22, 2.9, 0.05, 0.9), trs(_p.x, _p.y + 0.98, _p.z, yq), new THREE.Color(0xd2c3a6));
+        this.acc.trim.add(bevelBox(0.55, 2.2, 0.55, 0.08, 1.4), trs(_p.x, _p.y + 2.0, _p.z, yq + 0.4), new THREE.Color(0xf0e6d0));
+        this.acc.trim.add(bevelBox(1.5, 0.2, 1.5, 0.05, 1.2), trs(_p.x, _p.y + 2.55, _p.z, yq + 0.4), new THREE.Color(0xe6d8bc));
+        this.dropShadow(_p, 3.0, u, 0.8);
+        this.claim(_p, 3.4);
+      } else {
+        // a knot of onlookers, standing in a group rather than in a line
+        const n = 3 + ((rng() * 5) | 0);
+        for (let q = 0; q < n; q++) {
+          _p2.set(_p.x + (rng() - 0.5) * 3.4, _p.y, _p.z + (rng() - 0.5) * 3.4);
+          this.settle(_p2, u);
+          this.spectator(trs(_p2.x, _p2.y, _p2.z, inward + (rng() - 0.5) * 2.2, 0.84 + rng() * 0.34), rng);
+          this.dropShadow(_p2, 0.34, u, 0.7);
+        }
+        this.claim(_p, 2.2);
+      }
+    }
   }
 
   /** 0.38–0.52: cliff traverse — sparse, wind-bent, exposed. */
@@ -1731,7 +1993,8 @@ export class Scenery implements System {
     this.at(t, side * (s.halfWidth + dist - 0.25), _p2, s);
     this.settle(_p2, t);
     const bm = trs(_p2.x, _p2.y, _p2.z, Math.atan2(-s.binormal.x * side, -s.binormal.z * side), 1.5, 1.15, 1);
-    this.sets.sponsor.add(bm, { uv: this.signCell(this.signSeq++), lod: 240 });
+    const cell = this.signCell(this.signSeq++, ((t % 1) + 1) % 1 * (this.ctx.track.length || 1));
+    if (cell) this.sets.sponsor.add(bm, { uv: cell, lod: 240 });
     this.claim(_p2, 3);
     return true;
   }
@@ -2469,13 +2732,24 @@ export class Scenery implements System {
       const kind = this.hash1(i, 0x51ed);
       i++;
       side = -side;
-      d += 62 + this.hash1(i, 0x9e37) * 28;
+      // 62–90 m -> 42–70 m. §9.5 wants a foreground plane in every frame and
+      // the round-1 measurement was that hero, closeup, drift and corner all
+      // had NOTHING nearer to camera than the road surface — two depth planes,
+      // which reads flat however good the fog is. At an 80 m mean station and a
+      // chase camera that sees maybe 45 m of useful near field, better than half
+      // the racing line was guaranteed to have no near element at all. A 56 m
+      // mean puts one inside 12 m of the lens roughly three quarters of the
+      // time, which is the stated target. Cost is ~40% more stations, each of
+      // which is one instanced palm, one rope or a handful of pennants.
+      d += 42 + this.hash1(i, 0x9e37) * 28;
       if (inTunnel) continue;
 
       // Bunting across the road: two masts plus a catenary of pennants. It
       // reads at any distance, occludes the sky band, and costs one rope plus
-      // ~16 triangles.
-      if (kind < 0.3 && !this.isSea(t, s.halfWidth + 5, s) && !this.isSea(t, -(s.halfWidth + 5), s)) {
+      // ~16 triangles. Raised to 42% of stations: this is the only near-field
+      // element that is guaranteed to cross the TOP of the frame rather than
+      // the side, which is what the note is actually asking for.
+      if (kind < 0.42 && !this.isSea(t, s.halfWidth + 5, s) && !this.isSea(t, -(s.halfWidth + 5), s)) {
         if (this.crossBunting(t, s, rng)) continue;
       }
 
@@ -2486,7 +2760,12 @@ export class Scenery implements System {
       // so fall back to the inside rather than skipping the station.
       let placed = -2;
       let lat = 0;
-      const reach = 5.5 + rng() * 13;
+      // 5.5–18.5 m -> 2.4–10.4 m outboard of the road edge. A leaning palm whose
+      // trunk is twenty metres off the racing line never gets its crown into
+      // frame at the chase camera's pitch; the same palm at four metres hangs
+      // over the kerb, which is the shot. `blocked` still keeps it out of the
+      // barrier, the terrace line and everything else that has claimed ground.
+      const reach = 2.4 + rng() * 8;
       for (const cand of [outside, -outside]) {
         const l = cand * (s.halfWidth + reach);
         if (this.isSea(t, l, s)) continue;
@@ -2506,12 +2785,22 @@ export class Scenery implements System {
       const outward = placed;
       // yaw of the inward direction, so anything with a face looks at the road
       const inward = Math.atan2(-s.binormal.x * outward, -s.binormal.z * outward);
+      let cell: THREE.Vector4 | null = null;
 
       if (kind < 0.56) {
         // Leaning palm — crown hangs out over the tarmac. This is the element
         // that made pack.png the one frame in the set that worked.
-        const lean = 0.2 + rng() * 0.16;
-        this.foliage.palm(_p.clone(), 1.15 + rng() * 0.4, rng() * 6.28, t, lean, inward);
+        // HEIGHT SCALES WITH SETBACK. pack.png's top-left has two palm trunks
+        // running off the top of the frame with their crowns entirely out of
+        // shot — they read as bare poles, which is worse than no tree. A 10 m
+        // palm three metres off the kerb cannot get its crown into a chase
+        // frame; the same palm fifteen metres out can. So the closest ones are
+        // short (≈6.8 m, a young tree, crown at the top of frame) and only the
+        // outboard ones get the full hero height. The lean still hangs the
+        // crown over the tarmac, which is what makes it an occluder at all.
+        const near01 = clamp((reach - 2.4) / 8, 0, 1);
+        const lean = 0.28 - near01 * 0.10 + rng() * 0.12;
+        this.foliage.palm(_p.clone(), lerp(0.94, 1.48, near01) + rng() * 0.12, rng() * 6.28, t, lean, inward);
         // a couple of understorey shrubs so the trunk is not a lone pole
         for (let k = 0; k < 2; k++) {
           this.at(t, lat - outward * (1.4 + rng() * 2.2), _p2, s);
@@ -2526,11 +2815,21 @@ export class Scenery implements System {
           this.pennant(trs(_p2.x, _p2.y, _p2.z, rng() * 6.28, 1, 1.35 + rng() * 0.75, 1), rng);
           this.dropShadow(_p2, 0.4, t, 0.6);
         }
-      } else if (kind < 0.88) {
+      } else if (kind < 0.88 && this.inHoardingZone(t) && (cell = this.signCell(i, ((t % 1) + 1) % 1 * L))) {
         // Signage gantry: a full-height hoarding on stilts, tall enough to
         // break the horizon line rather than sit under it.
-        const m = trs(_p.x, _p.y, _p.z, inward, 1.7 + rng() * 0.5, 2.1 + rng() * 0.6, 1);
-        this.sets.sponsor.add(m, { uv: this.signCell(i), lod: 0 });
+        //
+        // THIS is the object that made scenery.png's two biggest masses both
+        // adverts: a sponsor panel at 1.7–2.2x scale, in the midground, on a
+        // corner exit the camera looks straight into. Two boards of it (GOLD and
+        // NITRO) were the first two things the eye landed on in a frame billed
+        // as the environment-dense showcase of a Mediterranean village. Now it
+        // only runs in the start-straight and tunnel-approach zones, and it also
+        // has to win a cell from the 300 m uniqueness rule; everywhere else the
+        // slot falls through to the cypress trio below, which is the vertical
+        // §1 actually asks for through the village.
+        const m = trs(_p.x, _p.y, _p.z, inward, 1.55 + rng() * 0.35, 1.8 + rng() * 0.45, 1);
+        this.sets.sponsor.add(m, { uv: cell, lod: 0 });
         this.sets.sponsorPost.add(m, { color: _col.set(0xb8bcc4).clone(), uv: new THREE.Vector4(1, 1, 0, 0), lod: 0 });
         this.dropShadow(_p, 2.6, t, 0.7);
       } else {
@@ -2571,7 +2870,12 @@ export class Scenery implements System {
     }
     const dist = a.distanceTo(b);
     const sag = dist * 0.09;
-    this.acc.rope.add(ropeGeo(a, b, sag, 0.03), _m4.identity(), new THREE.Color(0xd8cba8));
+    // 0.03 -> 0.055 m radius. A 6 cm cable at 60 m is 1.5 screen pixels, which
+    // MSAA renders as a dotted trail that vanishes in places (§9.6, "no aliasing
+    // crawl on thin geometry") — reported against wide.png. 11 cm holds ~3 px at
+    // the same distance, which survives, and at close range it simply reads as
+    // the rope a bunting swag is actually strung on.
+    this.acc.rope.add(ropeGeo(a, b, sag, 0.055), _m4.identity(), new THREE.Color(0xd8cba8));
     const n = Math.max(6, Math.floor(dist / 1.15));
     for (let k = 1; k < n; k++) {
       const u = k / n;
@@ -3109,17 +3413,33 @@ export class Scenery implements System {
    * doing no work. `hero` adds the printed course-name banner, a start-light
    * gantry and a bunting swag under the beam.
    */
+  /**
+   * A banner arch straddling the road.
+   *
+   * `span` was `halfWidth * 2 + 2.4`, i.e. 1.2 m of clearance either side of a
+   * 26 m harbour boulevard — the uprights land inside the shoulders, which puts
+   * them where the kerb, the barrier and the crowd rank already are, and a
+   * `claim` collision there is the most likely reason the hero arch is not in
+   * frame in grid.png. 7 m of shoulder each side clears all of them and reads as
+   * a proper gantry over a wide start.
+   */
   private bannerArch(t: number, height: number, hero = false) {
     const rng = this.rng;
     const s = this.ctx.track.sample(t);
-    const span = s.halfWidth * 2 + 2.4;
+    const span = s.halfWidth * 2 + (hero ? 14 : 7);
     const g = bannerArchGeo(span, height);
     this.at(t, 0, _p, s);
     this.settle(_p, t);
     const yaw = Math.atan2(s.tangent.x, s.tangent.z);
     const m = trs(_p.x, _p.y - 0.3, _p.z, yaw);
     this.acc.wood.add(g.struct, m, new THREE.Color(0xf2ece0));
-    const banner = new THREE.Mesh(g.banner, hero ? this.mats.banner : this.mats.cloth);
+    // Always the printed banner sheet, never the fabric atlas. `mats.cloth`
+    // carries `patchInstUv`, which reads an `aUv` INSTANCE attribute — and this
+    // is a plain Mesh, so that attribute does not exist and WebGL hands the
+    // shader (0,0,0,1). Every non-hero arch was therefore sampling one texel of
+    // the fabric atlas and rendering as a flat colour bar. Now that the sheet is
+    // 2.8 m deep instead of 1.05 m that would be very visible.
+    const banner = new THREE.Mesh(g.banner, this.mats.banner);
     banner.name = 'banner-cloth';
     banner.applyMatrix4(m);
     banner.castShadow = true;
@@ -3153,7 +3473,7 @@ export class Scenery implements System {
     this.at(t, span / 2, b, s);
     a.y = b.y = ay + height * 0.86;
     const sag = span * 0.11;
-    this.acc.rope.add(ropeGeo(a, b, sag, 0.03), _m4.identity(), new THREE.Color(0xd8cba8));
+    this.acc.rope.add(ropeGeo(a, b, sag, 0.055), _m4.identity(), new THREE.Color(0xd8cba8));
     const nf = Math.max(8, Math.floor(span / 1.1));
     for (let k = 1; k < nf; k++) {
       const u = k / nf;
@@ -3181,8 +3501,7 @@ export class Scenery implements System {
   private standBanner(gm: THREE.Matrix4, len: number, y: number) {
     const rng = this.rng;
     const g = new THREE.PlaneGeometry(len, 1.5, 24, 2);
-    const uv = g.getAttribute('uv') as THREE.BufferAttribute;
-    for (let i = 0; i < uv.count; i++) uv.setXY(i, 1 - uv.getY(i), uv.getX(i));
+    bannerUvs(g);
     const n = g.getAttribute('position').count;
     const wind = new Float32Array(n * 4);
     for (let i = 0; i < n; i++) wind[i * 4] = rng() * 6;
@@ -3297,41 +3616,113 @@ export class Scenery implements System {
     }
   }
 
+  private signHistory: { cell: number; d: number }[] = [];
   /**
-   * Pick an atlas cell for placement `i`, never repeating a design inside a
-   * 120 m window. `signHistory` is a small ring of the last few cells used;
-   * a modulo cycle or a bare rng() both leave a readable loop period, which is
-   * the classic procedural-scatter tell.
+   * Pick an atlas cell, never repeating a design within 300 m of centreline.
+   *
+   * Round 1's ring held the last FOUR cells used, which at a 10–20 m board
+   * pitch is a 40–80 m window — and the identical purple GOLD board duly showed
+   * up in scenery.png at t = 0.86 and again in hud.png at t = 0.14 at the same
+   * size and the same orientation, which is what exposes a scatter as random
+   * rather than authored. The window is now quoted in METRES along the
+   * centreline, which is what the eye actually measures, and it is only
+   * satisfiable because the population below is a third of what it was.
+   * Returns null when every design is already spoken for nearby: the correct
+   * answer then is no board at all, not a duplicate.
    */
-  private signHistory: number[] = [];
-  private signCell(i: number): THREE.Vector4 {
+  private signCell(i: number, d: number): THREE.Vector4 | null {
+    const L = this.ctx.track.length || 1;
+    const near = (cell: number) =>
+      this.signHistory.some((h) => {
+        if (h.cell !== cell) return false;
+        const dd = Math.abs(h.d - d);
+        return Math.min(dd, L - dd) < 300;
+      });
     let cell = (this.hash1(i, 0x5be3) * 8) | 0;
-    for (let k = 0; k < 8 && this.signHistory.indexOf(cell) >= 0; k++) cell = (cell + 1) % 8;
-    this.signHistory.push(cell);
-    if (this.signHistory.length > 4) this.signHistory.shift();
+    let k = 0;
+    while (k < 8 && near(cell)) {
+      cell = (cell + 1) % 8;
+      k++;
+    }
+    if (k >= 8) return null;
+    this.signHistory.push({ cell, d });
     return new THREE.Vector4(0.5, 0.25, (cell % 2) * 0.5, ((cell / 2) | 0) * 0.25);
   }
 
   private signSeq = 0;
 
   /**
-   * Roadside signage. Three body styles (hoarding, A-frame, wall-mounted),
-   * eight printed designs, and jittered yaw / offset / spacing, because the
-   * round-1 set read its own loop period off the barrier at a glance.
+   * ==========================================================================
+   *  Roadside signage — and the ~70% cull that goes with it.
+   * ==========================================================================
+   *  Round 1's biggest readable text in three separate frames was GOLD, NITRO,
+   *  ROYALE and BOOST on large rectangular hoardings. That is what a generic
+   *  rally circuit looks like; §1's course is an Amalfi coastal village, and in
+   *  scenery.png the two largest objects in the frame were both adverts, so the
+   *  eye's first stop was a billboard rather than the track or the kart.
+   *
+   *  Three rules now:
+   *
+   *  (a) LARGE HOARDINGS ONLY WHERE A CIRCUIT WOULD ACTUALLY SELL SPACE — the
+   *      start straight and the tunnel approach, per the note. Everywhere else
+   *      the big style is off entirely.
+   *  (b) OUTSIDE THOSE ZONES the population drops to about a fifth, and what
+   *      survives is the small stuff: an A-frame at a café verge, a wall-mounted
+   *      shop fascia. Both are village furniture, not advertising.
+   *  (c) THE FACE POINTS AT ONCOMING TRAFFIC. The old yaw aimed the panel
+   *      straight across the road, so from anywhere on the approach you saw it
+   *      edge-on, and from behind you saw its blank back — which is precisely
+   *      what occupies the right third of grid.png. Angling it upstream means a
+   *      driver reads it as they come to it and the back is never presented.
    */
+  private static readonly HOARDING_ZONES: [number, number][] = [
+    [0.0, 0.105],
+    [0.455, 0.605],
+  ];
+  private inHoardingZone(t: number): boolean {
+    const u = ((t % 1) + 1) % 1;
+    return Scenery.HOARDING_ZONES.some(([a, b]) => (a <= b ? u >= a && u <= b : u >= a || u <= b));
+  }
+
   private sponsorBoard(t: number, s: TrackSample, side: number, rng: RNG) {
     const i = this.signSeq++;
-    // spacing jitter: skip a placement now and then so the rhythm is uneven
-    if (this.hash1(i, 0x1c33) < 0.22) return;
+    const zone = this.inHoardingZone(t);
+    // spacing jitter: skip a placement now and then so the rhythm is uneven —
+    // and outside the hoarding zones, skip four in five.
+    if (this.hash1(i, 0x1c33) < (zone ? 0.22 : 0.82)) {
+      // Culling four in five boards must not leave the verge emptier than it
+      // was — the note is that the advertising is the wrong GENRE, not that the
+      // rhythm of trackside verticals was wrong. So most of the culled slots get
+      // course furniture instead: a marker flag on a mast, or a stack of crates
+      // outside a shop. Both already exist as instanced sets, so this is free.
+      if (zone || this.hash1(i, 0x9d17) > 0.55) return;
+      const lat0 = side * (s.halfWidth + 2.6 + this.hash1(i, 0x4c02) * 2.4);
+      if (this.isSea(t, lat0, s)) return;
+      this.at(t, lat0, _p, s);
+      this.settle(_p, t, _n);
+      if (this.blocked(_p, 1.2) || (!this.flatWorld && this.surfaceAt(_p, t) === Surface.Road)) return;
+      if (this.hash1(i, 0x22b9) < 0.62) {
+        this.pennant(trs(_p.x, _p.y, _p.z, rng() * 6.28, 1, 1.1 + rng() * 0.7, 1), rng);
+        this.dropShadow(_p, 0.35, t, 0.7);
+      } else {
+        this.kitCrateStack(_p, t, Math.atan2(-s.binormal.x * side, -s.binormal.z * side), rng);
+      }
+      this.claim(_p, 1.2);
+      return;
+    }
     const lat = side * (s.halfWidth + 2.2 + (this.hash1(i, 0x77a1) - 0.5) * 3.0);
     if (this.isSea(t, lat, s)) return;
     this.at(t, lat, _p, s);
     this.settle(_p, t);
-    // The panel's own +Z is its face: point it ACROSS the track at the road,
-    // which leaves its width running along the track as a hoarding should.
-    const yaw = Math.atan2(-s.binormal.x * side, -s.binormal.z * side) + (this.hash1(i, 0x3ee1) - 0.5) * 0.42;
-    const uv = this.signCell(i);
-    const style = this.hash1(i, 0xa55e);
+    // Face = across the road AND upstream, so it is read on the approach and
+    // never presents its back to a following camera.
+    _p2.set(-s.binormal.x * side - s.tangent.x * 0.85, 0, -s.binormal.z * side - s.tangent.z * 0.85);
+    const yaw = Math.atan2(_p2.x, _p2.z) + (this.hash1(i, 0x3ee1) - 0.5) * 0.3;
+    const uv = this.signCell(i, ((t % 1) + 1) % 1 * (this.ctx.track.length || 1));
+    if (!uv) return;
+    // Outside the zones the hoarding body style is unavailable: everything falls
+    // through to the A-frame / wall-sign half of the range.
+    const style = zone ? this.hash1(i, 0xa55e) : this.hash1(i, 0xa55e) * 0.38;
     if (style < 0.2) {
       // low double-sided A-frame propped at the verge
       const m = trs(_p.x, _p.y, _p.z, yaw + Math.PI / 2 + (rng() - 0.5) * 0.3);
@@ -3361,7 +3752,10 @@ export class Scenery implements System {
     for (let i = 0; i < n; i++) {
       const top = i === n - 1 && rng() < 0.6;
       this.sets.tyre.add(trs(_p.x + (rng() - 0.5) * 0.06, _p.y + i * 0.255, _p.z + (rng() - 0.5) * 0.06, rng() * 6.28), {
-        color: top ? _col.set(pick(rng, [PAL.kerbRed, 0x4fc3ff, 0xff9d2e])).clone() : _col.set(0x8e8e96).clone(),
+        // 0x8e8e96 -> 0xa8a6ac. The tint multiplies an already very dark rubber
+        // albedo, and the product was landing where the shadow side had nothing
+        // to give back at all (see `MatLib.rubber`).
+        color: top ? _col.set(pick(rng, [PAL.kerbRed, 0x4fc3ff, 0xff9d2e])).clone() : _col.set(0xa8a6ac).clone(),
         uv: new THREE.Vector4(1, 1, 0, 0),
         lod: 130,
       });
@@ -3406,10 +3800,25 @@ export class Scenery implements System {
     });
   }
 
+  /**
+   * One spectator.
+   *
+   * `uv` selects one of the nine garment cards in `TexLib.crowdCloth`. The cell
+   * walks with `crowdSeq` rather than rolling free, because a random draw puts
+   * neighbours on the same card roughly one time in nine — and a repeat one
+   * metre away in a dense rank is far more visible than a repeat twenty metres
+   * away. A stride of 4 against 9 cells is coprime, so it cycles through all
+   * nine before it repeats and never lands adjacent to itself.
+   *
+   * The canvas is uploaded flipY, so canvas row `r` is v-offset `(2 - r) / 3`.
+   */
+  private crowdSeq = 0;
   private spectator(m: THREE.Matrix4, rng: RNG, variant = -1) {
     const v = variant >= 0 ? variant : rng() < 0.24 ? 1 : rng() < 0.22 ? 2 : rng() < 0.3 ? 3 : 0;
+    const k = (this.crowdSeq = (this.crowdSeq + 4) % 9);
     this.sets['crowd' + v].add(m, {
       color: _col.set(pick(rng, PAL.crowd)).clone(),
+      uv: new THREE.Vector4(1 / 3, 1 / 3, (k % 3) / 3, (2 - ((k / 3) | 0)) / 3),
       wind: new THREE.Vector4(rng() * 100, 0, 0, rng()),
       lod: 130,
     });
@@ -3433,15 +3842,58 @@ export class Scenery implements System {
     const rng = this.rng;
     const d = density * clamp(this.ctx.settings.foliageDensity ?? 1, 0.25, 1.5);
     let seq = 0;
-    this.walk(t0, t1, 0.85, (t, s) => {
-      const i = seq++;
-      // clustering field: two out-of-phase sines plus a corner boost
-      const knot = 0.5 + 0.5 * Math.sin(i * 0.21 + t * 61) * Math.sin(i * 0.071 + 2.1);
+    // ------------------------------------------------------------------------
+    //  ROUND 2: BANKS, NOT A SPRINKLE.
+    // ------------------------------------------------------------------------
+    //  The smooth-sine knot field above never actually got to 1, so every step
+    //  was an independent coin flip at 30–70% on a 0.85 m pitch — which is a
+    //  Poisson scatter, and a Poisson scatter at that rate is exactly what
+    //  hud.png shows: isolated figures in ones and twos with three to five
+    //  metres of empty grass between them. Sparse-even is the amateur read.
+    //
+    //  A real crowd is bimodal. It packs solid against a rail in runs of fifteen
+    //  to forty at shoulder pitch, and between those banks there is nobody at
+    //  all. So this is now a two-state machine over the walk: IN a bank every
+    //  step places (and the step is dropped to 0.7 m so the rank is contiguous),
+    //  BETWEEN banks nothing is placed for a genuinely empty stretch. Corners
+    //  make banks longer and more frequent, not merely denser.
+    //  Total figure count is held roughly where it was — the same bodies,
+    //  redistributed — so nothing here moves the instance budget.
+    let inBank = 0;
+    let gap = 0;
+    // The tiered bank is a CONTINUOUS terrace, stamped every few steps, not one
+    // box per spectator: at a 0.7 m pitch that would be four overlapping boxes
+    // per figure, which is triangles spent on geometry nobody can see.
+    let bankRun = 0;
+    const corner0 = clamp(Math.abs(this.curvature((t0 + t1) * 0.5)) * 90, 0, 1);
+    this.walk(t0, t1, 0.7, (t, s) => {
+      seq++;
       const corner = clamp(Math.abs(this.curvature(t)) * 90, 0, 1);
-      const local = d * (0.24 + knot * 1.5) * (0.7 + corner * 0.9);
-      if (rng() > local) return;
-      const back = rng() < 0.34;
-      const lat = side * (s.halfWidth + railClear + (back ? 2.6 + rng() * 2.0 : rng() * 1.9));
+      if (inBank <= 0) {
+        if (gap > 0) {
+          gap--;
+          return;
+        }
+        // bank length in steps: 15–40 figures, longer where the action is
+        inBank = 15 + ((rng() * 25) | 0) + ((corner * 12) | 0);
+        // and the empty run between banks, shortened by density and by corners
+        gap = Math.round((18 + rng() * 40) / Math.max(0.2, d * (0.8 + corner)));
+        if (rng() > clamp(d * 1.9 + corner0 * 0.2, 0.08, 1)) {
+          // this whole bank is skipped: some stretches genuinely have no crowd
+          inBank = 0;
+          return;
+        }
+      }
+      inBank--;
+      // A little porosity inside the bank so it is a crowd and not a fence.
+      if (rng() < 0.12) return;
+      // TIERED DEPTH. Roughly a third of a bank stands on the back bank, and a
+      // sixth in a third rank behind that — the layered mass Nintendo always
+      // has, which one row of figures at one offset can never read as.
+      const rank = rng();
+      const back = rank > 0.66;
+      const third = rank > 0.90;
+      const lat = side * (s.halfWidth + railClear + (third ? 4.9 + rng() * 1.6 : back ? 2.6 + rng() * 1.6 : rng() * 1.5));
       if (this.isSea(t, lat, s)) return;
       this.at(t, lat, _p, s);
       this.settle(_p, t);
@@ -3449,10 +3901,21 @@ export class Scenery implements System {
         const surf = this.surfaceAt(_p, t);
         if (surf === Surface.Road || surf === Surface.Boost) return;
       }
-      // The back rank stands on a low bank so its heads clear the front row.
+      // The back ranks stand on a terrace so their heads clear the row in front.
       if (back) {
-        const yaw0 = Math.atan2(s.tangent.x, s.tangent.z);
-        this.acc.stone.add(bevelBox(2.6, 0.9, 2.4, 0.06, 0.5), trs(_p.x, _p.y - 0.2, _p.z, yaw0), new THREE.Color(0xc4b79e), (_x, y) => lerp(0.45, 1, smoothstep(-0.45, 0.3, y)));
+        if (--bankRun <= 0) {
+          bankRun = 5; // one 4 m terrace segment per ~3.5 m of rank
+          const yaw0 = Math.atan2(s.tangent.x, s.tangent.z);
+          this.at(t, side * (s.halfWidth + railClear + 4.2), _p2, s);
+          this.settle(_p2, t);
+          // local X = binormal, local Z = tangent, so the run is the Z extent
+          this.acc.stone.add(
+            bevelBox(4.6, 1.4, 4.0, 0.05, 0.5),
+            trs(_p2.x, _p2.y - 0.26, _p2.z, yaw0),
+            new THREE.Color(0xc4b79e),
+            (_x, y) => lerp(0.42, 1, smoothstep(-0.75, 0.35, y))
+          );
+        }
         _p.y += 0.44;
       }
       const yaw = Math.atan2(-s.binormal.x * side, -s.binormal.z * side) + (rng() - 0.5) * 1.1;
@@ -4085,22 +4548,48 @@ export class Scenery implements System {
     return false;
   }
 
-  /** A line of cypress/pine spires standing ON the crest, not near it. */
+  /**
+   * A line of cypress/pine spires standing ON the crest, not near it.
+   *
+   * ROUND 2. These were being drawn as ISOLATED needles: one spire per random
+   * crest column, height `dist * 0.022` (35 m at the range band) against a
+   * radius of 0.11–0.16 of that, i.e. a 7:1 spike with five hundred metres of
+   * bare skyline either side of it. Zoomed, the horizon in hud.png reads as a
+   * cactus, and that spikiness is a large part of why the ridges came back
+   * described as traffic cones.
+   *
+   * Two changes, both about how trees actually sit on a ridge. They GROUP —
+   * a stand of cypress is six to ten trunks inside twenty metres with long
+   * empty runs between stands — and they are shorter and fatter relative to the
+   * landform than this was making them. A clustered, tufted top edge reads as
+   * vegetation; evenly spaced needles read as a comb.
+   */
   private crestSpires(base: THREE.Matrix4, crest: number[], n: number, dist: number, rng: RNG) {
     const cols = crest.length / 3;
     if (cols < 4) return;
     const col = this.hazeTint(dist, 0x3f5230);
+    // stands of 3–6, so `n` spires arrive as a handful of clumps
+    let anchor = 2 + ((rng() * (cols - 4)) | 0);
+    let left = 0;
     for (let i = 0; i < n; i++) {
-      // Cluster toward the summits: spires on a saddle read as a hedge, spires
-      // on a skyline read as Tuscany.
-      let c = 2 + ((rng() * (cols - 4)) | 0);
-      for (let k = 0; k < 3; k++) {
-        const alt = 2 + ((rng() * (cols - 4)) | 0);
-        if (crest[alt * 3 + 1] > crest[c * 3 + 1]) c = alt;
+      if (left <= 0) {
+        // Cluster toward the summits: spires on a saddle read as a hedge, spires
+        // on a skyline read as Tuscany.
+        anchor = 2 + ((rng() * (cols - 4)) | 0);
+        for (let k = 0; k < 3; k++) {
+          const alt = 2 + ((rng() * (cols - 4)) | 0);
+          if (crest[alt * 3 + 1] > crest[anchor * 3 + 1]) anchor = alt;
+        }
+        left = 3 + ((rng() * 4) | 0);
       }
-      const h = Math.max(9, dist * 0.022) * (0.7 + rng() * 0.7);
-      const spire = loft((t, o) => o.set(0, t * h, 0), 4, 5, (t) => Math.pow(Math.sin(Math.pow(t, 0.6) * Math.PI * 0.95), 0.7) * h * (0.11 + rng() * 0.05), 1, true, true);
-      const jitter = (rng() - 0.5) * 2;
+      left--;
+      const c = anchor;
+      // 0.022 -> 0.0145 of the viewing distance, and a third fatter. Still a
+      // clear vertical at 2 km; no longer a needle.
+      const h = Math.max(7, dist * 0.0145) * (0.72 + rng() * 0.6);
+      const spire = loft((t, o) => o.set(0, t * h, 0), 4, 5, (t) => Math.pow(Math.sin(Math.pow(t, 0.6) * Math.PI * 0.95), 0.7) * h * (0.16 + rng() * 0.08), 1, true, true);
+      // tight in-stand jitter: two or three columns, not the whole crest
+      const jitter = (rng() - 0.5) * 3.4;
       const ci = clamp(c + Math.round(jitter), 0, cols - 1) | 0;
       // KEEP THE BASE BURIED. `crest` is a line of points ON the summit ridge,
       // and the ridge runs along local X with its front flank facing local +Z —

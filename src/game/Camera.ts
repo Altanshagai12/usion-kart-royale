@@ -352,7 +352,23 @@ const FRAME_Y = -0.24;           // base: subject below the axis, horizon high
 const FRAME_Y_SPEED = -0.05;     // faster -> a little more road ahead
 const FRAME_Y_DRIFT = -0.06;     // sideways -> more background above the kart
 const FRAME_Y_VISTA = -0.10;     // a view to show -> drop the subject, lift the bay
-const FRAME_Y_MIN = -0.46;       // never into the speedo
+/**
+ * Floor on how far down the frame the subject may be pushed.
+ *
+ * -0.46 was two thirds of the way to the bottom edge, and on the corner plate
+ * the terms stacked to reach it: base, speed and vista all pull the same way,
+ * and the coastal 180 fires all three at once. A subject at -0.42 with a HUD
+ * element under it and a lateral offset beside it reads as "shoved into the
+ * corner", which is exactly the note that came back.
+ *
+ * -0.40 rather than the -0.333 thirds line itself: the vista and drift terms
+ * exist to make a scenic frame and a sideways frame *different* from a cruise,
+ * and a floor set at the thirds line would saturate all three into the same
+ * number and undo that. The corner plate now lands near -0.33 on its own,
+ * because the vista drop is faded under cornering where the two used to stack
+ * (see poseChase); the clamp is the backstop, not the mechanism.
+ */
+const FRAME_Y_MIN = -0.40;
 const FRAME_Y_MAX = -0.08;
 const FRAME_X_CORNER = 0.34;
 /** A slide has to throw the kart further across the frame than an ordinary
@@ -441,6 +457,168 @@ const GROUND_CLEAR = 0.68;
 const MIN_ARM = 2.85;
 const ARM_RECOVER = 0.55;    // seconds for the arm to ease back out after a hit
 
+// --- scenery occlusion ----------------------------------------------------
+/**
+ * Round eight's blocker, and the only note in the set that made a frame
+ * *unshippable* rather than merely weak: the rig parked itself behind a
+ * roadside sign panel and photographed the back of it.
+ *
+ * The cause is structural, not a tuning miss. Everything this file knew about
+ * the world came from two analytic queries — `track.probe` (terrain height) and
+ * `track.collideWalls` (barriers) — plus a raycast against the tunnel bore.
+ * Signs, poles, gantries, banners, parasols and mooring posts are none of those
+ * things, so as far as the camera was concerned the verge was empty air. The
+ * arm swept clean through a billboard and the LOS report came back clear
+ * because the one ray anybody was casting happened to pass over the panel and
+ * hit the roll bar.
+ *
+ * So the rig now carries its own picture of trackside furniture: a flat array
+ * of world-space AABBs, built once from the scene graph and tested with a slab
+ * intersection. Boxes rather than triangles is a deliberate choice — signs,
+ * posts, crates and gantry legs *are* boxes, a slab test is twenty flops with
+ * no allocation and no BVH, and it is exact enough to answer the only question
+ * being asked ("is there something solid on this segment"). Three tests run per
+ * frame: the arm itself (pulls the arm in, through the existing armFrac spring
+ * so it cannot pump), five rays to the subject's box (lifts and swings the rig
+ * out, which is what a spring arm does when the subject is screened by
+ * something the arm itself misses), and a point test on the eye (hard push-out,
+ * so the lens can never end up *inside* a panel).
+ */
+/** widest a box may be, in the horizontal plane, and still count as furniture.
+ *  Above this it is architecture — a facade, a grandstand, a banner arch — and
+ *  collapsing the arm every time one is near the sightline is far worse than
+ *  the occasional clipped corner. Terrain and walls already answer for those. */
+const PROP_MAX_SPAN = 13;
+/** and tallest. A 20 m building or a landscape-scale mesh is not an occluder
+ *  this rig should be dodging; it is the backdrop. */
+const PROP_MAX_HEIGHT = 15;
+/** hard ceiling on the box list, so a scenery system that instances ten
+ *  thousand fence posts cannot turn the camera into the frame budget. */
+const PROP_MAX_COUNT = 2400;
+/** per-instance boxes are extracted up to this count; denser fields (kerb
+ *  segments, crowd, foliage) are skipped wholesale. */
+const PROP_MAX_INSTANCES = 384;
+/** Frames at which the box list is (re)built. Scenery is not all present on
+ *  frame one — some of it is parented into groups that already exist, so a
+ *  child-count watch alone would never fire and one early build would latch an
+ *  empty list. After the last of these the list is final unless the scene's
+ *  top-level shape changes, and never more than PROP_MAX_BUILDS times total. */
+const PROP_BUILD_FRAMES = [0, 12, 40, 110, 300];
+const PROP_MAX_BUILD = 9;
+/** Names that are never furniture. Karts are excluded structurally (they move,
+ *  so a cached box would be a phantom blocker parked on the grid); foliage is
+ *  excluded because a palm's AABB is nine parts air and pulling the arm in for
+ *  a frond is a worse artefact than seeing through one. */
+const PROP_SKIP = new RegExp([
+  // backdrop and the surfaces the track already answers for analytically
+  'sky|cloud|sea|water|ocean|backdrop|horizon|fog|terrain|ground',
+  'road|tarmac|asphalt|kerb|curb|grass|sand',
+  // things with no solidity to speak of
+  'shadow|decal|spark|smoke|dust|particle|trail|godray|flare|glow',
+  // foliage: the AABB is nine parts air, and pulling the arm in for a frond is
+  // a worse artefact than seeing through one
+  'foliage|leaf|leaves|frond|palm|tree|bush|shrub|hedge|plant|flower',
+  // crowds are instanced and animated, and a spectator is not an occluder
+  'crowd|spectator',
+  // gameplay objects: they move, they are meant to be driven through, and a
+  // cached box for one would be a phantom blocker sitting where it spawned
+  'item|pickup|coin|shell|banana|bomb|star|projectile|boostpad|pad',
+  'minimap|helper|gizmo',
+].join('|'), 'i');
+/** metres of extra eye height the rig will climb to clear the subject */
+const CLEAR_LIFT_MAX = 2.30;
+/** and metres it will swing outboard, away from whatever is screening it */
+const CLEAR_OUT_MAX = 1.55;
+/**
+ * Shortest the *furniture* sweep alone may leave the arm, as a fraction of the
+ * arm the rig asked for. Terrain, walls and the tunnel bore are not floored —
+ * see sweepArm for why furniture is the one occluder class that gets a floor,
+ * and what an unfloored one did to the hero plate.
+ *
+ * High deliberately: this test is the softest of the three furniture responses
+ * and is the only one that is not load-bearing. propPush guarantees the lens is
+ * never inside a box and subjectBlocked guarantees the kart is never behind
+ * one, so all the arm sweep has to add is a light ease-off as the rig passes a
+ * sign — not a range change the viewer reads as a cut.
+ *
+ * Measured at the hero mark, arm fraction -> range -> subject height in frame:
+ * unfloored 0.297 -> 2.56 m (bumper cam, two thirds of the frame bare asphalt);
+ * 0.62 -> 4.32 m (still visibly short); 0.85 -> 5.39 m, which is the range the
+ * plate is composed for. Anything that genuinely must collapse the arm further
+ * than this is ground or a barrier, and both of those get their say above.
+ */
+const PROP_ARM_MIN_FRAC = 0.85;
+/** fraction of the subject rays that must be blocked before the rig moves,
+ *  and the fraction it must fall back under before the rig comes home. The gap
+ *  is the hysteresis that stops the correction chasing its own tail. */
+const CLEAR_ON = 0.25;
+const CLEAR_OFF = 0.08;
+
+// --- banking --------------------------------------------------------------
+/**
+ * The banked coastal 180 is the bible's declared money shot (§1) and round
+ * eight photographed it as "a vertical wall of tarmac with nothing happening".
+ *
+ * Two things were missing, and neither is a tuning value:
+ *
+ *  1. Height. A lens two metres over the road on the LOW side of a 20 degree
+ *     bank is looking *into* the banking — the outer half of the road is above
+ *     eye level, so the frame is a wall. The rig has to climb the bank, which
+ *     means both a lift along the road normal and a slide toward the high side.
+ *     ROLL_GAIN was already tilting the horizon; tilting the horizon over a
+ *     picture of tarmac does not make it a picture of a corner.
+ *  2. A reason to believe there is a corner. The aim lead was a flat 0.2 blend
+ *     toward a mark 24-44 m ahead whatever the road was doing, so a 180 got the
+ *     same amount of look-ahead as a straight and the exit was thirty degrees
+ *     outside the frustum.
+ *
+ * `TrackSample.bank` is signed with the right side raised, so a banked
+ * right-hander (outside = left = high) reports negative; the rig's own sign
+ * convention is +1 = right-hander, hence the negation where it is read.
+ */
+/** radians of bank that count as "fully banked" — deliberately under the 20
+ *  degree apex so the entry and exit thirds, where the shots actually land,
+ *  are already carrying most of the response. */
+const BANK_FULL = 0.30;
+/** metres the eye climbs at full bank */
+const BANK_HEIGHT = 1.15;
+/** metres it slides up the bank, toward the outside. Added to the corner
+ *  swing, which on a properly banked corner already points the same way. */
+const BANK_LAT = 2.10;
+/** extra horizon tilt at full bank, ~5 degrees, on top of what the road
+ *  normal already contributes through ROLL_GAIN. This is the term that gets a
+ *  frame taken on the *entry* of the coastal curve over the 8 degree floor the
+ *  review asked for, without touching the apex (which MAX_ROLL still caps). */
+const BANK_ROLL = 0.088;
+/** how much further down the road the aim reaches at |corner| = 1, metres,
+ *  and how much harder it blends toward it. Together these are what put the
+ *  corner EXIT in frame instead of the inside of the banking. */
+const CORNER_LEAD_DIST = 30;
+const CORNER_LEAD_BLEND = 0.24;
+
+// --- the establishing plate ----------------------------------------------
+/**
+ * Range and lens, solved backwards from "the subject must be 8-10% of frame
+ * height" rather than forwards from "an establishing shot is far away".
+ *
+ * Vertical footprint at the subject is `2 * range * tan(fov/2)`. At the old
+ * 55 m / 36 deg that is 35.8 m, which renders a 2.1 m kart at 5.9% of frame
+ * height on its long axis and about 2.5% on its short one — the "60 px red
+ * speck" the review measured. At 42 m / 31 deg it is 23.3 m: 9.0% long axis,
+ * and the karts finally read as karts.
+ *
+ * The lens goes LONGER as the range comes in, not wider. Shortening the range
+ * alone would have bought the subject size back by widening coverage and
+ * flattening the compression, which is the opposite of what an aerial plate is
+ * for; taking three degrees off the lens at the same time keeps the stacking.
+ */
+const WIDE_RANGE = 42;
+const WIDE_FOV = 31;
+/** Thirds intersection, signed away from the direction of travel so the racing
+ *  line runs into the frame rather than out of it. */
+const WIDE_FRAME_X = 0.31;
+const WIDE_FRAME_Y = -0.26;
+
 const INTRO_DUR = 3.55;      // countdown fly-in length
 const FINISH_HOLD = 2.3;     // seconds the finish-line cut holds trackside
 
@@ -465,9 +643,25 @@ const _vel = new THREE.Vector3();
 const _lead = new THREE.Vector3();
 const _camR = new THREE.Vector3();
 const _camU = new THREE.Vector3();
+const _cr = new THREE.Vector3();
+const _pt = new THREE.Vector3();
+const _kr = new THREE.Vector3();
 const _q = new THREE.Quaternion();
 const _m = new THREE.Matrix4();
+const _m2 = new THREE.Matrix4();
+const _box = new THREE.Box3();
 const _euler = new THREE.Euler();
+
+/** the five stations on the subject the clearance test asks about: lateral
+ *  offset (chassis widths), vertical offset (metres), forward offset. Centre
+ *  first, so the common "nothing is in the way" case exits on the first ray. */
+const SUBJ_PROBE = [
+  0.0, 0.45, 0.0,
+  0.0, 1.10, 0.0,
+  0.78, 0.45, 0.0,
+  -0.78, 0.45, 0.0,
+  0.0, 0.28, 0.95,
+];
 
 /** Track.sample() accepts a scratch target; the ITrack interface hides it. */
 type SampleFn = (t: number, out?: TrackSample) => TrackSample;
@@ -571,6 +765,17 @@ export class ChaseCamera implements System {
   private vistaVel = { v: 0 };
   private vistaSide = 0;     // signed: +1 the drop is to the right, -1 left
   private vistaSideVel = { v: 0 };
+  /** signed, normalised road bank: +1 = a fully banked right-hander (outside,
+   *  i.e. the left edge, is the high one). Sign matches `corner`. */
+  private bank = 0;
+  private bankVel = { v: 0 };
+  /** metres of extra eye height / outboard swing bought by the subject
+   *  clearance test, and which way "outboard" currently is */
+  private clearLift = 0;
+  private clearLiftVel = { v: 0 };
+  private clearOut = 0;
+  private clearOutVel = { v: 0 };
+  private clearSide = 1;
   private brakeAmt = 0;
   private brakeVel = { v: 0 };
   private lookAmt = 0;
@@ -610,6 +815,18 @@ export class ChaseCamera implements System {
   private ray = new THREE.Raycaster();
   private hits: THREE.Intersection[] = [];
   private unsub: (() => void) | null = null;
+  /** trackside furniture as world-space AABBs, six floats each:
+   *  minX minY minZ maxX maxY maxZ. Static, built once (see ensureProps). */
+  private props: Float32Array | null = null;
+  private propCount = 0;
+  private propSceneChildren = -1;
+  private propBuilds = 0;
+  private propStage = 0;
+  /** index of the box the last segment test entered first, or -1 */
+  private propHit = -1;
+  /** broad-phase scratch: offsets into `props`, filled by propGather */
+  private cand = new Int32Array(96);
+  private prevMode: CamMode | null = null;
 
   // =======================================================================
 
@@ -671,6 +888,260 @@ export class ChaseCamera implements System {
 
   dispose() { this.unsub?.(); this.unsub = null; }
 
+  // =======================================================================
+  //  Trackside furniture — the thing this rig used to be blind to
+  // =======================================================================
+
+  /**
+   * Flatten every piece of roadside furniture into a flat array of world-space
+   * AABBs. Built lazily and rebuilt only when the scene's top-level child count
+   * changes (scenery, props and karts arrive across several boot frames), with
+   * a hard cap on rebuilds so a system that churns the graph cannot make this
+   * run every frame. Nothing here allocates once the array is built.
+   *
+   * What goes in: signs, posts, gantry legs, crates, parasols, mooring bollards
+   * — anything solid, ground-planted and small enough that a camera can
+   * sensibly go round or over it.
+   *
+   * What stays out, and why each one matters:
+   *  - karts, structurally, by walking `race.karts[].object` first. They move,
+   *    and a cached box would be a phantom occluder parked on the grid.
+   *  - foliage and crowd, by name. A palm's AABB is mostly air; pulling the arm
+   *    in for a frond is a worse artefact than seeing through one.
+   *  - anything wider than PROP_MAX_SPAN or taller than PROP_MAX_HEIGHT. A
+   *    facade, a grandstand or a banner arch spanning the road is architecture,
+   *    and terrain + walls already answer for those. This is also what keeps a
+   *    start-line arch from collapsing the arm on every lap.
+   *  - dense instanced fields, which are kerb segments and foliage by
+   *    construction (the bible mandates instancing exactly those).
+   */
+  private ensureProps(ctx: Ctx) {
+    // Two triggers, because either one alone fails. A top-level child count
+    // change catches a system that parents its output straight onto the scene;
+    // the frame schedule catches the far more likely case of scenery being
+    // built into a group that already existed, where the count never moves and
+    // a single early build would latch an empty list and silently disable the
+    // whole occlusion path for the session. Both are capped: after the last
+    // milestone this never runs again, so nothing here can reach the steady
+    // state hot path or allocate in it.
+    const n = ctx.scene.children.length;
+    const stageDue = this.propStage < PROP_BUILD_FRAMES.length
+      && ctx.frame >= PROP_BUILD_FRAMES[this.propStage];
+    const changed = this.props === null || n !== this.propSceneChildren;
+    if (stageDue) this.propStage++;
+    else if (!changed || this.propBuilds >= PROP_MAX_BUILD) return;
+    this.propBuilds++;
+    this.propSceneChildren = n;
+
+    // Karts are excluded by identity, not by name — they are the one thing in
+    // the scene that is guaranteed to invalidate a cached box.
+    const skipRoots = new Set<THREE.Object3D>();
+    const karts = ctx.race?.karts;
+    if (karts) for (let i = 0; i < karts.length; i++) skipRoots.add(karts[i].object);
+
+    const out: number[] = [];
+    const push = (b: THREE.Box3) => {
+      if (out.length >= PROP_MAX_COUNT * 6) return;
+      const sx = b.max.x - b.min.x, sy = b.max.y - b.min.y, sz = b.max.z - b.min.z;
+      if (!(sx > 0.05 && sy > 0.35 && sz > 0.05)) return;   // decals, thin mats
+      if (sx > PROP_MAX_SPAN || sz > PROP_MAX_SPAN || sy > PROP_MAX_HEIGHT) return;
+      out.push(b.min.x, b.min.y, b.min.z, b.max.x, b.max.y, b.max.z);
+    };
+
+    ctx.scene.traverse((o) => {
+      if (skipRoots.has(o)) { skipRoots.add(o); return; }
+      // A kart's children are reached through the kart root, which is already
+      // in the set; traverse() has no skip-subtree, so re-check the ancestry
+      // cheaply by marking descendants as we meet them.
+      if (o.parent && skipRoots.has(o.parent)) { skipRoots.add(o); return; }
+
+      const m = o as THREE.Mesh;
+      if (!(m as any).isMesh || !m.visible || !m.geometry) return;
+      if (PROP_SKIP.test(m.name)) return;
+      const geo = m.geometry;
+      if (!geo.boundingBox) geo.computeBoundingBox();
+      const bb = geo.boundingBox;
+      if (!bb) return;
+      m.updateWorldMatrix(true, false);
+
+      const inst = m as unknown as THREE.InstancedMesh;
+      if ((inst as any).isInstancedMesh) {
+        if (inst.count > PROP_MAX_INSTANCES) return;
+        for (let i = 0; i < inst.count; i++) {
+          inst.getMatrixAt(i, _m2);
+          _m.multiplyMatrices(m.matrixWorld, _m2);
+          _box.copy(bb).applyMatrix4(_m);
+          push(_box);
+        }
+        return;
+      }
+
+      _box.copy(bb).applyMatrix4(m.matrixWorld);
+      push(_box);
+    });
+
+    this.props = out.length ? new Float32Array(out) : null;
+    this.propCount = out.length / 6;
+  }
+
+  /**
+   * Parametric distance along `p0 -> p1` at which the segment first enters any
+   * furniture box, inflated by `pad`. Returns 1 when the segment is clear.
+   *
+   * A branchless-ish slab test behind a six-compare AABB reject, over a flat
+   * Float32Array. At a couple of thousand boxes the reject costs about the same
+   * as one particle update and the slab test runs on the handful that survive;
+   * there is no allocation, no raycaster and no BVH to keep warm.
+   */
+  /**
+   * Broad phase for the clearance test. One pass over the whole array collects
+   * the handful of boxes that overlap the eye-to-subject region; the five slab
+   * tests then run against those instead of against everything, which turns
+   * five full scans into one. At a couple of thousand boxes that is the
+   * difference between "measurable" and "not".
+   */
+  private propGather(a: THREE.Vector3, b: THREE.Vector3, pad: number): number {
+    const P = this.props;
+    if (!P) return 0;
+    const x0 = Math.min(a.x, b.x) - pad, x1 = Math.max(a.x, b.x) + pad;
+    const y0 = Math.min(a.y, b.y) - pad, y1 = Math.max(a.y, b.y) + pad;
+    const z0 = Math.min(a.z, b.z) - pad, z1 = Math.max(a.z, b.z) + pad;
+    let n = 0;
+    for (let i = 0, o = 0; i < this.propCount; i++, o += 6) {
+      if (P[o + 3] < x0 || P[o] > x1 || P[o + 4] < y0 || P[o + 1] > y1 || P[o + 5] < z0 || P[o + 2] > z1) continue;
+      this.cand[n++] = o;
+      if (n === this.cand.length) break;
+    }
+    return n;
+  }
+
+  private propSegment(p0: THREE.Vector3, p1: THREE.Vector3, pad: number, candN = -1): number {
+    this.propHit = -1;
+    const P = this.props;
+    if (!P) return 1;
+    if (candN === 0) return 1;
+
+    const dx = p1.x - p0.x, dy = p1.y - p0.y, dz = p1.z - p0.z;
+    // A finite stand-in for 1/0: an exact zero would make the (b - p) * inv
+    // product NaN whenever the origin sits exactly on a slab plane.
+    const ix = dx !== 0 ? 1 / dx : 1e30;
+    const iy = dy !== 0 ? 1 / dy : 1e30;
+    const iz = dz !== 0 ? 1 / dz : 1e30;
+
+    const qx0 = (dx < 0 ? p1.x : p0.x) - pad, qx1 = (dx < 0 ? p0.x : p1.x) + pad;
+    const qy0 = (dy < 0 ? p1.y : p0.y) - pad, qy1 = (dy < 0 ? p0.y : p1.y) + pad;
+    const qz0 = (dz < 0 ? p1.z : p0.z) - pad, qz1 = (dz < 0 ? p0.z : p1.z) + pad;
+
+    // Either the whole list, or the candidates propGather already narrowed to.
+    const count = candN >= 0 ? candN : this.propCount;
+    let best = 1;
+    for (let i = 0; i < count; i++) {
+      const o = candN >= 0 ? this.cand[i] : i * 6;
+      const bx0 = P[o], by0 = P[o + 1], bz0 = P[o + 2];
+      const bx1 = P[o + 3], by1 = P[o + 4], bz1 = P[o + 5];
+      if (bx1 < qx0 || bx0 > qx1 || by1 < qy0 || by0 > qy1 || bz1 < qz0 || bz0 > qz1) continue;
+
+      let t0 = 0, t1 = best;
+      let a = (bx0 - pad - p0.x) * ix, b = (bx1 + pad - p0.x) * ix;
+      if (a > b) { const s = a; a = b; b = s; }
+      if (a > t0) t0 = a; if (b < t1) t1 = b;
+      if (t0 > t1) continue;
+
+      a = (by0 - pad - p0.y) * iy; b = (by1 + pad - p0.y) * iy;
+      if (a > b) { const s = a; a = b; b = s; }
+      if (a > t0) t0 = a; if (b < t1) t1 = b;
+      if (t0 > t1) continue;
+
+      a = (bz0 - pad - p0.z) * iz; b = (bz1 + pad - p0.z) * iz;
+      if (a > b) { const s = a; a = b; b = s; }
+      if (a > t0) t0 = a; if (b < t1) t1 = b;
+      if (t0 > t1) continue;
+
+      best = t0;
+      this.propHit = o;
+      if (best <= 0) break;
+    }
+    return best;
+  }
+
+  /**
+   * How much of the subject is screened from `eye`, 0..1, over five rays that
+   * span the kart's box rather than the single centre ray that reported the
+   * corner plate clear while a sign panel covered half the chassis.
+   *
+   * Also picks the direction to escape in: away from whatever is doing the
+   * screening, in the frame's own lateral axis, so the rig swings out from
+   * behind a sign rather than deeper into it.
+   */
+  private subjectBlocked(eye: THREE.Vector3, k: IKart): number {
+    if (!this.props) return 0;
+
+    _cr.copy(k.position).sub(eye);
+    if (_cr.lengthSq() < 1e-4) return 0;
+    _cr.crossVectors(_cr.normalize(), this.upSm);
+    if (_cr.lengthSq() < 1e-6) _cr.set(1, 0, 0); else _cr.normalize();
+
+    _kr.crossVectors(k.forward, this.upSm);
+    if (_kr.lengthSq() < 1e-6) _kr.copy(_cr); else _kr.normalize();
+
+    // One broad-phase pass, padded by the widest station offset, then five
+    // narrow tests against whatever survived it.
+    const n = this.propGather(eye, k.position, 1.4);
+    if (n === 0) return 0;
+
+    let blocked = 0;
+    let sideSum = 0;
+    for (let i = 0; i < 5; i++) {
+      const o = i * 3;
+      _pt.copy(k.position)
+        .addScaledVector(_kr, SUBJ_PROBE[o])
+        .addScaledVector(this.upSm, SUBJ_PROBE[o + 1])
+        .addScaledVector(k.forward, SUBJ_PROBE[o + 2]);
+      // Stop a little short of the subject so the kart's own bounding volume,
+      // and anything legitimately touching it, cannot read as an occluder.
+      _pt.lerp(eye, 0.06);
+      if (this.propSegment(eye, _pt, 0, n) < 1) {
+        blocked++;
+        const o2 = this.propHit;
+        if (o2 >= 0) {
+          const P = this.props;
+          _tmp.set(
+            (P[o2] + P[o2 + 3]) * 0.5 - eye.x,
+            0,
+            (P[o2 + 2] + P[o2 + 5]) * 0.5 - eye.z,
+          );
+          sideSum += _tmp.dot(_cr);
+        }
+      }
+    }
+    if (blocked > 0 && Math.abs(sideSum) > 0.15) this.clearSide = sideSum > 0 ? -1 : 1;
+    return blocked / 5;
+  }
+
+  /**
+   * Last line of defence: the lens is inside a panel. Push it out along the
+   * axis of least penetration. Boxes that also contain the kart are skipped —
+   * driving through a prop's bounding volume is the scenery system's problem,
+   * and yanking the camera out of it would be a far louder artefact.
+   */
+  private propPush(p: THREE.Vector3, kart: THREE.Vector3, pad: number) {
+    const P = this.props;
+    if (!P) return;
+    for (let i = 0, o = 0; i < this.propCount; i++, o += 6) {
+      const bx0 = P[o] - pad, by0 = P[o + 1] - pad, bz0 = P[o + 2] - pad;
+      const bx1 = P[o + 3] + pad, by1 = P[o + 4] + pad, bz1 = P[o + 5] + pad;
+      if (p.x < bx0 || p.x > bx1 || p.y < by0 || p.y > by1 || p.z < bz0 || p.z > bz1) continue;
+      if (kart.x >= bx0 && kart.x <= bx1 && kart.z >= bz0 && kart.z <= bz1) continue;
+
+      const px = Math.min(p.x - bx0, bx1 - p.x);
+      const py = by1 - p.y;                       // out of the top only, never down
+      const pz = Math.min(p.z - bz0, bz1 - p.z);
+      if (py <= px && py <= pz && py < 2.5) { p.y = by1; continue; }
+      if (px <= pz && px < 2.5) { p.x = (p.x - bx0 < bx1 - p.x) ? bx0 : bx1; continue; }
+      if (pz < 2.5) p.z = (p.z - bz0 < bz1 - p.z) ? bz0 : bz1;
+    }
+  }
+
   addShake(a: number, s = 0.3) {
     this.trauma = Math.min(1, this.trauma + a);
     // A longer requested duration means a slower bleed-off, not a timer — so
@@ -699,6 +1170,22 @@ export class ChaseCamera implements System {
 
     const mode: CamMode = ((window as any).__camMode as CamMode) || 'chase';
     const state = ctx.race.state;
+
+    this.ensureProps(ctx);
+
+    // A harness mode change is a CUT, not a move, and the lens has to be at its
+    // new focal length on the very first frame of it: frameSubject solves the
+    // subject's screen position against `fovOsc.v`, and a wide plate composed
+    // against a stale 50 degrees puts the kart a third of a frame off where the
+    // composition asked. applyFov's own settle is fine for everything else.
+    if (mode !== this.prevMode) {
+      // Including the very first frame: the harness sets the mode before the
+      // rig has ever run, so "no previous mode" is precisely the case where
+      // the lens is most likely to be wrong.
+      this.fovOsc.v = (mode === 'wide' ? WIDE_FOV : mode === 'close' ? 34 : FOV_BASE) * this.fovAspectMul;
+      this.fovOsc.vel = 0;
+      this.prevMode = mode;
+    }
 
     // --- speed / drift / brake scalars ------------------------------------
     const speed = Math.abs(k.forwardSpeed);
@@ -815,8 +1302,20 @@ export class ChaseCamera implements System {
     let lean = 0;
     if (mode === 'chase') {
       lean = this.corner * CORNER_ROLL;
+      // ...and the bank on top. ROLL_GAIN already carries the road normal into
+      // the frame, but it carries the normal AT THE KART, and the plates get
+      // taken on the entry and exit thirds where a 20 degree apex is only
+      // running six or eight. The review asked for 8-12 degrees of tilt on the
+      // banked corner specifically because the bank is the entire subject of
+      // that shot; this is the term that guarantees it there instead of only at
+      // the apex, and MAX_ROLL still caps the apex itself.
+      lean += this.bank * BANK_ROLL;
     }
-    if (this.driftAmt > 1e-3) {
+    // A drift is a drift in every gameplay framing, but an establishing plate
+    // wants a level horizon (see the wide gain above) — leaving this ungated
+    // meant a wide shot captured mid-slide came back dutched by ten degrees,
+    // which is the one thing an establishing frame must not be.
+    if (mode !== 'wide' && this.driftAmt > 1e-3) {
       const driftLean = (DRIFT_ROLL + DRIFT_ROLL_TIER * this.tierAmt) * this.driftSigned;
       // The two are measured from different things and do NOT have to agree:
       // `corner` is the yaw rate of the *travel* heading, driftSigned is which
@@ -1004,9 +1503,12 @@ export class ChaseCamera implements System {
   private updateVista(ctx: Ctx, k: IKart, dt: number) {
     let drop = 0;
     let side = this.vistaSide >= 0 ? 1 : -1;
+    let bank = 0;
 
     // Never lift inside the bore: the roof is 4.5 m up and the sweep would just
-    // yank the arm straight back in, which pumps.
+    // yank the arm straight back in, which pumps. Same gate for the bank
+    // response below — a banked tunnel would otherwise hoist the lens into
+    // the rock.
     if (!(this.hasBlockers && this.blockerBox.containsPoint(k.position))) {
       const s = this.sampleFn!(k.t, this.smpV!);
       const out = s.halfWidth + VISTA_PROBE;
@@ -1018,6 +1520,15 @@ export class ChaseCamera implements System {
 
       drop = Math.max(dropL, dropR);
       side = dropR >= dropL ? 1 : -1;
+
+      // `TrackSample.bank` is signed with the RIGHT side raised; the rig's own
+      // convention (corner, driftSigned, the lean applied about the arm) is
+      // +1 = right-hander. A properly built right-hander raises its outside,
+      // which is the left edge, so the two are negatives of each other. Reading
+      // the declared quantity rather than reconstructing it from the normal
+      // also means a flat-but-turning corner reports zero here and gets its
+      // framing from `corner` alone, which is correct.
+      bank = clamp(-s.bank / BANK_FULL, -1, 1);
     }
 
     const v = smootherstep((drop - VISTA_MIN) / (VISTA_MAX - VISTA_MIN));
@@ -1025,6 +1536,10 @@ export class ChaseCamera implements System {
     // must neither bob over a gully nor snap back down at a bridge abutment.
     this.vista = damp1(this.vista, v, this.vistaVel, v > this.vista ? 0.75 : 0.8, dt);
     this.vistaSide = damp1(this.vistaSide, side * v, this.vistaSideVel, 0.75, dt);
+    // Faster than the vista (a bank arrives over tens of metres, not hundreds)
+    // but still slower than the arm, so entering the coastal curve is a move
+    // rather than a step.
+    this.bank = damp1(this.bank, bank, this.bankVel, 0.42, dt);
   }
 
   // =======================================================================
@@ -1134,9 +1649,16 @@ export class ChaseCamera implements System {
     let dist = ARM_DIST + ARM_DIST_SPEED * sp + surge * BOOST_SURGE_DIST
       - this.brakeAmt * 0.85 - this.lookAmt * 1.4
       - boost * BOOST_DIST + VISTA_DIST * vista;
+    const bank = Math.abs(this.bank) * (1 - this.lookAmt);
     let height = ARM_HEIGHT + ARM_HEIGHT_SPEED * sp + surge * BOOST_SURGE_HEIGHT
       - this.brakeAmt * 0.3 + this.lookAmt * 0.25
-      - boost * BOOST_HEIGHT - this.driftAmt * 0.18 + VISTA_HEIGHT * vista;
+      - boost * BOOST_HEIGHT - this.driftAmt * 0.18 + VISTA_HEIGHT * vista
+      // Climb the banking. A lens two metres over the road on the low side of a
+      // 20 degree bank is looking INTO the banking: the outer half of the road
+      // is above eye level and the frame is a wall of tarmac with the exit
+      // hidden behind it. This, plus the outboard slide below, is what makes
+      // the money shot a picture of a corner instead of a picture of asphalt.
+      + BANK_HEIGHT * bank;
     if (k.airborne) height += 0.35;
     // The arm may never fold through the chassis, whatever the surge, the
     // brake and the boost decide between them.
@@ -1171,7 +1693,14 @@ export class ChaseCamera implements System {
     // fighting the aim, which is glued to the kart, and the aim wins. Screen
     // position is frameSubject's job; this decides what is behind the kart —
     // on the village hairpin, whether that is the facades or an empty apron.
-    let swing = this.corner * CORNER_LAT * (1 - this.lookAmt);
+    //
+    // The bank adds to it, and adds in the same direction on any corner built
+    // the way a corner should be: `bank` is signed +1 for a right-hander whose
+    // outside (left) edge is raised, which is exactly where `corner` is already
+    // sending the eye. On the coastal 180 the two together put the lens up on
+    // the high side of the banking, looking down across it at the exit and the
+    // bay, which is the shot §1 of the bible describes.
+    let swing = (this.corner * CORNER_LAT + this.bank * BANK_LAT) * (1 - this.lookAmt);
     // Slide the rig toward the outside of the SLIDE, which is a different
     // quantity — see the roll and framing notes: `corner` reads the travel
     // heading's yaw rate, driftSigned reads which way the chassis was kicked,
@@ -1185,14 +1714,32 @@ export class ChaseCamera implements System {
     }
     if (Math.abs(swing) > 1e-3) _eye.addScaledVector(_right, -swing);
 
-    // Both offsets are lateral, so the arm sweep (which only walks the arm
-    // itself) cannot see them. One analytic wall query resolves it — and it is
-    // a resolve, not a bail-out, so the composition survives a brush past a
-    // guardrail instead of snapping back to centre.
-    if (vista > 1e-3 || this.driftAmt > 1e-3 || Math.abs(swing) > 1e-3) {
-      const w = ctx.track.collideWalls(_eye, CAM_RADIUS, k.t);
-      if (w) _eye.add(w.push);
-    }
+    // --- get off the sign -------------------------------------------------
+    //
+    // The spring-arm clearance correction, applied from LAST frame's
+    // measurement so the loop closes cleanly: pose, measure, correct next
+    // frame. Measuring the pose we are about to modify and then modifying it
+    // would be a fixed-point iteration with no guarantee of one, and a rig that
+    // hunts between "behind the sign" and "clear of it" is worse than one that
+    // is simply late.
+    //
+    // Height carries most of the escape because trackside furniture is
+    // ground-planted and finite: signs, posts and gantry legs all run out at
+    // three or four metres, and going over is both shorter and better composed
+    // than going round. The outboard component is the remainder, signed away
+    // from whatever is actually doing the screening (see subjectBlocked).
+    if (this.clearLift > 1e-3) _eye.addScaledVector(this.upSm, this.clearLift);
+    if (this.clearOut > 1e-3) _eye.addScaledVector(_right, this.clearSide * this.clearOut);
+
+    // Every offset above is lateral or vertical, so the arm sweep (which only
+    // walks the arm itself) cannot see any of them. One analytic wall query
+    // resolves the barriers — and it is a resolve, not a bail-out, so the
+    // composition survives a brush past a guardrail instead of snapping back to
+    // centre — and one point test resolves the furniture the walls do not know
+    // about, which is how the lens ended up inside a billboard.
+    const w = ctx.track.collideWalls(_eye, CAM_RADIUS, k.t);
+    if (w) _eye.add(w.push);
+    this.propPush(_eye, k.position, CAM_RADIUS);
 
     // Aim ahead along the arm, plus a lead into the coming corner so the apex
     // is on screen before the kart gets there.
@@ -1208,10 +1755,18 @@ export class ChaseCamera implements System {
     _aim.addScaledVector(_dir, (5.2 + 4.6 * sp) * (1 - 0.35 * this.lookAmt));
 
     if (this.lookAmt < 0.5) {
-      const ahead = (24 + 30 * sp) / Math.max(1, ctx.track.length);
+      // The lead scales with how hard the road is turning. A flat 0.2 blend
+      // toward a mark 24-44 m ahead gives a 180 degree hairpin exactly as much
+      // look-ahead as a straight, and on a 180 that is nowhere near enough: the
+      // exit is thirty degrees outside the frustum and the frame answers "where
+      // does the track go" with a wall of tarmac. At |corner| = 1 the mark goes
+      // out to ~74 m and the blend to 0.44, which is what puts the exit — and
+      // the bay beyond it — in frame beside the subject.
+      const cAbs = Math.abs(this.corner);
+      const ahead = (24 + 30 * sp + CORNER_LEAD_DIST * cAbs) / Math.max(1, ctx.track.length);
       const s = this.sampleFn!(k.t + ahead, this.smp!);
       _tmp.copy(s.pos).addScaledVector(s.normal, AIM_LEAD_UP);
-      _aim.lerp(_tmp, 0.2 * (1 - this.lookAmt * 2));
+      _aim.lerp(_tmp, (0.2 + CORNER_LEAD_BLEND * cAbs) * (1 - this.lookAmt * 2));
     }
 
     // --- and finally, compose ---------------------------------------------
@@ -1233,17 +1788,55 @@ export class ChaseCamera implements System {
     // corner term is faded out wherever it would subtract from the slide, and
     // never the other way round.
     if (this.driftAmt > 1e-3 && cornerX * driftX < 0) cornerX *= 1 - this.driftAmt;
+    // The third member of the same family, and the one still left unguarded:
+    // `vistaSide` is which way the ground falls away, `corner` is which way the
+    // road turns, and on a banked corner with the bay on the inside they are
+    // opposed. Left to add freely they land the subject at an arbitrary
+    // fraction of wherever either one asked for — the corner plate came back
+    // with the kart pinned to one edge and two thirds of the frame empty, and
+    // no term in this file could tell you which of the two put it there.
+    // A corner is the stronger compositional statement (the exit is a place the
+    // eye wants to go; a drop is only a backdrop), so it wins, and the vista
+    // offset fades wherever it would fight it.
+    let vistaX = this.vistaSide * FRAME_X_VISTA;
+    if (cornerX * vistaX < 0) vistaX *= 1 - Math.abs(this.corner);
     const fx = clamp(
-      cornerX + driftX + this.vistaSide * FRAME_X_VISTA,
+      cornerX + driftX + vistaX,
       -FRAME_X_MAX, FRAME_X_MAX,
     ) * look;
+    // The vista drop is faded out under cornering. Both terms push the subject
+    // down the frame and the coastal 180 fires both at once — that stack is
+    // what put the kart at -0.42 with a HUD element under it and produced the
+    // "shoved into the corner at small scale" note. A scenic STRAIGHT still
+    // gets the full drop, which is where it earns its keep.
     const fy = clamp(
-      FRAME_Y + FRAME_Y_SPEED * sp + FRAME_Y_DRIFT * this.driftAmt + FRAME_Y_VISTA * vista,
+      FRAME_Y + FRAME_Y_SPEED * sp + FRAME_Y_DRIFT * this.driftAmt
+      + FRAME_Y_VISTA * vista * (1 - 0.6 * Math.abs(this.corner)),
       FRAME_Y_MIN, FRAME_Y_MAX,
     );
     // Negated: a right-hander (corner > 0) throws the kart to the LEFT of frame,
     // which is the outside of the turn, and opens the exit up ahead of it.
     this.frameSubject(ctx, k, -fx, fy);
+
+    // --- and then check our work ------------------------------------------
+    //
+    // Everything above assumed the subject is visible. Measure whether it
+    // actually is, and hand the answer to the next frame's clearance offset.
+    // Deliberately hysteretic: grow while genuinely screened, hold through the
+    // middle band, release only when properly clear — otherwise the correction
+    // un-blocks the subject, the target collapses to zero, the rig falls back
+    // behind the sign and the whole thing limit-cycles at a couple of hertz.
+    const blocked = this.subjectBlocked(_eye, k);
+    let liftT = this.clearLift;
+    let outT = this.clearOut;
+    if (blocked >= CLEAR_ON) { liftT = CLEAR_LIFT_MAX * blocked; outT = CLEAR_OUT_MAX * blocked; }
+    else if (blocked <= CLEAR_OFF) { liftT = 0; outT = 0; }
+    // Snap out from behind an obstruction, ease back home — the review asked
+    // for ~0.25 s, and an asymmetric pair means the recovery never races the
+    // next occluder.
+    const ct = liftT > this.clearLift ? 0.18 : 0.30;
+    this.clearLift = damp1(this.clearLift, liftT, this.clearLiftVel, ct, dt);
+    this.clearOut = damp1(this.clearOut, outT, this.clearOutVel, ct, dt);
   }
 
   /**
@@ -1320,6 +1913,45 @@ export class ChaseCamera implements System {
         frac = (i - 1) / SAMPLES;
         break;
       }
+    }
+
+    // Trackside furniture, as one exact segment test rather than as stations.
+    // Station sampling is the wrong tool here and would have missed the very
+    // panel that produced the blocker: a sign is 0.2 m thick and the stations
+    // are a metre apart, so four times out of five the arm steps straight
+    // through it. The slab test cannot.
+    if (this.props) {
+      _tmp.copy(pivot).addScaledVector(dir, -dist).addScaledVector(this.upSm, height);
+      const tp = this.propSegment(pivot, _tmp, CAM_RADIUS);
+      // Stop short of the surface, not on it, or the eye sits in the panel's
+      // own near-plane and renders its back face across the frame.
+      //
+      // ...but FLOORED, which the terrain and wall tests above deliberately are
+      // not. Those two answer for ground and barriers, and an eye inside a hill
+      // or through a guardrail has no acceptable framing, so they may collapse
+      // the arm to nothing. Furniture is different in kind: it is thin, it is
+      // beside the road rather than across it, and there is a whole line of it
+      // down every interesting straight.
+      //
+      // Unfloored, this amputated the signature shot. Measured at the `hero`
+      // mark, where the verge carries a sign panel and a banner on posts (two
+      // boxes about 3.9 x 4.4 x 3.6 m, based 2.1 m up, 7.5 m off the racing
+      // line): the sweep hit them and drove armFrac to 0.297, so the plate was
+      // shot from 2.56 m on a 55 degree lens instead of the six the rig asked
+      // for. The frame came back as two thirds bare asphalt with the bay, the
+      // headland and the whole sunset squeezed into the top eighth — the exact
+      // "nothing happening" note this file keeps trying to answer, reintroduced
+      // by the fix for a different one.
+      //
+      // Trimming is still right; amputating is not. The two guarantees that
+      // actually matter are kept elsewhere and are unaffected by this floor:
+      // propPush resolves the eye out of any box it ends up inside (so the lens
+      // can never render a panel's back face), and subjectBlocked lifts and
+      // swings the rig when the SUBJECT is screened (so the kart can never end
+      // up behind one). This test is the third and softest of the three, and a
+      // floor is what makes it read as a spring arm easing past a sign rather
+      // than as a cut to a bumper cam every time one goes by.
+      if (tp < 1) frac = Math.min(frac, Math.max(PROP_ARM_MIN_FRAC, tp - 0.07));
     }
 
     if (this.hasBlockers && this.blockerBox.containsPoint(pivot)) {
@@ -1523,21 +2155,25 @@ export class ChaseCamera implements System {
   private poseWide(ctx: Ctx, k: IKart) {
     this.ensureWideBlockers(ctx);
 
-    // Subject first: the player, with the ribbon running away from them.
+    // --- 1. range and lens: the subject has to be big enough to find --------
     //
-    // The lead has to be read against the frame it is composed into, which is
-    // the one thing the first version of this did not do: it aimed 42% of the
-    // way to a mark 95 m down-track, i.e. 40 m ahead of the kart, while a 36
-    // degree lens at 55 m sees a ground footprint about 36 m tall. The subject
-    // was a frame and a half below the bottom edge — measured at four points
-    // round the circuit it was off-screen at every one of them, so the plate
-    // that exists to show a kart on a circuit showed neither. Aim a third of a
-    // frame ahead instead: the road still enters low and leaves high, and the
-    // kart sits in the lower third rather than outside the picture.
+    // Round eight measured the player at ~3% of frame height on this plate and
+    // called it, correctly, a shot with no subject. 55 m at 36 degrees puts a
+    // 36 m ground footprint in frame, and a 2.1 m kart inside a 36 m footprint
+    // is a speck whatever else the composition does. WIDE_RANGE / WIDE_FOV are
+    // solved backwards from the requirement instead: 42 m at 31 degrees sees a
+    // 23 m footprint, so the kart occupies 9-10% of frame height — the band the
+    // review asked for, and roughly triple what shipped.
     //
-    // Lerping toward the sampled centreline rather than adding a raw offset is
-    // deliberate — it also pulls the aim back onto the ribbon when the player is
-    // out wide, which is what keeps the kart off the frame edge through corners.
+    // Closing the range and lengthening the lens together is deliberate. A
+    // shorter range alone would have widened the coverage and flattened the
+    // compression; taking three degrees off the lens at the same time keeps the
+    // long-lens stacking that makes an establishing plate read as chosen.
+    //
+    // Aim at the ribbon a little ahead of the player: lerping toward the
+    // sampled centreline rather than adding a raw offset pulls the axis back
+    // onto the road when the player is out wide, so the racing line runs
+    // through the frame rather than off the side of it.
     const LEAD = 13;
     const s = this.sampleFn!(k.t + LEAD / Math.max(1, ctx.track.length), this.smp!);
     _aim.copy(k.position).lerp(s.pos, 0.8).addScaledVector(WORLD_UP, 2.2);
@@ -1547,43 +2183,83 @@ export class ChaseCamera implements System {
     _dir.y = 0;
     if (_dir.lengthSq() < 1e-6) _dir.set(0, 0, 1); else _dir.normalize();
 
-    const RANGE = 55;
-    let elev = 0.61;                       // ~35 degrees
-    for (let i = 0; i < 6; i++) {
+    // --- 2. an elevation that is VERIFIED clear of the subject --------------
+    //
+    // This loop existed and did not work, and the reason is worth stating: it
+    // tested the sightline to `_aim`, which is a point on the centreline ten
+    // metres ahead of the player. A telegraph pole standing between the lens
+    // and the KART is not on that ray, so the escalation never fired, the plate
+    // came back with a gantry through the middle of it, and the harness dutifully
+    // reported the line of sight clear. The test now runs against the subject,
+    // over five stations spanning the kart's box, exactly as the chase rig's
+    // clearance test does — and it is the same failure both were built to catch.
+    let elev = 0.55;                       // ~31 degrees
+    for (let i = 0; i < 7; i++) {
       _eye.copy(_aim)
-        .addScaledVector(_dir, -RANGE * Math.cos(elev))
-        .addScaledVector(WORLD_UP, RANGE * Math.sin(elev));
+        .addScaledVector(_dir, -WIDE_RANGE * Math.cos(elev))
+        .addScaledVector(WORLD_UP, WIDE_RANGE * Math.sin(elev));
       // Terrain is not in the blocker list (it is the one thing the track can
       // answer analytically), so clear it here.
       const pr = ctx.track.probe(_eye, k.t);
       if (_eye.y < pr.y + 8) _eye.y = pr.y + 8;
-      if (!this.occluded()) break;
-      elev += 0.122;                       // ~7 degrees
+      if (!this.subjectOccluded(k)) break;
+      elev += 0.115;                       // ~6.6 degrees
       if (elev > 1.25) break;              // 72 degrees is already a map view
     }
+
+    // --- 3. compose ---------------------------------------------------------
+    //
+    // Same screen-space solver the chase rig uses, for the same reason: the
+    // previous version hoped the subject would land somewhere reasonable given
+    // a world-space aim offset, and hope put it in the lower-left at 3% with no
+    // relationship to any line in the frame. Ask for the thirds intersection
+    // and get it.
+    //
+    // The side is derived, not fixed: put the kart on the side of the frame it
+    // is driving AWAY from, so the road ahead of it — the racing line, the
+    // thing that is supposed to lead the eye — occupies the two thirds it is
+    // heading into. On a plate whose bearing flips relative to the track, a
+    // hard-coded side would put the player nose-first into the frame edge.
+    _cr.crossVectors(_dir, WORLD_UP);
+    if (_cr.lengthSq() > 1e-6) _cr.normalize(); else _cr.set(1, 0, 0);
+    const side = s.tangent.dot(_cr) >= 0 ? -1 : 1;
+    this.frameSubject(ctx, k, side * WIDE_FRAME_X, WIDE_FRAME_Y);
   }
 
   /**
-   * Is anything standing between `_eye` and `_aim`? Cast from the subject
-   * outward, so the near clip skips the subject's own geometry and the far
-   * clip stops short of the lens.
+   * Is the SUBJECT screened from `_eye`? Five rays spanning the kart's box,
+   * cast from the kart outward so the near clip skips its own geometry and the
+   * far clip stops short of the lens.
    *
-   * Only ever called from the `wide` harness mode. Gameplay pays nothing —
-   * neither the traversal below nor this ray runs on a chase frame.
+   * Only ever called from the `wide` harness mode, at most seven times per
+   * frame. Gameplay pays nothing — neither the traversal nor these rays run on
+   * a chase frame; the chase rig uses the far cheaper AABB path instead.
    */
-  private occluded(): boolean {
+  private subjectOccluded(k: IKart): boolean {
     const list = this.wideBlockers;
     if (!list || list.length === 0) return false;
-    _tmp.copy(_eye).sub(_aim);
-    const len = _tmp.length();
-    if (len < 8) return false;
-    _tmp.multiplyScalar(1 / len);
-    this.ray.set(_aim, _tmp);
-    this.ray.near = 4;
-    this.ray.far = len - 2;
-    this.hits.length = 0;
-    this.ray.intersectObjects(list, false, this.hits);
-    return this.hits.length > 0;
+
+    _kr.crossVectors(k.forward, WORLD_UP);
+    if (_kr.lengthSq() < 1e-6) _kr.set(1, 0, 0); else _kr.normalize();
+
+    for (let i = 0; i < 5; i++) {
+      const o = i * 3;
+      _pt.copy(k.position)
+        .addScaledVector(_kr, SUBJ_PROBE[o])
+        .addScaledVector(WORLD_UP, SUBJ_PROBE[o + 1])
+        .addScaledVector(k.forward, SUBJ_PROBE[o + 2]);
+      _tmp.copy(_eye).sub(_pt);
+      const len = _tmp.length();
+      if (len < 8) return false;
+      _tmp.multiplyScalar(1 / len);
+      this.ray.set(_pt, _tmp);
+      this.ray.near = 3;
+      this.ray.far = len - 2;
+      this.hits.length = 0;
+      this.ray.intersectObjects(list, false, this.hits);
+      if (this.hits.length) return true;
+    }
+    return false;
   }
 
   /**
@@ -1675,8 +2351,8 @@ export class ChaseCamera implements System {
     let omega = 11;
     let zeta = 0.62;
 
-    // The plate is a long lens now, not a wide one — see poseWide.
-    if (mode === 'wide') { target = 36; omega = 8; zeta = 1; }
+    // The plate is a long lens now, not a wide one — see poseWide / WIDE_FOV.
+    if (mode === 'wide') { target = WIDE_FOV; omega = 8; zeta = 1; }
     else if (mode === 'close') { target = 34; omega = 8; zeta = 1; }
     else if (ctx.race.state === RaceState.Results || ctx.race.state === RaceState.Menu) {
       target = 40; omega = 7; zeta = 1;

@@ -345,13 +345,37 @@ function rr(c: CanvasRenderingContext2D, x: number, y: number, w: number, h: num
 
 /** Tangent tilt of the base coat: ~2 deg, i.e. a grazing-angle-only effect. */
 const PAINT_NORMAL_SCALE = 0.10;
-/** The coat is quieter still; it only has to disagree, not shout. */
-const COAT_NORMAL_SCALE = 0.055;
+/**
+ * ORANGE PEEL, and it now lives on the clearcoat where the physics puts it.
+ *
+ * Round 6 ran the coat normal at 0.055 over a 588 mm tile: a long-wave spray
+ * flow and nothing else. A flow that slow does not modulate a highlight, it
+ * only very slightly bends one — so the coat reflected the sky as a single
+ * unbroken wash and the panel read as terracotta. Meanwhile the BASE coat
+ * carried a 2 mm dimple field, which at the closeup framing is one screen pixel
+ * per dimple: not orange peel, velvet. That inversion is the whole "suede, not
+ * lacquer" note.
+ *
+ * The two frequencies have swapped ends. The base peel is now a 6 mm dimple
+ * (three-plus pixels at 2 m, so it reads as a surface rather than as noise) and
+ * the coat carries a genuine ~7 mm peel octave ON TOP of the long flow at a
+ * tilt you can actually see in a reflection. 0.12 is about 7 deg of tangent
+ * tilt on the peel octave, which is what breaks a mirrored horizon into the
+ * dimpled band real lacquer shows.
+ */
+const COAT_NORMAL_SCALE = 0.12;
+/**
+ * Chrome bakes its Toksvig against the same flow field but at its OWN normal
+ * scale (the material binds coatNormal at 0.045). It used to be handed
+ * COAT_NORMAL_SCALE, which was harmless while the two numbers were 0.055 and
+ * 0.045 and is a 2.7x over-compensation now that the coat has peel in it.
+ */
+const CHROME_NORMAL_SCALE = 0.045;
 const PLASTIC_NORMAL_SCALE = 0.30;
 /** Nomex is a fine woven cloth: the weave has to be felt, never seen. */
 const CLOTH_NORMAL_SCALE = 0.42;
 /** UVs are authored in metres, so repeat = tiles per metre. */
-const PAINT_REPEAT = 6;    // 167 mm tile -> the fBm cell below is ~2 mm
+const PAINT_REPEAT = 6;    // 167 mm tile -> the fBm cell below is ~6 mm
 const COAT_REPEAT = 1.7;   // 588 mm tile, shares no factor with the base coat
 const PLASTIC_REPEAT = 4;
 /** 128 mm tile over a 256 px map: one weave cell lands at ~2.5 mm. */
@@ -375,25 +399,30 @@ function surfaceDetail(): SurfaceDetail {
   const S = 512;
 
   // ---- lacquer base coat -------------------------------------------------
-  // fBm cell ~6 px against a 512 px / 167 mm tile = a 2 mm dimple, which is
-  // real orange peel. Amplitude x Sobel x PAINT_NORMAL_SCALE lands at ~2 deg.
+  // fBm cell ~18 px against a 512 px / 167 mm tile = a 6 mm dimple. It was 6 px
+  // / 2 mm, which at the closeup framing (a 0.6 m panel across ~450 px) is
+  // slightly under ONE SCREEN PIXEL per dimple: the mip chain cannot resolve it,
+  // the Toksvig bake converts it to roughness at every level below mip 0, and
+  // what is left at mip 0 is a per-pixel shimmer that reads as flocking. 6 mm is
+  // three to four pixels at the same framing, so it reads as a surface.
   const peel = canvas(S);
-  fbmFill(peel, 0, 0, S, S, 0.16, 3, 7717, (n) => {
-    const v = 128 + (n - 0.5) * 58;
+  fbmFill(peel, 0, 0, S, S, 0.055, 3, 7717, (n) => {
+    const v = 128 + (n - 0.5) * 46;
     return [v, v, v];
   });
   // polish swirls — deliberately fainter than the peel so they only show when
-  // the sun rakes across a panel
-  peel.globalAlpha = 0.16;
+  // the sun rakes across a panel. Widened off sub-pixel for the same reason as
+  // the peel: a 0.6 px stroke is not a swirl, it is aliasing with a direction.
+  peel.globalAlpha = 0.13;
   peel.strokeStyle = '#fff';
   const rnd = lcg(4242);
   for (let i = 0; i < 46; i++) {
-    peel.lineWidth = 0.6 + rnd() * 0.8;
+    peel.lineWidth = 1.8 + rnd() * 1.6;
     peel.beginPath();
     const x = rnd() * S;
     const y = rnd() * S;
     const a = rnd() * Math.PI;
-    const l = 14 + rnd() * 90;
+    const l = 20 + rnd() * 110;
     peel.moveTo(x, y);
     peel.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l);
     peel.stroke();
@@ -402,14 +431,22 @@ function surfaceDetail(): SurfaceDetail {
   const peelSlope = heightSlope(peel, 0.40);
   const paintNormal = tex(slopeToNormal(peelSlope, S, S), false, PAINT_REPEAT);
 
-  // Base roughness 0.22..0.34: wide enough that the diffuse red varies across
-  // a panel, tight enough that the specular lobe stays a lobe.
+  // Base roughness 0.24..0.31, in PANEL-SIZED sweeps rather than 54 mm blotches.
+  //
+  // The old field was scale 0.006 x 4 octaves on a 512 map: a fundamental at
+  // ~166 px (54 mm on the tile) with three octaves under it reaching 7 mm, over
+  // a 0.12 range. That is a dirt map. It does not read as "the roughness varies
+  // spatially" (§4), it reads as mottling in the ALBEDO, because a 0.12 swing in
+  // roughness on a diffuse-dominated red panel changes the broad sky term by
+  // more than it changes the lobe. Three octaves from a 290 mm fundamental keeps
+  // the §4 requirement — a bonnet is still not one value anywhere — while the
+  // smallest feature is 70 mm, which is a sweep across a panel and not a stain.
   const prough = canvas(S);
-  fbmFill(prough, 0, 0, S, S, 0.006, 4, 991, (n) => {
-    const v = Math.round((0.22 + n * 0.12) * 255);
+  fbmFill(prough, 0, 0, S, S, 0.0034, 3, 991, (n) => {
+    const v = Math.round((0.24 + n * 0.07) * 255);
     return [v, v, v];
   });
-  const paintRough = toksvigTexture(prough, peelSlope, PAINT_NORMAL_SCALE, PAINT_REPEAT, true, 0.21);
+  const paintRough = toksvigTexture(prough, peelSlope, PAINT_NORMAL_SCALE, PAINT_REPEAT, true, 0.23);
 
   // ---- clearcoat ---------------------------------------------------------
   // Long-wave spray-gun flow, one seventh the frequency of the peel and on an
@@ -420,16 +457,45 @@ function surfaceDetail(): SurfaceDetail {
     const v = 128 + (n - 0.5) * 46;
     return [v, v, v];
   });
+  // ...PLUS THE PEEL ITSELF. This is the term the closeup note was actually
+  // missing, and it is worth being precise about how much was missing. The flow
+  // alone is a 36-texel wave of 0.09 amplitude; Sobel it at strength 0.42 and
+  // multiply by the old COAT_NORMAL_SCALE of 0.055 and the coat's peak tangent
+  // tilt was 0.08 DEGREES. The clearcoat normal map was, numerically, off.
+  //
+  // 256 px over a 588 mm tile is 2.3 mm per texel, so an 8-texel cell is a
+  // ~19 mm dimple — orange peel at Nintendo scale, coarse enough that a
+  // reflected horizon visibly ripples instead of dissolving. It is composited
+  // ON the flow rather than replacing it, and it goes into the HEIGHT before
+  // the Sobel so both frequencies share one slope field and therefore one
+  // Toksvig bake: whatever mips away becomes coat roughness instead of sparkle.
+  // With the scale below the peak tilt is ~1.7 deg, i.e. twenty times what the
+  // coat had. (The long flow now contributes little to the NORMAL; it still
+  // carries the coat's roughness hazes and the chrome's polish bake, which is
+  // where it was always doing the work.)
+  {
+    const dimple = canvas(C);
+    fbmFill(dimple, 0, 0, C, C, 0.12, 2, 5507, (n) => {
+      const v = 128 + (n - 0.5) * 110;
+      return [v, v, v];
+    });
+    flow.globalAlpha = 0.45;
+    flow.drawImage(dimple.canvas, 0, 0);
+    flow.globalAlpha = 1;
+  }
   const flowSlope = heightSlope(flow, 0.42);
   const coatNormal = tex(slopeToNormal(flowSlope, C, C), false, COAT_REPEAT);
-  // Coat roughness 0.035..0.11 in soft panel-sized hazes — the crown of a
-  // bonnet stays near-mirror, the flanks haze off.
+  // Coat roughness 0.026..0.086 in soft panel-sized hazes — the crown of a
+  // bonnet stays near-mirror, the flanks haze off. Tightened about 25% off
+  // round 6: a clearcoat at 0.11 spreads the sun's 1.1 deg disc over ~12 deg of
+  // panel, which is a sheen, not a highlight. §4 asks for clearcoatRoughness
+  // 0.06; this brackets it instead of sitting above it.
   const crough = canvas(C);
   fbmFill(crough, 0, 0, C, C, 0.010, 3, 8123, (n) => {
-    const v = Math.round((0.035 + n * 0.075) * 255);
+    const v = Math.round((0.026 + n * 0.060) * 255);
     return [v, v, v];
   });
-  const coatRough = toksvigTexture(crough, flowSlope, COAT_NORMAL_SCALE, COAT_REPEAT, true, 0.03);
+  const coatRough = toksvigTexture(crough, flowSlope, COAT_NORMAL_SCALE, COAT_REPEAT, true, 0.026);
 
   // ---- moulded plastic ---------------------------------------------------
   const grain = canvas(S);
@@ -460,12 +526,22 @@ function surfaceDetail(): SurfaceDetail {
   // so the highlight running along a bumper is interrupted several times per
   // its own width. Chrome does not look polished because it is uniformly
   // smooth; it looks polished because it is ALMOST uniformly smooth.
+  //
+  // ROUND 7: the range moves off 0.08..0.24 to 0.13..0.32, and that is the
+  // bumper note, not a taste change. The front rub strip is a 1 m metalness-1
+  // bar aimed at a golden-hour horizon whose radiance is above 1.0 linear
+  // BEFORE the key and the bloom get to it. At roughness 0.08 it returns that
+  // horizon nearly mirror-sharp over its whole length, clips, blooms, and
+  // arrives as the unbroken white-and-blue tube the review called a lightsaber.
+  // §4's "chrome 0.15" is a centre, not a floor: 0.13..0.32 still brackets it,
+  // and the extra spread is what turns one clipped bar into a rolled highlight
+  // with tarnish either side of it. Paired with a 0.72x cut in `ENV_TARGET`.
   const chr = canvas(C);
   fbmFill(chr, 0, 0, C, C, 0.045, 3, 6611, (n) => {
-    const v = Math.round((0.08 + n * 0.16) * 255);
+    const v = Math.round((0.13 + n * 0.19) * 255);
     return [v, v, v];
   });
-  const chromeRough = toksvigTexture(chr, flowSlope, COAT_NORMAL_SCALE, COAT_REPEAT, true, 0.075);
+  const chromeRough = toksvigTexture(chr, flowSlope, CHROME_NORMAL_SCALE, COAT_REPEAT, true, 0.12);
 
   // ---- race-suit cloth ---------------------------------------------------
   // The driver shared the moulded-plastic family in round 1, so the suit, the
@@ -539,9 +615,25 @@ const ENV_TARGET = {
   // 0.95 is the honest ceiling; `PAINT_ENV_RESPONSE` below does the rest, and
   // it does it in chroma rather than in energy so the highlight is untouched.
   paint: 0.95,
-  chrome: 1.55,
+  // 1.55 -> 1.12. A metalness-1 surface at 1.55 is returning 155% of the
+  // radiance in the probe, and the probe's horizon band at 14 deg elevation is
+  // already superwhite. The front rub strip is the worst case in the game for
+  // that (a metre of near-cylinder pointed straight at the low sun) and it is
+  // the shot the review called a lightsaber. 1.12 keeps chrome the brightest
+  // material on the kart — §2 explicitly wants chrome highlights to clip and
+  // bloom — while leaving the CORE of the highlight to clip rather than the
+  // whole bar. The roll bar and the exhaust stacks were never the problem and
+  // they still read as mirrors; they curve, so they only ever show the horizon
+  // along a line.
+  chrome: 1.12,
   plastic: 0.55,
-  wheel: 0.95,
+  // 0.95 -> 0.72. See the wheel atlas: the tyre reading tan is an ALBEDO fault
+  // and it is fixed there, not here. But 0.95 was still wrong on its own terms —
+  // rubber is a dielectric with an F0 near 0.05, and at a roughness of 0.62-0.92
+  // its specular is supposed to be a broad, dim sheen rather than a mirror of a
+  // sunset. 0.72 is where the flank sheen band survives without the tyre picking
+  // up a hue from the sky it is standing under.
+  wheel: 0.72,
   glass: 2.2,
   character: 0.70,
   // The distant kart is one merged surface standing in for six, so its env
@@ -566,12 +658,30 @@ const ENV_TARGET = {
  * the minimap all identify racers by roster colour, and `#ff3b5c` (Vela) drifted
  * far enough toward magenta to start colliding with `#8b5cf6` (Onyx) and
  * `#e8456b` (Cinder) — three of the eight, unreadable at minimap dot size.
+ *
+ * ROUND 7 — THE ENERGY RAMP IS INVERTED, AND THAT IS THE LACQUER NOTE.
+ *
+ * The docblock above says the fix "does it in chroma rather than in energy so
+ * the highlight is untouched". The numbers did not: faceScale 1.0 / grazeScale
+ * 0.72 is a ramp that DIMS the reflection as the surface turns away, which is
+ * the exact opposite of Fresnel. Every dielectric coat on earth goes from ~4%
+ * reflectance head-on to 100% at grazing, and that ramp is the single strongest
+ * cue the eye uses to tell lacquer from unglazed clay. Suppressing it is why
+ * the closeup shows a flat pale veil across the rear fender crown (a head-on
+ * panel taking the sky at full strength) and no bright coat edge anywhere on a
+ * silhouette (a grazing panel taking it at 72%). Terracotta, precisely.
+ *
+ * So: 0.82 head-on, 1.30 at grazing. Total energy over a curved panel is
+ * roughly unchanged — it is redistributed from the middle, where it was
+ * washing the pigment out, to the edges, where a coat belongs. The chroma
+ * clamp that actually fixed the iridescence is untouched (and pulled a little
+ * harder at grazing, which is now the brighter end).
  */
 const PAINT_ENV_RESPONSE = {
-  faceScale: 1.0,
-  grazeScale: 0.72,
+  faceScale: 0.82,
+  grazeScale: 1.30,
   faceChroma: 0.45,
-  grazeChroma: 0.30,
+  grazeChroma: 0.26,
   power: 3.0,
 } as const;
 
@@ -600,7 +710,77 @@ export function syncKartEnv(sceneEnvIntensity: number) {
   }
   if (_heroPaint) _heroPaint.envMapIntensity = envFor('paint');
   if (_impostor) _impostor.envMapIntensity = envFor('impostor');
+  for (const m of _gripArms) m.envMapIntensity = envFor('character');
   for (const l of _liveries.values()) l.decalMat.envMapIntensity = envFor('paint');
+}
+
+// --- driver arm grip skin ----------------------------------------------------
+//
+// THE HANDS MUST BE ON THE RIM AT EVERY STEERING ANGLE, AND THEY WERE NOT.
+//
+// Driver.ts derives the whole glove from RIM_R — palm outboard of the rim,
+// finger roll inboard, thumb along the tangent — so at REST the grip is exact
+// and built by construction. Then the rig turned the wheel by -steer * 0.85 and
+// the arms (one rigid mesh) by -steer * 0.22, both about the column axis. At
+// full lock that is 0.63 rad of relative rotation on a 155 mm rim: the hands
+// slide 98 mm around the wheel and end up beside it. Every review shot with any
+// steering in it therefore shows two pale blocks floating next to a rim, which
+// is exactly what the closeup note reports — and no amount of modelling the
+// hand better can fix a rig that moves it off the thing it is holding.
+//
+// The arm cannot simply ride the wheel node instead: the shoulder is 0.35 m off
+// the column axis, so 0.85 rad there would tear the deltoid out of the torso.
+// What is wanted is a two-bone limb — shoulder fixed, wrist on the rim, elbow
+// solved between them — and the cheapest honest version of that on a mesh this
+// small is a one-bone linear blend skin. Each vertex carries `aGrip` (0 at the
+// deltoid, 1 at the glove, ramped across the forearm) and the vertex shader
+// rotates it about the column axis by `uGrip * aGrip`. `uGrip` is set to the
+// wheel node's own rotation, so aGrip == 1 IS the rim's frame: the grip is
+// attached by construction again, and stays attached through full lock.
+//
+// Cost: one extra mat2 and a sin/cos on ~900 vertices per kart. No extra draw
+// call — the arms were always their own mesh — but the uniform has to be per
+// driver, so each rig gets a clone of the shared character material. Clones
+// share one program (same cache key), so this is eight uniform blocks, not
+// eight shader compiles.
+const _gripArms: THREE.MeshStandardMaterial[] = [];
+
+export interface GripArmMaterial {
+  material: THREE.MeshStandardMaterial;
+  /** Set to the steering wheel node's `rotation.y` every frame. */
+  angle: { value: number };
+}
+
+export function gripArmMaterial(): GripArmMaterial {
+  const m = kartMaterials().character.clone();
+  const angle = { value: 0 };
+  m.onBeforeCompile = (shader) => {
+    shader.uniforms.uGrip = angle;
+    shader.vertexShader = `uniform float uGrip;\nattribute float aGrip;\n${shader.vertexShader}`
+      // The rotation is about the mesh's local +Y, which is the steering column
+      // axis: Driver.ts bakes the arms into the column frame for exactly this.
+      // mat2(c,s,-s,c) is column-major, so this is the same (x,z) map three
+      // applies for Object3D.rotation.y — the two cannot drift apart.
+      .replace(
+        '#include <beginnormal_vertex>',
+        `#include <beginnormal_vertex>
+        float gA = uGrip * aGrip;
+        float gC = cos( gA ), gS = sin( gA );
+        mat2 gRot = mat2( gC, - gS, gS, gC );
+        objectNormal.xz = gRot * objectNormal.xz;`,
+      )
+      .replace(
+        '#include <begin_vertex>',
+        `#include <begin_vertex>
+        transformed.xz = gRot * transformed.xz;`,
+      );
+  };
+  // Without this every clone would hash to the stock MeshStandardMaterial key
+  // and three would hand them a program compiled from the UNPATCHED source.
+  m.customProgramCacheKey = () => 'kartGripArm';
+  m.envMapIntensity = envFor('character');
+  _gripArms.push(m);
+  return { material: m, angle };
 }
 
 // --- wheel atlas -------------------------------------------------------------
@@ -619,6 +799,36 @@ export function syncKartEnv(sceneEnvIntensity: number) {
 // and smeared into itself, and there was no polished contact band at all. All
 // of that is authored below; the reason none of it *showed* is that the whole
 // wheel was lit with envMapIntensity 1.0 x a 0.40 global (see ENV_TARGET).
+//
+// ---------------------------------------------------------------------------
+// ROUND 7: "TAN / CARDBOARD BROWN". The tyre is not picking up the sky — the
+// sky's DIFFUSE contribution is globally scaled to 0.115 by the sky system, so
+// on a 0.2-albedo surface it is worth about a percent. The khaki was authored
+// here, in three coats of dust that were individually defensible and together
+// added up to a rendered albedo around #4a443c:
+//
+//   sidewall dust gradient   #c9a97e at 16% (bead) rising to 22% (shoulder)
+//   tread groove grime       up to rgb(80,78,74) at 25%
+//   tread valley dust        #c9a97e at up to 28%
+//
+// Composite those over a #26282e carcass and the flank comes out at roughly
+// (74,68,64) — a warm mid-grey — and a warm #ffd9a8 key at intensity 4.2 then
+// takes the lit face to about (130,115,95). That is cardboard, and it is what
+// the review measured. The dust is not deleted (a racing tyre is not clean and
+// §6 asks for surface-keyed dirt): it is cut to roughly a third, moved off the
+// block crowns that a revolution wipes clean, and cooled from a sand tan
+// (#c9a97e) toward a grey road film (#9d968a), which is what actually collects
+// on rubber. The carcass itself drops to the bible's carbon black.
+// ---------------------------------------------------------------------------
+
+/** Carcass rubber. §3 forbids pure #000; this is as dark as rubber may go. */
+const RUBBER_BASE = '#1a1b1f';
+/** Moulded block face — slightly lifted off the carcass so blocks read. */
+const RUBBER_BLOCK = '#232429';
+/** Groove floor: in shadow under the blocks, so darker still, never black. */
+const RUBBER_GROOVE = '#141519';
+/** Road film. Grey, not sand: this is brake dust and tarmac, not beach. */
+const DUST_R = 157, DUST_G = 150, DUST_B = 138;
 
 export const WHEEL_UV = {
   rimFace: [0.02, 0.02, 0.46, 0.235] as const,  // x,y,w,h in UV space
@@ -648,7 +858,7 @@ function wheelMaps() {
   // profile interpolates v from 0.575 to 0.620 across the shoulder quad, so it
   // walks straight through that gutter: a garbage highlight ring exactly where
   // the sidewall meets the tread, on the closest object to the camera all race.
-  alb.fillStyle = '#212328';
+  alb.fillStyle = RUBBER_BASE;
   alb.fillRect(0, 0, S, S);
   hgt.fillStyle = '#6a6a6a';
   hgt.fillRect(0, 0, S, S);
@@ -692,7 +902,7 @@ function wheelMaps() {
   const t = WHEEL_UV.tread;
   const tx0 = px(t[1]);
   const th = px(t[3]);
-  alb.fillStyle = '#181a1f';           // groove floor — dark, never #000
+  alb.fillStyle = RUBBER_GROOVE;       // groove floor — dark, never #000
   alb.fillRect(px(t[0]), tx0, px(t[2]), th);
   hgt.fillStyle = '#303030';
   hgt.fillRect(px(t[0]), tx0, px(t[2]), th);
@@ -705,7 +915,11 @@ function wheelMaps() {
       const y = tx0 + th * (0.06 + row * 0.31);
       const h = th * 0.26;
       const w = bw * (row === 1 ? 0.74 : 0.66);
-      const top = row === 1 ? '#33353e' : '#2d2f37';
+      // The centre row is the contact band. Rubber that has been scrubbed on
+      // tarmac is DARKER and glossier than moulded rubber, not lighter — round 6
+      // had the crown row as the lightest thing on the tyre, which is backwards
+      // and is half of why the tread read as one flat tan extrusion.
+      const top = row === 1 ? '#1c1d22' : RUBBER_BLOCK;
       // lo == the groove floor painted above, so the shoulder starts flush
       chamferedBlock(hgt, x, y, w, h, 10, 0x30, 0xdc);
       alb.fillStyle = top;
@@ -719,11 +933,13 @@ function wheelMaps() {
       }
     }
   }
-  // grime in the grooves so the tread is not uniformly clean
-  alb.globalAlpha = 0.25;
+  // grime in the grooves so the tread is not uniformly clean. 0.14, not 0.25,
+  // and a source that tops out at 52 rather than 80: this pass alone was
+  // lifting the whole tread band by ~15 levels of warm grey.
+  alb.globalAlpha = 0.14;
   fbmFillInto(alb, 0, tx0, S, th, 0.02, 3, 313, (n) => {
-    const v = Math.round(20 + n * 60);
-    return [v, v - 2, v - 6];
+    const v = Math.round(16 + n * 36);
+    return [v, v - 1, v - 4];
   });
   alb.globalAlpha = 1;
   // (the tread's dust is applied after the height field is complete — see the
@@ -733,10 +949,26 @@ function wheelMaps() {
   const sw = WHEEL_UV.sidewall;
   const sy = px(sw[1]);
   const sh = px(sw[3]);
-  alb.fillStyle = '#26282e';
+  alb.fillStyle = RUBBER_BASE;
   alb.fillRect(0, sy, S, sh);
   hgt.fillStyle = '#6a6a6a';
   hgt.fillRect(0, sy, S, sh);
+  // RADIAL RIBS — the fine vertical relief that runs up a real tyre's lower
+  // flank from the bead. The review asked for them by name and they are the
+  // cheapest sidewall cue there is: 88 ribs over the circumference at this
+  // radius is a ~23 mm pitch (≈11 texels), which survives every mip the wheel
+  // will ever be seen at, unlike the 9 mm knurl further out. Height only — a
+  // rib is relief, not a stripe, and painting it into the albedo as well is how
+  // a moulded feature starts reading as a printed one.
+  for (let i = 0; i < 88; i++) {
+    const x = (i / 88) * S;
+    const g = hgt.createLinearGradient(0, sy + sh * 0.06, 0, sy + sh * 0.40);
+    g.addColorStop(0.0, 'rgba(255,255,255,0)');
+    g.addColorStop(0.35, 'rgba(255,255,255,0.30)');
+    g.addColorStop(1.0, 'rgba(255,255,255,0)');
+    hgt.fillStyle = g;
+    hgt.fillRect(x, sy + sh * 0.06, S / 88 * 0.42, sh * 0.34);
+  }
   // Knurl band, moved OUT to the shoulder end of the flank (v 0.72-0.94). It
   // used to sit at 0.60-0.90, straight through the space the moulded lettering
   // needs once that lettering is clear of the bead AO — see below.
@@ -782,13 +1014,17 @@ function wheelMaps() {
       c.font = `900 ${big}px "Arial Black", Impact, system-ui, sans-serif`;
       // raised letters: a dark drop under a bright face reads as a moulded
       // edge once the Sobel gets hold of it
-      c.fillStyle = c === hgt ? '#3d3d3d' : '#17181c';
+      // Contrast raised against the new (much darker) carcass. On a #26282e
+      // flank a #54565f letter face was 12 levels of separation, which is gone
+      // by the second mip; on #1a1b1f at #6d707b it is 83, and the legend
+      // survives to the distance the pack shot is taken from.
+      c.fillStyle = c === hgt ? '#3d3d3d' : '#101116';
       c.fillText('SUNSET BAY', 0, 3);
-      c.fillStyle = c === hgt ? '#f6f6f6' : '#54565f';
+      c.fillStyle = c === hgt ? '#f6f6f6' : '#6d707b';
       c.fillText('SUNSET BAY', 0, 0);
       const small = fitText(c, 'GT 360/R • RADIAL', 26, slot * 0.80);
       c.font = `700 ${small}px "Arial Black", Impact, system-ui, sans-serif`;
-      c.fillStyle = c === hgt ? '#c8c8c8' : '#42444d';
+      c.fillStyle = c === hgt ? '#c8c8c8' : '#4e515b';
       c.fillText('GT 360/R • RADIAL', 0, 32);
       c.restore();
     }
@@ -806,10 +1042,16 @@ function wheelMaps() {
   bead.addColorStop(1, 'rgba(0,0,0,0.78)');
   alb.fillStyle = bead;
   alb.fillRect(0, sy, S, sh * 0.20);
+  // Road film on the flank. A THIRD of what it was, and grey instead of sand:
+  // 22% of #c9a97e over the mid-flank is not a dusty tyre, it is a beige tyre,
+  // and it is most of the "tan / cardboard brown" the review measured. What is
+  // left is a hint in the bead trough and a scuff at the kerb-struck shoulder,
+  // which is where a kart tyre actually carries dirt.
+  const film = `${DUST_R},${DUST_G},${DUST_B}`;
   const swDust = alb.createLinearGradient(0, sy, 0, sy + sh);
-  swDust.addColorStop(0.00, 'rgba(201,169,126,0.16)'); // bead, dust collects in it
-  swDust.addColorStop(0.55, 'rgba(201,169,126,0.02)');
-  swDust.addColorStop(1.00, 'rgba(201,169,126,0.22)'); // shoulder, kerb-scuffed
+  swDust.addColorStop(0.00, `rgba(${film},0.07)`); // bead, dust collects in it
+  swDust.addColorStop(0.55, `rgba(${film},0.01)`);
+  swDust.addColorStop(1.00, `rgba(${film},0.09)`); // shoulder, kerb-scuffed
   alb.fillStyle = swDust;
   alb.fillRect(0, sy, S, sh);
 
@@ -841,26 +1083,42 @@ function wheelMaps() {
     const band = alb.getImageData(0, ty, S, tH);
     const hb = hgt.getImageData(0, ty, S, tH).data;
     const ab = band.data;
-    const DR = 201, DG = 169, DB = 126; // the sand/stone dust of §3
+    const DR = DUST_R, DG = DUST_G, DB = DUST_B; // grey road film, not beach sand
     for (let y = 0; y < tH; y++) {
       // across the tread: 0 at the crown, 1 at either shoulder
       const across = Math.abs((y / tH) * 2 - 1);
-      const rim = 0.08 + 0.20 * across * across;
+      // 0.02 on the crown, 0.13 at the shoulder — a third of round 6, and the
+      // exponent on `depth` is now cubic rather than square so a block FACE
+      // (depth 0) keeps essentially none of it. The crown of a kart tyre is
+      // scrubbed clean by the road every revolution; the review's "cardboard"
+      // was a 5% flat film sitting on exactly the band that should be blackest.
+      const rim = 0.02 + 0.11 * across * across;
       for (let x = 0; x < S; x++) {
         const i = (y * S + x) * 4;
         // 1 on the groove floor, 0 on a block face
         let depth = (hb[i] - 0x38) / (0xd0 - 0x38);
         depth = 1 - (depth < 0 ? 0 : depth > 1 ? 1 : depth);
-        // Peaks at 0.28 in a shoulder groove and falls to 0.03 on the crown of a
-        // block, against round 3's flat 0.34 everywhere on the shoulder — so
-        // this is LESS total dust, arranged where dust can actually stay.
-        const a = rim * (0.35 + 0.65 * depth * depth);
+        const a = rim * (0.12 + 0.88 * depth * depth * depth);
         ab[i] += (DR - ab[i]) * a;
         ab[i + 1] += (DG - ab[i + 1]) * a;
         ab[i + 2] += (DB - ab[i + 2]) * a;
       }
     }
+    // POLISHED CONTACT BAND, in the albedo as well as the roughness. Scrubbed
+    // rubber goes dark and slightly blue-black; this is what makes the crown of
+    // the tyre read as "worn on tarmac" rather than as a lighter stripe. It runs
+    // last so it survives the dust pass above rather than being dusted over.
+    const crown = alb.createLinearGradient(0, ty + tH * 0.30, 0, ty + tH * 0.50);
+    crown.addColorStop(0.0, 'rgba(9,10,13,0.0)');
+    crown.addColorStop(1.0, 'rgba(9,10,13,0.34)');
     alb.putImageData(band, 0, ty);
+    alb.fillStyle = crown;
+    alb.fillRect(0, ty + tH * 0.30, S, tH * 0.20);
+    const crown2 = alb.createLinearGradient(0, ty + tH * 0.70, 0, ty + tH * 0.50);
+    crown2.addColorStop(0.0, 'rgba(9,10,13,0.0)');
+    crown2.addColorStop(1.0, 'rgba(9,10,13,0.34)');
+    alb.fillStyle = crown2;
+    alb.fillRect(0, ty + tH * 0.50, S, tH * 0.20);
   }
 
   // ---- rim face ----------------------------------------------------------
@@ -951,23 +1209,30 @@ function wheelMaps() {
   };
 
   zone(0, 0, S, S, 0.9, 0);
-  // Tread: 0.93 on the shoulders falling to 0.72 across the crown. Round 1 took
-  // the crown to 0.55, which made the CROWN the glossiest rubber on the wheel —
-  // glossier than the flank. That is backwards for reading: the flank is the
-  // part with a large smooth curvature facing the sky, so if the crown out-
-  // glosses it the tyre loses the long sheen band that says "torus" and reads
-  // as one extruded matte shape (round 2's note). The polished contact band is
-  // still there, it just no longer wins.
+  // THE POLARITY IS NOW THE PHYSICAL ONE: polished tread crown, matte flank.
+  //
+  // Round 6 ran the crown at 0.78 and the mid-flank at 0.62 — a tyre glossier
+  // on the moulded sidewall than on the band that has been ground against
+  // tarmac for three laps — and argued for it on the grounds that the flank
+  // sheen is what says "torus". It does say that, but it also says "vinyl", and
+  // combined with a tan albedo it is a large part of why the review read the
+  // tyres as cardboard rather than as rubber: the one band with a specular
+  // story was the one facing the camera with the wrong story.
+  //
+  // Crown 0.64, shoulders 0.93, flank 0.80-0.90. The "torus" read does not
+  // depend on the flank out-glossing the tread — the flank is a large smooth
+  // curve and it still carries a broad low-intensity sheen, which is exactly
+  // what §4 and the review both describe rubber as wanting. What it no longer
+  // does is out-shine the contact patch.
   roughRamp(0, tx0, S, th, 0, [
-    [0.00, 0.94], [0.16, 0.93], [0.34, 0.84], [0.50, 0.78], [0.66, 0.84], [0.84, 0.93], [1.00, 0.94],
+    [0.00, 0.94], [0.16, 0.92], [0.34, 0.74], [0.50, 0.64], [0.66, 0.74], [0.84, 0.92], [1.00, 0.94],
   ]);
-  // Sidewall: glossiest at the mid-flank (0.58), where a real tyre's moulded
-  // rubber is unscuffed and slightly waxy, dulling to 0.66 at the bead and 0.86
-  // at the kerb-rashed shoulder. Same v orientation as the bead AO above — low
-  // v is the rim end. That mid-flank band is what catches the low sun as a
-  // curved highlight running round the wheel.
+  // Sidewall: matte moulded rubber. Slightly waxy at the mid-flank (0.80) where
+  // it is unscuffed, dulling to 0.86 in the bead trough and 0.93 at the
+  // kerb-rashed shoulder. Same v orientation as the bead AO above — low v is
+  // the rim end.
   roughRamp(0, sy, S, sh, 0, [
-    [0.00, 0.68], [0.22, 0.64], [0.46, 0.62], [0.72, 0.74], [1.00, 0.88],
+    [0.00, 0.86], [0.22, 0.83], [0.46, 0.80], [0.72, 0.86], [1.00, 0.93],
   ]);
   zone(rx, ry, rw, rh, 0.30, 1);
   zone(0, px(nb[1]), S, px(nb[3]), 0.10, 1);
@@ -980,14 +1245,22 @@ function wheelMaps() {
   // map. Two passes now, at different scales for the same reason the lacquer
   // runs two lobes — a broad worn/unworn patchiness round the circumference
   // (kart tyres do not wear evenly) under a finer kerb-and-gravel scuff — and
-  // together they swing roughness by about 0.28. §9.3 asks for spatially
+  // together they swing roughness by about 0.20. §9.3 asks for spatially
   // varying roughness; this is the tyre's share of it.
-  orm.globalAlpha = 0.55;
-  fbmFillInto(orm, 0, tx0, S, th, 0.012, 2, 4021, (n) => [255, Math.round(150 + n * 105), 0]);
-  orm.globalAlpha = 0.40;
-  fbmFillInto(orm, 0, tx0, S, th, 0.05, 3, 1207, (n) => [255, Math.round(165 + n * 90), 0]);
-  orm.globalAlpha = 0.40;
-  fbmFillInto(orm, 0, sy, S, sh, 0.025, 3, 4409, (n) => [255, Math.round(160 + n * 90), 0]);
+  //
+  // The two TREAD alphas came down from 0.55/0.40 to 0.28/0.22 when the ramp
+  // above was re-polarised. `fbmFillInto` composites toward an ABSOLUTE source,
+  // so a 0.55-alpha pass whose source averages 0.79 drags a 0.64 crown to 0.72
+  // and simply erases the polished contact band the ramp exists to author. At
+  // 0.28 the crown lands near 0.67 and the shoulder near 0.87 — the same ±0.09
+  // of local variation, applied as a modulation of the ramp rather than as a
+  // replacement for it.
+  orm.globalAlpha = 0.28;
+  fbmFillInto(orm, 0, tx0, S, th, 0.012, 2, 4021, (n) => [255, Math.round(128 + n * 105), 0]);
+  orm.globalAlpha = 0.22;
+  fbmFillInto(orm, 0, tx0, S, th, 0.05, 3, 1207, (n) => [255, Math.round(140 + n * 90), 0]);
+  orm.globalAlpha = 0.34;
+  fbmFillInto(orm, 0, sy, S, sh, 0.025, 3, 4409, (n) => [255, Math.round(178 + n * 72), 0]);
   orm.globalAlpha = 0.4;
   fbmFillInto(orm, rx, ry, rw, rh, 0.02, 3, 71, (n) => [255, Math.round(52 + n * 78), 255]);
   orm.globalAlpha = 1;

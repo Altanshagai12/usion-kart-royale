@@ -131,212 +131,365 @@ function clamp(v: number, lo: number, hi: number) {
 // --- item-box art -------------------------------------------------------------
 
 /**
- * Translucent lacquered cube with a gold "?" on every face.
+ * ============================================================================
+ *  THE ITEM BOX — a glass shell around a lit mark, not a printed cube
+ * ============================================================================
  *
- * The value range here is the whole job. Against a golden-hour sky the box is
- * lit from behind and read against the brightest thing in the frame, so an
- * albedo that starts near white has nowhere left to go: the key blows the lit
- * faces to paper, bloom eats the edges, and the cube stops being an object. The
- * previous gradient ran `#dff6ff → #ffe9c8` — 0.87 to 0.95 luma before a single
- * photon hit it — under a mirror clearcoat at `envMapIntensity 1.4`, with an
- * additive un-tone-mapped core burning through from inside.
+ * Round-1 note: "flat pale-cyan cubes with a printed '?' — no transmission, no
+ * refraction, no emissive, no env reflection, no iridescence, and hard
+ * unchamfered 90° cube edges that catch no specular at all."
  *
- * So: the glass is pitched down into the sea/sky end of the course palette
- * where it has three stops of headroom, the frame trim and the glyph keep the
- * hot values, and the two are far enough apart in value that the facets
- * separate under any exposure. Only the trim and the mark are allowed to bloom.
+ * Two of those are misdiagnosed and one is the whole problem, so it is worth
+ * being precise about which is which:
+ *
+ *  · **The edges are chamfered** and always were — `roundedBox(1.55, 0.26, 6)`,
+ *    a 26 cm fillet, 17% of the half-extent. Look at the crop and the corners
+ *    are visibly round. What is true is that the fillet *caught no highlight*,
+ *    and that is a material fact, not a geometry one: the roughness map's mean
+ *    put the effective gloss around 0.3 and `envMapIntensity` was **0.75**, so
+ *    the fillet returned a broad dull sheen instead of a tight swept line.
+ *    Geometry is therefore untouched (432 tris, one instanced draw — §8); the
+ *    material is rebuilt around roughness ≤ 0.14 and env at 2.2, which is what
+ *    actually lights an edge.
+ *
+ *  · **The '?' was a decal on the outer face, inside a printed inset frame.**
+ *    That is the real reason the boxes read as flat: every face carried a
+ *    complete little card — border, vignette, glyph — so the cube read as six
+ *    stickers rather than as one solid. Whatever the shading did afterwards was
+ *    fighting an albedo that had already drawn a 2D object. The frame is gone
+ *    entirely and the mark now lives on a **separate emissive inner shell**
+ *    that is seen *through* the glass, with its own rotation offset so the
+ *    glyph parallaxes against the facets. That parallax is the single strongest
+ *    "this is a solid volume" cue available, and it is free.
+ *
+ *  · **No transmission — deliberately, and this is a considered refusal.**
+ *    `MeshPhysicalMaterial.transmission` makes three.js run a *second opaque
+ *    scene pass* into a transmission render target and mip it, every frame, for
+ *    as long as one transmissive object is visible. Round 1 measured 37 fps
+ *    against a 60 fps budget (§8); spending a full extra scene pass on a 1.55 m
+ *    pickup would be buying a beauty note with the frame rate, which §8
+ *    forbids. What the note actually asks for — "the sky horizon shows in the
+ *    facets" — is *refraction of the environment*, and that is one extra PMREM
+ *    tap in the fragment shader: no pass, no target, no mip chain. So the glass
+ *    refracts the sky properly (`ior 1.45`, IOR-correct `refract()`, fresnel-
+ *    weighted) and the scene behind it is approximated by ordinary alpha, which
+ *    at this size and distance is visually indistinguishable and costs nothing.
+ *
+ *  · Iridescence, on the other hand, is a BRDF lobe with no extra pass, so it
+ *    is taken at full strength with a real thickness *map* — without one three
+ *    uses the range maximum uniformly and the film is a flat tint rather than
+ *    the blue→magenta shift across the faces the note is after.
+ * ============================================================================
  */
-function boxMaterial(ctx: Ctx): THREE.MeshPhysicalMaterial {
-  // 1024², not 256². The player drives *through* these, so they are inside the
-  // bible's "within 5 m" band (§4) every few seconds, and at 256 the glyph was
-  // being magnified roughly 4x past its native size — the single most obvious
-  // thing wrong with the box in the round-1 frame. One texture, ~5 MB with
-  // mips, shared by every instance.
-  const S = 1024;
+
+/**
+ * The glass shell: tint, spatially varying gloss, and the iridescent film's
+ * thickness ramp. No glyph, no frame, nothing that draws a picture on a face.
+ */
+function glassMaterial(ctx: Ctx): THREE.MeshPhysicalMaterial {
+  // 512², not 1024². The 1024 existed to resolve the glyph; with the glyph
+  // moved inside, everything left on this texture is a low-frequency gradient
+  // and a single hairline, which 512 carries past the point the box fills the
+  // screen. The 1024 is spent on the mark instead, where the detail is.
+  const S = 512;
   const p = pad(S);
   const g = p.g;
-  // Sea-glass, keyed to `sea shallow #3fc9c4` and `sky-warm #ffd0a0`. Mid
-  // values, so the key light has somewhere to travel.
+
+  // Sea-glass, keyed to `sea shallow #3fc9c4` and `sky-warm #ffd0a0` (§3).
+  // Pitched dark on purpose: this is a *transparent shell* at 0.62 alpha whose
+  // apparent colour comes mostly from the env reflection, the refracted sky and
+  // the film. An albedo with any weight in it turns all three into a wash.
   const grd = g.createLinearGradient(0, 0, S, S);
-  grd.addColorStop(0.0, '#6fd8d4');
-  grd.addColorStop(0.42, '#3fa8bc');
-  grd.addColorStop(0.74, '#7d86c8');
-  grd.addColorStop(1.0, '#d8a26a');
+  grd.addColorStop(0.00, '#3f9fa8');
+  grd.addColorStop(0.42, '#1f6d8c');
+  grd.addColorStop(0.74, '#43508f');
+  grd.addColorStop(1.00, '#8f5f3e');
   g.fillStyle = grd;
   g.fillRect(0, 0, S, S);
 
-  // Corner-to-centre falloff. A flat fill reads as a card whichever way the
-  // cube turns; a face that is darker at its edges reads as a pane with depth.
-  const vig = g.createRadialGradient(S * 0.5, S * 0.45, S * 0.05, S * 0.5, S * 0.5, S * 0.78);
-  vig.addColorStop(0, 'rgba(210,255,255,0.42)');
-  vig.addColorStop(0.55, 'rgba(120,190,205,0.0)');
-  vig.addColorStop(1, 'rgba(18,58,78,0.5)');
+  // Corner-to-centre falloff — a pane with depth rather than a flat card.
+  const vig = g.createRadialGradient(S * 0.46, S * 0.40, S * 0.04, S * 0.5, S * 0.5, S * 0.80);
+  vig.addColorStop(0.00, 'rgba(160,235,248,0.30)');
+  vig.addColorStop(0.58, 'rgba(60,140,165,0.0)');
+  vig.addColorStop(1.00, 'rgba(6,30,46,0.62)');
   g.fillStyle = vig;
   g.fillRect(0, 0, S, S);
 
-  // inset frame — reads as a bevelled pane rather than a painted decal. This
-  // is one of the two things allowed to clip: a hot thin line against a mid
-  // face is what draws the eye from 60 m.
-  g.strokeStyle = 'rgba(255,244,214,0.95)';
-  g.lineWidth = S * 0.035;
-  g.strokeRect(S * 0.085, S * 0.085, S * 0.83, S * 0.83);
-  g.strokeStyle = 'rgba(14,52,70,0.55)';
-  g.lineWidth = S * 0.016;
-  g.strokeRect(S * 0.145, S * 0.145, S * 0.71, S * 0.71);
-
-  // the mark
-  g.font = `900 ${S * 0.62}px "SF Pro Display", system-ui, sans-serif`;
-  g.textAlign = 'center';
-  g.textBaseline = 'middle';
-  g.lineJoin = 'round';
-  // Two-pass outline: a wide dark keyline that survives bloom, then a thin
-  // warm one inside it. At 256 the wide stroke alone was all that resolved and
-  // the glyph read as a soft brown smudge.
-  g.lineWidth = S * 0.095;
-  g.strokeStyle = '#4a2404';
-  g.strokeText('?', S * 0.5, S * 0.55);
-  g.lineWidth = S * 0.042;
-  g.strokeStyle = '#8c4a10';
-  g.strokeText('?', S * 0.5, S * 0.55);
-  const q = g.createLinearGradient(0, S * 0.2, 0, S * 0.85);
-  q.addColorStop(0, '#fff6d8');
-  q.addColorStop(0.45, '#ffd45c');
-  q.addColorStop(1, '#f09520');
-  g.fillStyle = q;
-  g.fillText('?', S * 0.5, S * 0.55);
-
-  // Glass sweep. A single diagonal band of near-specular white across the pane,
-  // clipped to the inside of the frame. It is what makes a flat quad read as
-  // something with a surface between you and the mark.
-  g.save();
-  g.beginPath();
-  g.rect(S * 0.145, S * 0.145, S * 0.71, S * 0.71);
-  g.clip();
-  const sweep = g.createLinearGradient(S * 0.1, S * 0.75, S * 0.72, S * 0.05);
-  sweep.addColorStop(0.00, 'rgba(255,255,255,0)');
-  sweep.addColorStop(0.44, 'rgba(255,255,255,0)');
-  sweep.addColorStop(0.52, 'rgba(238,252,255,0.30)');
-  sweep.addColorStop(0.58, 'rgba(255,255,255,0)');
-  sweep.addColorStop(1.00, 'rgba(255,255,255,0)');
-  g.fillStyle = sweep;
-  g.fillRect(0, 0, S, S);
-  g.restore();
+  // One hairline, sitting exactly on the fillet seam. `roundedBox` leaves the
+  // flat core spanning |coord| <= h - r, i.e. uv 0.17 .. 0.83, so this lands on
+  // the crease where the face turns into the chamfer and reads as the edge of
+  // a ground pane. It replaces the two-stroke inset frame, which was the thing
+  // making every face read as its own little card.
+  g.strokeStyle = 'rgba(214,248,255,0.5)';
+  g.lineWidth = S * 0.010;
+  g.strokeRect(S * 0.17, S * 0.17, S * 0.66, S * 0.66);
 
   // --- roughness -----------------------------------------------------------
-  // §4: "Roughness must vary spatially. A constant roughness value reads as
-  // plastic and is the #1 tell of an amateur real-time scene." The pane is
-  // polished glass, the frame trim is brushed metal-ish, the glyph's raised
-  // outline is matte lacquer — three different responses to the same key.
+  // §4: roughness must vary spatially. Polished toward the key's hot spot,
+  // slightly frosted out at the chamfer — a real ground-glass edge is never as
+  // polished as the face it borders, and the variation is what stops the whole
+  // cube returning one identical sky.
   const rp = pad(S >> 1);
   const rg = rp.g;
   const R = rp.size;
-  rg.fillStyle = '#3d3d3d';                              // pane: glossy
-  rg.fillRect(0, 0, R, R);
-  const rgrd = rg.createRadialGradient(R * 0.42, R * 0.36, R * 0.02, R * 0.5, R * 0.5, R * 0.8);
-  rgrd.addColorStop(0, '#242424');                       // polished toward the hot spot
-  rgrd.addColorStop(1, '#5a5a5a');                       // duller at the edges
+  const rgrd = rg.createRadialGradient(R * 0.42, R * 0.34, R * 0.02, R * 0.5, R * 0.5, R * 0.82);
+  rgrd.addColorStop(0.00, '#2e2e2e');   // 0.16 * 0.18 -> 0.029, near-mirror
+  rgrd.addColorStop(0.62, '#4e4e4e');
+  rgrd.addColorStop(1.00, '#e0e0e0');   // 0.16 * 0.88 -> 0.141, frosted crease
   rg.fillStyle = rgrd;
   rg.fillRect(0, 0, R, R);
-  rg.strokeStyle = '#1e1e1e';                            // trim: near-mirror
-  rg.lineWidth = R * 0.035;
-  rg.strokeRect(R * 0.085, R * 0.085, R * 0.83, R * 0.83);
-  rg.font = `900 ${R * 0.62}px "SF Pro Display", system-ui, sans-serif`;
-  rg.textAlign = 'center';
-  rg.textBaseline = 'middle';
-  rg.lineJoin = 'round';
-  rg.lineWidth = R * 0.095;
-  rg.strokeStyle = '#a8a8a8';                            // glyph keyline: matte
-  rg.strokeText('?', R * 0.5, R * 0.55);
-  rg.fillStyle = '#7c7c7c';
-  rg.fillText('?', R * 0.5, R * 0.55);
-  const rghMap = padTexture(rp, false);
+  // a faint brushed streak so the highlight has structure to travel across
+  rg.globalAlpha = 0.28;
+  rg.strokeStyle = '#787878';
+  rg.lineWidth = R * 0.02;
+  for (let i = 0; i < 7; i++) {
+    rg.beginPath();
+    rg.moveTo(-R * 0.1, R * (i / 7) * 1.2 - R * 0.1);
+    rg.lineTo(R * 1.1, R * (i / 7) * 1.2 + R * 0.28);
+    rg.stroke();
+  }
+  rg.globalAlpha = 1;
+
+  // --- iridescent film thickness -------------------------------------------
+  // Sampled from `.g`, remapped into `iridescenceThicknessRange`. A diagonal
+  // ramp means the film runs the full 190 nm -> 720 nm sweep across each face,
+  // which is a blue -> gold -> magenta shift as the box turns. Without this map
+  // three clamps the film to the range maximum everywhere and iridescence is
+  // just a constant tint.
+  const ip = pad(128);
+  const ig = ip.g;
+  const I = ip.size;
+  const ird = ig.createLinearGradient(0, I, I, 0);
+  ird.addColorStop(0.00, '#000000');
+  ird.addColorStop(0.35, '#6a6a6a');
+  ird.addColorStop(0.70, '#d0d0d0');
+  ird.addColorStop(1.00, '#ffffff');
+  ig.fillStyle = ird;
+  ig.fillRect(0, 0, I, I);
 
   const m = new THREE.MeshPhysicalMaterial({
     map: padTexture(p, true),
-    roughnessMap: rghMap,
+    roughnessMap: padTexture(rp, false),
+    iridescenceThicknessMap: padTexture(ip, false),
     transparent: true,
-    // Near-opaque, and paired with `depthWrite` below. At 0.86 with no depth
-    // write, whichever instance the buffer happened to submit last won, so a
-    // box 20 m further down the row composited over the one in front of it and
-    // the whole group averaged to the milky wash the review picked up on.
-    opacity: 0.94,
-    // Not a mirror. A little roughness is what lets the facets take different
-    // amounts of key instead of all returning the same sky. The map above
-    // modulates this, so it is the ceiling rather than the value.
-    roughness: 1,
+    // Genuinely see-through now: the mark is a separate object *behind* this
+    // surface and has to read through it. 0.62 leaves the glass plenty of
+    // presence (its specular, env and film all survive the blend) while the
+    // glyph stays legible at racing distance.
+    opacity: 0.62,
+    // Ceiling, modulated down by the map above to 0.03 .. 0.14. This is the
+    // number that decides whether a 26 cm fillet returns a swept highlight or a
+    // dull sheen; at the old effective ~0.3 it could only ever be the latter.
+    roughness: 0.16,
     metalness: 0,
+    ior: 1.45,
+    // Thin-film. `iridescenceIOR` under the glass IOR keeps the shift in the
+    // blue->magenta half of the wheel rather than running the whole rainbow,
+    // which would drag colours the course palette does not contain (§3) across
+    // the most salient object on screen.
+    iridescence: 0.6,
+    iridescenceIOR: 1.30,
+    iridescenceThicknessRange: [190, 720],
     clearcoat: 1,
-    clearcoatRoughness: 0.08,
-    emissive: new THREE.Color(0x1d5566),
-    emissiveIntensity: 0.22,
-    // Grazing-angle rim, so the silhouette survives against a blown sky
-    // instead of dissolving into it. Pulled back from 1 now that an explicit
-    // fresnel term (below) does this job properly — the two stacked was two
-    // rims on the same edge.
-    sheen: 0.55,
-    sheenRoughness: 0.34,
+    clearcoatRoughness: 0.05,
+    emissive: new THREE.Color(0x11485c),
+    emissiveIntensity: 0.16,
+    // Grazing-angle lift on top of the explicit fresnel below. Cloth lobe, so
+    // it is tinted by the key and stays energy-conserving — it widens the rim
+    // without adding another un-exposed additive term (§6).
+    sheen: 0.4,
+    sheenRoughness: 0.36,
     sheenColor: new THREE.Color(0xbff2ff),
     // Front faces only. `DoubleSide` is the intuitive choice for glass and it is
     // what was flattening the cube: the six faces of one instance are submitted
     // in geometry order with no per-triangle depth sort, so a *back* face —
     // which at golden hour is the face the sun is behind, i.e. the brightest and
     // least informative one in the box — frequently composited on top of the
-    // near faces at 0.86 opacity and buried their shading. Whether the cube
-    // showed any facet separation at all came down to which way it happened to
-    // be spinning. Drawing only the near faces makes the three visible facets
-    // read the key honestly, and halves the transparent fragment cost of ~70
-    // instances while it is at it.
+    // near faces and buried their shading. Drawing only the near faces makes
+    // the three visible facets read the key honestly, and halves the
+    // transparent fragment cost of ~70 instances while it is at it.
     side: THREE.FrontSide,
-    // Writes depth. At 0.94 the shell is opaque enough that the usual reason to
-    // skip it — soft edges bleeding into each other — does not apply, and
-    // without it the transparent queue sorts *objects*, not the ~70 instances
-    // inside this one mesh, so box-behind-box ordering was decided by buffer
-    // index. The glow shell and the ground pool are both drawn ahead of it
-    // (lower `renderOrder`) so they are unaffected.
+    // Writes depth. Without it the transparent queue sorts *objects*, not the
+    // ~70 instances inside this one mesh, so box-behind-box ordering was decided
+    // by buffer index. With it, whichever of two overlapping boxes reaches the
+    // buffer first, the depth test resolves them the same way. The glow shell
+    // and the ground pool are drawn ahead of it (lower `renderOrder`) so they
+    // are unaffected; the mark shell is opaque and so is already ahead of the
+    // whole transparent queue.
     depthWrite: true,
   });
 
-  // --- fresnel rim ---------------------------------------------------------
-  // Sheen alone is a cloth lobe; it lifts the grazing angles a little but it is
-  // energy-conserving and tinted by the key, so against a blown golden-hour sky
-  // the silhouette still dissolved. This is an explicit view-dependent term
-  // added to emissive: the edge of the glass lights up regardless of what is
-  // behind it, which is the whole job of a rim on a translucent pickup.
+  // --- refraction + fresnel rim --------------------------------------------
   m.onBeforeCompile = (shader) => {
-    // Tight and confined to the silhouette. This feeds emissive, which is
-    // un-lit and un-exposed, so a broad term here is a free trip past the bloom
-    // threshold across a third of the cube — power 3 keeps it to the last few
-    // degrees of grazing angle, which is where a real glass edge lights up.
     shader.uniforms.uRimColor = { value: new THREE.Color(0x9fe8ff) };
     shader.uniforms.uRimPower = { value: 3.0 };
-    shader.uniforms.uRimStrength = { value: 0.9 };
+    shader.uniforms.uRimStrength = { value: 0.38 };
+    // 1 / ior. Air -> glass, so the ratio is inverted going in.
+    shader.uniforms.uEta = { value: 1 / 1.45 };
+    // Face-on gain is uRefract * envMapIntensity * 0.5 of sky radiance. Keeping
+    // that coefficient under 1 is necessary but NOT sufficient, which is how the
+    // box ended up as a white blob with an invisible "?" in r1-verify's hud and
+    // drift frames: the coefficient was read on its own, against an assumed sky
+    // of ~1. This sky is golden-hour and several units of linear radiance, and
+    // the refraction term is *added to emissive* — so it stacks on top of the
+    // 2.2 env reflection and the rim, all of it un-lit and all of it landing
+    // past the bloom threshold. 0.44 of a bright sky is not a tint, it is an
+    // emitter, and the shape it dissolved is the one this term exists to save.
+    // Sized now against the sum rather than the coefficient.
+    shader.uniforms.uRefract = { value: 0.24 };
     shader.fragmentShader = shader.fragmentShader
       .replace(
         '#include <common>',
         `#include <common>
 uniform vec3 uRimColor;
 uniform float uRimPower;
-uniform float uRimStrength;`,
+uniform float uRimStrength;
+uniform float uEta;
+uniform float uRefract;`,
       )
       .replace(
         '#include <emissivemap_fragment>',
         // `normal` (not the raw `vNormal` varying) is the shading normal after
-        // <normal_fragment_begin>, so the rim follows the fillet's interpolated
-        // curvature — which is the whole point of chamfering the edges.
+        // <normal_fragment_begin>, so both terms follow the fillet's
+        // interpolated curvature — which is the whole point of the chamfer.
         `#include <emissivemap_fragment>
 {
-  float rimF = 1.0 - saturate( abs( dot( normal, normalize( vViewPosition ) ) ) );
-  totalEmissiveRadiance += uRimColor * pow( rimF, uRimPower ) * uRimStrength;
+  vec3 vDir = normalize( vViewPosition );
+  float ndv = saturate( abs( dot( normal, vDir ) ) );
+  float fres = pow( 1.0 - ndv, 5.0 );
+
+  #if defined( USE_ENVMAP ) && defined( ENVMAP_TYPE_CUBE_UV )
+  // The sky, bent through the glass. This is what the "the sky horizon shows
+  // in the facets" note is actually asking for, and unlike real transmission
+  // it is one PMREM tap rather than a second scene pass (see the header).
+  // Weighted by (1 - fresnel) because at grazing angles a dielectric reflects
+  // rather than transmits — which is exactly when the rim below takes over, so
+  // the two hand off to each other instead of stacking.
+  vec3 refr = refract( -vDir, normal, uEta );
+  if ( dot( refr, refr ) > 0.0 ) {
+    // transformDirectionByInverseViewMatrix + envMapRotation is exactly what
+    // getIBLRadiance does; matching it means the refracted sky and the reflected
+    // sky agree about which way the world is facing, which matters because the
+    // sky system is free to rotate its PMREM.
+    vec3 worldRefr = transformDirectionByInverseViewMatrix( refr, viewMatrix );
+    vec3 sky = textureCubeUV( envMap, envMapRotation * worldRefr, roughnessFactor ).rgb;
+    totalEmissiveRadiance += sky * envMapIntensity * uRefract * ( 1.0 - fres ) * 0.5;
+  }
+  #endif
+
+  // Explicit view-dependent rim. Power 3 keeps it to the last few degrees of
+  // grazing angle — this feeds emissive, which is un-lit, so a broad term is a
+  // free trip past the bloom threshold across a third of the cube (§6).
+  totalEmissiveRadiance += uRimColor * pow( 1.0 - ndv, uRimPower ) * uRimStrength;
 }`,
       );
   };
   // One material, one program — but be explicit so a future variant does not
   // silently share this one's compiled shader.
-  m.customProgramCacheKey = () => 'itembox-fresnel';
+  m.customProgramCacheKey = () => 'itembox-glass-v2';
 
+  if (ctx.envMap) m.envMap = ctx.envMap;
+  // High on purpose — but not this high. The shell's job is to hold a
+  // recognisable piece of the golden-hour sky in every facet; §2's "clip to
+  // white and bloom" is about *highlights*, not about the whole face. At 0.75
+  // the facets returned a grey suggestion of the sky and the box read as
+  // plastic; at 2.2 every facet clipped at once and the box read as a white
+  // blob with no "?" in it at all, which is worse — a plastic box is at least
+  // an item box. 1.2 keeps the sky in the facets and leaves the mark visible.
+  m.envMapIntensity = 1.2;
+  return m;
+}
+
+/**
+ * The mark: an opaque shell *inside* the glass carrying an emissive "?".
+ *
+ * Opaque and drawn in the ordinary opaque queue, so it is on screen and in the
+ * depth buffer before any transparent geometry is considered — the glass then
+ * simply blends over it, in the right order, every time, with no per-instance
+ * sorting to get wrong. It is also what makes the glyph *behind* a surface
+ * rather than printed on one: as the two shells rotate at different rates the
+ * mark slides against the facets, and that parallax is the cue that reads as
+ * volume from 60 m.
+ */
+function markMaterial(ctx: Ctx): THREE.MeshStandardMaterial {
+  const S = 1024;
+  const p = pad(S);
+  const g = p.g;
+
+  // Body: deep, so the glyph has three stops of separation and the shell reads
+  // as a dark core suspended in the glass rather than as a second white cube.
+  const body = g.createLinearGradient(0, 0, S, S);
+  body.addColorStop(0.00, '#123a4a');
+  body.addColorStop(0.55, '#0c2534');
+  body.addColorStop(1.00, '#1b2a4a');
+  g.fillStyle = body;
+  g.fillRect(0, 0, S, S);
+
+  // The mark. Bigger than the old decal (0.72 of the face against 0.62) because
+  // the shell it sits on is 0.62 of the box, so on-screen the glyph comes out
+  // the same size it was — the difference is that it is now behind glass.
+  const drawGlyph = (c: CanvasRenderingContext2D, size: number, fill: string | CanvasGradient) => {
+    c.font = `900 ${size * 0.72}px "SF Pro Display", system-ui, sans-serif`;
+    c.textAlign = 'center';
+    c.textBaseline = 'middle';
+    c.lineJoin = 'round';
+    c.lineWidth = size * 0.085;
+    c.strokeStyle = '#4a2404';
+    c.strokeText('?', size * 0.5, size * 0.54);
+    c.fillStyle = fill;
+    c.fillText('?', size * 0.5, size * 0.54);
+  };
+  const q = g.createLinearGradient(0, S * 0.16, 0, S * 0.88);
+  q.addColorStop(0.00, '#fff6d8');
+  q.addColorStop(0.45, '#ffd45c');
+  q.addColorStop(1.00, '#f09520');
+  drawGlyph(g, S, q);
+
+  // --- emissive: the glyph only --------------------------------------------
+  // Black body, lit mark. This is what "reads through the glass" means: the
+  // shell is shaded normally and receives the key like everything else, and the
+  // one thing that emits is the symbol. An emissive whole shell would have been
+  // a lamp in a box and would have bloomed the glass into the milky wash the
+  // review picked up on in round 1.
+  const ep = pad(S >> 1);
+  const eg = ep.g;
+  eg.fillStyle = '#000000';
+  eg.fillRect(0, 0, ep.size, ep.size);
+  drawGlyph(eg, ep.size, '#ffd98a');
+
+  // --- roughness ------------------------------------------------------------
+  // Matte lacquer body, glossier glyph — two distinct responses to the same key
+  // inside a single object (§4).
+  const rp = pad(S >> 2);
+  const rg = rp.g;
+  rg.fillStyle = '#c8c8c8';
+  rg.fillRect(0, 0, rp.size, rp.size);
+  const rv = rg.createRadialGradient(
+    rp.size * 0.5, rp.size * 0.45, rp.size * 0.05,
+    rp.size * 0.5, rp.size * 0.5, rp.size * 0.8,
+  );
+  rv.addColorStop(0, '#8c8c8c');
+  rv.addColorStop(1, '#e4e4e4');
+  rg.fillStyle = rv;
+  rg.fillRect(0, 0, rp.size, rp.size);
+  drawGlyph(rg, rp.size, '#4a4a4a');
+
+  const m = new THREE.MeshStandardMaterial({
+    map: padTexture(p, true),
+    emissiveMap: padTexture(ep, true),
+    roughnessMap: padTexture(rp, false),
+    emissive: new THREE.Color(0xffc978),
+    // Tone-mapped, exposed, and kept under the bloom threshold on its own: the
+    // glass in front of it multiplies it by 0.62, so this is the value that
+    // arrives at ~0.8 through the shell — bright enough to be unmistakably lit,
+    // short of the point where three effects stacking whites the frame out (§6).
+    emissiveIntensity: 1.35,
+    roughness: 1,
+    metalness: 0.05,
+  });
   if (ctx.envMap) {
     m.envMap = ctx.envMap;
-    m.envMapIntensity = 0.75;
+    m.envMapIntensity = 0.9;
   }
   return m;
 }
@@ -354,11 +507,14 @@ export class Items implements IItems {
   private ctx!: Ctx;
 
   private boxMesh!: THREE.InstancedMesh;
+  /** the emissive "?" shell living inside the glass */
+  private markMesh!: THREE.InstancedMesh;
   private coreMesh!: THREE.InstancedMesh;
   private boxShadows!: BlobShadows;
   private boxGlow!: BlobShadows;
   private orbitMesh!: THREE.InstancedMesh;
   private boxMat!: THREE.MeshPhysicalMaterial;
+  private markMat!: THREE.MeshStandardMaterial;
   private coreMat!: THREE.MeshBasicMaterial;
   private env: THREE.Texture | null = null;
 
@@ -458,16 +614,19 @@ export class Items implements IItems {
       }
     }
 
-    this.boxMat = boxMaterial(ctx);
-    if (this.boxMat.map) {
-      this.boxMat.map.anisotropy = Math.min(8, ctx.renderer.capabilities.getMaxAnisotropy());
-    }
+    const aniso = Math.min(8, ctx.renderer.capabilities.getMaxAnisotropy());
+
+    this.boxMat = glassMaterial(ctx);
+    if (this.boxMat.map) this.boxMat.map.anisotropy = aniso;
     // seg 6, not 4. `roundedBox` subdivides uniformly and then projects
     // everything outside the inner core onto the fillet, so at seg 4 the only
     // ring outside the core was the outermost one: every rounded edge was a
     // *single* quad, which is a chamfer the shading cannot resolve into a
-    // highlight. Six puts two rings in the fillet and the edges start catching
-    // the key the way §5 asks for. 432 tris, one instanced draw.
+    // highlight. Six puts a full ring in the fillet with the seam landing on a
+    // grid line, so the interpolated normal sweeps cleanly from face to chamfer
+    // and the edge takes a highlight. 432 tris, one instanced draw — and it
+    // stays 432, because the round-1 note's "unchamfered" reading was a
+    // material problem, not a geometry one (see the art header above).
     const geo = roundedBox(BOX_SIZE, BOX_SIZE * 0.17, 6);
     this.boxMesh = new THREE.InstancedMesh(geo, this.boxMat, this.boxes.length);
     this.boxMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -475,6 +634,24 @@ export class Items implements IItems {
     this.boxMesh.frustumCulled = false;
     this.boxMesh.renderOrder = 4;
     this.boxMesh.name = 'item-boxes';
+
+    // The mark, inside. Opaque, so it renders in the ordinary opaque queue
+    // ahead of everything transparent and the glass simply blends over it.
+    // 0.62 of the shell puts it comfortably inside the 1.03 m flat core, so it
+    // can rotate independently without ever poking through a facet. 108 tris.
+    this.markMat = markMaterial(ctx);
+    if (this.markMat.map) this.markMat.map.anisotropy = aniso;
+    const markGeo = roundedBox(BOX_SIZE * 0.62, BOX_SIZE * 0.62 * 0.13, 3);
+    this.markMesh = new THREE.InstancedMesh(markGeo, this.markMat, this.boxes.length);
+    this.markMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.markMesh.castShadow = false;
+    this.markMesh.frustumCulled = false;
+    // `updateBoxes` sets this every frame; starting at 0 means the one frame
+    // between construction and the first update cannot show 70 unplaced shells
+    // stacked at the world origin. Unlike the glass, this one is opaque, so it
+    // would be an unmissable black brick if it ever did.
+    this.markMesh.count = 0;
+    this.markMesh.name = 'item-box-marks';
 
     // The glow. This used to be a core *inside* the cube, and with the shell now
     // writing depth at 0.94 an interior lamp is a lamp in a box: 94% of it is
@@ -485,11 +662,18 @@ export class Items implements IItems {
     // survives is a warm halo bleeding out past the edges. Against the sky that
     // is the "this is a pickup" read, and it is the same instanced mesh and the
     // same draw call it always was.
+    //
+    // Pulled back from 0.34 to 0.19. It was authored against a 0.94-opacity
+    // shell that hid most of it; the glass is now 0.62, so the same halo is
+    // read at nearly twice the strength through the box and was the milky wash
+    // sitting over the crop. At 0.19 it survives as a rim outside the
+    // silhouette — which is the only place it was ever doing any work — without
+    // desaturating the facets it is behind.
     this.coreMat = new THREE.MeshBasicMaterial({
       color: 0xffd9a0,
       map: radialSprite(64, 0.0, 2.1),
       transparent: true,
-      opacity: 0.34,
+      opacity: 0.19,
       blending: THREE.AdditiveBlending,
       depthWrite: false,
       toneMapped: false,
@@ -522,7 +706,9 @@ export class Items implements IItems {
       renderOrder: 1,
       name: 'item-box-glow',
     });
-    this.group.add(this.boxMesh, this.coreMesh, this.boxGlow.mesh, this.boxShadows.mesh);
+    this.group.add(
+      this.markMesh, this.boxMesh, this.coreMesh, this.boxGlow.mesh, this.boxShadows.mesh,
+    );
   }
 
   private buildOrbit() {
@@ -739,6 +925,11 @@ export class Items implements IItems {
       this.env = ctx.envMap;
       this.boxMat.envMap = this.env;
       this.boxMat.needsUpdate = true;
+      // The glass refracts the env in a hand-written chunk guarded on
+      // `USE_ENVMAP`, so gaining one has to recompile — `needsUpdate` above does
+      // that. The mark only reflects it.
+      this.markMat.envMap = this.env;
+      this.markMat.needsUpdate = true;
       const om = this.orbitMesh.material as THREE.MeshPhysicalMaterial;
       om.envMap = this.env;
       om.needsUpdate = true;
@@ -861,6 +1052,26 @@ export class Items implements IItems {
       _m.compose(_v2, _q, _s);
       this.boxMesh.setMatrixAt(live, _m);
 
+      // The mark, inside the glass, on its own clock.
+      //
+      // Same centre, near-enough the same attitude — a fixed 0.26 rad of yaw
+      // offset plus a slow relative wobble — so a "?" is always facing roughly
+      // where a facet is facing (it has to stay readable), but the two never
+      // line up. That mismatch is the whole point: as the box turns, the glyph
+      // slides against the facet in front of it, and *seeing a thing move
+      // behind a surface* is the cue that reads as a solid volume. A decal
+      // printed on the outer face can never produce it, which is why round 1's
+      // boxes read as six cards however they were shaded.
+      _e.set(
+        Math.sin(now * 0.7 + b.phase) * 0.22 + Math.sin(now * 0.41 + b.phase) * 0.13,
+        now * 1.15 + b.phase + 0.26,
+        Math.cos(now * 0.53 + b.phase * 1.3) * 0.18 - Math.sin(now * 0.37 + b.phase) * 0.11,
+      );
+      _q.setFromEuler(_e);
+      _s.setScalar(pop);
+      _m.compose(_v2, _q, _s);
+      this.markMesh.setMatrixAt(live, _m);
+
       // the halo counter-rotates and breathes — two motions, never in sync
       const pulse = 0.94 + Math.sin(now * 4.1 + b.phase * 2.1) * 0.10;
       _e.set(now * -0.9, now * 1.9 + b.phase, 0);
@@ -884,8 +1095,10 @@ export class Items implements IItems {
     }
 
     this.boxMesh.count = live;
+    this.markMesh.count = live;
     this.coreMesh.count = live;
     this.boxMesh.instanceMatrix.needsUpdate = true;
+    this.markMesh.instanceMatrix.needsUpdate = true;
     this.coreMesh.instanceMatrix.needsUpdate = true;
     this.boxShadows.end();
     this.boxGlow.end();
@@ -931,12 +1144,18 @@ export class Items implements IItems {
   dispose() {
     this.proj.dispose();
     this.boxMesh.geometry.dispose();
+    this.markMesh.geometry.dispose();
     this.coreMesh.geometry.dispose();
     this.orbitMesh.geometry.dispose();
     (this.orbitMesh.material as THREE.Material).dispose();
     this.boxMat.map?.dispose();
     this.boxMat.roughnessMap?.dispose();
+    this.boxMat.iridescenceThicknessMap?.dispose();
     this.boxMat.dispose();
+    this.markMat.map?.dispose();
+    this.markMat.emissiveMap?.dispose();
+    this.markMat.roughnessMap?.dispose();
+    this.markMat.dispose();
     this.coreMat.dispose();
     this.boxShadows.dispose();
     this.boxGlow.dispose();

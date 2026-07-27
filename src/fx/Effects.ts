@@ -55,12 +55,28 @@ const C_TIER = [
   new THREE.Color(0xff9d2e),
   new THREE.Color(0xc05cff),
 ];
+/**
+ * Authoring colour for anything emitted on a live tier CHANNEL. The particle
+ * stores only its intensity; `Particles.setChannelColor` supplies the hue every
+ * frame from the kart's current drift tier, so a promotion recolours the shower
+ * already in the air. See EmitParams.channel.
+ */
+const C_CHANNEL = new THREE.Color(1, 1, 1);
 const C_HOT = new THREE.Color(0xfff2d4);
 const C_FLAME_MID = new THREE.Color(0xff9a2e);
 const C_FLAME_COOL = new THREE.Color(0xc4331a);
 /** blue-white root of a boost flame — hotter and cooler-hued than C_HOT */
 const C_FLAME_ROOT = new THREE.Color(0xdcefff);
 const C_SMOKE = new THREE.Color(0xb9b4ac);
+/**
+ * Smoke torn off a tyre on TARMAC. Vaporised rubber and road binder is a cool
+ * light grey; `C_SMOKE` is a warm grey authored for dust, and warming it a
+ * further 42% toward the key put the drift cloud on exactly the hue of dry dirt
+ * — the review reads it as "driving through a dust cloud, not tyres tearing at
+ * tarmac". The sun side is warmed by the wrap-lighting term in Particles, which
+ * is where that warmth belongs: in the LIGHT, not in the albedo.
+ */
+const C_SMOKE_TARMAC = new THREE.Color(0xc4c6cf);
 // Old, cooled smoke. Nudged off the warm grey it used to be: a puff that has
 // stopped being lit by the exhaust is lit by the sky, and §2 puts the shadow
 // end of the grade on the cool side. It is the far end of the birth→death ramp,
@@ -767,17 +783,35 @@ void main() {
   // Along the plume: a soft shoulder off the stack mouth, then a long dissolve.
   float axial = pow(max(0.0, 1.0 - vU), 1.15) * smoothstep(0.0, 0.09, vU);
 
-  // Temperature. White-yellow at the root on the spine, cooling to orange and
-  // then to a deep ember red at the tip — art bible section 6.
-  float temp = clamp((1.0 - vU * 1.05) * (0.30 + 0.70 * spine), 0.0, 1.0);
-  vec3 ember = vec3(0.68, 0.13, 0.05);
-  vec3 mid   = vec3(1.00, 0.46, 0.10);
-  vec3 hot   = vec3(1.00, 0.94, 0.74);
-  vec3 rgb = mix(ember, mid, smoothstep(0.0, 0.52, temp));
-  rgb = mix(rgb, hot, smoothstep(0.46, 1.0, temp));
-  // The mini-turbo tier only ever tints the cool outer sheath — the core is
-  // combustion, it does not get to be purple.
-  rgb = mix(rgb, vTint, (1.0 - spine) * 0.30 * (1.0 - temp));
+  // TEMPERATURE — and this is where four rounds of "there is no flame in the
+  // boost frame" were actually decided.
+  //
+  // The old ramp topped out at vec3(1.00, 0.94, 0.74): a colour that is already
+  // 94% neutral before it is multiplied by an intensity of up to fourteen. Any
+  // ramp whose hot end is near-white produces a near-white core, and once that
+  // core has been through bloom the whole plume is a cream smear with no fire
+  // in it. The fix is not to dim the flame, it is to make the hot end a colour.
+  //
+  // Three authored stops, straight off the palette in art bible section 3:
+  //   C_FLAME_COOL #c4331a  deep ember, the dissolving tail
+  //   C_FLAME_MID  #ff9d2e  the body — this is what the flame *is*
+  //   C_FLAME_ROOT #dcefff  blue-white, and confined to a short kiss on the
+  //                         spine at the stack mouth, which is the only place
+  //                         combustion is genuinely that hot
+  vec3 ember = vec3(0.769, 0.200, 0.102);
+  vec3 mid   = vec3(1.000, 0.616, 0.180);
+  vec3 root  = vec3(0.863, 0.937, 1.000);
+  float temp = clamp((1.0 - vU * 1.15) * (0.28 + 0.72 * spine), 0.0, 1.0);
+  vec3 rgb = mix(ember, mid, smoothstep(0.0, 0.55, temp));
+  // The blue-white root. A hard, short window: gone by a tenth of the tongue.
+  float kiss = spine * (1.0 - smoothstep(0.0, 0.11, vU));
+  rgb = mix(rgb, root, kiss * 0.80);
+
+  // The mini-turbo tier owns the sheath and the tail — everything that is not
+  // the combusting spine. A mushroom boost and a tier-3 mini-turbo have to be
+  // distinguishable at a glance and 0.30 of a tint on the outermost fringe was
+  // not doing it.
+  rgb = mix(rgb, vTint, clamp((1.0 - spine) * 0.52 + vU * 0.30, 0.0, 0.72));
 
   float a = axial * (0.42 * body + 0.74 * spine);
   // Head-on two ribbons overlap, so back the alpha off a little or the crossing
@@ -787,7 +821,20 @@ void main() {
   if (a < 0.004) discard;
 
   vec3 outRgb = rgb * vPower.x * uGain;
-  outRgb = outRgb / (1.0 + outRgb * uClip);
+  // SOFT KNEE ON THE MAX CHANNEL, NOT PER CHANNEL. Per-channel Reinhard
+  // compresses the strongest channel hardest, so as the plume gets brighter its
+  // channels converge and #ff9d2e arrives at the tone mapper as grey. That is
+  // the mechanism behind "clips to flat pure white"; compressing the max and
+  // scaling all three by the same factor is the same curve with the same
+  // asymptote and leaves the hue exactly where it was authored.
+  //
+  // The knee is also driven by the plume's own coverage: where two ribbons and
+  // their fins overlap the alpha is high, and that is precisely where the sum
+  // runs away — so the shoulder tightens there and the crossing point saturates
+  // to orange instead of to paper.
+  float knee = uClip * (1.0 + 1.6 * a);
+  float mxc = max(max(outRgb.r, outRgb.g), outRgb.b);
+  outRgb *= mxc > 1e-4 ? 1.0 / (1.0 + mxc * knee) : 1.0;
   gl_FragColor = vec4(outRgb, a);
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
@@ -1155,20 +1202,29 @@ export class Effects implements System {
         const col = C_TIER[tier];
         this.rearPoints(e.kart, fx);
 
-        // Kill what is left of the previous tier BEFORE firing the new burst.
-        // Two contradictory tier colours on screen at once is worse than no
-        // colour at all — it is the one thing this effect must never do.
+        // THE PROMOTION RECOLOURS THE SHOWER IN FLIGHT. No purge.
         //
-        // 700 slots, not 260: the shower is several times denser than it was,
-        // so 260 is now barely an eighth of a second of emission and the
-        // outgoing tier would survive the promotion.
-        this.particles.retireRecent(true, 700, 0.06);
+        // What used to be here was `retireRecent(true, 700, 0.06)` — kill the
+        // newest 700 additive slots so the outgoing tier could not be on screen
+        // beside the incoming one. It never worked and it could not have: a
+        // tier-1 drift spawns roughly 1400 additive particles a second, the
+        // long-lived ricochets outlive any window worth calling "recent", and
+        // the shot harness fires its shutter on the *frame* the tier flips —
+        // which is why the reviewed tier-2 frame is a screen full of tier-1
+        // blue with an orange HUD arc over it. Killing more of them harder only
+        // trades a wrong colour for a hole in the shower.
+        //
+        // Drift particles now carry a colour CHANNEL rather than a colour (see
+        // EmitParams.channel). Pointing this kart's channel at the new tier
+        // repaints every grain already in the air, this frame, for the cost of
+        // three floats.
+        this.particles.setChannelColor(e.kart.id + 1, col);
 
         fx.tierFlash = 0.22;
         const n = 52 + tier * 20;
         const boost = 1.35 + tier * 0.14;
-        this.burstSparks(this.skidLRef, col, n, boost, fx, e.kart);
-        this.burstSparks(this.skidRRef, col, n, boost, fx, e.kart);
+        this.burstSparks(this.skidLRef, n, boost, e.kart.id + 1, fx, e.kart);
+        this.burstSparks(this.skidRRef, n, boost, e.kart.id + 1, fx, e.kart);
 
         // NO ANNULUS. A 1.7 m-radius vertical torus spawned inside the chassis
         // is geometrically *inside* the kart for its whole life: it cuts through
@@ -1380,7 +1436,10 @@ export class Effects implements System {
       p.life = 0.20; p.lifeJitter = 0.35;
       p.size0 = 0.34; p.size1 = 0.10; p.sizeJitter = 0.35;
       p.drag = 6; p.gravity = 2.2; p.velJitter = 2.2; p.posJitter = 0.08;
-      p.fadeIn = 0.04; p.count = 7;
+      // 5 at 1.9x, down from 7 at 2.6x. This lands on the same pixels as the
+      // plume, the ribbon, the root kiss and the boost lamp, all within the
+      // 0.3 s the ignition overshoot is also multiplying everything else.
+      p.fadeIn = 0.04; p.count = 5;
       this.particles.ground(fx.groundY, fx.groundN, 0.5, 0.2);
       this.particles.at(_p.x, _p.y, _p.z);
       // Carries most of the kart's velocity so the burst stays with the car
@@ -1389,8 +1448,8 @@ export class Effects implements System {
         k.velocity.x * 0.88 - _fwd.x * 3.0 + _side.x * (s === 0 ? -1.6 : 1.6),
         k.velocity.y * 0.88 + 2.2,
         k.velocity.z * 0.88 - _fwd.z * 3.0 + _side.z * (s === 0 ? -1.6 : 1.6));
-      this.particles.colorA(C_FLAME_ROOT, 2.6, 0.95);
-      this.particles.colorB(C_FLAME_MID, 0.7, 0);
+      this.particles.colorA(C_FLAME_ROOT, 1.9, 0.85);
+      this.particles.colorB(C_FLAME_MID, 0.6, 0);
       this.particles.emit(true);
     }
 
@@ -1409,7 +1468,11 @@ export class Effects implements System {
     this.particles.emit(true);
 
     fx.igniteT = 0.30;
-    this.tyreSmokePuff(k, fx, 8, 1.4);
+    // 6 puffs at 1.15, down from 8 at 1.4. Mini-turbo ignition is corner exit —
+    // the moment the chase camera is closest to the rear axle and pointing
+    // along it — and sixteen 2.1 m puffs arriving at once two metres from the
+    // lens is the other half of "the boost effect deletes the subject".
+    this.tyreSmokePuff(k, fx, 6, 1.15);
     if (k.isPlayer) this.ctx.shake(0.16 + 0.05 * tier, 0.22);
     this.blastLoad = Math.max(this.blastLoad, 0.5);
   }
@@ -1760,6 +1823,11 @@ export class Effects implements System {
     if (sparking && k.driftTier > 0) {
       const tier = Math.min(3, k.driftTier);
       const col = C_TIER[tier];
+      // Publish the live tier hue on this kart's colour channel. Every drift
+      // particle it has in the air reads it this frame, so the shower can never
+      // be one tier behind the HUD again — which was the blocker in the drift
+      // review frame (orange arc, blue sparks, same image).
+      this.particles.setChannelColor(k.id + 1, col);
       // 60 + 30/tier, up from 30 + 12. The review is blunt — a tier-2 shower
       // read as "dust motes" — and the shower has to be dense enough that the
       // eye integrates it into a continuous jet rather than resolving the
@@ -1769,8 +1837,8 @@ export class Effects implements System {
       const n = Math.floor(fx.sparkAcc);
       if (n > 0) {
         fx.sparkAcc -= n;
-        this.emitSparks(this.skidLRef, k, col, n, tier, -1);
-        this.emitSparks(this.skidRRef, k, col, n, tier, 1);
+        this.emitSparks(this.skidLRef, k, n, tier, -1);
+        this.emitSparks(this.skidRRef, k, n, tier, 1);
       }
 
       // Coloured light pool on the road under the sparks. Sparks that light
@@ -1781,7 +1849,7 @@ export class Effects implements System {
       const np = Math.floor(fx.poolAcc);
       if (np > 0) {
         fx.poolAcc -= np;
-        this.groundPool(k, fx, col, tier);
+        this.groundPool(k, fx, tier);
       }
       // ...and the nearest few karts additionally get a real point light, so
       // the tarmac, the kerb and the kart's own underbody all pick the tier up.
@@ -1811,12 +1879,19 @@ export class Effects implements System {
       // as often and a shade stronger, because this is the only part of the
       // drift that persists after the sparks have gone and it is what gives the
       // corner a history.
-      fx.scorchAcc += grounded ? dt * (10 + 4 * tier) : 0;
+      // Twice the radius, twice the strength, on BOTH contact patches, and on
+      // the eroded Scorch disc rather than the small Smudge kiss. The review
+      // counted this as producing nothing visible on the road at tier 2, and it
+      // was right: a 0.46 m Smudge at 0.58 strength is a 40 cm mark that the
+      // drift smoke sits directly on top of. A drift has to leave a history on
+      // the tarmac or the corner has no memory of what happened in it.
+      fx.scorchAcc += grounded ? dt * (7 + 3 * tier) : 0;
       if (fx.scorchAcc >= 1) {
         fx.scorchAcc -= 1;
-        const at = Math.random() < 0.5 ? this.skidLRef : this.skidRRef;
-        this.decals.scorch(at, fx.groundN, 0.46, col, now, 6.0, 0.30 + 0.14 * tier,
-          DecalTile.Smudge);
+        for (let s = 0; s < 2; s++) {
+          this.decals.scorch(s === 0 ? this.skidLRef : this.skidRRef, fx.groundN,
+            0.62 + 0.10 * tier, col, now, 9.0, 0.52 + 0.13 * tier, DecalTile.Scorch);
+        }
       }
     } else {
       fx.sparkAcc = 0;
@@ -1843,8 +1918,8 @@ export class Effects implements System {
       const n = Math.floor(fx.smokeAcc);
       if (n > 0) {
         fx.smokeAcc -= n;
-        this.tyreSmoke(k, fx, this.skidLRef, n, props.dustColor);
-        this.tyreSmoke(k, fx, this.skidRRef, n, props.dustColor);
+        this.tyreSmoke(k, fx, this.skidLRef, n, props.dustColor, tier);
+        this.tyreSmoke(k, fx, this.skidRRef, n, props.dustColor, tier);
       }
     } else {
       fx.smokeAcc = 0;
@@ -1900,15 +1975,18 @@ export class Effects implements System {
         // #c05cff and the ribbon has to be one of the three, whatever colour
         // the car is painted.
         _col.copy(C_TIER[btier]).lerp(C_FLAME_ROOT, 0.18);
-        // Narrow and short. This is a heat ribbon threading the plume
-        // together, not the effect itself — at 0.62 m wide, 1.5x intensity and
-        // ~11 m long it was the widest, flattest, brightest thing on screen the
-        // moment its tail swung past the chase camera. 4.5 m keeps the whole
-        // ribbon in front of the lens at every rig distance.
-        // Widened and brightened with the plume it threads. The ribbon now has
-        // a Reinhard shoulder of its own (see Trails), so raising the authored
-        // intensity cannot compound where two of them cross.
-        fx.trail = this.trails.acquire(0.54, _col, 2.1, 0.55, 0.16, 0.22, 5.0);
+        // Narrow and short. This is a heat ribbon threading the plume together,
+        // not the effect itself.
+        //
+        // Cut hard from 0.54 m / 2.1x / 5.0 m. In the reviewed boost frame this
+        // ribbon is the flat cyan band lying across the road behind the kart —
+        // a half-metre-wide strip of saturated additive colour seen almost
+        // edge-on, which perspective smears into a painted stripe, and which
+        // sums into exactly the same pixels as the plume it is supposed to be
+        // threading. The plume is now a properly structured flame and does not
+        // need a second ribbon to carry it; this is reduced to a heat spine
+        // behind the stacks that you notice only when it is missing.
+        fx.trail = this.trails.acquire(0.24, _col, 1.05, 0.42, 0.16, 0.20, 3.0);
       }
       if (fx.trail >= 0) {
         // Between the two stacks, at stack height — not at the chassis centre
@@ -1927,10 +2005,15 @@ export class Effects implements System {
       if (dist < 55) {
         _p.copy(k.position).addScaledVector(k.forward, -1.0); _p.y += 0.55;
         _col.copy(C_TIER[btier]).lerp(C_FLAME_MID, 0.45);
+        // 0.42, down from 0.70 (so 1.09 rather than 1.82 at full ignition
+        // overshoot). This lamp is inside the same volume as the plume, the
+        // ribbon and the root kiss, and every one of them was authored as if it
+        // were the only thing there. The flame reads at the right brightness
+        // when the SUM does, not when each layer does.
         const kick = 1 + 1.6 * (fx.igniteT / 0.30);
         this.lights.request(
           k.id, (k.isPlayer ? 200 : 60) - dist * 0.05, _p, _col,
-          0.7 * kick * (1 - dist / 55) * this.gain, 7.0);
+          0.42 * kick * (1 - dist / 55) * this.gain, 7.0);
       }
     } else if (fx.trail >= 0) {
       this.trails.release(fx.trail);
@@ -2031,7 +2114,9 @@ export class Effects implements System {
     // thin, warm, sun-lit wisp off the stacks, cheap enough to run on the whole
     // field (~9 puffs/s/kart before LOD).
     if (!boosting && grounded && speed > 6 && dist < 70) {
-      fx.exhaustAcc += dt * 9 * lod * Math.min(1, speed / 14);
+      // 5/s, down from 9. See idleExhaust for the arithmetic on why eighteen
+      // puffs a second behind a cruising kart is an opaque column.
+      fx.exhaustAcc += dt * 5 * lod * Math.min(1, speed / 14);
       const n = Math.floor(fx.exhaustAcc);
       if (n > 0) { fx.exhaustAcc -= n; this.idleExhaust(k, fx, n); }
     } else {
@@ -2045,9 +2130,17 @@ export class Effects implements System {
     // while the rival two car-lengths away threw sparks and smoke. Speed-scaled
     // so it disappears at a crawl and never fights the drift smoke.
     if (grounded && !drifting && dist < 75) {
-      const sr = THREE.MathUtils.clamp((speed - 9) / 16, 0, 1);
+      // Knee moved from 9 m/s to 13. The closeup frame is a 15.4 m/s cruise and
+      // at the old knee that already evaluated to 0.4 — nearly half strength for
+      // a kart that is not doing anything. This is a wake for a car that is
+      // genuinely travelling, not a permanent haze; it now only really arrives
+      // above about 60 km/h.
+      const sr = THREE.MathUtils.clamp((speed - 13) / 16, 0, 1);
       if (sr > 0) {
-        fx.rollAcc += dt * 21 * sr * lod;
+        // 12/s, down from 21. This and idleExhaust are the two emitters that run
+        // on a clean lap, and together they were the grey column standing behind
+        // the kart in the closeup — on a shot that exists to show the bodywork.
+        fx.rollAcc += dt * 12 * sr * lod;
         const n = Math.floor(fx.rollAcc);
         if (n > 0) { fx.rollAcc -= n; this.rollDust(k, fx, n, props.dustColor, sr); }
       } else {
@@ -2104,7 +2197,11 @@ export class Effects implements System {
    * throw the same cone and the pair collapses into one clump under the middle
    * of the kart, which is exactly what the tier-2 shot showed.
    */
-  private emitSparks(at: THREE.Vector3, k: IKart, col: THREE.Color, n: number, tier: number, side: number) {
+  private emitSparks(at: THREE.Vector3, k: IKart, n: number, tier: number, side: number) {
+    // Colour comes from the kart's live tier channel, not from a value captured
+    // at spawn — see EmitParams.channel and the drift-spark event.
+    const col = C_CHANNEL;
+    const channel = k.id + 1;
     // sparks fly backwards and away from the direction of the turn
     _fwd.copy(k.forward);
     _side.crossVectors(UP, _fwd).multiplyScalar(-k.driftDir);
@@ -2127,9 +2224,27 @@ export class Effects implements System {
     // detached clusters sitting on bare kerb rather than a shower coming off
     // the car. Half the kart's velocity keeps the whole shower inside two
     // metres of the contact patch without making it look welded on.
-    const keep = 0.48;
+    // 0.68, up from 0.48. The review is precise about the failure: "the sparks
+    // are not attached to anything — they emit from a diffuse pool spread over
+    // ~4 m of tarmac behind the kart". At 0.48 a spark keeps barely half the
+    // car's speed, so it falls back 8 m/s relative to the wheel that struck it
+    // and, over a 0.62 s tail, ends up four metres adrift. Two thirds keeps the
+    // shower inside a metre and a half of the contact patch — close enough that
+    // the eye reads a jet coming off a tyre rather than a stain on the road —
+    // while still leaving a visible slip between the shower and the car.
+    const keep = 0.68;
+
+    // The tangential component: real sparks leave along the SLIP vector, not
+    // along a fixed body axis. `slipx/slipz` is the part of the kart's velocity
+    // that is sideways, which is the direction the rubber is actually being
+    // dragged, so the cone off each tyre swings with the angle of the drift
+    // instead of staying welded to the chassis.
+    _r.crossVectors(UP, _fwd).normalize();
+    const lat = k.velocity.x * _r.x + k.velocity.z * _r.z;
+    const slipx = _r.x * lat * 0.32, slipz = _r.z * lat * 0.32;
 
     const p = this.particles.reset();
+    p.channel = channel;
     p.tile = PTile.Core;
     p.mode = PMode.Stretch;
     // Sparks must streak along their own velocity or they read as evenly
@@ -2152,7 +2267,10 @@ export class Effects implements System {
     // read; real ones come off a tyre in a wide spread of masses.
     p.sizeJitter = 0.6;
     p.gravity = -14; p.drag = 1.5;
-    p.posJitter = 0.10; p.velJitter = 3.2; p.velScatter = 0.55;
+    // Tightened from 3.2 / 0.55. A 3.2 m/s isotropic jitter on a 4.5 m/s cone
+    // is most of what turned two jets into one diffuse pool: the scatter was
+    // comparable to the signal, so the shower had no direction left in it.
+    p.posJitter = 0.08; p.velJitter = 1.9; p.velScatter = 0.38;
     p.fadeIn = 0.02;
     // Bias the count to the loaded outside wheel, not just its speed.
     p.count = Math.max(1, Math.round(n * 3 * (outside > 1 ? 1.35 : 0.7)));
@@ -2174,9 +2292,9 @@ export class Effects implements System {
     // A real 3D cone: backwards, outwards along the wheel's own side, and up.
     _r.crossVectors(UP, _fwd);
     this.particles.vel(
-      k.velocity.x * keep - _fwd.x * sp * 0.75 + (_side.x * sp + _r.x * splay) * outside,
+      k.velocity.x * keep - _fwd.x * sp * 0.75 + (_side.x * sp + _r.x * splay) * outside - slipx,
       k.velocity.y * keep + 2.5 + tier * 0.5,
-      k.velocity.z * keep - _fwd.z * sp * 0.75 + (_side.z * sp + _r.z * splay) * outside);
+      k.velocity.z * keep - _fwd.z * sp * 0.75 + (_side.z * sp + _r.z * splay) * outside - slipz);
     // 2.35, up from 1.30 — and the reasoning that produced 1.30 was half
     // right, so it is worth writing down which half.
     //
@@ -2221,7 +2339,14 @@ export class Effects implements System {
     // takes a generous camera bias, or the depth test slices its lower half off
     // against the road and leaves a hard horizontal cut. Spawned 12 cm higher
     // than the cores for the same reason.
-    this.particles.ground(fx.groundY, fx.groundN, 0.16, 0.34);
+    //
+    // 0.55 m of fade depth, not 0.16. At 0.16 the fade window is 18 cm wide on a
+    // disc that is a metre across, which is not a soft particle, it is a hard
+    // edge with a bevel: the review reads exactly that as "the blue spark cloud
+    // terminates in a hard straight cut line where the billboard quad intersects
+    // the road plane". The fade has to be comparable to the sprite, not to the
+    // spawn height.
+    this.particles.ground(fx.groundY, fx.groundN, 0.55, 0.34);
     this.particles.at(at.x, at.y + 0.12, at.z);
     this.particles.colorA(col, 1.80, 0.62);
     this.particles.colorB(col, 0.38, 0);
@@ -2237,32 +2362,39 @@ export class Effects implements System {
     p.size0 = 0.82 + 0.20 * tier; p.size1 = 0.52;
     p.gravity = 0; p.drag = 6; p.velJitter = 0; p.posJitter = 0.04;
     p.count = 1; p.fadeIn = 0.2;
-    this.particles.ground(fx.groundY, fx.groundN, 0.24, 0.38);
+    // Same reasoning as the halo above: a 1.2 m disc needs a fade of the same
+    // order as its own size or it terminates on the road in a straight line.
+    this.particles.ground(fx.groundY, fx.groundN, 0.70, 0.38);
     this.particles.at(at.x, at.y + 0.14, at.z);
     this.particles.vel(k.velocity.x * 0.9, 0.4, k.velocity.z * 0.9);
     this.particles.colorA(col, 1.45, 0.70);
     this.particles.colorB(col, 0.42, 0);
     this.particles.emit(true);
 
-    // Long-lived ricochets: a handful of grains per emission that survive four
-    // times as long, drag almost nothing and bounce out well clear of the kart.
-    // Real sparks are not a uniform population — the shower has a bright dense
-    // root and a scatter of stragglers arcing away from it, and the stragglers
-    // are what give the effect its reach across the frame. Few enough to cost
-    // nothing, and they carry the tier colour furthest from the car.
+    // Ricochets: a handful of grains per emission that survive longer, drag
+    // almost nothing and arc out clear of the kart. Real sparks are not a
+    // uniform population — the shower has a bright dense root and a scatter of
+    // stragglers arcing away from it.
+    //
+    // 0.44 s and drag 0.9, down from 0.95 s (up to 1.43 with jitter) and drag
+    // 0.45. THIS emitter was the diffuse four-metre pool in the review frame,
+    // not the shower: a near-dragless grain living a second and a half at
+    // 10 m/s relative to a car that is also moving ends up wherever it likes,
+    // and there were enough of them to read as the main event. They still reach
+    // furthest from the car; they just no longer outlive the drift itself.
     p.tile = PTile.Core; p.mode = PMode.Stretch; p.stretch = 4.0;
-    p.life = 0.95; p.lifeJitter = 0.5;
+    p.life = 0.44; p.lifeJitter = 0.45;
     p.size0 = 0.075 + 0.02 * tier; p.size1 = 0.012; p.sizeJitter = 0.5;
-    p.gravity = -16; p.drag = 0.45;
-    p.velJitter = 4.5; p.velScatter = 0.7; p.posJitter = 0.12;
-    p.count = Math.max(1, n);
+    p.gravity = -16; p.drag = 0.9;
+    p.velJitter = 3.0; p.velScatter = 0.55; p.posJitter = 0.10;
+    p.count = Math.max(1, n >> 1);
     // Pinpoints again: back to no soft fade, small bias.
     this.particles.ground(fx.groundY, fx.groundN, 0, 0.14);
     this.particles.at(at.x, at.y, at.z);
     this.particles.vel(
-      k.velocity.x * keep - _fwd.x * sp * 0.6 + (_side.x * sp * 1.5 + _r.x * splay) * outside,
+      k.velocity.x * keep - _fwd.x * sp * 0.6 + (_side.x * sp * 1.5 + _r.x * splay) * outside - slipx,
       k.velocity.y * keep + 4.4 + tier * 0.7,
-      k.velocity.z * keep - _fwd.z * sp * 0.6 + (_side.z * sp * 1.5 + _r.z * splay) * outside);
+      k.velocity.z * keep - _fwd.z * sp * 0.6 + (_side.z * sp * 1.5 + _r.z * splay) * outside - slipz);
     this.particles.colorA(col, 2.10, 1);
     this.particles.colorB(col, 0.45, 0);
     this.particles.emit(true);
@@ -2276,8 +2408,10 @@ export class Effects implements System {
    * sparks; the decal layer is multiplicative so it can only darken, which is
    * why the *bright* half of that note has to be a particle.
    */
-  private groundPool(k: IKart, fx: KartFx, col: THREE.Color, tier: number) {
+  private groundPool(k: IKart, fx: KartFx, tier: number) {
+    const col = C_CHANNEL;
     const p = this.particles.reset();
+    p.channel = k.id + 1;
     p.tile = PTile.Glow; p.mode = PMode.Ground;
     p.life = 0.30; p.lifeJitter = 0.25;
     p.size0 = 0.85 + 0.16 * tier; p.size1 = 1.8 + 0.34 * tier; p.sizeJitter = 0.25;
@@ -2308,7 +2442,9 @@ export class Effects implements System {
    */
   private rollDust(k: IKart, fx: KartFx, n: number, dust: THREE.Color, sr: number) {
     const road = fx.surface === Surface.Road || fx.surface === Surface.Boost;
-    _col.copy(road ? C_SMOKE : dust).lerp(this.sunColor, 0.35);
+    // Cool on tarmac, the surface's own colour off it, and only lightly warmed
+    // in albedo — the key light does the warming now (see tyreSmoke).
+    _col.copy(road ? C_SMOKE_TARMAC : dust).lerp(this.sunColor, 0.16);
     _fwd.copy(k.forward);
     const p = this.particles.reset();
     p.tile = PTile.Smoke; p.mode = PMode.Billboard;
@@ -2316,8 +2452,8 @@ export class Effects implements System {
     // clean lap, so it is the single biggest producer of stranded puffs: at
     // 25 m/s a 0.55 s world-frame puff ends eleven metres back, which is the
     // chain of detached blobs strung out behind the pack in the pack frame.
-    p.life = trailLife(Math.abs(k.forwardSpeed), 10, 0.26, 0.65); p.lifeJitter = 0.35;
-    p.size0 = 0.18; p.size1 = 1.15 + 0.65 * sr; p.sizeJitter = 0.45;
+    p.life = trailLife(Math.abs(k.forwardSpeed), 7, 0.22, 0.5); p.lifeJitter = 0.35;
+    p.size0 = 0.14; p.size1 = 0.62 + 0.42 * sr; p.sizeJitter = 0.45;
     p.gravity = 0.7; p.drag = 2.6; p.spin = 1.3;
     p.posJitter = 0.16; p.velJitter = 0.9; p.fadeIn = 0.14;
     p.count = n;
@@ -2332,7 +2468,9 @@ export class Effects implements System {
     // as detached grey smudges lying on the tarmac behind the field rather than
     // as air being disturbed. Split the difference — still comfortably above
     // the 0.11 that was invisible.
-    this.particles.colorA(_col, 1.0, 0.13 + 0.17 * sr);
+    // 0.08 + 0.10, down from 0.13 + 0.17. This runs on every kart on every clean
+    // lap; the alpha that makes one puff legible makes twenty of them a wall.
+    this.particles.colorA(_col, 1.0, 0.08 + 0.10 * sr);
     this.particles.colorB(_col, 0.8, 0);
     for (let s = 0; s < 2; s++) {
       const at = s === 0 ? this.skidLRef : this.skidRRef;
@@ -2383,12 +2521,19 @@ export class Effects implements System {
    * below 70% of top speed. Nothing here allocates.
    */
   private slipstream(k: IKart, n: number, ramp: number, boosting: boolean) {
+    const fx = this.state(k);
     _fwd.copy(k.forward);
     _side.crossVectors(UP, _fwd).normalize();
     _r.crossVectors(_fwd, _side).normalize();
-    // Boost tints the rush to the mini-turbo blue; a plain fast lap gets the
-    // warm key colour so it reads as air rather than as a power-up.
-    _col.copy(boosting ? C_TIER[1] : C_SUNMOTE);
+    // A SPEED STREAK IS A VALUE CUE, NOT AN OBJECT.
+    //
+    // This used to be C_TIER[1] under boost — #4fc3ff, a fully saturated cyan,
+    // and on golden-hour tarmac the single hue in the palette that cannot be
+    // mistaken for anything atmospheric. Sitting at road height it read as
+    // paint. Air moving past the lens is near-white with the faintest warm cast
+    // from the key; the *speed* has to come from length and motion, not from
+    // colour. Art bible section 6: "they frame, they don't obscure."
+    _col.copy(C_SPARK_WHITE).lerp(C_SUNMOTE, boosting ? 0.25 : 0.55);
 
     const p = this.particles.reset();
     p.tile = PTile.Streak; p.mode = PMode.Stretch;
@@ -2398,8 +2543,11 @@ export class Effects implements System {
     // so it is what makes the screen-space comb in PostFX read as air moving
     // rather than as a filter laid over the picture.
     p.stretch = boosting ? 5.4 : 3.6;
-    p.life = 0.34; p.lifeJitter = 0.30;
-    p.size0 = (0.055 + 0.02 * ramp) * (boosting ? 1.5 : 1); p.size1 = 0.02; p.sizeJitter = 0.5;
+    // Shorter, and seeded further out (see `ahead` below), so a streak dies of
+    // old age at roughly the distance the chase camera sits rather than sailing
+    // through the lens as a frame-wide bar.
+    p.life = 0.30; p.lifeJitter = 0.28;
+    p.size0 = (0.062 + 0.024 * ramp) * (boosting ? 1.5 : 1); p.size1 = 0.02; p.sizeJitter = 0.5;
     p.gravity = 0; p.drag = 0.05; p.spin = 0;
     p.fadeIn = 0.16; p.count = 1;
     // Low, and scaled by the ramp on top of the global additive gain: three of
@@ -2407,6 +2555,11 @@ export class Effects implements System {
     const rushI = (0.85 + 0.55 * ramp) * (boosting ? 1.5 : 1);
     this.particles.colorA(_col, rushI, (0.10 + 0.24 * ramp) * (boosting ? 1.45 : 1));
     this.particles.colorB(_col, 0.20, 0);
+    // A generous camera-ward bias and a real soft fade against the road plane.
+    // Without them a streak that grazes the tarmac is depth-tested against it
+    // and terminates on the intersection line, which is most of why these read
+    // as track markings rather than as air.
+    this.particles.ground(fx.groundY, fx.groundN, 0.9, 0.30);
 
     for (let i = 0; i < n; i++) {
       const a = Math.random() * Math.PI * 2;
@@ -2415,12 +2568,21 @@ export class Effects implements System {
       // tightens the annulus toward the axis: converging lines read as speed,
       // a wide ring reads as weather.
       const rad = (boosting ? 1.7 : 2.3) + Math.random() * 3.0;
-      const ahead = 9 + Math.random() * 13;
+      const ahead = 12 + Math.random() * 15;
       _p.copy(k.position)
         .addScaledVector(_fwd, ahead)
         .addScaledVector(_side, Math.cos(a) * rad)
-        .addScaledVector(_r, Math.sin(a) * rad * 0.62);
-      _p.y += 0.9;
+        // Vertical component biased ENTIRELY POSITIVE. The annulus used to be
+        // centred on the kart's own axis, so half of every ring was spawned
+        // below it — which on a kart sitting 40 cm off the deck means half the
+        // streaks were born at or under road height. Depth-tested against the
+        // tarmac and lying in its plane, those are the two flat cyan stripes
+        // painted across the road in the boost frame. Speed lines belong in the
+        // air between 0.5 m and 3 m above the surface and nowhere else.
+        .addScaledVector(_r, 0.55 + (0.5 + 0.5 * Math.sin(a)) * rad * 0.62);
+      // Belt and braces: whatever the track is doing underneath, never below
+      // half a metre off it.
+      _p.y = Math.max(_p.y, fx.groundY + 0.55);
       this.particles.at(_p.x, _p.y, _p.z);
       const rv = boosting ? 36 : 26;
       this.particles.vel(-_fwd.x * rv, -_fwd.y * rv, -_fwd.z * rv);
@@ -2428,9 +2590,11 @@ export class Effects implements System {
     }
   }
 
-  private burstSparks(at: THREE.Vector3, col: THREE.Color, n: number, intensity: number,
+  private burstSparks(at: THREE.Vector3, n: number, intensity: number, channel: number,
                       fx?: KartFx, k?: IKart) {
+    const col = C_CHANNEL;
     const p = this.particles.reset();
+    p.channel = channel;
     p.tile = PTile.Core; p.mode = PMode.Stretch; p.stretch = 4.0;
     p.life = 0.62; p.lifeJitter = 0.45;
     p.size0 = 0.17; p.size1 = 0.018; p.sizeJitter = 0.55;
@@ -2463,12 +2627,23 @@ export class Effects implements System {
     this.particles.emit(true);
   }
 
-  private tyreSmoke(k: IKart, fx: KartFx, at: THREE.Vector3, n: number, dust: THREE.Color) {
-    // Grey smoke on grey road is invisible by construction. Warm the puff
-    // toward the key light so it separates from the tarmac by hue as well as
-    // by value — that is what "it must catch the sun" in §6 actually buys.
-    _col.copy(fx.surface === Surface.Road || fx.surface === Surface.Boost ? C_SMOKE : dust)
-      .lerp(this.sunColor, 0.42);
+  private tyreSmoke(k: IKart, fx: KartFx, at: THREE.Vector3, n: number, dust: THREE.Color,
+                    tier: number) {
+    // SURFACE-KEYED, AND ONLY LIGHTLY WARMED.
+    //
+    // Tarmac gets the cool rubber grey; everything else gets the surface's own
+    // dust colour from SURFACE_PROPS. The old 0.42 lerp toward the key light was
+    // trying to do the lighting's job in the albedo and landed the whole cloud
+    // on #d5c4a8 — dry dirt — whatever it was actually driving on. 0.14 is a
+    // hint of ambient warmth; the sun side is now carried by the wrap/backscatter
+    // term in the particle shader, which varies across the puff the way real
+    // light does.
+    const onRoad = fx.surface === Surface.Road || fx.surface === Surface.Boost;
+    _col.copy(onRoad ? C_SMOKE_TARMAC : dust).lerp(this.sunColor, 0.14);
+    // 18% toward the live tier, so a tier-3 drift smokes faintly violet and the
+    // charge is legible even in the smoke — art bible §6 wants the tier readable
+    // at a glance, and the smoke is the largest thing a drift puts on screen.
+    if (tier > 0) _col.lerp(C_TIER[Math.min(3, tier)], 0.18);
     _col2.copy(_col).lerp(C_SMOKE_DARK, 0.5);
     const speed = Math.abs(k.forwardSpeed);
     const p = this.particles.reset();
@@ -2491,15 +2666,23 @@ export class Effects implements System {
     this.particles.ground(fx.groundY, fx.groundN, 1.15, 0.40);
     p.count = n;
     _fwd.copy(k.forward);
-    // Spawned clear of the ground plane: at 0.08 m the soft-particle fade was
-    // eating two thirds of the alpha before it ever reached the frame.
-    this.particles.at(at.x, at.y + 0.30, at.z);
-    // Half the kart's velocity. Smoke torn off a sliding tyre is thrown into
-    // the wake, not left standing in still air the instant it leaves the
-    // rubber: with zero inheritance the first frame of the cloud is already
-    // half a metre adrift and the column never looks attached to the car.
+    // STRICTLY BEHIND THE CONTACT PATCH. The review has the drift smoke sitting
+    // beside and slightly *ahead* of the kart, which is what an emitter seeded
+    // on the patch itself does once the puff's own outward jitter is added: half
+    // of the cloud is born forward of where the rubber is. Backing the seed off
+    // 45 cm along -forward puts every puff in the wake at birth.
+    this.particles.at(
+      at.x - _fwd.x * 0.45, at.y + 0.26, at.z - _fwd.z * 0.45);
+    // The kart's velocity MINUS the slip vector: the smoke leaves with the car
+    // but not with the part of the car's motion that is sideways, which is the
+    // component the tyre is fighting. That difference is what makes a cloud read
+    // as being torn off rubber rather than as being carried along by it.
+    _side.crossVectors(UP, _fwd).normalize();
+    const latv = k.velocity.x * _side.x + k.velocity.z * _side.z;
     this.particles.vel(
-      k.velocity.x * 0.50 - _fwd.x * 2.0, 1.5, k.velocity.z * 0.50 - _fwd.z * 2.0);
+      k.velocity.x * 0.50 - _side.x * latv * 0.30 - _fwd.x * 2.0,
+      1.5,
+      k.velocity.z * 0.50 - _side.z * latv * 0.30 - _fwd.z * 2.0);
     // 0.55, not 0.85. Individually opaque puffs read as popcorn; the cloud has
     // to be built out of many translucent ones or the lighting model in
     // Particles has nothing to shade through — and the two-lobe warm/cool split
@@ -2561,7 +2744,7 @@ export class Effects implements System {
     p.gravity = 0.4; p.drag = 2.6; p.spin = 1.1;
     p.posJitter = 0.5; p.velJitter = 2.2; p.velScatter = 0.5; p.fadeIn = 0.08;
     p.count = n;
-    this.particles.ground(fx.groundY, fx.groundN, 0.7, 0.30);
+    this.particles.ground(fx.groundY, fx.groundN, 1.10, 0.30);
     this.particles.at(k.position.x, fx.groundY + 0.12, k.position.z);
     // A landing throws its dust forward with the kart. Emitted world-static, a
     // hop puff is dropped on the road behind and reads as belonging to nothing.
@@ -2597,7 +2780,7 @@ export class Effects implements System {
     p.gravity = heavy ? -6.5 : 0.5; p.drag = heavy ? 1.4 : 1.7; p.spin = 1.0;
     p.posJitter = 0.22; p.velJitter = heavy ? 2.6 : 1.2; p.fadeIn = 0.1;
     p.count = n;
-    this.particles.ground(fx.groundY, fx.groundN, 0.7, heavy ? 0.14 : 0.34);
+    this.particles.ground(fx.groundY, fx.groundN, heavy ? 0.35 : 1.10, heavy ? 0.14 : 0.34);
     this.particles.colorA(dust, heavy ? 1.0 : 0.95, heavy ? 0.85 : 0.5);
     this.particles.colorB(dust, 0.75, 0);
     for (let s = 0; s < 2; s++) {
@@ -2727,31 +2910,88 @@ export class Effects implements System {
     _side.crossVectors(UP, _fwd).normalize();
     _col.copy(C_TIER[tier]);
 
-    // Longer and fatter than the 0.26 m radius it was authored at: the chase
-    // camera looks almost straight down the exhaust axis, so the plume's length
-    // projects to a few dozen pixels whatever it is, and the readable dimension
-    // from behind is its WIDTH — two tongues at 0.26 m together were narrower
-    // than a rear tyre.
+    // HARD CAP AT ~1.1x KART LENGTH, and this is a silhouette rule, not a taste
+    // call. At 2.60 + 1.40 with a 1.40 ignition multiplier the tongue reached
+    // 5.6 m — two and a half times the length of the car it was attached to —
+    // and because the model's exhaust anchor points up as well as back, a plume
+    // that long sweeps through the kart's own screen silhouette from any camera
+    // above the axis. The boost frame is the result: the driver, the roll bar,
+    // the front bumper and the front-left wheel all gone behind it. Nothing
+    // this file emits is allowed to be bigger than the subject.
     //
-    // Trimmed back from 3.20 / 0.46 / 6.2 on the premise those were sized
-    // against: "the plume is the boost's only permanent screen event, the post
-    // stack's speed lines are dead". They are not dead any more — they were
-    // being multiplied by a gate that never opened, and now that they carry
-    // their share the plume no longer has to carry all of it alone. At the
-    // larger size it swallowed the hero kart whole on the tunnel frame, driver
-    // and roll bar included, which is the subject the shot is of.
-    const len = (2.60 + 1.40 * burn) * (1 + 0.40 * ignite);
-    const rad = 0.40 + 0.17 * burn + 0.07 * ignite;
-    const intensity = (5.2 + 2.4 * burn) * (1 + 0.9 * ignite);
+    // At 5.6 m the tongue also reached PAST the chase camera, which sits about
+    // six metres behind the kart — so the "plume" the boost frame photographed
+    // is largely its own tail sweeping through the lens at point-blank range.
+    // 2.15 m keeps the whole flame nearly three metres in front of the eye at
+    // every rig distance. The readable dimension from directly behind is width,
+    // and the shader already widens the tongue as it turns to face us
+    // (`W *= 1 + 0.70 * align`), so a shorter plume is not a smaller one on
+    // screen — it is a plume that is behind the car instead of over it.
+    // Then partly given back, because 1.05 + 0.62 overshot the cure. The r1
+    // frame lost the kart behind the flame; the r1-verify frame lost the FLAME
+    // — a 33 m/s boost shot with speed lines, FOV punch and a pale wisp near
+    // the rear axle, which fails the frame's brief as squarely as the white-out
+    // did, just quietly. The two failures are not symmetric in how they read,
+    // and that is what made this one easy to ship.
+    //
+    // What makes the length safe now is not the length: it is the 25-degree
+    // cone clamp and the 12 cm rearward root below, neither of which existed
+    // when 2.60 was dangerous. Those hold the plume BEHIND the car regardless
+    // of how long it is, so length can go back to doing its job. 2.32 m peak is
+    // ~1.2x kart length and still three and a half metres clear of the chase
+    // eye, so nothing sweeps the lens.
+    const len = (1.45 + 0.72 * burn) * (1 + 0.28 * ignite);
+    const rad = 0.29 + 0.12 * burn + 0.05 * ignite;
+    // Down from 5.2 + 2.4 with a 1.9x ignition kick, i.e. from a peak of 14.4.
+    // Fourteen units of additive radiance through a Reinhard shoulder is still
+    // five units on the framebuffer, which after ACES is white whatever colour
+    // went in. At 3.1 (4.7 on ignition) the spine composites to roughly 2.3
+    // linear — comfortably over PostFX's 1.55 bloom gate, so it still throws a
+    // halo, but low enough that the tone curve returns an incandescent orange
+    // rather than paper. The intensity the effect *reads* at now comes from
+    // bloom carrying it, which is what the review asked for.
+    // Nudged up from 2.00 + 1.10. The reasoning above is right and the target it
+    // names — "incandescent orange rather than paper" — is the right one; 2.00
+    // simply landed under it. At peak burn the spine now composites to roughly
+    // 3.4 linear against the same 1.55 bloom gate: still less than a quarter of
+    // the old 14.4, still nowhere near the white-out, but far enough over the
+    // gate that bloom actually carries it instead of merely clearing it.
+    const intensity = (2.70 + 1.45 * burn) * (1 + 0.50 * ignite);
     // Fade out with distance rather than popping off at the LOD boundary.
-    const alpha = 0.88 * THREE.MathUtils.clamp(1.25 - dist / 90, 0.15, 1);
+    const alpha = 0.80 * THREE.MathUtils.clamp(1.25 - dist / 90, 0.15, 1);
+
+    // 25 degrees, per the review. cos/sin precomputed.
+    const COS_MAX = 0.9063, SIN_MAX = 0.4226;
 
     for (let s = 0; s < 2; s++) {
-      // Origin AND axis come from the model's own exhaust anchor, whose +Z is
-      // authored up-and-rearward. Splayed a further 7 degrees outboard so the
-      // two tongues separate from head-on instead of overlapping into one bar.
+      // Origin comes from the model's own exhaust anchor so the flame is welded
+      // to the pipe through body roll and pitch, then biased 12 cm further back
+      // so its root starts behind the bodywork rather than inside it.
       this.stackMouth(k, s, _p, _q);
-      _q.addScaledVector(_side, (s === 0 ? -0.14 : 0.14)).normalize();
+      _p.addScaledVector(_fwd, -0.12);
+
+      // CONSTRAIN THE CONE ABOUT -forward.
+      //
+      // KartModel authors the anchor's +Z up-and-rearward at about 33 degrees,
+      // which is right for the pipe and wrong for the flame: a chase camera
+      // sits above the axis, so a tongue leaning that far up projects across the
+      // bodywork instead of trailing behind it. Splay outboard, allow a little
+      // buoyancy, then clamp the whole thing into a 25-degree half-angle about
+      // straight-back — exactly the constraint the review specified.
+      _q.multiplyScalar(0.35)
+        .addScaledVector(_fwd, -0.65)
+        .addScaledVector(UP, 0.12)
+        .addScaledVector(_side, s === 0 ? -0.10 : 0.10)
+        .normalize();
+      _n.copy(_fwd).multiplyScalar(-1);
+      const c = _q.dot(_n);
+      if (c < COS_MAX) {
+        // q = c*n + s*perp; rebuild it at exactly the maximum half-angle.
+        _q.addScaledVector(_n, -c);
+        const sl = _q.length();
+        if (sl > 1e-5) _q.multiplyScalar(SIN_MAX / sl);
+        _q.addScaledVector(_n, COS_MAX).normalize();
+      }
       this.plumes.add(_p, _q, len, rad, _col, intensity, alpha, k.id * 2 + s);
     }
   }
@@ -2789,57 +3029,83 @@ export class Effects implements System {
       const p = this.particles.reset();
       p.tile = PTile.Glow; p.mode = PMode.Billboard;
       p.life = 0.10; p.lifeJitter = 0.3;
-      p.size0 = 0.17 + 0.09 * burn; p.size1 = 0.05; p.sizeJitter = 0.25;
+      // 1.35, down from 2.2. Two of these plus the ribbon's own root kiss plus
+      // the trail spine all land on the same handful of pixels; the sum is what
+      // the frame sees, and the sum was three times over white.
+      p.size0 = 0.11 + 0.06 * burn; p.size1 = 0.04; p.sizeJitter = 0.25;
       p.drag = 5; p.velJitter = 0.35; p.posJitter = 0.04; p.fadeIn = 0.05;
       p.count = Math.max(1, n >> 2);
       this.particles.ground(fx.groundY, fx.groundN, 0.5, 0.18);
       this.particles.at(_p.x, _p.y, _p.z);
       this.particles.vel(vx, vy + 0.6, vz);
-      this.particles.colorA(C_FLAME_ROOT, 2.2, 0.85);
-      this.particles.colorB(C_FLAME_MID, 0.8, 0);
+      this.particles.colorA(C_FLAME_ROOT, 1.35, 0.75);
+      this.particles.colorB(C_FLAME_MID, 0.6, 0);
       this.particles.emit(true);
 
-      // Dim tier sheath. The flame body is too hot to hold a hue, so this is
-      // what actually carries the mini-turbo colour at a glance.
+      // Tier sheath. BORN SMALL AND GROWS — this is the note, verbatim: a puff
+      // that is born at its terminal size has no expansion in it and reads as
+      // fog rather than as gas leaving a pipe under pressure. It also has to
+      // start small because it starts AT the stack mouth, where anything wide
+      // is already overlapping the bodywork.
       p.tile = PTile.Glow; p.life = 0.22;
-      p.size0 = 0.34; p.size1 = 0.62 * burn + 0.28; p.sizeJitter = 0.3;
-      p.count = Math.max(1, n >> 2); p.drag = 4;
-      this.particles.vel(vx * 0.92 - _fwd.x * 2.0, vy * 0.92 + 1.2, vz * 0.92 - _fwd.z * 2.0);
-      this.particles.colorA(_col, 0.75, 0.42);
-      this.particles.colorB(_col, 0.18, 0);
+      p.size0 = 0.09; p.size1 = 0.44 * burn + 0.20; p.sizeJitter = 0.3;
+      p.count = Math.max(1, n >> 2); p.drag = 4; p.fadeIn = 0.12;
+      this.particles.vel(vx * 0.92 - _fwd.x * 2.4, vy * 0.92 + 0.8, vz * 0.92 - _fwd.z * 2.4);
+      this.particles.colorA(_col, 0.62, 0.38);
+      this.particles.colorB(_col, 0.15, 0);
       this.particles.emit(true);
 
       // Cooling embers shed off the tip, so the plume dissipates into the
-      // slipstream instead of ending on the ribbon's clean edge.
+      // slipstream instead of ending on the ribbon's clean edge. Thrown further
+      // back and given the ember hue at both ends of the ramp: these are the
+      // sparse C_FLAME_COOL tail the review asked for, and they are the only
+      // part of the effect allowed past the tongue's own length.
       p.tile = PTile.Streak; p.mode = PMode.Stretch; p.stretch = 3.0;
-      p.life = 0.26; p.lifeJitter = 0.5;
-      p.size0 = 0.05; p.size1 = 0.012; p.sizeJitter = 0.5;
-      p.gravity = -3.0; p.drag = 1.6; p.velJitter = 2.0; p.velScatter = 0.4;
-      p.count = Math.max(1, n >> 1);
+      p.life = 0.24; p.lifeJitter = 0.5;
+      p.size0 = 0.035; p.size1 = 0.010; p.sizeJitter = 0.5;
+      p.gravity = -3.0; p.drag = 1.6; p.velJitter = 1.6; p.velScatter = 0.4;
+      p.fadeIn = 0.03;
+      p.count = Math.max(1, n >> 2);
       this.particles.vel(
-        vx * 0.70 - _fwd.x * 3.0 + _side.x * sx * 1.6,
-        vy * 0.70 + 1.0,
-        vz * 0.70 - _fwd.z * 3.0 + _side.z * sx * 1.6);
-      this.particles.colorA(C_FLAME_MID, 2.2, 1);
-      this.particles.colorB(C_FLAME_COOL, 0.8, 0);
+        vx * 0.70 - _fwd.x * 4.2 + _side.x * sx * 1.4,
+        vy * 0.70 + 0.8,
+        vz * 0.70 - _fwd.z * 4.2 + _side.z * sx * 1.4);
+      this.particles.colorA(C_FLAME_MID, 1.55, 1);
+      this.particles.colorB(C_FLAME_COOL, 0.55, 0);
       this.particles.emit(true);
     }
   }
 
-  /** Baseline running-engine wisp off the exhaust stacks. */
+  /**
+   * Baseline running-engine wisp off the exhaust stacks.
+   *
+   * A WISP. The closeup frame — a cruise at 55 km/h, no drift, no boost, a shot
+   * whose stated subject is the kart's own materials — came back with an unlit
+   * grey-brown column rising out of the back of the car to the top of the
+   * frame, the second largest element in the image. That column is this emitter
+   * plus `rollDust`, both of them running at drift-scale volume on a clean lap:
+   * eighteen puffs a second at 0.85 m terminal size and 0.30 alpha, living most
+   * of a second each, is fifteen overlapping sprites behind the kart at all
+   * times, and fifteen translucent puffs stacked is an opaque one.
+   *
+   * Roughly a third of the volume, half the size, half the alpha and a life
+   * budgeted in metres rather than seconds. It still says "eight running
+   * engines" in the pack shot — which is why it exists — without saying "the
+   * kart is on fire" in every other shot.
+   */
   private idleExhaust(k: IKart, fx: KartFx, n: number) {
     _fwd.copy(k.forward);
     _side.crossVectors(UP, _fwd).normalize();
     _col.copy(C_SMOKE_DARK).lerp(this.sunColor, 0.35);
     const p = this.particles.reset();
     p.tile = PTile.Smoke; p.mode = PMode.Billboard;
-    p.life = 0.62; p.lifeJitter = 0.35;
-    p.size0 = 0.16; p.size1 = 0.85; p.sizeJitter = 0.35;
-    p.gravity = 1.4; p.drag = 3.2; p.spin = 1.2;
-    p.posJitter = 0.10; p.velJitter = 0.8; p.fadeIn = 0.10;
+    p.life = trailLife(Math.abs(k.forwardSpeed), 5.5, 0.22, 0.5); p.lifeJitter = 0.35;
+    p.size0 = 0.10; p.size1 = 0.42; p.sizeJitter = 0.35;
+    p.gravity = 1.4; p.drag = 3.2; p.spin = 1.6;
+    p.posJitter = 0.08; p.velJitter = 0.6; p.fadeIn = 0.12;
     this.particles.ground(fx.groundY, fx.groundN, 0.5, 0.22);
     p.count = n;
-    this.particles.colorA(_col, 1.0, 0.30);
+    this.particles.colorA(_col, 1.0, 0.15);
     this.particles.colorB(_col, 0.85, 0);
     for (let s = 0; s < 2; s++) {
       // Off the model's real stack tips, like the plume — a wisp that leaves

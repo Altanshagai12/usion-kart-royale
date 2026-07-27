@@ -88,7 +88,13 @@ void main() {
   float a = vColor.a * pow(edge, 0.65) * pow(1.0 - vU, 2.4) * vNear;
   if (a < 0.004) discard;
   vec3 rgb = vColor.rgb * uGain;
-  rgb = rgb / (1.0 + rgb * uClip);
+  // Compress the MAX CHANNEL and scale all three by the same factor. Per-channel
+  // Reinhard squeezes the strongest channel hardest, so a saturated ribbon
+  // desaturates as it brightens and two crossing ribbons meet in white — which
+  // is the one thing an additive shoulder exists to prevent. Same curve, same
+  // 1/uClip asymptote, hue untouched.
+  float mxc = max(max(rgb.r, rgb.g), rgb.b);
+  rgb *= mxc > 1e-4 ? 1.0 / (1.0 + mxc * uClip) : 1.0;
   gl_FragColor = vec4(rgb, a);
   #include <tonemapping_fragment>
   #include <colorspace_fragment>

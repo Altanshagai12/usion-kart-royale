@@ -159,6 +159,10 @@ export class Menus {
 
   private rosterEl!: HTMLDivElement;
   private standingsEl!: HTMLDivElement;
+  /** the in-race running order, shown on the pause screen (see buildPause) */
+  private pauseOrderEl!: HTMLDivElement;
+  /** throttle on the pause board rebuild — it only changes when places do */
+  private pauseOrderKey = '';
   private lapsEl!: HTMLDivElement;
   private resultTitle!: HTMLDivElement;
 
@@ -260,6 +264,8 @@ export class Menus {
         this.resultsFinished = done;
         this.fillResults(ctx);
       }
+    } else if (want === 'pause') {
+      this.fillPauseOrder(ctx);
     }
 
     if (want !== this.screen) {
@@ -420,6 +426,16 @@ export class Menus {
     }
   }
 
+  /**
+   * Pause. ROUND 8: this screen now carries the full running order.
+   *
+   * The eight-driver order used to be a permanent 200x320 timing tower pinned
+   * to the right-centre of the in-race HUD — the largest single element on
+   * screen, sitting on the outside of every right-hand corner, occluding the
+   * rivals it was describing. It belongs here and on the results screen, where
+   * the race is stopped and eight rows are actually readable. Same rows, same
+   * type, same rules as the results board: one standings object in the game.
+   */
   private buildPause() {
     const s = this.makeScreen('kr-s-pause');
     const inner = s.firstElementChild as HTMLDivElement;
@@ -427,9 +443,20 @@ export class Menus {
     box.style.display = 'flex';
     box.style.flexDirection = 'column';
     box.style.alignItems = 'center';
+    box.style.width = '100%';
     el('div', 'kr-pause-badge', box, 'Race suspended');
     el('div', 'kr-title kr-gold', box, 'Paused');
-    const list = el('div', 'kr-menu-list', box);
+
+    const grid = el('div', 'kr-pause-grid', box);
+    const left = el('div', undefined, grid);
+    el('div', 'kr-order-title', left, 'Running order');
+    this.pauseOrderEl = el('div', 'kr-standings', left);
+    const right = el('div', undefined, grid) as HTMLDivElement;
+    right.style.display = 'flex';
+    right.style.flexDirection = 'column';
+    right.style.justifyContent = 'center';
+    right.style.height = '100%';
+    const list = el('div', 'kr-menu-list', right);
 
     const resume = el('div', 'kr-btn', list, 'Resume');
     // Clearing `localPause` alone is not enough: on a real race the director
@@ -483,6 +510,41 @@ export class Menus {
         group[i].classList.toggle('sel', group === list && i === this.btnIndex);
       }
     }
+  }
+
+  /**
+   * The running order, on the pause screen. Rebuilt only when the order (or
+   * the lap the leader is on) actually changes — the pause screen is static
+   * and a per-frame rebuild of eight rows would be eight allocations a frame
+   * for nothing.
+   */
+  private fillPauseOrder(ctx: Ctx) {
+    const race = ctx.race;
+    const player = race.player;
+    const order: IKart[] = race.standings.length ? race.standings : race.karts;
+
+    let key = '';
+    for (let i = 0; i < order.length; i++) key += order[i].id + ':' + order[i].lap + '|';
+    if (key === this.pauseOrderKey) return;
+    this.pauseOrderKey = key;
+
+    // Rebuilt rows must not re-deal the entrance animation on every reorder.
+    this.pauseOrderEl.classList.add('settled');
+    this.pauseOrderEl.textContent = '';
+    order.forEach((k, i) => {
+      const row = el('div', 'kr-row' + (k === player ? ' you' : ''), this.pauseOrderEl);
+      row.style.setProperty('--c', cssColor(k.stats.color));
+      const p = el('div', 'kr-row-p', row);
+      p.innerHTML = `${i + 1}<sup>${ordinalSuffix(i + 1)}</sup>`;
+      el('div', 'kr-row-c', row);
+      // Full names, never truncated: the roster's longest name is authored and
+      // the row is sized for it. `text-overflow: ellipsis` on content whose
+      // maximum length you control is the loudest "unfinished" tell there is,
+      // and the old in-race tower shipped "BRAMB…" and "MARLO…" in all ten
+      // review frames.
+      el('div', 'kr-row-n', row, k.stats.name);
+      el('div', 'kr-row-t', row, `Lap ${clamp(k.lap + 1, 1, race.totalLaps)}/${race.totalLaps}`);
+    });
   }
 
   private fillResults(ctx: Ctx) {

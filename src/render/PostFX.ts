@@ -319,10 +319,23 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, const in float depth,
   // takes a single tap — which is every frame that is not fast or boosting,
   // including all of the still, low-speed captures.
   if (travel > 0.0002) {
+    // The tap budget follows the length of the streak rather than being fixed.
+    //
+    // This matters now that the radial rush is driven by sustained speed and
+    // not only by a boost: the smear loop is entered on every frame above ~70%
+    // of top speed, which is most of a lap, where it used to be entered for two
+    // seconds at a time. A full budget is only needed once the streak is long
+    // enough for the gaps between taps to show — under ~8 px at 1080p, half the
+    // taps plus the per-pixel jitter already resolve into a smooth gradient, and
+    // half the taps is half the bandwidth over ~90% of the frame. Boost streaks
+    // (17-24 px at the corner) still get everything.
+    int taps = travel > 0.0040 ? SMEAR_SAMPLES : (SMEAR_SAMPLES / 2);
+    float fTaps = float(taps);
     c = vec3(0.0);
     if (fringePx > 0.0) {
       for (int i = 0; i < SMEAR_SAMPLES; ++i) {
-        float k = (float(i) + 0.5 + jitter) / float(SMEAR_SAMPLES) - 0.5;
+        if (i >= taps) break;
+        float k = (float(i) + 0.5 + jitter) / fTaps - 0.5;
         vec2 p = uv + velocity * k;
         c.r += texture2D(inputBuffer, clamp(p + fringe, lo, hi)).r;
         c.g += texture2D(inputBuffer, clamp(p, lo, hi)).g;
@@ -330,11 +343,12 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, const in float depth,
       }
     } else {
       for (int i = 0; i < SMEAR_SAMPLES; ++i) {
-        float k = (float(i) + 0.5 + jitter) / float(SMEAR_SAMPLES) - 0.5;
+        if (i >= taps) break;
+        float k = (float(i) + 0.5 + jitter) / fTaps - 0.5;
         c += texture2D(inputBuffer, clamp(uv + velocity * k, lo, hi)).rgb;
       }
     }
-    c /= float(SMEAR_SAMPLES);
+    c /= fTaps;
   } else if (fringePx > 0.0) {
     c.r = texture2D(inputBuffer, clamp(uv + fringe, lo, hi)).r;
     c.g = texture2D(inputBuffer, clamp(uv, lo, hi)).g;
@@ -521,7 +535,22 @@ export class GradeEffect extends Effect {
         // touched the shadows), and the warm midtones *gain* chroma as it comes
         // off, because the teal was desaturating them. 0.45 lands the road near
         // 0.32 and still delivers the §2 sky-fill in the shadows.
-        ['coolTint', new THREE.Uniform(new THREE.Vector3(0.917, 0.993, 1.070))],
+        //
+        // ROTATED TOWARD TEAL THIS ROUND, at constant chroma. Measured off the
+        // banked tarmac in r1/corner.png (600x300 px, 180 000 samples): the
+        // shaded road comes out mean rgb(24.0, 26.6, 37.7), i.e. B/G = 1.42 and
+        // an HSV saturation of 0.48 — that is a blue-violet shadow, not the
+        // teal §2 asks for, and 0.48 is also well over the 0.32 the last round
+        // set out to land. This pair was the last multiplicative thing in the
+        // chain still leaning on blue alone: 0.917/0.993/1.070 lifts B without
+        // lifting G at all, which is a *blue* axis by definition however small
+        // it is. 0.900/1.010/1.045 moves G above unity with B, which is what
+        // makes the axis teal, and it does it with slightly LESS total chroma
+        // (spread 0.145 against 0.153) and slightly less luminance loss
+        // (0.9892 against 0.9825) — so the road desaturates a little rather
+        // than gaining more colour, and §9.6's "no pure-black shadows" gains a
+        // hair of headroom at the same time.
+        ['coolTint', new THREE.Uniform(new THREE.Vector3(0.900, 1.010, 1.045))],
         ['warmTint', new THREE.Uniform(new THREE.Vector3(1.115, 1.005, 0.878))],
         // Additive teal lift on the bottom of the curve — art bible §2 asks for
         // a #a8c8ff sky fill in the shadows, and nothing multiplicative can
@@ -529,7 +558,20 @@ export class GradeEffect extends Effect {
         // Scaled with `coolTint` to 45% of the authored value (was
         // -0.0015/0.0035/0.0092) — see the note there; the two are one effect
         // and retuning either alone just moves the blue between them.
-        ['shadowLift', new THREE.Uniform(new THREE.Vector3(-0.00068, 0.00158, 0.00414))],
+        // Rotated with `coolTint` — the two are one effect. B/G was 2.62, which
+        // is a violet offset with a token amount of green in it; it is 1.20
+        // now, which is teal. Total chroma comes DOWN (0.0039 against 0.0048)
+        // and the luminance lift goes UP (0.0018 against 0.0013), which is the
+        // right direction on both counts: the measured shaded road is
+        // oversaturated at 0.48 and 1-2% of every frame sits below display 8.
+        //
+        // It is deliberately still small. Raising this far enough to put the
+        // shaded tarmac at the 0.04-0.06 floor §9.6 wants would need ~+0.018,
+        // which is 4.6 counts of flat teal poured over every dark pixel in the
+        // frame — that milks the blacks instead of tinting them, and it is the
+        // regression the last round spent itself undoing. The floor has to come
+        // from the sky-fill ambient in Sky.ts, not from the grade.
+        ['shadowLift', new THREE.Uniform(new THREE.Vector3(-0.00090, 0.00250, 0.00300))],
         // Highlight shoulder: knee just above sunlit diffuse white, then
         // x^0.72 above it, with only a light pull toward luminance so a hot
         // colour stays a colour until it is genuinely an order of magnitude
@@ -586,8 +628,44 @@ const CA_BOOST = 0.0016;
 // display white over a scene sitting at ~0.08, and the capture came back as a
 // starburst with no track in it. Halved, and the comb is now scaled by what is
 // actually under it (see `sceneLit`).
+//
+// STREAK_BOOST is now the ceiling for *either* driver — a flat-out lap reaches
+// it too. What still separates a boost is the second, whiter, faster comb the
+// shader adds on top of it (gated on `rush.z`), not the gain of the first one.
 const STREAK_REST = 0.095;
 const STREAK_BOOST = 0.25;
+
+/**
+ * The value `ctx.speedIntensity` takes at 100% of top speed with no boost.
+ *
+ * THIS IS THE NUMBER THE "no screen-space speed cue" BLOCKER TURNS ON, so it is
+ * worth writing down what the signal actually is. `speedIntensity` is NOT a
+ * fraction of top speed: Effects.updateSignals already applies the art bible's
+ * "only above ~70% top speed" gate — `want = clamp((ratio - 0.70) / 0.42)` —
+ * and then publishes `want * 0.42 + boost * 0.52`. So the number arriving here
+ * is zero at 70% of top speed, 0.30 flat out, and 0.42 only with a slipstream
+ * or a star on top; a boost adds a floor of 0.52 on top of all of that.
+ *
+ * Everything downstream was reading it as if it were a 0..1 speed fraction, and
+ * that is the whole bug. Worked through on the reviewed frames: hud.png at
+ * 101 km/h is ratio 0.935, so `want` = 0.56 and speedIntensity = 0.235. The
+ * streak gain was `STREAK_REST + (STREAK_BOOST - STREAK_REST) * kick` with kick
+ * = 0 (no boost), i.e. 0.095, times a gate of smoothstep(0.235, 0.08, 0.50) =
+ * 0.31 — a final gain of 0.029, which is under three counts of display white on
+ * the brightest tenth of the comb. The radial rush was 0.0065 * 0.235^2 =
+ * 0.00036, which is 0.4 px of travel at the frame corner at 1080p. Both are
+ * "nothing", exactly as reviewed, and closeup.png at 55 km/h (ratio 0.51, below
+ * the 70% gate) is a true zero — so the two frames are identical by
+ * construction.
+ *
+ * The review's suggested fix, `smoothstep(0.70, 1.0, speed)`, would have made
+ * that permanent: `speed` cannot exceed 0.42, so that expression is identically
+ * zero at every speed the game can produce. The 70% gate is upstream. What the
+ * lens needs is that gated ramp renormalised, which is what this constant is
+ * for: `fast = min(speed / SPEED_FLATOUT, 1)` is 0 at ~70% of top speed, 0.44
+ * at 90 km/h, 0.78 at 101 km/h and 1.0 flat out.
+ */
+const SPEED_FLATOUT = 0.30;
 
 /**
  * The boost kick, 0..1, recovered from `ctx.fovPunch`.
@@ -693,7 +771,32 @@ export class PostFX {
       // value as road five metres away". 0.9 m still reaches the kerb/tarmac
       // joint and the wall bases, and it puts most of the sample budget inside
       // the contact band where §9.4 needs it.
-      cfg.aoRadius = 0.9;
+      //
+      // BACK UP TO 1.2 m. The move from 1.5 to 0.9 last round was reasoned from
+      // the tyre contact patch and it overshot in the other direction, because
+      // the AO buffer is HALF RESOLUTION everywhere except Ultra and the review
+      // is judging objects at chase distance, not at 1 m. Work it out at the
+      // distance the frames are actually shot from: with a 62 deg vertical FOV
+      // at 1920x1080, a 0.9 m world radius around a kart 25 m away subtends
+      // ~58 px full-res, i.e. 29 px on the half-res buffer — but the occluded
+      // BAND, the part that is actually dark, is only as wide as the gap under
+      // the chassis projects, a handful of half-res pixels, and the poisson
+      // denoise then averages across 4 of them. Measured on r1/grid.png, where
+      // eight karts sit on flat tarmac with the sun head-on: the road
+      // immediately in front of the lead kart reads mean luma 25.3 against 29.8
+      // and 37.6 for the same tarmac 3 m to either side — a 23% delta that is
+      // inside the frame's own left-to-right falloff. There is effectively no
+      // footprint under any of the eight karts, which is the §9.4 blocker.
+      //
+      // 1.2 m is what the review asked for and it is the right number for two
+      // separate reasons: it widens the contact band past the denoise kernel so
+      // it survives to the screen, and it is the smallest radius that reaches
+      // across anything at ENVIRONMENT scale — the kerb-to-tarmac step, the
+      // wall bases, the concavities in the cliff face — which is the other half
+      // of the note ("large surfaces receive a single constant multiplier").
+      // distanceFalloff is unchanged at 1.0, so the depth rejection band scales
+      // with it to 0.24 m and still sits under the kart's 0.25 m ride height.
+      cfg.aoRadius = 1.2;
       // Left at 1.0 deliberately while the radius came down. N8AO folds the two
       // together — the depth rejection band is radius * distanceFalloff * 0.2,
       // so this is already tightening from 0.30 m to 0.18 m on its own. Pulling
@@ -791,11 +894,24 @@ export class PostFX {
         // fewer sources, each allowed to glow harder.
         intensity: 0.88,
         // Wide and soft — a big mip chain with a high radius reads as a lens,
-        // a small one reads as a glow filter. One level down at High: the top
-        // mip of an eight-level chain is a quarter-frame halo, which is what
-        // let a single blown highlight bleed across the whole horizon.
-        radius: 0.74,
-        levels: high ? 7 : 6,
+        // a small one reads as a glow filter.
+        //
+        // ONE MORE LEVEL OFF, and this is the "the entire midground dissolves
+        // into a formless white haze" note. Measured on r1/boost.png: nothing
+        // in that frame clips — 0.000% of pixels are above display luma 250 and
+        // the whole shot ceilings at 245 — so it is NOT overexposure and
+        // clamping the additive term (the review's suggestion) would have
+        // treated a symptom that is not present. What the numbers show is a
+        // VEIL: the horizon band at y300-400 runs 158 -> 218 -> 164 across the
+        // frame with a local sd of 52, i.e. plenty of energy and no structure.
+        // A seven-level chain at 1080p blurs the top mip over ~128 px, so the
+        // sun sitting on the horizon smears a halo a fifth of the frame wide
+        // over the road, the trackside props and the vanishing point — which is
+        // exactly the region the reviewers say they cannot read. Six levels
+        // halves that reach to ~64 px, keeps the disc glow §2 asks for, and
+        // costs one fewer up/down mip pair per frame.
+        radius: 0.72,
+        levels: 6,
       });
       this.bloom = bloom;
       this.add(composer, new EffectPass(ctx.camera, bloom));
@@ -886,38 +1002,59 @@ export class PostFX {
       (1 - Math.exp(-dt / (kickTarget > this.punch ? 0.05 : 0.28)));
     const kick = this.punch;
 
+    // The sustained-speed driver. See SPEED_FLATOUT: zero at ~70% of top speed,
+    // 0.44 at 90 km/h, 0.78 at 101 km/h, 1.0 flat out — and it does not need a
+    // boost to get there, which is the entire point of this round's fix.
+    const fast = Math.min(speed / SPEED_FLATOUT, 1);
+    // Whichever of "genuinely fast" and "boosting" is stronger drives the lens.
+    // A boost taken at half pace still fringes and still streaks; a flat-out lap
+    // with no boost now does too.
+    const drive = Math.max(fast, kick);
+
     // Shutter is normalised against a 60 Hz frame so the blur length is a
-    // function of how fast the world moves, not of how fast we happen to run.
+    // function of how fast the world moves, not of how fast we happen to run —
+    // and it now also lengthens with speed, so a 101 km/h pass integrates a
+    // longer camera streak than a 55 km/h cruise at the same frame rate. The
+    // subject is masked out of the velocity in the shader, so this only ever
+    // smears the world around the kart, never the kart.
     const shutter = ctx.settings.motionBlur
-      ? 0.5 * THREE.MathUtils.clamp(1 / 60 / Math.max(dt, 1e-4), 0.2, 2)
+      ? (0.50 + 0.34 * fast) * THREE.MathUtils.clamp(1 / 60 / Math.max(dt, 1e-4), 0.2, 2)
       : 0;
 
     const lens = grade.lens;
-    // Aberration ramps on whichever is stronger — raw speed or the boost kick —
-    // so a mushroom taken at half pace still fringes.
-    lens.x = CA_REST + (CA_BOOST - CA_REST) * Math.max(speed, kick);
-    lens.z = STREAK_REST + (STREAK_BOOST - STREAK_REST) * kick;
+    lens.x = CA_REST + (CA_BOOST - CA_REST) * drive;
+    lens.z = STREAK_REST + (STREAK_BOOST - STREAK_REST) * drive;
     lens.w = shutter;
 
     const rush = grade.rush;
-    // Radial zoom-blur. The quadratic term keeps it off during ordinary
-    // driving; the linear kick term is what makes a boost smear the world even
-    // when the boost is taken at a speed the plain ramp would ignore — which is
-    // every boost the capture rig has ever photographed (18.8 m/s in the
-    // reviewed frame, i.e. below the 70%-of-top-speed gate entirely).
+    // Radial zoom-blur, and the second half of the "no speed cue at speed" fix.
     //
-    // Halved from 0.014/0.020. At the old values a boosting kart put 42 px of
-    // radial streak on the frame corner at 1920 and every straight edge in the
-    // outer half of the image — kerb stripes, tunnel rock, roof lines — turned
-    // to directional mush. The kick term stays the larger of the two, so a
-    // boost is still what makes the world move.
-    rush.x = shutter > 0 ? 0.0065 * speed * speed + 0.0105 * kick * speed : 0;
-    // The gate. Effects publishes 0 below ~70% of top speed, 0.13 at 83%, 0.37
-    // flat out and 0.52-0.94 on a boost, so a knee at 0.08-0.50 puts the first
-    // faint lines in at exactly the "~70% top speed" the art bible asks for,
-    // has them properly present flat out, and lets a boost pin the gate open on
-    // its own — because a boost IS the event the lines exist to announce.
-    rush.y = Math.max(THREE.MathUtils.smoothstep(speed, 0.08, 0.50), kick * 0.9);
+    // The old expression was `0.0065 * speed^2 + 0.0105 * kick * speed`, i.e.
+    // quadratic in a signal that never exceeds 0.42 and linear in a term that is
+    // zero unless a boost is running. At 101 km/h that is 0.4 px of travel at
+    // the frame corner. The sustained term below is quadratic in `fast`, which
+    // is the same ramp renormalised, so it is still off during ordinary driving
+    // (0 at 70% of top speed, 2.1 px at 90 km/h) and reaches 6.7 px at 101 km/h
+    // and 11 px flat out — a readable edge smear that leaves the middle of the
+    // frame, the racing line and the vanishing point untouched, because the term
+    // is radial and therefore exactly zero at frame centre.
+    //
+    // It is combined with `max`, not `+`: the boost path keeps the value it was
+    // tuned to (0.0145, ~17 px at the corner) rather than gaining the sustained
+    // term on top of it. The reviewers are already unhappy about how much of
+    // boost.png is smeared; this must not make that worse.
+    rush.x = shutter > 0
+      ? Math.max(0.0095 * fast * fast, 0.0065 * speed * speed + 0.0105 * kick * speed)
+      : 0;
+    // The gate on the speed-line comb, now driven by the renormalised ramp: it
+    // cracks open just above the art bible's ~70% of top speed and is fully open
+    // by ~88%. A boost still pins it open on its own, because a boost IS the
+    // event the lines exist to announce.
+    // Gated on the SAME renormalised ramp the gain uses. Gating on the raw
+    // signal while the gain used the ramp was how the two ended up multiplying
+    // each other down to nothing: 0.216 of gain behind a gate of 0.31 is 0.067,
+    // which is invisible however the gain is tuned.
+    rush.y = Math.max(THREE.MathUtils.smoothstep(fast, 0.03, 0.55), kick * 0.9);
     rush.z = kick;
 
     // Keep `time` in a range where fract() still has bits left for the grain.
@@ -926,7 +1063,15 @@ export class PostFX {
 
     if (this.bloom !== null) {
       // A touch more glow under boost; the flame and the sparks are the payload.
-      this.bloom.intensity = 0.88 + 0.16 * speed + 0.26 * kick;
+      //
+      // Trimmed from 0.16/0.26. The reviewed boost frame runs kick ~1 and
+      // speed 0.89, so the old expression put the bloom at 1.29 — a 47% lift
+      // over the base — on the one frame in the set whose midground is already
+      // gone. The flame and the sparks are the payload and they clear the
+      // threshold on their own; the extra gain was mostly being spent on the
+      // sun sitting in the middle of that midground. 1.08 at full boost keeps
+      // the punch and stops the veil growing with it.
+      this.bloom.intensity = 0.88 + 0.06 * fast + 0.14 * kick;
     }
 
     const player = ctx.race?.player;

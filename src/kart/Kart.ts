@@ -67,6 +67,62 @@ const DRIFT_TIERS = [0.9, 2.0, 3.2];
 const DRIFT_BOOST_TIME = [0, 0.85, 1.35, 2.1];
 const DRIFT_BOOST_STRENGTH = [1, 1.1, 1.19, 1.3];
 
+/** slip angle the slide controller aims for, at full outward / full inward lock */
+const DRIFT_SLIP_OUT = 0.18;
+const DRIFT_SLIP_IN = 0.44;
+/** how hard the controller closes the slip-angle error, 1/s */
+const DRIFT_SLIP_GAIN = 2.6;
+
+/**
+ * ============================================================================
+ *  The authored drift pose
+ * ============================================================================
+ *  Nintendo does not *simulate* the drift silhouette, it poses it. A shipped
+ *  Mario Kart drift is 25-35 degrees of crab, eight to ten degrees of roll onto
+ *  the outside springs and daylight under the inside wheels — held at that value
+ *  for the whole slide, independent of what the tyres happen to be doing that
+ *  frame. Round 1 proved why that separation matters: the drift state machine
+ *  was charging all the way to tier 2 while the chassis tracked its velocity to
+ *  within 0.7 degrees, so the shot had sparks, a boost and a HUD, and a kart
+ *  driving in a straight line. Every readable thing about a drift lived on one
+ *  number that the physics was free to lose.
+ *
+ *  So the pose is authored here and the physics slip angle is *credited against
+ *  it* rather than being what produces it: the rendered yaw offset is
+ *  `beta - betaWanted`, which collapses to zero exactly when the tyres deliver
+ *  the whole angle on their own and grows to cover the shortfall when they do
+ *  not. Physics stays the thing that decides where the kart goes; the pose only
+ *  decides which way it is pointing while it goes there.
+ *
+ *  All of it lives on `visual` and `bodyNode`. `position`, `quaternion`,
+ *  `forward` and `right` — everything the camera, the AI and the collision
+ *  system read — are untouched, so a 30 degree crab cannot destabilise a chase
+ *  camera or make an AI think it is aimed at the scenery.
+ * ============================================================================
+ */
+/** rendered slip at drift entry, rad (19 deg) */
+const DRIFT_POSE_BASE = 0.33;
+/** added by mini-turbo charge, up to tier 3 (+11 deg => 30 deg) */
+const DRIFT_POSE_TIER = 0.19;
+/** added/removed by the stick, so tightening the line reads (+-3 deg) */
+const DRIFT_POSE_LOCK = 0.05;
+/** hard cap on the rendered yaw offset, rad (35 deg) */
+const DRIFT_POSE_MAX = 0.62;
+/** bodywork lean onto the outside springs, rad (8.6 deg) */
+const DRIFT_BODY_ROLL = 0.15;
+/** roll of the WHOLE kart, rad (3.4 deg) — this is what tilts the wheelbase */
+const DRIFT_CHASSIS_ROLL = 0.06;
+/** extra visual lock on the front wheels while sliding, rad (8 deg) */
+const DRIFT_POSE_STEER = 0.14;
+/**
+ * Share of the inside corners' travel left uncompensated under the chassis roll.
+ * The outside pair is held exactly on the road; the inside pair is deliberately
+ * left short of it, which is where the inside-wheel daylight comes from.
+ */
+const POSE_WHEEL_LIFT = 0.45;
+/** ground speed, m/s, at which the pose is fully engaged */
+const POSE_SPEED_FULL = 9;
+
 /**
  * Forward assist while sliding, m/s^2. A drift at 25 degrees of slip scrubs
  * roughly 4.5 m/s^2 through lateral tyre work, which over a long corner costs
@@ -227,11 +283,48 @@ export class Kart implements IKart {
   // smoothed body accelerations, drive the roll/pitch springs and the driver
   private aLat = 0;
   private aLong = 0;
+  /**
+   * Lateral *specific force*, i.e. `aLat` without the centripetal term.
+   *
+   * `aLat` is the number a passenger feels pressed sideways by, and it is
+   * deliberately the frozen-frame velocity change PLUS `yawRate * v` so that the
+   * roll spring and the driver's lean read a corner as hard as it looks. That is
+   * fine for feel and wrong for kinematics: the slip-angle identity the drift
+   * controller is built on, `beta' = a/v - yawRate`, wants the plain specific
+   * force, and feeding it the doubled one turns a proportional controller into
+   * an integrator on the wrong variable. The fixed point stops being
+   * `beta = target` and becomes `courseRate = gain * (target - beta)`, so beta
+   * settles wherever the corner's own curvature puts it — which on a medium
+   * radius is a fraction of a degree. That is round 1's drift shot: tier 2
+   * charged, sparks lit, chassis dead straight. Keep the two apart.
+   */
+  private aLatPure = 0;
 
   // squash & stretch
   private squashTime = 0;
   private squashLen = 0.3;
   private spinDir = 1;
+
+  // authored drift pose — see the DRIFT_POSE_* block above
+  /** 0..1 how far the pose is ramped in; survives the release so it can decay */
+  private posePhase = 0;
+  /** drift direction latched for the decay, since driftDir clears on release */
+  private poseDir = 0;
+  // NOTE (public, deliberately not on IKart): the rendered yaw offset about the
+  // chassis up axis, radians, + = nose swung toward `right`. `quaternion` is the
+  // physics heading and does NOT contain this — that separation is the whole
+  // point, it is what keeps the chase camera and the AI stable while the kart
+  // crabs. Anything that places world-space geometry relative to a part of the
+  // MODEL (drift sparks and their scorch decal at the rear contact patches, tyre
+  // smoke, exhaust plumes) must rotate its body-space offset by this angle about
+  // `up` before applying `quaternion`, or it will sit where the kart would have
+  // been if it were not drifting — up to 0.4 m adrift of the wheel it is meant
+  // to be coming off.
+  driftPoseYaw = 0;
+  /** whole-kart roll actually applied this frame, after the clearance contraction */
+  private poseChassisRoll = 0;
+  /** extra visual lock carried by the front wheel nodes, rad */
+  private poseSteer = 0;
 
   // respawn bookkeeping
   private track: ITrack | null = null;
@@ -465,9 +558,12 @@ export class Kart implements IKart {
    * Height of the lowest point of the bodywork for a given lean, in chassis
    * space — where y = 0 is the contact plane.
    *
-   * `updateVisuals` poses the shell with Euler order ZYX as (pitch, 0, -roll),
-   * whose second row with no yaw is exactly the expression below. Kept in sync
-   * with that call by hand; there is no cheaper way to ask three.js for one row.
+   * `updateVisuals` poses the shell as (pitch, yaw, -roll) — order ZYX on the
+   * bodywork and YZX on the outer group, which differ only in where the yaw
+   * sits. Either way the yaw is a rotation about the up axis and cannot change
+   * a height, so the row below (the no-yaw second row, shared by both orders) is
+   * exact for both. Kept in sync with those calls by hand; there is no cheaper
+   * way to ask three.js for one row.
    */
   private lowestBody(roll: number, pitch: number): number {
     const h = this.leanHull;
@@ -480,6 +576,15 @@ export class Kart implements IKart {
       if (y < lo) lo = y;
     }
     return lo;
+  }
+
+  /** Drop the authored drift pose without a transition. Teleports only. */
+  private clearPose() {
+    this.posePhase = 0;
+    this.poseDir = 0;
+    this.driftPoseYaw = 0;
+    this.poseSteer = 0;
+    this.poseChassisRoll = 0;
   }
 
   // ---------------------------------------------------------------------------
@@ -497,11 +602,12 @@ export class Kart implements IKart {
     this.forwardSpeed = 0;
     this.steerInput = 0;
     this.steerAngle = 0;
-    this.aLat = this.aLong = 0;
+    this.aLat = this.aLong = this.aLatPure = 0;
     this.driftDir = 0;
     this.driftCharge = 0;
     this.driftTier = 0;
     this.driftTime = 0;
+    this.clearPose();
     this.boostTime = 0;
     this.boostStrength = 1;
     this.stunTime = 0;
@@ -834,11 +940,17 @@ export class Kart implements IKart {
         // driftDir. And since beta' = aLat/v - yawRate, raising the yaw rate
         // *deepens* the slide: steering the yaw rate proportionally to the
         // error rather than against it is positive feedback and spins the kart.
+        // `aLatPure`, not `aLat`: the identity is only true for the plain
+        // specific force, and the doubled one silently cancels the slide. See
+        // the field comment — that single term is why round 1 drifted at 0.7
+        // degrees while the tier counter ran to 2.
         const v = Math.max(6, Math.hypot(latBefore, fwdBefore));
         const beta = Math.atan2(latBefore, Math.max(2, Math.abs(fwdBefore)));
-        const target = -this.driftDir * THREE.MathUtils.lerp(0.16, 0.42, (inward + 1) * 0.5);
+        const target = -this.driftDir *
+          THREE.MathUtils.lerp(DRIFT_SLIP_OUT, DRIFT_SLIP_IN, (inward + 1) * 0.5);
         // Yaw rate that would hold beta steady, biased to close the error.
-        const desired = this.aLat / v - clamp(target - beta, -0.45, 0.45) * 2.6;
+        const desired = this.aLatPure / v -
+          clamp(target - beta, -0.45, 0.45) * DRIFT_SLIP_GAIN;
         this.yawRate += clamp(desired - this.yawRate, -2.5, 2.5) * 6 * h;
         this.driftBeta = beta;
       } else {
@@ -901,11 +1013,17 @@ export class Kart implements IKart {
     // --- body accelerations, for roll/pitch and the driver rig ---------------
     const latNow = this.velocity.dot(this.right);
     const fwdNow = this.velocity.dot(this.forward);
-    const aLatRaw = (latNow - latBefore) / h + this.yawRate * fwdNow;
+    // `this.right` is still the basis this substep started with — updateBasis
+    // does not run again until the next one — so this difference is already the
+    // lateral specific force. `aLat` adds the centripetal term on top of it on
+    // purpose (see the field comment); `aLatPure` is the one the kinematics use.
+    const aLatSpecific = (latNow - latBefore) / h;
+    const aLatRaw = aLatSpecific + this.yawRate * fwdNow;
     const aLongRaw = (fwdNow - fwdBefore) / h - this.yawRate * latNow;
     // Clamped well beyond any achievable cornering load but far short of what
     // a momentary spin would produce, so the roll spring can never saturate.
     const k = smooth(24, h);
+    this.aLatPure += (clamp(aLatSpecific, -45, 45) - this.aLatPure) * k;
     this.aLat += (clamp(aLatRaw, -45, 45) - this.aLat) * k;
     this.aLong += (clamp(aLongRaw, -45, 45) - this.aLong) * k;
     this.lateralAccel = this.aLat;
@@ -1161,9 +1279,56 @@ export class Kart implements IKart {
   // visuals
   // ---------------------------------------------------------------------------
 
+  /**
+   * Ramp the authored drift pose and work out the rendered yaw offset.
+   *
+   * The offset is the *shortfall*: whatever slip angle the tyres are already
+   * carrying counts toward the target, so this goes to zero on a kart that is
+   * genuinely sideways and opens up on one that is not. That is what stops the
+   * two systems fighting — the silhouette is the same either way, and the pose
+   * never adds a crab on top of a real one.
+   */
+  private updateDriftPose(dt: number) {
+    const live = this.driftDir !== 0 && this.stunTime <= 0;
+    if (live) this.poseDir = this.driftDir;
+
+    // Below walking pace a crabbed kart reads as broken rather than committed,
+    // and the drift itself bails at 3.5 m/s anyway.
+    const groundSpeed = Math.hypot(this.velocity.x, this.velocity.z);
+    const want = live ? clamp((groundSpeed - 3) / (POSE_SPEED_FULL - 3), 0, 1) : 0;
+    // Snaps in with the hop, relaxes out over the mini-turbo — asymmetric on
+    // purpose: the entry is an event, the exit is a recovery.
+    this.posePhase += (want - this.posePhase) * smooth(want > this.posePhase ? 9 : 5.5, dt);
+
+    let yawWant = 0;
+    let steerWant = 0;
+    if (this.posePhase > 1e-3 && this.poseDir !== 0) {
+      const e = this.posePhase;
+      const tierMix = clamp((this.driftTier + this.driftCharge) / 3, 0, 1);
+      const lock = clamp(this.steerInput * this.poseDir, -1, 1);
+      const pose = DRIFT_POSE_BASE + DRIFT_POSE_TIER * tierMix + DRIFT_POSE_LOCK * lock;
+      // Signed like the physical slip target in `substep`: nose leads the
+      // velocity, so beta carries the opposite sign to the drift direction.
+      const betaWant = -this.poseDir * pose;
+      const beta = Math.atan2(
+        this.velocity.dot(this.right),
+        Math.max(2.5, Math.abs(this.velocity.dot(this.forward))),
+      );
+      yawWant = clamp((beta - betaWant) * e, -DRIFT_POSE_MAX, DRIFT_POSE_MAX);
+      steerWant = this.poseDir * DRIFT_POSE_STEER * e;
+    } else {
+      this.posePhase = 0;
+      this.poseDir = 0;
+    }
+
+    this.driftPoseYaw += (yawWant - this.driftPoseYaw) * smooth(11, dt);
+    this.poseSteer += (steerWant - this.poseSteer) * smooth(13, dt);
+  }
+
   private updateVisuals(dt: number) {
     this.object.position.copy(this.position);
     this.object.quaternion.copy(this.quaternion);
+    this.updateDriftPose(dt);
 
     const sus = this.suspension;
     // The physical roll is honest but subtle; a Nintendo kart wants to lean.
@@ -1171,8 +1336,18 @@ export class Kart implements IKart {
     // would put a wheel through the bodywork.
     let roll = clamp(sus.roll * 2.3, -0.3, 0.3);
     let pitch = clamp(sus.pitch * 1.7, -0.22, 0.22);
-    // Reinforce the physical outward lean of a slide rather than fighting it.
-    if (this.driftDir !== 0) roll = clamp(roll - this.driftDir * 0.07, -0.36, 0.36);
+    // The authored lean. Split across two nodes rather than piled onto one:
+    // the bodywork carries most of it (that is the lean you read), while a
+    // smaller roll of the whole kart tilts the wheelbase itself — which is what
+    // gives the outside pair its compression and the inside pair its daylight.
+    // Rolling the bodywork alone can never do that, because the wheels do not
+    // hang off it. Both are reinforcing the physical roll, never fighting it.
+    let chassisRoll = 0;
+    if (this.posePhase > 0 && this.poseDir !== 0) {
+      const e = this.posePhase;
+      roll = clamp(roll - this.poseDir * DRIFT_BODY_ROLL * e, -0.38, 0.38);
+      chassisRoll = -this.poseDir * DRIFT_CHASSIS_ROLL * e;
+    }
 
     // --- keep the shell out of the road -------------------------------------
     // Measured on this model, the lean asked for above costs 145 mm of the
@@ -1181,19 +1356,28 @@ export class Kart implements IKart {
     // bumper corner both end up under the surface. Both channels are contracted
     // by the same factor rather than clamped apart, so a kart braking hard
     // mid-drift keeps the *shape* of its pose and only loses the excess.
-    let sink = this.leanFloor - this.lowestBody(roll, pitch);
+    //
+    // The chassis roll counts toward the same budget. It pivots about the
+    // contact plane rather than the shell's own origin, but the two differ only
+    // by `bodyRestY * (1 - cos)` — tens of microns at these angles, and in the
+    // safe direction — so the pair can be tested as one angle and contracted
+    // together. Yaw is exempt: a rotation about the up axis cannot change the
+    // height of anything, which is precisely why the crab is free.
+    let sink = this.leanFloor - this.lowestBody(roll + chassisRoll, pitch);
     if (sink > BODY_SINK_MAX) {
       let lo = 0;
       let hi = 1;
       for (let it = 0; it < 5; it++) {
         const k = (lo + hi) * 0.5;
-        if (this.leanFloor - this.lowestBody(roll * k, pitch * k) <= BODY_SINK_MAX) lo = k;
+        if (this.leanFloor - this.lowestBody((roll + chassisRoll) * k, pitch * k) <= BODY_SINK_MAX) lo = k;
         else hi = k;
       }
       roll *= lo;
       pitch *= lo;
-      sink = this.leanFloor - this.lowestBody(roll, pitch);
+      chassisRoll *= lo;
+      sink = this.leanFloor - this.lowestBody(roll + chassisRoll, pitch);
     }
+    this.poseChassisRoll = chassisRoll;
 
     // Trick: a full rotation over the airtime, eased so it lands flat.
     let trickRoll = 0;
@@ -1206,13 +1390,25 @@ export class Kart implements IKart {
     }
 
     // A trick rotates the WHOLE kart — wheels and all — so it lives on the
-    // outer group. Lean and dive rotate only the bodywork, so the wheels stay
-    // planted in their wells.
+    // outer group, and so do the two channels of the drift pose that have to
+    // take the wheels with them: the crab and the chassis roll. Lean and dive
+    // rotate only the bodywork, so the wheels stay planted in their wells.
+    //
+    // Order YZX, not ZYX: it puts the yaw outermost, so the roll happens about
+    // the kart's own longitudinal axis instead of about the direction of
+    // travel. At thirty degrees of crab that is the difference between a kart
+    // leaning into its slide and a kart leaning sideways across it. With no yaw
+    // the two orders are identical, so nothing that predates the pose moves.
     const sameNode = this.bodyNode === this.visual;
-    _euler.set(trickPitch, 0, trickRoll, 'ZYX');
+    _euler.set(trickPitch, this.driftPoseYaw, trickRoll - chassisRoll, 'YZX');
     if (!sameNode) this.visual.rotation.copy(_euler);
 
-    _euler.set(pitch + (sameNode ? trickPitch : 0), 0, -roll + (sameNode ? trickRoll : 0), 'ZYX');
+    _euler.set(
+      pitch + (sameNode ? trickPitch : 0),
+      sameNode ? this.driftPoseYaw : 0,
+      -roll + (sameNode ? trickRoll - chassisRoll : 0),
+      sameNode ? 'YZX' : 'ZYX',
+    );
     this.bodyNode.rotation.copy(_euler);
     // Float off whatever penetration survived the contraction. Skipped when the
     // model never separated its bodywork, because there the "body" carries the
@@ -1235,12 +1431,31 @@ export class Kart implements IKart {
 
   private applyWheelVisuals(dt: number) {
     const sus = this.suspension;
+    // Undo the chassis roll at each corner so the wheels stay where the physics
+    // has them. Rolling the kart by `rho` about the contact plane drops the
+    // hardpoint at local x by `x * sin(rho)`, so adding that back to the node's
+    // own height puts the tyre exactly on the road again — for the loaded pair.
+    // The unloaded pair gets only part of it back, and the remainder is the
+    // inside-wheel lift: about 20 mm of daylight at full pose, enough to read in
+    // a close shot without looking like a kart on two wheels in a wide one.
+    const roll = this.poseChassisRoll;
+    const sr = roll !== 0 ? Math.sin(roll) : 0;
     for (let i = 0; i < 4; i++) {
       const w = sus.wheels[i];
       const node = this.wheels[this.wheelMap[i]];
       if (!node) continue;
-      node.position.y = this.wheelRestY[i] + sus.visualOffset(w);
-      if (w.front) node.rotation.y = this.steerAngle;
+      let y = this.wheelRestY[i] + sus.visualOffset(w);
+      if (sr !== 0) {
+        const drop = node.position.x * sr;
+        y += drop > 0 ? drop : drop * (1 - POSE_WHEEL_LIFT);
+      }
+      node.position.y = y;
+      // The front wheels carry extra lock while sliding. The physical rack is
+      // already biased toward the drift, but it is a compromise between the
+      // slide and the stick and it can wind itself flat when the two disagree —
+      // which is exactly what round 1 photographed. The pose is not a
+      // compromise.
+      if (w.front) node.rotation.y = this.steerAngle + this.poseSteer;
       // +X rotation carries the top of the wheel forward, i.e. rolling forward
       w.spinAngle += w.spinRate * dt;
       if (!Number.isFinite(w.spinAngle)) w.spinAngle = 0;
@@ -1253,14 +1468,20 @@ export class Kart implements IKart {
     const g = clamp(this.aLat / GRAVITY, -1.2, 1.2);
 
     if (this.driverRig) {
+      // The driver leans off the same authored pose as the chassis, not off the
+      // measured load. A pilot sitting bolt upright inside a kart that is thirty
+      // degrees sideways is the tell that the pose is painted on. `poseDir`
+      // carries the same sign as the g the corner would have produced, so the
+      // two only ever add.
+      const lean = clamp(g / 1.1 + this.poseDir * 0.5 * this.posePhase, -1, 1);
       // KartModel's rig channels are all -1..1 (duck 0..1) and it must be
       // updated every frame — left undriven it runs its own idle loop.
       this.driverRig.setPose(
         clamp(this.steerAngle / MAX_STEER, -1, 1),
-        clamp(g / 1.1, -1, 1),                                    // + = right-hand corner
+        lean,                                                     // + = right-hand corner
         clamp(-this.aLong / GRAVITY, -1, 1),                      // + = braking, tuck forward
         this.boostTime > 0 ? 1 : clamp(Math.abs(this.forwardSpeed) / 34, 0, 0.55),
-        clamp(this.steerInput * 0.7 + this.driftDir * 0.45, -1, 1),
+        clamp(this.steerInput * 0.7 + this.poseDir * 0.55 * this.posePhase, -1, 1),
       );
       this.driverRig.update(dt);
       return;
@@ -1346,13 +1567,14 @@ export class Kart implements IKart {
     if (this.up.y < 0.2) this.up.set(0, 1, 0);
     this.t = this.lastGoodT;
     this.forwardSpeed = 0;
-    this.aLat = this.aLong = 0;
+    this.aLat = this.aLong = this.aLatPure = 0;
     this.steerInput = 0;
     this.steerAngle = 0;
     this.driftDir = 0;
     this.driftTier = 0;
     this.driftCharge = 0;
     this.driftTime = 0;
+    this.clearPose();
     this.boostTime = 0;
     this.boostStrength = 1;
     this.stunTime = 0;

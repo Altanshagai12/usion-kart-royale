@@ -23,8 +23,8 @@
  */
 import * as THREE from 'three';
 import {
-  Mesher, Role, kartMaterials, liveryGeometry, mat,
-  type Built, type Livery, type Section,
+  Mesher, Role, gripArmMaterial, kartMaterials, liveryGeometry, mat,
+  type Built, type GripArmMaterial, type Livery, type Section,
 } from './Liveries';
 
 // --- rig constants -----------------------------------------------------------
@@ -47,6 +47,57 @@ const RIM_TUBE = 0.030;
 function rimPoint(phi: number, col: THREE.Matrix4, out: THREE.Vector3): THREE.Vector3 {
   return out.set(Math.sin(phi) * RIM_R, 0, Math.cos(phi) * RIM_R).applyMatrix4(col);
 }
+
+/**
+ * Arc-length parameter (0 at the shoulder, 1 at the wrist) of the point on
+ * `path` nearest `p`, together with that distance. This is what turns a bag of
+ * tubes into a skin: every vertex of the arm — limb, sleeve, cuff, glove, thumb,
+ * knuckle strap, deltoid — gets its blend weight from where it sits ALONG the
+ * limb, so parts that were authored independently cannot disagree about how far
+ * down the arm they are.
+ */
+function limbParam(
+  path: readonly THREE.Vector3[], lens: Float64Array, total: number,
+  p: THREE.Vector3, seg: THREE.Vector3, rel: THREE.Vector3,
+): { t: number; d2: number } {
+  let bestD2 = Infinity;
+  let bestS = 0;
+  for (let i = 0; i < path.length - 1; i++) {
+    seg.subVectors(path[i + 1], path[i]);
+    const len2 = seg.lengthSq();
+    rel.subVectors(p, path[i]);
+    let u = len2 > 1e-12 ? rel.dot(seg) / len2 : 0;
+    u = u < 0 ? 0 : u > 1 ? 1 : u;
+    const dx = rel.x - seg.x * u;
+    const dy = rel.y - seg.y * u;
+    const dz = rel.z - seg.z * u;
+    const d2 = dx * dx + dy * dy + dz * dz;
+    if (d2 < bestD2) {
+      bestD2 = d2;
+      bestS = lens[i] + Math.sqrt(len2) * u;
+    }
+  }
+  return { t: bestS / total, d2: bestD2 };
+}
+
+/**
+ * Where along the limb the wheel's rotation takes over from the shoulder's.
+ * Below GRIP_T0 the arm is bolted to the torso; at GRIP_T1 (the wrist, which
+ * IS a point on the rim) it is bolted to the wheel.
+ *
+ * 0.15, not 0.28, and the reason is the ring spacing. `addTube` lays one ring
+ * per control point, so the limb only has seven weights to work with: at
+ * arc-length parameters 0, 0.20, 0.39 (elbow), 0.59, 0.82, 0.94, 1. A ramp
+ * starting at 0.28 leaves the first two rings at zero and crams the whole
+ * deformation into three segments, which at full lock is a 0.46 step between
+ * adjacent rings — a visible kink rather than a bend. From 0.15 the weights run
+ * 0 / 0.01 / 0.20 / 0.46 / 0.88 / 0.99 / 1: the same total travel spread over
+ * five segments. The elbow moves about 60 mm at full lock, which is what an
+ * elbow does when a driver turns a wheel a third of a turn, and the deltoid at
+ * t≈0 still does not move at all.
+ */
+const GRIP_T0 = 0.15;
+const GRIP_T1 = 1.0;
 
 /** Superellipse outline; p ~3.4 traces a softly rounded rectangle. */
 function squircle(t: number, p: number, out: [number, number]): [number, number] {
@@ -190,7 +241,13 @@ function torsoAndLegs(): Built {
         new THREE.Vector3(s * 0.162, 0.055, 0.44),
       ],
       (t) => 0.105 - t * 0.022,
-      8,
+      // 6 radial, not 8. The thigh runs from the seat pan into the nose
+      // bodywork and the only part of it that ever reaches a pixel is the
+      // 40 mm strip between the tub rail and the knee pad. This, the shin and
+      // the pad below pay for the wheel-rim and roll-bar segment counts the
+      // closeup note asks for — the triangles move from geometry the camera
+      // cannot reach to geometry it is 1 m from.
+      6,
       Role.Suit,
     );
     m.addTube(
@@ -200,11 +257,11 @@ function torsoAndLegs(): Built {
         new THREE.Vector3(s * 0.17, -0.10, 0.60),
       ],
       (t) => 0.085 - t * 0.012,
-      8,
+      6,
       Role.Suit,
     );
     // knee pad — a bright chip that catches the sun above the bodywork
-    m.addGeometry(new THREE.SphereGeometry(0.085, 6, 5), Role.Base, mat(s * 0.158, 0.085, 0.42, 0, 0, 0, 1, 0.85, 1.15), 1.2);
+    m.addGeometry(new THREE.SphereGeometry(0.085, 5, 4), Role.Base, mat(s * 0.158, 0.085, 0.42, 0, 0, 0, 1, 0.85, 1.15), 1.2);
     // Boot. Fully enclosed by the nose bodywork, so two sections is all it
     // earns — and the heel is left open: it starts 50 mm from the shin tube's
     // end cap, well inside that cap's 62 mm dome, so the 24 triangles the
@@ -261,6 +318,7 @@ function torsoAndLegs(): Built {
  */
 function arms(): Built {
   const m = new Mesher();
+  const limbPaths: THREE.Vector3[][] = [];
   const col = columnMatrix();
   const hub = new THREE.Vector3(0, 0, 0).applyMatrix4(col);
   // the rim's own plane normal, in hips space: the axis fingers curl about
@@ -312,13 +370,19 @@ function arms(): Built {
       new THREE.Vector3(s * 0.288, 0.424, 0.318),
       new THREE.Vector3(s * 0.214, 0.482, 0.398),
       wristIn,
+      // The GRIP point itself closes the chain. It is not swept — the glove
+      // covers it — but the skin has to know that the limb ends on the rim,
+      // not 30 mm short of it, or the palm's weight comes out below 1 and the
+      // hand lags the wheel by a few degrees at full lock.
+      wrist.clone(),
     ];
-    m.addTube(limb, (t) => 0.086 - 0.036 * Math.pow(t, 0.85), 9, Role.Suit);
+    limbPaths.push(limb);
+    m.addTube(limb.slice(0, 6), (t) => 0.086 - 0.036 * Math.pow(t, 0.85), 9, Role.Suit);
     // Sleeve of the livery coat from the elbow down — the value break that
     // separates the limb from the dark tub it crosses. It is a CONCENTRIC tube
     // ~9 mm fatter than the limb running underneath it, so the colour changes
     // without the silhouette changing: no join, nothing to crease.
-    m.addTube(limb.slice(2), (t) => 0.078 - t * 0.022, 8, Role.Base);
+    m.addTube(limb.slice(2, 6), (t) => 0.078 - t * 0.022, 8, Role.Base);
     // cuff: overlaps the sleeve's end dome AND the palm, so no pose can open a
     // gap between glove and sleeve
     a0.lerpVectors(wristIn, limb[4], 0.34);
@@ -360,8 +424,41 @@ function arms(): Built {
     m.addTube([a0, a1, a2], 0.011, 5, Role.Plastic);
   }
   const b = m.finish();
-  // Bake into the steering-column frame so the whole assembly can counter-steer
-  // about the column axis with a single rotation.y.
+
+  // --- skin weights -------------------------------------------------------
+  // One float per vertex: 0 = rides the torso, 1 = rides the steering wheel.
+  // Computed in HIPS space, before the column bake below, because that is the
+  // space the limb polylines are authored in. See `gripArmMaterial` in
+  // Liveries for what the shader does with it.
+  {
+    const pos = b.geo.getAttribute('position');
+    const grip = new Float32Array(pos.count);
+    const lens = limbPaths.map((path) => {
+      const l = new Float64Array(path.length);
+      for (let i = 1; i < path.length; i++) l[i] = l[i - 1] + path[i].distanceTo(path[i - 1]);
+      return l;
+    });
+    const p = new THREE.Vector3();
+    const seg = new THREE.Vector3();
+    const rel = new THREE.Vector3();
+    for (let i = 0; i < pos.count; i++) {
+      p.fromBufferAttribute(pos, i);
+      let best = Infinity;
+      let t = 0;
+      for (let k = 0; k < limbPaths.length; k++) {
+        const total = lens[k][lens[k].length - 1];
+        const r = limbParam(limbPaths[k], lens[k], total, p, seg, rel);
+        if (r.d2 < best) { best = r.d2; t = r.t; }
+      }
+      const x = THREE.MathUtils.clamp((t - GRIP_T0) / (GRIP_T1 - GRIP_T0), 0, 1);
+      grip[i] = x * x * (3 - 2 * x); // smoothstep: C1 at both ends, no crease
+    }
+    b.geo.setAttribute('aGrip', new THREE.BufferAttribute(grip, 1));
+  }
+
+  // Bake into the steering-column frame. The skin's rotation is about local +Y,
+  // so this is what makes local +Y the column axis — and therefore what makes
+  // "weight 1" mean "in the steering wheel's own frame" exactly.
   b.geo.applyMatrix4(columnMatrix().invert());
   return b;
 }
@@ -524,11 +621,15 @@ function helmet(): { helmet: Built; visor: Built } {
   // a real recess, and nothing coplanar anywhere near it.
   const v = new Mesher();
   v.addGeometry(
+    // Four rings, not five. The glass is a CONSTANT-radius cap — every ring
+    // lies on the same sphere — so the interior rings buy no curvature at all;
+    // they only subdivide a surface that is already exactly spherical. All the
+    // shape is in the outline, and the outline is `VISOR_COLS`, which is
+    // untouched. 44 triangles toward the wheel rim.
     spherePatch(VISOR_YAW, VISOR_PITCH, VISOR_HALF, [
       [0.000, 0.2072],
-      [0.400, 0.2072],
-      [0.700, 0.2072],
-      [0.880, 0.2072],
+      [0.500, 0.2072],
+      [0.800, 0.2072],
       [0.965, 0.2072],
     ], VISOR_COLS),
     Role.Plastic, shell, 1,
@@ -566,6 +667,7 @@ export class DriverRig {
   private column = new THREE.Group();
   private armRig = new THREE.Group();
   private wheelNode = new THREE.Group();
+  private armGrip: GripArmMaterial;
 
   private sSteer = 0;
   private sLean = 0;
@@ -589,8 +691,13 @@ export class DriverRig {
         helmet: liveryGeometry(g.helmet, livery),
         wheel: liveryGeometry(g.wheel, livery),
       };
+      // `liveryGeometry` re-uses the source buffers and only owns a fresh colour
+      // attribute, so the skin weights have to be carried across by hand. They
+      // are livery-independent, so all eight share the one buffer.
+      per.arms.setAttribute('aGrip', g.arms.geo.getAttribute('aGrip'));
       _perLivery.set(livery.index, per);
     }
+    this.armGrip = gripArmMaterial();
 
     const mesh = (geo: THREE.BufferGeometry, material: THREE.Material, name: string) => {
       const o = new THREE.Mesh(geo, material);
@@ -611,7 +718,7 @@ export class DriverRig {
     this.armRig.rotation.x = COL_RAKE;
     this.column.add(this.wheelNode);
     this.wheelNode.add(mesh(per.wheel, mats.plastic, 'steeringWheel'));
-    this.armRig.add(mesh(per.arms, mats.character, 'driverArms'));
+    this.armRig.add(mesh(per.arms, this.armGrip.material, 'driverArms'));
 
     this.hips.add(this.column);
     this.hips.add(this.armRig);
@@ -675,11 +782,26 @@ export class DriverRig {
     this.head.rotation.z = -this.sLean * 0.24 - shudder * 1.6;
     this.head.rotation.x = -this.sDuck * 0.22 - this.sPitch * 0.05 - breath * 1.6;
 
-    this.wheelNode.rotation.y = -this.sSteer * 0.85;
-    // The arms swing about the column too, but at a quarter of the rim's
-    // throw: the shoulder balls ride with them and have to stay inside the
-    // torso's shoulder line at full lock.
-    this.armRig.rotation.y = -this.sSteer * 0.22;
+    // 0.62 rad (35 deg) of rim throw, down from 0.85 (49 deg).
+    //
+    // This is a consequence of the grip skin below, and it is the honest number
+    // rather than the convenient one. Once the hands actually track the rim, the
+    // rim's throw IS the arm's throw, and 49 deg swings the forearm far enough
+    // about the column axis to drive it through the wheel and the driver's own
+    // chest at full lock — rendered and confirmed. It was only ever survivable
+    // because the arms were ignoring the wheel. 35 deg is also the truer number:
+    // a kart has direct, unassisted steering and a real one turns about a third
+    // of a turn lock to lock, not two thirds.
+    this.wheelNode.rotation.y = -this.sSteer * 0.62;
+    // THE GRIP. The arm node itself no longer turns: it used to swing at 0.22
+    // against the rim's 0.85, which is 0.63 rad of slip at full lock and 98 mm
+    // of daylight between the glove and the wheel it is supposed to be holding.
+    // The skin now carries the whole difference — weight 0 at the deltoid,
+    // weight 1 at the wrist, which is the rim's own frame — so the hands are on
+    // the wheel at every steering angle by construction and the shoulder never
+    // leaves the torso. One float, set from the wheel's own rotation, so the two
+    // physically cannot disagree.
+    this.armGrip.angle.value = this.wheelNode.rotation.y;
   }
 }
 

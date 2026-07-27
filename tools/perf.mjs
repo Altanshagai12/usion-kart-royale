@@ -15,7 +15,6 @@
  */
 import { spawn } from 'node:child_process';
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
-import { createConnection } from 'node:net';
 import { join } from 'node:path';
 import puppeteer from 'puppeteer';
 import { startVite } from './vite-server.mjs';
@@ -38,7 +37,24 @@ const LABEL = arg('label', 'run');
  */
 const BASELINE = argv.includes('--baseline');
 
-const SHOTS = [
+/**
+ * The nine standard vantage points are all *clean* frames: the field is spread
+ * out and nothing is going off. The draw-call peak of a real race is not there,
+ * it is in the moments the shot list never reaches — the whole field nose to
+ * tail, every kart at max drift tier with boost lit and a triple-mushroom orbit
+ * up, which is every per-kart mesh visible at once on top of every FX pool.
+ *
+ * `stress: true` forces that state on every kart during the hold, so the number
+ * reported is the worst frame the game can actually produce rather than the
+ * worst frame the screenshot harness happens to catch.
+ */
+const STRESS_SHOTS = [
+  { name: 'chaos-pack',  t: 0.74, speed: 26, ahead: 7, stress: 1 },
+  { name: 'chaos-grid',  t: 0.995, speed: 0, settle: 1.1, hold_still: true, stress: 1 },
+  { name: 'chaos-scene', t: 0.86, speed: 22, ahead: 7, stress: 1 },
+];
+
+const BASE_SHOTS = [
   { name: 'hero',    t: 0.06, speed: 24 },
   { name: 'grid',    t: 0.995, speed: 0, settle: 1.1, hold_still: true },
   { name: 'boost',   t: 0.40, speed: 32, boost: 1 },
@@ -50,21 +66,28 @@ const SHOTS = [
   { name: 'hud',     t: 0.14, speed: 28 },
 ];
 
+const SHOTS = argv.includes('--stress') ? [...BASE_SHOTS, ...STRESS_SHOTS] : BASE_SHOTS;
+
 const AI_CRUISE = 36;
 const APPROACH_TIMEOUT = 30;
 const HOLD = 0.62;
 
-function portOpen(port) {
-  return new Promise((res) => {
-    const s = createConnection({ port, host: '127.0.0.1' });
-    s.on('connect', () => { s.destroy(); res(true); });
-    s.on('error', () => res(false));
-    setTimeout(() => { s.destroy(); res(false); }, 800);
-  });
-}
-
+/**
+ * Delegates to the shared helper, exactly as tools/shot.mjs does.
+ *
+ * This used to pre-check the port itself and return `null` when something was
+ * already serving it, which teardown then dereferenced: every run that adopted
+ * a server — a developer's own `npm run dev`, or simply a second harness run
+ * against a still-warm port — did all its work, wrote its JSON, and then died
+ * on `server.stop()` with "Cannot read properties of null". Exit code 1 and no
+ * result line, on a run that had in fact succeeded.
+ *
+ * `startVite` already distinguishes the two cases and is the only thing that
+ * should: it adopts a live port and hands back a no-op `stop()` so a server we
+ * did not start is never killed. Asking the question twice, in two places, with
+ * two different return shapes, is what produced the crash.
+ */
 async function ensureServer() {
-  if (await portOpen(PORT)) return null;
   return startVite(PORT);
 }
 
@@ -294,22 +317,61 @@ const main = async () => {
           k.velocity.addScaledVector(k.forward, (s.speed - cur) * 0.25);
         }
         if (s.boost && k.boostTime < 0.6) k.applyBoost(1.2, 1.2);
+        // Worst-case FX: hold the whole field at max drift tier with boost lit
+        // and a triple-mushroom orbit up. Re-applied every frame because the
+        // kart integrator decays all three.
+        if (s.stress) {
+          for (let i = 0; i < ctx.race.karts.length; i++) {
+            const kk = ctx.race.karts[i];
+            ctx.items.give(kk, 2 /* TripleMushroom */, 3);
+            if (kk.boostTime < 0.6) kk.applyBoost(1.2, 1.25);
+            kk.driftDir = i % 2 ? 1 : -1;
+            kk.driftCharge = 1;
+            kk.driftTier = 3;
+          }
+          ctx.speedIntensity = 1.2;
+        }
         if (performance.now() < until) requestAnimationFrame(tick);
         else done(null);
       };
       requestAnimationFrame(tick);
     }), { ...shot, hold_still: !!shot.hold_still }, hold);
 
-    const data = await page.evaluate(() => window.__perf.sample(20));
-    const calls = data.frames.map((f) => f.total).sort((a, b) => a - b);
-    const scene = data.frames.map((f) => f.scene).sort((a, b) => a - b);
+    const data = await page.evaluate(() => window.__perf.sample(30));
     const med = (a) => a[Math.floor(a.length / 2)];
+    /**
+     * Frame counts here are bimodal, and a plain median over the sample is not
+     * a stable statistic: the far shadow cascade redraws one frame in three
+     * (FAR_UPDATE_INTERVAL in render/Sky), and on that frame every shadow
+     * caster in the world is submitted a second time. Depending on where the
+     * 30-frame window lands relative to that cycle, the median can sit in
+     * either cluster, which is worth ~40 draw calls and swamps the effect of
+     * any change being measured.
+     *
+     * So split the sample at the midpoint of its own range and report both
+     * populations: `typical` is the frame the budget actually governs, `cascade`
+     * is the one-in-three refresh frame.
+     */
+    const split = (vals) => {
+      const a = vals.slice().sort((x, y) => x - y);
+      const mid = (a[0] + a[a.length - 1]) / 2;
+      const lo = a.filter((v) => v < mid);
+      const hi = a.filter((v) => v >= mid);
+      return {
+        typical: lo.length ? med(lo) : med(a),
+        cascade: hi.length ? med(hi) : med(a),
+        median: med(a), min: a[0], max: a[a.length - 1],
+        cascadeShare: +(hi.length / a.length).toFixed(2),
+      };
+    };
+    const calls = data.frames.map((f) => f.total);
+    const scene = data.frames.map((f) => f.scene);
     const last = data.frames[data.frames.length - 1];
     report.shots.push({
       name: shot.name,
       reachedMark: waited.ok,
-      totalCalls: { median: med(calls), min: calls[0], max: calls[calls.length - 1] },
-      sceneCalls: { median: med(scene), min: scene[0], max: scene[scene.length - 1] },
+      totalCalls: split(calls),
+      sceneCalls: split(scene),
       triangles: last.triangles,
       sceneTriangles: last.sceneTris,
       programs: last.programs,
@@ -317,8 +379,10 @@ const main = async () => {
       geometries: last.geometries,
       objects: data.objects,
     });
+    const t = report.shots[report.shots.length - 1].totalCalls;
     process.stdout.write(
-      `${shot.name.padEnd(9)} total=${med(calls)}  scene=${med(scene)}  ` +
+      `${shot.name.padEnd(11)} typical=${String(t.typical).padStart(3)}  ` +
+      `cascade=${String(t.cascade).padStart(3)}  peak=${String(t.max).padStart(3)}  ` +
       `tris=${(last.triangles / 1000).toFixed(0)}k  progs=${last.programs} texs=${last.textures}\n`);
   }
 

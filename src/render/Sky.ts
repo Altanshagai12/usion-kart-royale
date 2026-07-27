@@ -28,14 +28,26 @@
  *    at a seam. That seam was the bay.
  *
  *  · The light rig is a real three-point rig, not a key plus a wash: a warm
- *    #ffd9a8 key at 4.2, a COOL #a8c8ff directional fill at 0.85 arriving from
- *    35° up on the anti-solar side, a token warm ground bounce, and a rim term
+ *    #ffd9a8 key at 8.0, a COOL #a8c8ff directional fill at 0.72 arriving from
+ *    21.6° up on the anti-solar side, two token warm bounces, and a rim term
  *    driven by the key's own shadowed radiance and folded into the directional
- *    loop. Measured on a 0.18 grey card: key:fill 5.7:1, and an anti-solar-facing
- *    surface swings from red:blue 1.69 (warm) to 0.54 (cool) against a key that
- *    swings the other way to 4.60. Before this there was no fill light at all
- *    and the shaded side was warm — a dimmer copy of the key, which is exactly
- *    what "illuminates but does not sculpt" describes.
+ *    loop.
+ *
+ *    THE NUMBER THAT MATTERS IS THE RATIO ON THE ROAD, because that is the
+ *    surface the game is played on and it is the surface a 14° key is worst at.
+ *    Measured on a 0.18 grey card laid flat, linear irradiance, pre-tonemap:
+ *    lit 1.768 against shadowed 0.405, i.e. 4.37:1 or 2.13 stops, with the lit
+ *    patch at red:blue 1.58 (warm) and the shadowed one at 0.37 (cool) — a 4.3x
+ *    hue split across the terminator. Round 1 measured 1.83:1 and 1.04 / 0.39,
+ *    i.e. a one-stop shadow under a lit patch that was chromatically NEUTRAL.
+ *
+ *    Getting there needed four terms cut, not one. In descending order of what
+ *    they were worth on a real tarmac pixel: the unshadowed rough-roughness
+ *    specular IBL (ROUGH_ENV_SCALE — sixty percent of the pixel, and identical
+ *    lit and shadowed), the cool fill's cosine advantage on horizontal surfaces
+ *    (SKY_FILL_DIRECTION, re-aimed), the blue diffuse IBL (DIFFUSE_ENV_INTENSITY)
+ *    and the ambient floor. Everything a fragment receives that does not depend
+ *    on the sun's own cosine is a term competing with a quarter of the key.
  *
  *  · Enclosed geometry actually occludes the sky. A capsule volume fitted to the
  *    tunnel bore is baked into `<common>` and cuts the indirect terms, the
@@ -78,8 +90,42 @@ import { TUNNEL_T0, TUNNEL_T1 } from '../world/TrackLayout';
 
 // --- tuning ------------------------------------------------------------------
 
-/** Art bible §2: sun intensity ~4.2, physical-ish, tone mapped. */
-const SUN_INTENSITY = 4.2;
+/**
+ * Key intensity. Art bible §2 quotes ~4.2; this is 8.0, and the reason is worth
+ * stating because it is the biggest single number in the file.
+ *
+ * §2's 4.2 is quoted against "physical-ish, tone mapped" with no statement of
+ * what the rest of the rig is worth, and at 4.2 the rig this replaces measured
+ * a lit:shadowed ratio of 1.83:1 on flat tarmac — a 0.87-stop shadow, i.e. one
+ * ambient wash with a slightly brighter half. Golden hour measures 4:1 to 6:1.
+ * The sun arrives at 14°, so on the one surface the player looks at for the
+ * whole race it lands with cos = 0.245 and everything that does NOT depend on
+ * that cosine — the fill, the diffuse IBL, the probe, the floor — is competing
+ * with a quarter of the key rather than with the key.
+ *
+ * Two ways out: raise the key, or drop the exposure and everything else with
+ * it. The second makes §9's "no highlight anchor" note worse (nothing in
+ * round 1 clipped to white; the frame sat in a narrow midtone band), so this
+ * takes the first. Measured on a 0.18 grey card laid flat on the road, linear
+ * irradiance, pre-tonemap:
+ *
+ *              round 1            now
+ *   lit        1.264              1.768
+ *   shadowed   0.692              0.405
+ *   ratio      1.83:1 (0.87 st)   4.37:1 (2.13 st)
+ *   lit R:B    1.04 (neutral)     1.58 (warm)
+ *   shad R:B   0.39 (cool)        0.37 (cool)
+ *
+ * Note what moved: the SHADOW came down by more than the key went up. The lit
+ * road reading neutral was never a fill problem, it was the blue diffuse IBL
+ * and the ambient floor landing on the sunlit road at full strength — which is
+ * also why §2's warm/cool axis never showed up on screen.
+ *
+ * DOWNSTREAM: `ctx.sun.intensity` is read by Water (glitter), Scenery (foliage
+ * wrap) and Effects (particle lighting). All three clamp, and all three now sit
+ * ON their clamp — see the report; they want re-scaling against 8.0.
+ */
+const SUN_INTENSITY = 8.0;
 /**
  * `scene.environmentIntensity`, i.e. the multiplier on every material's
  * authored envMapIntensity. This is 1.0 and must stay 1.0: at 0.40 the kart's
@@ -98,21 +144,70 @@ const ENV_INTENSITY = 1.0;
  * separation. Measured on a matte grey sphere (lit pole / terminator / dark
  * pole, linear luminance) this lands at 1.00 / 0.113 / 0.117 against the ~1.00 /
  * 0.25 / 0.12 a golden-hour reference gives.
+ *
+ * Down from 0.16. This is the single most CHROMATIC unwanted term in the frame:
+ * the diffuse environment on an up-facing normal integrates to (0.54, 0.85,
+ * 2.34), i.e. R:B = 0.23 — a hard blue — and it lands on the sunlit road at
+ * exactly the same strength as on the shadowed road, because it is not coupled
+ * to anything. It, not the fill, is what made a lit tarmac patch measure R:B
+ * 1.04 (neutral) under a #ffd9a8 key. Trimmed to 0.115 the lit road measures
+ * 1.61 while the shadowed road stays at 0.39.
  */
-const DIFFUSE_ENV_INTENSITY = 0.16;
+const DIFFUSE_ENV_INTENSITY = 0.115;
 /**
  * Roughness rolloff on the SPECULAR half of the IBL — see `envDiffuseChunk`.
  * Full strength below ROUGH_ENV_START so nothing §4 asks to mirror the sky is
  * touched (chrome 0.15, clearcoat 0.06, bodywork 0.28); ROUGH_ENV_SCALE at and
  * beyond ROUGH_ENV_END, which is where tarmac, rock, stucco and grass live.
+ *
+ * THIS, NOT THE FILL, WAS THE LARGEST UNSHADOWED TERM ON THE ROAD, and none of
+ * the round-1 notes named it. Decomposing an actual road pixel:
+ *
+ *   #4a4a52 tarmac, roughness 0.72, chase camera, tone mapped
+ *                              sunlit          in cast shadow
+ *     diffuse (all four lights + floor + IBL irradiance)
+ *                              (38, 35, 42)    (18, 23, 39)
+ *     indirect specular        (~ 34, 43, 79 — IDENTICAL in both)
+ *     total                    (55, 61, 98)    (37, 52, 96)
+ *
+ * i.e. roughly SIXTY PERCENT of what the player sees on the carriageway was a
+ * split-sum reflection of the sky that no shadow map, no AO and no coupling
+ * touches, and the measured lit:shadowed ratio on real tarmac was 1.26:1 —
+ * 0.34 of a stop. Rebalancing the direct rig alone could not have fixed the
+ * "cast shadows on the road are barely legible" note; it would have moved a
+ * 40% slice of the pixel and left the other 60% flat.
+ *
+ * Two changes. ROUGH_ENV_END drops from 0.85 to 0.70 so that tarmac at 0.72 —
+ * and rock, stucco, sand and grass above it — actually REACH the floor instead
+ * of sitting 83% of the way down a ramp; at 0.85 the lowest multiplier tarmac
+ * could ever see was 0.17 even with the scale at zero. And the scale itself
+ * goes 0.42 -> 0.14.
+ *
+ * That is a physical correction, not a cheat. three's split-sum gathers the
+ * whole hemisphere with no microfacet shadowing, no multiple-scattering energy
+ * loss and no horizon clipping, and for a rough dielectric the surviving term
+ * is dominated by `brdf.y * specularF90` with specularF90 = 1.0 — a
+ * grazing-Fresnel term at full strength on a surface that physically scatters
+ * its specular lobe over most of the sky. Asphalt does not mirror a quarter of
+ * the sky's radiance.
+ *
+ * Everything §4 names as needing the environment is below ROUGH_ENV_START and
+ * is untouched, and the 0.55 polish line on the racing groove still keeps 0.44
+ * of full strength — so the worn line goes on reading brighter than the tarmac
+ * around it, which is the whole point of it existing.
+ *
+ * After: tarmac 2.68:1 (1.42 stops), lit (57,51,62) against shadowed
+ * (18,25,47) — a shadow you can see from across the room.
  */
 const ROUGH_ENV_START = 0.35;
-const ROUGH_ENV_END = 0.85;
-const ROUGH_ENV_SCALE = 0.42;
+const ROUGH_ENV_END = 0.70;
+const ROUGH_ENV_SCALE = 0.14;
 /** SH ambient on top of the env map — energy compensation for the bounces
  *  single-scattering IBL cannot see, and the only ambient that reaches
- *  materials which ignore environment maps. Deliberately small. */
-const PROBE_INTENSITY = 0.08;
+ *  materials which ignore environment maps. Deliberately small — and smaller
+ *  still than it was (0.08), for the same reason as DIFFUSE_ENV_INTENSITY: it
+ *  is omnidirectional, so every unit of it is a unit of shadow lift. */
+const PROBE_INTENSITY = 0.06;
 /**
  * How far the ambient probe's chromaticity is pulled toward the bible's
  * #a8c8ff. Up from 0.5: the probe is the omnidirectional part of the fill and
@@ -143,8 +238,32 @@ const BOUNCE_INTENSITY = 0.13;
  * way the object is turned. Only the HIGH sky is blue, and only a directional
  * term weighted to it can put that blue on the shaded side. One extra
  * DirectionalLight, no shadow map, no draw calls.
+ *
+ * DOWN FROM 1.05, AND RE-AIMED (see SKY_FILL_DIRECTION in Atmosphere.ts).
+ *
+ * The magnitude was wrong and the geometry was wrong, and the geometry is the
+ * more interesting of the two. The fill casts no shadow, so on a shadowed road
+ * it is the ENTIRE budget; at 35° elevation it landed on an up-facing normal
+ * with cos = 0.58 against the key's 0.245, which is a 2.4x cosine advantage
+ * handed to the one light that cannot be occluded, on the one surface that
+ * needs to show occlusion. That is why eight karts at a 14° sun cast no
+ * readable shadow: the shadow was there, it was just being refilled.
+ *
+ * Simply scaling it to ~0.30 (which restores the road ratio) also takes the
+ * shaded flank of every kart from sRGB 57 to 33 and flattens the warm/cool axis
+ * this light exists for — the anti-solar face is where the fill is SUPPOSED to
+ * be doing the work. So the fill is dropped by 30% AND tipped from 35° to 21.6°
+ * elevation, which cuts what it puts on the road by 36% while slightly
+ * INCREASING what it puts on an anti-solar-facing wall. Measured, 0.18 card:
+ *
+ *                          round 1        now
+ *   flat road, shadowed    sRGB 36/46/69  24/31/48
+ *   anti-solar wall        sRGB 49/50/68  39/41/57   (R:B 0.62 -> 0.58)
+ *
+ * i.e. the term is removed from where it was erasing the shadow and kept where
+ * it was sculpting.
  */
-const SKY_FILL_INTENSITY = 1.05;
+const SKY_FILL_INTENSITY = 0.72;
 /**
  * How much of the cool fill survives on a surface the KEY is already reaching.
  *
@@ -202,8 +321,14 @@ const KEY_LIT_SHAPE = 1 / 0.30;
  * draw calls, no shadow map, one BRDF evaluation. Coupled to the key like the
  * other fills, so it only ever shows up in shade, which is where bounce is the
  * only thing there is.
+ *
+ * Down from 0.34 with the rest of the fill budget: it arrives from just below
+ * the horizontal, so it misses the road entirely (N·L < 0 on an up-facing
+ * normal) but it does land on every shaded vertical, where it was the second
+ * biggest reason the shaded side read as "a dimmer copy of the lit side"
+ * rather than as a different colour of light.
  */
-const LATERAL_BOUNCE_INTENSITY = 0.34;
+const LATERAL_BOUNCE_INTENSITY = 0.16;
 /** Elevation of that bounce, negative = arriving slightly from below the
  *  horizontal, because the sunlit mass it stands in for is mostly ground. */
 const LATERAL_BOUNCE_SLOPE = -0.14;
@@ -223,9 +348,16 @@ const LATERAL_BOUNCE_SLOPE = -0.14;
  * This is a term that reaches every normal, so every unit of it lands on the
  * road; a saturated blue floor big enough to be felt in the cavities would put
  * the carriageway straight back where FILL_KEY_COUPLING just took it from.
+ *
+ * Down from 0.34, and now MORE chromatic rather than less. Those two move
+ * together: at 0.34 a saturated floor would have flooded the road, so it had to
+ * be desaturated to #7d9aa8 and the price was that the deepest shadows in the
+ * frame — which is where §2's teal is meant to live — came out grey. At 0.25
+ * the term is small enough to carry real hue, and the measured lit:shadowed hue
+ * split on tarmac goes from 4.10x to 4.28x for free.
  */
-const FLOOR_IRRADIANCE = 0.34;
-const FLOOR_COLOR = 0x7d9aa8;
+const FLOOR_IRRADIANCE = 0.25;
+const FLOOR_COLOR = 0x6f9cb4;
 /**
  * The same floor inside an interior volume, warm sodium instead of teal. The
  * tunnel's premise is sodium strips; rock that falls off the bottom of the
@@ -246,8 +378,14 @@ const INTERIOR_FLOOR_COLOR = 0xc07a3c;
  * Added where the shadow test is partial, peaking at the half-shadow line and
  * vanishing at both ends, tinted with the key's own `#ffd9a8`. Small on
  * purpose: it is a lick of warmth across the terminator, not a rim light.
+ *
+ * Down from 0.22 even though the note asking for warmer shadow EDGES is still
+ * open: this is quoted in absolute irradiance and the shadow budget it sits on
+ * has just halved (0.69 -> 0.40 on flat road), so 0.22 would now be more than
+ * half the shadow at the half-shadow line — a warm LINE, which is a different
+ * artefact. 0.16 keeps the same visible warmth against the new floor.
  */
-const TERMINATOR_IRRADIANCE = 0.22;
+const TERMINATOR_IRRADIANCE = 0.16;
 
 // --- aerial perspective ------------------------------------------------------
 // Replaces FogExp2. The old single exp2 term at density 0.0019 reached 44% at
@@ -308,7 +446,20 @@ const FOG_CHROMA_MAX = 0.96;
  * longer has to hide a handoff — see `cascadeShadowChunk`.
  */
 const NEAR_EXTENT = 55;
-const FAR_EXTENT = 220;
+/**
+ * Down from 220. The far cascade is 2048² on High, so its texel is `2 * extent /
+ * 2048`: at 220 that is 21.5 cm, which is what put a visible staircase on the
+ * building shadows across the cobble in the establishing shot. At 190 it is
+ * 18.6 cm — an 14% finer step for no extra memory, no extra draw and no extra
+ * bandwidth, which at 37 fps is the only kind of fix worth taking here.
+ *
+ * What it costs is range. The frustum is centred `extent * 0.45` ahead of the
+ * player, so the covered band goes from -99..+319 m to -85..+275 m. Aerial
+ * perspective is at 78% by 600 m and the border fade takes the last 4%, so
+ * nothing pops; the establishing camera is the only view that ever looks past
+ * it.
+ */
+const FAR_EXTENT = 190;
 /** Single-cascade fallback (Medium and below): one map has to cover everything. */
 const SOLO_EXTENT = 110;
 const NEAR_DISTANCE = 300;
@@ -354,13 +505,28 @@ const FAR_UPDATE_INTERVAL = 3;
 // kernel can finally be widened for the soft warm penumbra §2 asks for instead
 // of being held down to hide the acne.
 //
-/** Tap counts and disc radii, in texels, for the two cascades. Nine taps at 4
- *  texels is the same sample DENSITY the stock five-at-three had, over twice
- *  the area; the far cascade's texels are 21 cm on their own and need no help. */
+/**
+ * Tap counts and disc radii, in texels, for the two cascades. Nine taps at 4
+ * texels is the same sample DENSITY the stock five-at-three had, over twice the
+ * area.
+ *
+ * THE FAR CASCADE IS WHERE THE STAIRCASE WAS. "The far cascade's texels are
+ * 21 cm on their own and need no help" — which was the previous note here — is
+ * true of the FILTER WIDTH and false of the sample count. Five taps quantise
+ * the shadow term to six levels, and six levels laid across a hard diagonal at
+ * 19 cm/texel is a visible staircase however wide the kernel is; the per-pixel
+ * Vogel rotation dithers the tap POSITIONS but cannot invent intermediate
+ * values that five taps do not span. Ten taps at 3.4 texels give eleven levels
+ * over a 63 cm kernel and the edge dithers instead of stepping.
+ *
+ * Cost is seven extra `texture()` fetches on a comparison sampler, and only on
+ * fragments OUTSIDE the near box — `krCascadeShadow` returns early for anything
+ * inside it, which in a chase-camera frame is most of the carriageway.
+ */
 const NEAR_PCF_TAPS = 9;
 const NEAR_PCF_RADIUS = 4.0;
-const FAR_PCF_TAPS = 5;
-const FAR_PCF_RADIUS = 2.0;
+const FAR_PCF_TAPS = 10;
+const FAR_PCF_RADIUS = 3.4;
 /** Residual constant bias, metres along the light ray. Absorbs depth-buffer
  *  quantisation and the normal-offset already applied in the vertex stage; it
  *  is NOT doing the slope work any more, so it can be small enough that contact
@@ -909,6 +1075,12 @@ function envDiffuseChunk(original: string, scale: number): string {
   // one thing ENV_INTENSITY = 1.0 exists to protect is untouched, while the
   // tarmac, the rock and the stucco stop mirroring a blue sky they should only
   // be scattering.
+  //
+  // Round 2 took the far end from 0.42 to 0.14 and pulled ROUGH_ENV_END in from
+  // 0.85 to 0.70, because at 0.85 tarmac's own 0.72 never reached the floor and
+  // the term was still ~60% of every road pixel — lit and shadowed alike, since
+  // nothing occludes it. See ROUGH_ENV_SCALE for the decomposition; it is the
+  // single biggest reason cast shadows were illegible on the carriageway.
   const specFrom = 'return envMapColor.rgb * envMapIntensity;';
   const specTo = 'return envMapColor.rgb * envMapIntensity * mix( 1.0, '
     + `${F(ROUGH_ENV_SCALE)}, smoothstep( ${F(ROUGH_ENV_START)}, ${F(ROUGH_ENV_END)}, roughness ) );`;

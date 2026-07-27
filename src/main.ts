@@ -191,3 +191,4 @@ boot().catch((err) => {
 (window as any).__ctx = ctx;
 // tools/perf.mjs turns this off to measure the un-LODed field for a before/after.
 (window as any).__drawBudget = drawBudget;
+(window as any).__camRig = camera; // TEMP-PROBE
