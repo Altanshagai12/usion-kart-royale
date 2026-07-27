@@ -389,7 +389,7 @@ html[data-touch] .kr-speed {
   right: 47vmin;
   transform: scale(.82);   /* transform-origin is already 100% 100% */
 }
-/* DEAD RULE REMOVED (round 10). This block repositioned `.kr-board`, the
+/* DEAD RULE REMOVED (round 10). This block repositioned '.kr-board', the
    eight-row standings tower that used to sit right-centre. Round 8 deleted
    that element — the in-race order is now one rival row inside the position
    plate at LEFT-centre — so this selector had matched nothing since. The

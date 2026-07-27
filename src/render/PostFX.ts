@@ -420,7 +420,7 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, const in float depth,
     float kick = rush.z;
     float n = krValueNoise(ang * 26.0 + time * 1.6) * 0.62
             + krValueNoise(ang * 63.0 - time * 2.4) * 0.38;
-    // Threshold widened from (0.60, 0.97). `n` is the sum of two value-noise
+    // Threshold widened from (0.60, 0.97). 'n' is the sum of two value-noise
     // octaves, so it is roughly normal about 0.5 with sd ~0.18: a 0.97 upper
     // edge means the comb only ever reached full strength on ~0.5% of angles
     // and sat under a third of it on almost all of the rest. Whatever gain was
@@ -486,7 +486,7 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, const in float depth,
   // is a second way to lose the top end; here it is what it is supposed to be,
   // a print-down of the finished image.
   //
-  // It CLOSES IN with speed now (`vig`, driven on the CPU side): the amount
+  // It CLOSES IN with speed now ('vig', driven on the CPU side): the amount
   // rises from the authored 0.22 to 0.36 and the inner edge walks from rad 0.30
   // to rad 0.16, so flat out the frame is being squeezed from a third of the
   // way out instead of only at the corners. This is the cheapest of all the
