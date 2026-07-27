@@ -26,6 +26,15 @@ export class Input implements IInput {
   touch = false;
 
   private keys = new Set<string>();
+  /**
+   * Keys that went down since the last `update`, whether or not they are still
+   * held. Edges are otherwise derived by polling `keys` once a frame, so a
+   * press and release landing entirely between two frames — a 16ms window at
+   * 60fps, which a quick tap on the item button really does hit — would never
+   * be observed at all. Latching guarantees every press is seen for exactly one
+   * frame; it is cleared at the end of `update`.
+   */
+  private latched = new Set<string>();
   /** edge bookkeeping — previous frame's held state per logical button */
   private wasDrift = false;
   private wasItem = false;
@@ -128,13 +137,14 @@ export class Input implements IInput {
   }
 
   private onDown = (e: KeyboardEvent) => {
+    if (!e.repeat) this.latched.add(e.code);
     this.keys.add(e.code);
     // Space and the arrows scroll the page; the game owns them.
     if (SWALLOW.has(e.code)) e.preventDefault();
   };
   private onUp = (e: KeyboardEvent) => { this.keys.delete(e.code); };
   /** Losing focus mid-corner must not leave a key stuck down. */
-  private onBlur = () => { this.keys.clear(); };
+  private onBlur = () => { this.keys.clear(); this.latched.clear(); };
   private onPad = (e: GamepadEvent) => { this.padIndex = e.gamepad.index; };
   private onPadOff = () => { this.padIndex = -1; };
 
@@ -142,14 +152,23 @@ export class Input implements IInput {
     const k = this.keys;
     const s = this.state;
     const has = (...codes: string[]) => codes.some((c) => k.has(c));
+    /**
+     * Held OR pressed-since-last-frame. Used for the buttons whose edge matters
+     * (item, pause, drift); steering and throttle deliberately stay on `has`,
+     * since a one-frame ghost of a held axis would feel like a twitch.
+     */
+    const hit = (...codes: string[]) => codes.some((c) => k.has(c) || this.latched.has(c));
 
     let steerTarget = (has('ArrowRight', 'KeyD') ? 1 : 0) - (has('ArrowLeft', 'KeyA') ? 1 : 0);
-    let accel = has('ArrowUp', 'KeyW', 'Space') ? 1 : 0;
+    let accel = has('ArrowUp', 'KeyW') ? 1 : 0;
     let brake = has('ArrowDown', 'KeyS') ? 1 : 0;
-    let drift = has('ShiftLeft', 'ShiftRight');
-    let item = has('ControlLeft', 'ControlRight', 'KeyE', 'Enter');
+    let drift = hit('ShiftLeft', 'ShiftRight');
+    // Space fires items. It used to be a third accelerate binding, which wasted
+    // the most reachable key on the board on a function two other keys already
+    // cover, and left firing on Ctrl — a modifier the OS intercepts.
+    let item = hit('Space', 'Enter', 'KeyE', 'ControlLeft', 'ControlRight');
     let look = has('KeyQ', 'AltLeft');
-    let pause = has('Escape', 'KeyP');
+    let pause = hit('Escape', 'KeyP');
 
     // Analogue sources report an absolute stick position, so they must not go
     // through the digital ramp below — that ramp exists to fake an axis out of
@@ -220,6 +239,9 @@ export class Input implements IInput {
       steerTarget !== 0 || look;
     s.anyPressed = any && !this.wasAny;
     this.wasAny = any;
+
+    // One frame of visibility per press, then gone.
+    this.latched.clear();
   }
 }
 

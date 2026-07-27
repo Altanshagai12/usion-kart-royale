@@ -128,6 +128,12 @@ export class Menus {
   screen: ScreenName = 'none';
   /** True while a full-screen menu owns the frame (HUD hides entirely). */
   blocking = false;
+  /**
+   * Set by a tap on a blocking screen. Touch devices have no Enter key, and the
+   * title screen's only affordance was a keyboard hint — so a tap anywhere on
+   * the title, select or results screen counts as confirm.
+   */
+  private tapConfirm = false;
 
   private root: HTMLDivElement;
   private screens: Record<Exclude<ScreenName, 'none'>, HTMLDivElement>;
@@ -168,6 +174,15 @@ export class Menus {
       else if (t.closest('.kr-card')) this.ui('move');
     });
 
+    // Tap-anywhere confirm. A real control that was tapped handles itself via
+    // its own click handler, so those are excluded to avoid confirming twice.
+    this.root.addEventListener('pointerdown', (e) => {
+      if (!this.blocking) return;
+      const t = e.target as HTMLElement;
+      if (t.closest('.kr-btn, .kr-card')) return;
+      this.tapConfirm = true;
+    });
+
     const forced = new URLSearchParams(location.search).get('ui');
     if (forced === 'title' || forced === 'select' || forced === 'pause' || forced === 'results') {
       this.forced = forced;
@@ -197,7 +212,22 @@ export class Menus {
     this.lastRaceTime = race.raceTime;
 
     const inRace = race.state === RaceState.Racing || race.state === RaceState.Countdown;
-    if (input.pausePressed) this.onConfirm(ctx, inRace);
+
+    // Confirm is `itemPressed` — Enter / Space / E / gamepad face button — which
+    // is what the on-screen hint actually promises. It used to read
+    // `pausePressed`, i.e. Escape or P alone, so the title screen said "PRESS
+    // ENTER TO START" and Enter did nothing at all.
+    //
+    // It is gated on a screen actually being up. Without that gate the same
+    // keypress that fires a shell also opens the pause menu, because with no
+    // screen showing `onConfirm` falls through to its pause branch.
+    if (this.screen !== 'none') {
+      if (input.itemPressed || this.tapConfirm) this.onConfirm(ctx, inRace);
+    } else if (input.pausePressed && inRace) {
+      this.localPause = true;
+      this.ui('pause');
+    }
+    this.tapConfirm = false;
 
     // steer edges drive menu navigation on keyboard/gamepad
     const st = input.steer;
@@ -222,6 +252,15 @@ export class Menus {
       this.syncButtons();
     }
     this.blocking = want === 'title' || want === 'select' || want === 'results';
+
+    // Inline, not stylesheet: the HUD layer sets `pointer-events: none` with
+    // enough specificity that an appended `.kr-screen.on` rule loses, and a
+    // blocking screen that cannot receive a tap is unstartable on a phone —
+    // there is no Enter key to fall back to. Inline always wins, and reverting
+    // to 'none' the moment the screen clears keeps the canvas clickable.
+    const pe = this.blocking ? 'auto' : 'none';
+    this.root.style.pointerEvents = pe;
+    if (want !== 'none') this.screens[want].style.pointerEvents = pe;
   }
 
   private selecting = false;
@@ -299,11 +338,16 @@ export class Menus {
     wrap.style.alignItems = 'center';
     wrap.innerHTML = LOGO_SVG.replace('RAYS', buildRays());
     el('div', 'kr-sub', wrap, 'Sunset Bay Circuit');
-    el('div', 'kr-prompt', wrap, 'Press Enter to Start');
+    // The prompt and the hints follow the input device actually in use — a phone
+    // has no Enter key, and telling a player to press one is how the title
+    // screen becomes a dead end.
+    const touch = matchMedia?.('(pointer: coarse)')?.matches || navigator.maxTouchPoints > 0;
+    el('div', 'kr-prompt', wrap, touch ? 'Tap to Start' : 'Press Enter to Start');
     const hint = el('div', 'kr-hint', wrap);
-    hint.innerHTML =
-      '<b>&#8592;</b><b>&#8594;</b> steer &nbsp;&nbsp; <b>&#8593;</b> accelerate &nbsp;&nbsp; ' +
-      '<b>Shift</b> drift &nbsp;&nbsp; <b>Ctrl</b> item &nbsp;&nbsp; <b>Enter</b> confirm';
+    hint.innerHTML = touch
+      ? '<b>Left thumb</b> steer &nbsp;&nbsp; <b>Drift</b> slide &nbsp;&nbsp; <b>Item</b> fire'
+      : '<b>&#8592;</b><b>&#8594;</b> steer &nbsp;&nbsp; <b>&#8593;</b> accelerate &nbsp;&nbsp; ' +
+        '<b>Shift</b> drift &nbsp;&nbsp; <b>Space</b> item &nbsp;&nbsp; <b>Esc</b> pause';
     return s;
   }
 

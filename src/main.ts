@@ -4,6 +4,7 @@ import { Bus } from './core/Bus';
 import { createSettings } from './core/Settings';
 import { Input } from './core/Input';
 import { Recorder } from './core/Recorder';
+import { prewarm } from './core/Prewarm';
 import { RenderPipeline } from './render/Renderer';
 import { DrawBudget } from './render/DrawBudget';
 import { Sky } from './render/Sky';
@@ -86,17 +87,63 @@ const systems: System[] = [
   drawBudget,
 ];
 
+/** Human-readable names for the boot progress readout, indexed with `systems`. */
+const SYSTEM_LABELS = [
+  'starting renderer', 'reading controls', 'raising the sun', 'mixing materials',
+  'laying the circuit', 'dressing the bay', 'rolling out the grid', 'loading item boxes',
+  'lighting the effects', 'mounting the camera', 'drawing the hud', 'tuning the engines',
+  'balancing the frame',
+];
+
+function bootProgress(frac: number, label: string) {
+  const bar = document.querySelector<HTMLElement>('.boot-bar i');
+  const step = document.querySelector<HTMLElement>('.boot-step');
+  if (bar) bar.style.width = `${Math.round(frac * 100)}%`;
+  if (step) step.textContent = label;
+}
+
 async function boot() {
-  for (const s of systems) await s.init?.(ctx);
+  for (let i = 0; i < systems.length; i++) {
+    bootProgress(i / (systems.length + 1), SYSTEM_LABELS[i] ?? 'loading');
+    // Yield to the compositor so the bar actually repaints between steps —
+    // without this the whole loop runs inside one frame and the player sees a
+    // frozen bar, which looks worse than no bar at all.
+    await new Promise((r) => requestAnimationFrame(r));
+    await systems[i].init?.(ctx);
+  }
   addEventListener('resize', resize);
   resize();
-  race.start();
+
+  // Compile every shader before the first frame is presented. Doing it here
+  // costs a moment of boot; not doing it costs a dropped frame mid-race every
+  // time a new material first appears, which reads as the screen flashing black.
+  bootProgress(systems.length / (systems.length + 1), 'compiling shaders');
+  await new Promise((r) => requestAnimationFrame(r));
+  const warm = await prewarm(ctx);
+  console.info(
+    `[prewarm] ${warm.programsBefore} -> ${warm.programsAfter} programs ` +
+    `(${warm.objectsRevealed} hidden objects included) in ${warm.ms}ms`,
+  );
+
+  // Deliberately NOT race.start(): the director already sits in RaceState.Menu,
+  // which is what puts the title screen and character select on screen. Booting
+  // straight into a countdown skipped the entire front end — it dated from the
+  // original scaffold, written before there was a front end to skip.
+  bootProgress(1, 'ready');
+
   // Press R to record. Deliberately not a System: it owns no scene state and
   // must keep working while the game is paused or on a menu.
   new Recorder().install();
   requestAnimationFrame(frame);
-  // Signal to the screenshot harness that the first real frame is up.
   (window as any).__gameReady = false;
+}
+
+/** Fades the boot curtain once a real frame is actually on screen. */
+function dismissBootScreen() {
+  const boot = document.getElementById('boot');
+  if (!boot) return;
+  boot.classList.add('done');
+  setTimeout(() => boot.remove(), 700);
 }
 
 let last = performance.now();
@@ -118,7 +165,10 @@ function frame(now: number) {
   for (const s of systems) s.lateUpdate?.(ctx, dt);
   pipeline.render(ctx);
 
-  if (ctx.frame === 8) (window as any).__gameReady = true;
+  if (ctx.frame === 8) {
+    (window as any).__gameReady = true;
+    dismissBootScreen();
+  }
 }
 
 function resize() {

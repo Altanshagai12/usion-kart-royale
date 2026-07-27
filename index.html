@@ -31,6 +31,55 @@
   <body>
     <div id="app"></div>
     <div id="ui"></div>
+
+    <!-- Painted on the very first frame, before a single module has parsed, so
+         the tab is never an unexplained black rectangle. main.ts advances it as
+         each system initialises and removes it once the first real frame is up.
+         Building a WebGL scene of this size takes a few seconds — the sky is
+         raymarched into a PMREM probe, every texture is generated procedurally
+         and every shader is compiled up front — and silence during that reads
+         as a hang. -->
+    <div id="boot">
+      <div class="boot-in">
+        <div class="boot-mark">KART<span>ROYALE</span></div>
+        <div class="boot-bar"><i></i></div>
+        <div class="boot-step">starting up</div>
+      </div>
+    </div>
+    <style>
+      #boot {
+        position: fixed; inset: 0; z-index: 100; display: grid; place-items: center;
+        background:
+          radial-gradient(120% 90% at 50% 8%, #2c3560 0%, #141a33 42%, #080b16 100%);
+        color: #f3f6fb; transition: opacity .55s ease; font-family: system-ui, -apple-system, sans-serif;
+      }
+      #boot.done { opacity: 0; pointer-events: none; }
+      .boot-in { display: flex; flex-direction: column; align-items: center; gap: 3.4vmin; }
+      .boot-mark {
+        font-size: 8.2vmin; font-weight: 900; letter-spacing: .1em; line-height: .96;
+        display: flex; flex-direction: column; align-items: center;
+        background: linear-gradient(180deg, #fff 12%, #ffd27a 58%, #f0a23c 100%);
+        -webkit-background-clip: text; background-clip: text; color: transparent;
+        filter: drop-shadow(0 3px 10px rgba(0,0,0,.55));
+      }
+      .boot-mark span { font-size: .52em; letter-spacing: .38em; margin-left: .38em; }
+      .boot-bar {
+        width: 42vmin; max-width: 380px; height: 5px; border-radius: 999px;
+        background: rgba(255,255,255,.13); overflow: hidden;
+      }
+      .boot-bar i {
+        display: block; width: 0%; height: 100%; border-radius: 999px;
+        background: linear-gradient(90deg, #6ad2ff, #ffd27a);
+        transition: width .3s ease; box-shadow: 0 0 12px rgba(255,200,120,.7);
+      }
+      .boot-step {
+        font-size: 2.5vmin; letter-spacing: .22em; text-transform: uppercase;
+        color: rgba(233,240,250,.62); min-height: 1.2em;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #boot, .boot-bar i { transition: none; }
+      }
+    </style>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
