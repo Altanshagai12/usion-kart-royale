@@ -2,11 +2,26 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+    <!-- viewport-fit=cover so env(safe-area-inset-*) reports real values on
+         notched phones. maximum-scale/user-scalable are kept for the engines
+         that still honour them, but iOS Safari has ignored them since iOS 10 —
+         the `touch-action: none` below is what actually stops pinch-zoom, along
+         with the gesture handlers in src/core/Input.ts. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
     <title>Kart Royale</title>
     <style>
       * { margin: 0; padding: 0; box-sizing: border-box; }
-      html, body { width: 100%; height: 100%; overflow: hidden; background: #05070d; }
+      html, body {
+        width: 100%; height: 100%; overflow: hidden; background: #05070d;
+        /* the page is a game surface, not a document: no panning, no pinch,
+           no double-tap zoom, no pull-to-refresh, no long-press callout */
+        touch-action: none;
+        overscroll-behavior: none;
+        -webkit-user-select: none; user-select: none;
+        -webkit-touch-callout: none;
+        -webkit-tap-highlight-color: transparent;
+        position: fixed; inset: 0;
+      }
       body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; -webkit-font-smoothing: antialiased; }
       #app { position: fixed; inset: 0; }
       canvas { display: block; width: 100%; height: 100%; touch-action: none; }

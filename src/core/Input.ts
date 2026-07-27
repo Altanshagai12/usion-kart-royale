@@ -33,6 +33,8 @@ export class Input implements IInput {
   private wasAny = false;
   private padIndex = -1;
   private pad = new TouchControls();
+  /** true once a finger has actually driven the on-screen pad */
+  private padUsed = false;
 
   init(_ctx: Ctx) {
     addEventListener('keydown', this.onDown);
@@ -42,13 +44,37 @@ export class Input implements IInput {
     addEventListener('gamepaddisconnected', this.onPadOff);
     addEventListener('keydown', this.onFirstKey, { once: true });
 
-    // Coarse pointer is the signal, not user-agent sniffing — it correctly
-    // catches touch laptops and correctly ignores a phone-sized desktop window.
-    // A Bluetooth keyboard paired to a tablet then hides the pad again, below.
+    // Two-stage detection, because one stage is not enough.
+    //
+    // Stage 1, eager: a coarse pointer or a positive touch-point count covers
+    // every phone and touch laptop, and correctly ignores a phone-sized desktop
+    // window. It is a media query rather than user-agent sniffing.
+    //
+    // Stage 2, lazy: iPadOS Safari defaults to "Request Desktop Website", under
+    // which it reports `pointer: fine` and `maxTouchPoints: 0` — it claims to be
+    // a Mac. Stage 1 says desktop and the pad never appears, which is exactly
+    // the bug this fixes. So an actual touch, from any device however it
+    // describes itself, mounts the pad on the spot. A real finger is the only
+    // evidence that cannot be wrong.
     this.touch = (matchMedia?.('(pointer: coarse)')?.matches ?? false) ||
-      navigator.maxTouchPoints > 0;
+      navigator.maxTouchPoints > 0 || 'ontouchstart' in window;
     if (this.touch) this.pad.mount();
+    // Capture phase on window, so this runs BEFORE the pad's own bubble-phase
+    // listener is consulted. Mounting here means the very touch that revealed
+    // the controls still reaches them on the way back up, instead of being
+    // swallowed and forcing the player to tap twice.
+    else addEventListener('pointerdown', this.onFirstTouch, { capture: true });
+
+    this.blockPageGestures();
   }
+
+  /** A real finger on a device that claimed to be a desktop. Believe the finger. */
+  private onFirstTouch = (e: PointerEvent) => {
+    if (this.touch || e.pointerType !== 'touch') return;
+    this.touch = true;
+    this.pad.mount();
+    removeEventListener('pointerdown', this.onFirstTouch, { capture: true } as any);
+  };
 
   dispose() {
     removeEventListener('keydown', this.onDown);
@@ -57,16 +83,49 @@ export class Input implements IInput {
     removeEventListener('gamepadconnected', this.onPad);
     removeEventListener('gamepaddisconnected', this.onPadOff);
     removeEventListener('keydown', this.onFirstKey);
+    removeEventListener('pointerdown', this.onFirstTouch, { capture: true } as any);
     this.pad.unmount();
   }
 
-  /** A real keypress means a real keyboard; the on-screen pad is then clutter. */
+  /**
+   * A real keypress means a real keyboard, so the on-screen pad is clutter —
+   * unless a finger has already used it, in which case this is a tablet with a
+   * keyboard attached and taking the controls away mid-race would be worse.
+   */
   private onFirstKey = () => {
-    if (this.touch) {
+    if (this.touch && !this.padUsed) {
       this.touch = false;
       this.pad.unmount();
     }
   };
+
+  /**
+   * iOS Safari has ignored `user-scalable=no` since iOS 10, so the viewport meta
+   * tag does not stop pinch-zoom — the page zooms under the player's thumbs
+   * mid-corner. These are the parts that actually work: `touch-action: none`
+   * (set on html/body in index.html) kills the browser's own panning and
+   * double-tap zoom, and Safari's proprietary `gesture*` events must be
+   * cancelled explicitly on top of that. Installed at boot rather than at pad
+   * mount, because a pinch can happen before the first single touch.
+   */
+  private blockPageGestures() {
+    const stop = (e: Event) => e.preventDefault();
+    for (const t of ['gesturestart', 'gesturechange', 'gestureend']) {
+      addEventListener(t, stop, { passive: false });
+    }
+    // Belt and braces for engines that honour neither of the above: cancel any
+    // multi-finger move that is not aimed at an interactive control.
+    addEventListener('touchmove', (e: TouchEvent) => {
+      if (e.touches.length > 1) e.preventDefault();
+    }, { passive: false });
+    // Double-tap-to-zoom fires as a second tap inside ~300ms.
+    let lastTap = 0;
+    addEventListener('touchend', (e: TouchEvent) => {
+      const now = e.timeStamp;
+      if (now - lastTap < 320) e.preventDefault();
+      lastTap = now;
+    }, { passive: false });
+  }
 
   private onDown = (e: KeyboardEvent) => {
     this.keys.add(e.code);
@@ -101,6 +160,7 @@ export class Input implements IInput {
     if (this.touch) {
       this.pad.update();
       const t = this.pad.state;
+      if (t.active) this.padUsed = true;
       if (t.steer !== 0) { steerTarget = t.steer; analogue = true; }
       accel = Math.max(accel, t.accel);
       brake = Math.max(brake, t.brake);
