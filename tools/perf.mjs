@@ -18,6 +18,7 @@ import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { join } from 'node:path';
 import puppeteer from 'puppeteer';
+import { startVite } from './vite-server.mjs';
 
 const root = new URL('..', import.meta.url).pathname;
 const argv = process.argv.slice(2);
@@ -64,15 +65,7 @@ function portOpen(port) {
 
 async function ensureServer() {
   if (await portOpen(PORT)) return null;
-  const p = spawn('npx', ['vite', '--port', String(PORT), '--strictPort'], {
-    cwd: root, stdio: 'ignore', detached: false,
-  });
-  for (let i = 0; i < 90; i++) {
-    await new Promise((r) => setTimeout(r, 400));
-    if (await portOpen(PORT)) return p;
-  }
-  p.kill();
-  throw new Error('vite did not come up on port ' + PORT);
+  return startVite(PORT);
 }
 
 /** Installed in the page: hooks the renderer and attributes draws to objects. */
@@ -331,7 +324,7 @@ const main = async () => {
 
   writeFileSync(join(OUT, `perf-${LABEL}.json`), JSON.stringify(report, null, 2));
   await browser.close();
-  if (server) server.kill();
+  server.stop();
   if (errors.length) {
     console.log(`\n!! ${errors.length} console errors:`);
     for (const e of errors.slice(0, 10)) console.log('  - ' + e.slice(0, 300));

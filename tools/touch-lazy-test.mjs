@@ -13,6 +13,7 @@
 import { spawn } from 'node:child_process';
 import { createConnection } from 'node:net';
 import puppeteer from 'puppeteer';
+import { startVite } from './vite-server.mjs';
 
 const root = new URL('..', import.meta.url).pathname;
 const PORT = 5182;
@@ -25,8 +26,7 @@ const open = (p) => new Promise((r) => {
   setTimeout(() => { s.destroy(); r(false); }, 800);
 });
 
-const srv = spawn('npx', ['vite', '--port', String(PORT), '--strictPort'], { cwd: root, stdio: 'ignore' });
-for (let i = 0; i < 90 && !(await open(PORT)); i++) await new Promise((r) => setTimeout(r, 400));
+const srv = await startVite(PORT);
 
 const browser = await puppeteer.launch({
   headless: 'shell',
@@ -91,5 +91,5 @@ const ok =
 
 console.log(ok ? '\nPASS — lazy mount + gesture lockout correct' : '\nFAIL — see values above');
 await browser.close();
-srv.kill();
+srv.stop();
 process.exit(ok ? 0 : 1);

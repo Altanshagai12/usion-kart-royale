@@ -2,11 +2,11 @@
 import { spawn } from 'node:child_process';
 import { createConnection } from 'node:net';
 import puppeteer from 'puppeteer';
+import { startVite } from './vite-server.mjs';
 const root = new URL('..', import.meta.url).pathname, PORT = 5179;
 const open = (p) => new Promise((r) => { const s = createConnection({ port: p, host: '127.0.0.1' });
   s.on('connect', () => { s.destroy(); r(true); }); s.on('error', () => r(false)); setTimeout(() => { s.destroy(); r(false); }, 800); });
-const srv = spawn('npx', ['vite', '--port', String(PORT), '--strictPort'], { cwd: root, stdio: 'ignore' });
-for (let i = 0; i < 90 && !(await open(PORT)); i++) await new Promise((r) => setTimeout(r, 400));
+const srv = await startVite(PORT);
 const b = await puppeteer.launch({ headless: 'shell', args: ['--no-sandbox', '--enable-unsafe-swiftshader', '--use-gl=angle'] });
 const pg = await b.newPage();
 await pg.goto(`http://127.0.0.1:${PORT}/?quality=low`, { waitUntil: 'domcontentloaded' });
@@ -25,4 +25,4 @@ const out = await pg.evaluate(async () => {
   }));
 });
 console.log(JSON.stringify(out, null, 1));
-await b.close(); srv.kill();
+await b.close(); srv.stop();

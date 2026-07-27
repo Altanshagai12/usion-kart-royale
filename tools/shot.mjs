@@ -17,6 +17,7 @@ import { mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { join } from 'node:path';
 import puppeteer from 'puppeteer';
+import { startVite } from './vite-server.mjs';
 
 const root = new URL('..', import.meta.url).pathname;
 const argv = process.argv.slice(2);
@@ -230,17 +231,15 @@ function portOpen(port) {
   });
 }
 
+/**
+ * Delegates to the shared helper, which spawns the vite BINARY rather than
+ * `npx vite`. The npx form leaks: it execs an `npm exec` wrapper that spawns
+ * the real server as a child, so killing the handle kills the wrapper and
+ * orphans a process still holding this port — which then breaks the next run,
+ * and the developer's own `npm run dev`, long after this script has exited.
+ */
 async function ensureServer() {
-  if (await portOpen(PORT)) return null;
-  const p = spawn('npx', ['vite', '--port', String(PORT), '--strictPort'], {
-    cwd: root, stdio: 'ignore', detached: false,
-  });
-  for (let i = 0; i < 90; i++) {
-    await new Promise((r) => setTimeout(r, 400));
-    if (await portOpen(PORT)) return p;
-  }
-  p.kill();
-  throw new Error('vite did not come up on port ' + PORT);
+  return startVite(PORT);
 }
 
 const main = async () => {
@@ -859,7 +858,7 @@ const main = async () => {
 
   writeFileSync(join(OUT, 'report.json'), JSON.stringify(report, null, 2));
   await browser.close();
-  if (server) server.kill();
+  server.stop();
 
   console.log(`\n${report.shots.length} shots -> ${OUT}`);
   console.log(`fps(headless capture): ${report.fps}`);

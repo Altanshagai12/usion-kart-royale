@@ -10,6 +10,7 @@
 import { spawn } from 'node:child_process';
 import { createConnection } from 'node:net';
 import puppeteer from 'puppeteer';
+import { startVite } from './vite-server.mjs';
 
 const root = new URL('..', import.meta.url).pathname;
 const PORT = 5178;
@@ -21,8 +22,7 @@ const portOpen = (port) => new Promise((res) => {
   setTimeout(() => { s.destroy(); res(false); }, 800);
 });
 
-const server = spawn('npx', ['vite', '--port', String(PORT), '--strictPort'], { cwd: root, stdio: 'ignore' });
-for (let i = 0; i < 90 && !(await portOpen(PORT)); i++) await new Promise((r) => setTimeout(r, 400));
+const server = await startVite(PORT);
 
 const browser = await puppeteer.launch({
   headless: 'shell',
@@ -71,4 +71,4 @@ const result = await page.evaluate(async () => {
 
 console.log(JSON.stringify(result, null, 2));
 await browser.close();
-server.kill();
+server.stop();
