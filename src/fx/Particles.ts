@@ -192,14 +192,25 @@ function particleTiles(): TileFn[] {
       const a = Math.min(1, Math.pow(f, 2.7) + 0.45 * Math.pow(f, 11));
       o[0] = o[1] = o[2] = 1; o[3] = a * border(u, v);
     },
-    // 1 — Core: hot pinpoint plus a subtle 4-point flare so sparks read.
+    // 1 — Core: a blown pinpoint riding a wide soft glow, plus a *feathered*
+    //     4-point flare.
+    //
+    //     The flare used to be `1 - |y| * 22`, i.e. a 1/22-wide linear ramp.
+    //     That is a hard-edged cross barely two texels across: once the sprite
+    //     is under ~20 px on screen the mip chain collapses it into a solid
+    //     diamond with a crisp silhouette and no falloff at all, which is
+    //     exactly the "blue confetti" the drift sparks were reading as. A
+    //     gaussian flare band and a wide power-law halo survive minification —
+    //     the sprite just gets softer as it shrinks instead of harder.
     (u, v, o) => {
       const x = (u - 0.5) * 2, y = (v - 0.5) * 2;
       const d = Math.hypot(x, y);
-      let a = Math.pow(Math.max(0, 1 - d), 7.5);
-      const fall = Math.pow(Math.max(0, 1 - d), 2.2);
-      a += 0.5 * fall * Math.max(0, 1 - Math.abs(y) * 22);
-      a += 0.5 * fall * Math.max(0, 1 - Math.abs(x) * 22);
+      const f = Math.max(0, 1 - d);
+      const core = Math.pow(f, 5.5);
+      const halo = 0.34 * Math.pow(f, 1.6);
+      const fall = Math.pow(f, 2.8);
+      const flare = Math.exp(-y * y * 26) + Math.exp(-x * x * 26);
+      const a = core + halo + 0.40 * fall * flare;
       // slightly warm core so additive stacking does not read as dead white
       o[0] = 1; o[1] = 0.97; o[2] = 0.93; o[3] = Math.min(1, a) * border(u, v);
     },
@@ -253,11 +264,16 @@ function particleTiles(): TileFn[] {
       a = Math.min(1, a + 0.28 * Math.pow(Math.max(0, 1 - r), 3.2));
       o[0] = 1; o[1] = 0.985; o[2] = 0.95; o[3] = a * border(u, v);
     },
-    // 5 — Streak: soft capsule along +v, for stretched sparks and debris.
+    // 5 — Streak: soft capsule along +v, for stretched sparks and debris. A
+    //     narrow blown spine inside a wider soft body, so a motion-streaked
+    //     spark still has a hot centre line rather than reading as a flat bar.
     (u, v, o) => {
       const x = (u - 0.5) * 2, y = (v - 0.5) * 2;
-      const a = sstep(0.0, 0.55, 1 - Math.abs(x) / 0.30) * Math.pow(Math.max(0, 1 - Math.abs(y)), 0.75);
-      o[0] = 1; o[1] = 0.98; o[2] = 0.95; o[3] = a * border(u, v);
+      const along = Math.pow(Math.max(0, 1 - Math.abs(y)), 0.75);
+      const body = sstep(0.0, 0.62, 1 - Math.abs(x) / 0.46);
+      const spine = Math.exp(-x * x * 34);
+      o[0] = 1; o[1] = 0.98; o[2] = 0.95;
+      o[3] = Math.min(1, along * (0.55 * body + 0.62 * spine)) * border(u, v);
     },
     // 6 — Ring: thin gaussian annulus.
     (u, v, o) => {
@@ -312,6 +328,7 @@ varying float vViewZ;
 varying float vGroundY;
 varying float vSoft;
 varying float vNear;
+varying float vHot;
 
 void main() {
   float age = uTime - aStart.w;
@@ -324,9 +341,18 @@ void main() {
   if (age < 0.0 || u >= 1.0) {
     vColor = vec4(0.0); vUv = vec2(0.0); vSprite = vec2(0.0);
     vWorld = vec3(0.0); vViewZ = 1.0; vGroundY = 0.0; vSoft = 0.0; vNear = 0.0;
+    vHot = 0.0;
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
     return;
   }
+
+  // Tiles that represent *incandescent* matter (spark cores and velocity
+  // streaks) get a white-hot centre in the fragment shader. A spark that is
+  // uniformly tier-blue from core to fringe is the single loudest tell that a
+  // particle is a UI sprite composited over the scene rather than a piece of
+  // burning metal — real sparks clip to white in the middle and only carry
+  // their colour in the falloff.
+  vHot = (abs(aMisc.x - 1.0) < 0.5 || abs(aMisc.x - 5.0) < 0.5) ? 1.0 : 0.0;
 
   // Closed-form v' = -k v + g. One exp() buys terminal velocity for free.
   float k = max(aDyn.y, 1e-3);
@@ -378,7 +404,11 @@ void main() {
     // flame tongue then reads as a hard triangular shard. Blend back to a plain
     // billboard before that happens rather than at the degenerate point.
     float project = vl > 1e-4 ? dl / vl : 0.0;
-    float blend = smoothstep(0.30, 0.56, project);
+    // Engage earlier than the degenerate point but still well clear of it. At
+    // the old 0.30 threshold a spark thrown sideways out of a rear wheel and
+    // viewed from a chase camera sat *below* the knee for most of its life, so
+    // nothing streaked and the sparks read as evenly-spaced confetti.
+    float blend = smoothstep(0.16, 0.44, project);
 
     vec2 axB = vec2(-sa, ca);                       // billboard up, with roll
     vec2 axS = dl > 1e-4 ? d / dl : axB;
@@ -434,6 +464,7 @@ varying float vViewZ;
 varying float vGroundY;
 varying float vSoft;
 varying float vNear;
+varying float vHot;
 
 void main() {
   vec4 tex = texture2D(uAtlas, vUv);
@@ -441,6 +472,17 @@ void main() {
   if (a < 0.004) discard;
 
   vec3 rgb = tex.rgb * vColor.rgb;
+
+#ifdef ADDITIVE
+  // Hot core. The sprite mask doubles as "how deep into the spark are we", so
+  // squaring it gives a tight centre and a wide fringe. Pulling the weak
+  // channels up to the strongest one desaturates the core toward white without
+  // touching its energy: the middle blows out and blooms neutral, the falloff
+  // keeps the whole of the tier hue. Off for every tile except the spark core
+  // and the streak (vHot), so glow halos still carry flat tier colour.
+  float mx = max(max(rgb.r, rgb.g), rgb.b);
+  rgb = mix(rgb, vec3(mx), vHot * tex.a * tex.a * 0.85);
+#endif
 
 #ifdef LIT
   // Reconstruct a hemisphere normal from the sprite disc so the puff shades
@@ -456,10 +498,20 @@ void main() {
   // Wrapped diffuse: vapour is translucent, it does not terminate at N.L = 0.
   float wrapD = clamp((ndl + 0.62) / 1.62, 0.0, 1.0);
   // Forward scattering when the sun is on the far side of the puff. This is
-  // the golden-hour money shot for tyre smoke on the cliff traverse.
-  float fwd = pow(clamp(-dot(uSunDir, V), 0.0, 1.0), 4.0);
+  // the golden-hour money shot for tyre smoke on the cliff traverse. Two lobes:
+  // a broad Henyey-Greenstein-ish haze plus a tight glow right on the sun
+  // vector, so a puff between the camera and a 14-degree sun goes genuinely hot
+  // rather than one shade lighter.
+  float sv = clamp(-dot(uSunDir, V), 0.0, 1.0);
+  float fwd = 0.55 * pow(sv, 2.0) + 1.25 * pow(sv, 7.0);
+  // Silhouette rim: the edge of a billboarded puff is where the sight line
+  // passes through the least vapour, so it is where backlight leaks through.
+  float rim = pow(clamp(dot(vSprite, vSprite), 0.0, 1.0), 1.6) * clamp(0.35 - ndl, 0.0, 1.0);
   vec3 amb = mix(uBounceColor, uSkyColor, N.y * 0.5 + 0.5);
-  rgb *= amb + uSunColor * (wrapD * 0.85 + fwd * 0.75);
+  // Ambient pulled down and the key pushed up: with the two at parity every
+  // puff landed on the same flat mid-grey no matter which way the sun was, and
+  // smoke with no warm/cool split has no volume.
+  rgb *= amb * 0.62 + uSunColor * (wrapD * 1.05 + fwd * 1.15 + rim * 1.4);
 #endif
 
   float soft = 1.0;
@@ -545,7 +597,10 @@ class Layer {
       },
       vertexShader: VERT,
       fragmentShader: FRAG,
-      defines: lit ? { LIT: '' } : {},
+      defines: {
+        ...(lit ? { LIT: '' } : {}),
+        ...(additive ? { ADDITIVE: '' } : {}),
+      } as Record<string, string>,
       transparent: true,
       depthWrite: false,
       depthTest: true,

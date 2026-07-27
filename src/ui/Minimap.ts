@@ -11,6 +11,26 @@ import { el, clamp, cssColor } from './uiUtil';
 const SAMPLES = 320;
 const PAD = 0.085; // fraction of the panel reserved as margin
 
+/** Dot radii in `unit`s. ART_DIRECTION §7 asks for the player as "a larger
+ *  dot"; 3.9 against 3.0 is a 1.3x radius difference that is invisible at
+ *  delivered size, so the player is now twice the radius AND a different
+ *  silhouette — shape carries the identification, not value. */
+const RIVAL_U = 3.0;
+const PLAYER_U = 6.0;
+
+/**
+ * Broad value steps along t, so the ribbon encodes where you are on the lap
+ * instead of being one uniform beige noodle. The breaks follow the authored
+ * section table in ART_DIRECTION §1: sea level through the village climb, the
+ * high ground (cliff traverse + tunnel), then the descent back to the beach
+ * and the bridge home.
+ */
+const BANDS: { t: number; c: string }[] = [
+  { t: 0.38, c: '#dcc396' },  // harbour, marina sweep, village climb
+  { t: 0.60, c: '#fdf4dc' },  // cliff traverse + tunnel — the +42 m apex
+  { t: 1.00, c: '#c19d6f' },  // beach descent, banked curve, bridge home
+];
+
 export class Minimap {
   readonly root: HTMLDivElement;
   private canvas: HTMLCanvasElement;
@@ -72,9 +92,11 @@ export class Minimap {
     this.dpr = Math.min(2, window.devicePixelRatio || 1);
 
     // The panel aspect follows the track's own aspect, clamped so a very long
-    // circuit doesn't produce a letterbox slot.
+    // circuit doesn't produce a letterbox slot. The lower bound is 1.0, not
+    // 0.6: the panel now lives in the bottom-left stack above the item box, and
+    // a taller-than-wide map would grow up into the position lockup.
     const aspect = this.built
-      ? Math.min(1.35, Math.max(0.6, this.spanX / this.spanZ))
+      ? Math.min(1.35, Math.max(1.0, this.spanX / this.spanZ))
       : 1.25;
     const cssH = cssW / aspect;
 
@@ -141,15 +163,28 @@ export class Minimap {
     g.lineWidth = unit * 4.6;
     g.stroke();
 
-    // 3 — road body, gradient so the far side of the circuit sits back
-    const grd = g.createLinearGradient(0, 0, 0, H);
-    grd.addColorStop(0, '#f6e8cd');
-    grd.addColorStop(0.55, '#e6d2ad');
-    grd.addColorStop(1, '#c9ab7e');
-    trace();
-    g.strokeStyle = grd;
+    // 3 — road body, in three broad value steps along t. Baked once, so the
+    //     extra strokes cost nothing per frame.
     g.lineWidth = unit * 3.1;
-    g.stroke();
+    let i0 = 0;
+    for (let b = 0; b < BANDS.length; b++) {
+      const i1 = Math.min(n - 1, Math.round(BANDS[b].t * (n - 1)));
+      g.beginPath();
+      this.project(p[i0].x, p[i0].z, s);
+      g.moveTo(s.x, s.y);
+      for (let i = i0 + 1; i <= i1; i++) {
+        this.project(p[i].x, p[i].z, s);
+        g.lineTo(s.x, s.y);
+      }
+      // close the loop on the last band so the ribbon has no seam at t=0
+      if (b === BANDS.length - 1) {
+        this.project(p[0].x, p[0].z, s);
+        g.lineTo(s.x, s.y);
+      }
+      g.strokeStyle = BANDS[b].c;
+      g.stroke();
+      i0 = i1;
+    }
 
     // 4 — centre dashes
     trace();
@@ -159,7 +194,10 @@ export class Minimap {
     g.stroke();
     g.setLineDash([]);
 
-    // 5 — start/finish, drawn perpendicular to the first segment
+    // 5 — start/finish. Was a ~5 px checkered nub mid-ribbon that no player
+    //     would ever find; it now runs well proud of the ribbon on both sides
+    //     with a gold cased frame, so the lap has a visible beginning at the
+    //     delivered panel size.
     this.project(p[0].x, p[0].z, s);
     const ax = s.x, ay = s.y;
     this.project(p[2 % n].x, p[2 % n].z, s);
@@ -170,16 +208,49 @@ export class Minimap {
     g.save();
     g.translate(ax, ay);
     g.rotate(Math.atan2(ny, nx));
-    const cell = unit * 1.75;
-    for (let i = 0; i < 3; i++) {
-      for (let j = 0; j < 2; j++) {
+    // Four fat cells, not eight thin ones: at a 227 px panel a fine check turns
+    // to mush, and what has to survive is "there is a gold-framed bar across
+    // the ribbon here".
+    const cell = unit * 2.6;
+    const cols = 4, rows = 2;
+    const halfW = (cols * 0.5) * cell;
+    const halfH = (rows * 0.5) * cell;
+    for (let i = 0; i < cols; i++) {
+      for (let j = 0; j < rows; j++) {
         g.fillStyle = (i + j) & 1 ? '#1a1626' : '#fbf5e6';
-        g.fillRect((i - 1.5) * cell, (j - 1) * cell, cell, cell);
+        g.fillRect(i * cell - halfW, j * cell - halfH, cell, cell);
       }
     }
-    g.strokeStyle = 'rgba(9,12,24,0.75)';
-    g.lineWidth = unit * 0.45;
-    g.strokeRect(-1.5 * cell, -cell, cell * 3, cell * 2);
+    g.strokeStyle = 'rgba(9,12,24,0.92)';
+    g.lineWidth = unit * 1.6;
+    g.strokeRect(-halfW, -halfH, halfW * 2, halfH * 2);
+    g.strokeStyle = '#ffcf6b';
+    g.lineWidth = unit * 0.9;
+    g.strokeRect(-halfW, -halfH, halfW * 2, halfH * 2);
+    g.restore();
+
+    // 6 — direction chevron a short way downstream of the line, so the ribbon
+    //     says which way the field is going.
+    const ci = Math.round(n * 0.075) % n;
+    this.project(p[ci].x, p[ci].z, s);
+    const bx = s.x, by = s.y;
+    this.project(p[(ci + 3) % n].x, p[(ci + 3) % n].z, s);
+    const dl = Math.hypot(s.x - bx, s.y - by) || 1;
+    g.save();
+    g.translate(bx, by);
+    g.rotate(Math.atan2((s.y - by) / dl, (s.x - bx) / dl));
+    g.beginPath();
+    g.moveTo(unit * 3.4, 0);
+    g.lineTo(-unit * 2.3, -unit * 3.0);
+    g.lineTo(-unit * 0.8, 0);
+    g.lineTo(-unit * 2.3, unit * 3.0);
+    g.closePath();
+    g.lineJoin = 'round';
+    g.lineWidth = unit * 1.8;
+    g.strokeStyle = 'rgba(9,12,24,0.9)';
+    g.stroke();
+    g.fillStyle = '#ffcf6b';
+    g.fill();
     g.restore();
   }
 
@@ -213,8 +284,8 @@ export class Minimap {
     const s = this.scratch;
     const n = karts.length;
 
-    const rivalR = unit * 3.0;
-    const playerR = unit * 3.9;
+    const rivalR = unit * RIVAL_U;
+    const playerR = unit * PLAYER_U;
 
     // --- project, then de-overlap ------------------------------------------
     // A bunched field used to collapse into one indistinct smear. Dots that
@@ -236,7 +307,9 @@ export class Minimap {
     }
 
     // three relaxation passes is plenty for an eight-kart field
-    const maxOff = rivalR * 3.4;
+    // 3.4 was not enough travel for a six-kart pack: the relaxation ran out of
+    // room and the dots still piled into one indistinct cluster.
+    const maxOff = rivalR * 5.0;
     for (let pass = 0; pass < 3; pass++) {
       for (let i = 0; i < n; i++) {
         const ri = karts[i] === player ? playerR : rivalR;
@@ -307,61 +380,62 @@ export class Minimap {
       g.strokeStyle = '#ffcf6b';
       g.stroke();
     }
-    // top catchlight — the dots read as beads, not as flat circles
+    // A hint of top light, no more. At 0.5 alpha these were glossy 3D beads
+    // with specular catchlights sitting next to a flat vector banana icon and
+    // cased 2D type — three rendering idioms inside one HUD.
     g.beginPath();
-    g.arc(x - r * 0.26, y - r * 0.3, r * 0.34, 0, Math.PI * 2);
-    g.fillStyle = 'rgba(255,255,255,0.5)';
+    g.arc(x - r * 0.24, y - r * 0.28, r * 0.30, 0, Math.PI * 2);
+    g.fillStyle = 'rgba(255,255,255,0.25)';
     g.fill();
   }
 
   private playerDot(
     g: CanvasRenderingContext2D, x: number, y: number, unit: number, k: IKart, time: number,
   ) {
-    const r = unit * 3.9;
+    // A chevron, not a bead. The player marker used to be cream #fff6e2 at
+    // 1.3x the rival radius, which is nearly the same value and nearly the same
+    // size as the amber and gold rivals it sits next to — you could not find
+    // yourself in a pack. Shape does the identifying now, so it survives even
+    // when a rival's livery happens to be cream.
+    const r = unit * PLAYER_U;
+
     // slow halo pulse so the eye finds the player instantly
     const pulse = 0.5 + 0.5 * Math.sin(time * 3.2);
     g.beginPath();
-    g.arc(x, y, r * (1.9 + pulse * 0.5), 0, Math.PI * 2);
-    g.fillStyle = `rgba(255,236,180,${0.10 + pulse * 0.10})`;
+    g.arc(x, y, r * (1.25 + pulse * 0.3), 0, Math.PI * 2);
+    g.fillStyle = `rgba(255,236,180,${0.12 + pulse * 0.12})`;
     g.fill();
 
-    // heading wedge
     const f = k.forward;
     const a = Math.atan2(f.z, f.x);
     g.save();
     g.translate(x, y);
     g.rotate(a);
     g.beginPath();
-    g.moveTo(r * 2.5, 0);
-    g.lineTo(r * 0.95, -r * 0.82);
-    g.lineTo(r * 0.95, r * 0.82);
+    g.moveTo(r * 1.12, 0);
+    g.lineTo(-r * 0.78, -r * 0.94);
+    g.lineTo(-r * 0.34, 0);
+    g.lineTo(-r * 0.78, r * 0.94);
     g.closePath();
-    g.fillStyle = '#fff6e2';
-    g.fill();
-    g.lineWidth = unit * 0.9;
     g.lineJoin = 'round';
-    g.strokeStyle = 'rgba(10,13,26,0.9)';
+    // contact shadow first, so the marker sits on the ribbon rather than over it
+    g.save();
+    g.shadowColor = 'rgba(6,9,20,0.75)';
+    g.shadowBlur = unit * 2.2;
+    g.shadowOffsetY = unit * 1.0;
+    g.lineWidth = r * 0.42;
+    g.strokeStyle = 'rgba(10,13,26,0.94)';
     g.stroke();
     g.restore();
-
-    g.beginPath();
-    g.arc(x, y + r * 0.24, r, 0, Math.PI * 2);
-    g.fillStyle = 'rgba(8,10,20,0.55)';
-    g.fill();
-
-    g.beginPath();
-    g.arc(x, y, r, 0, Math.PI * 2);
-    const grd = g.createRadialGradient(x - r * 0.35, y - r * 0.4, 0, x, y, r);
+    const grd = g.createLinearGradient(-r * 0.8, -r * 0.9, r * 1.1, r * 0.9);
     grd.addColorStop(0, '#fffdf6');
-    grd.addColorStop(0.45, '#ffe7b0');
-    grd.addColorStop(1, '#f2a63a');
+    grd.addColorStop(0.5, '#ffe7ae');
+    grd.addColorStop(1, '#f7ae3c');
     g.fillStyle = grd;
     g.fill();
-    g.lineWidth = r * 0.34;
-    g.strokeStyle = 'rgba(10,13,26,0.92)';
-    g.stroke();
     g.lineWidth = r * 0.16;
-    g.strokeStyle = 'rgba(255,250,236,0.85)';
+    g.strokeStyle = 'rgba(255,250,236,0.8)';
     g.stroke();
+    g.restore();
   }
 }

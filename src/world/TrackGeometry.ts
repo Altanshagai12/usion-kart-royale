@@ -50,9 +50,20 @@ const C_PAINT = new THREE.Color('#f2ece0');
  * it rides on top of whichever tarmac map the shared library handed us, and a
  * ratio survives that where an absolute colour would fight it.
  */
-const C_RACE_MUL = new THREE.Color(0x3e / 0x4a, 0x3e / 0x4a, 0x48 / 0x52);
+/*
+ * NB the ratio is taken in **linear** space, which is the space this multiplier
+ * is applied in. Round 1 used the sRGB *byte* ratio (0x3e/0x4a = 0.83) as if it
+ * were linear, which under-darkens the line by nearly half — 17% instead of the
+ * 29% the palette table actually specifies — and is why the racing line was
+ * invisible in every round-1 frame. Tempered slightly from the true 0.635
+ * because the polished core also gets the darker `tarmac-racing-line` map on top
+ * of this, and the two must not stack into a black stripe.
+ */
+const C_RACE_MUL = new THREE.Color(0.75, 0.75, 0.90);
 /** warm dusting where the beach blows sand across the outer lane */
 const C_SAND_MUL = new THREE.Color(1.30, 1.16, 0.92);
+/** pale silt and grit washed into the gutter, in patches, everywhere */
+const C_DUST_MUL = new THREE.Color(1.24, 1.14, 0.97);
 /** the dark kiss of rubber and dirt packed into the kerb/tarmac joint */
 const C_JOINT_MUL = new THREE.Color(0.42, 0.40, 0.42);
 
@@ -225,12 +236,12 @@ class MatLib {
    * Three folds `vertexColors` into the program cache key itself, so the bound
    * `customProgramCacheKey` cannot collide the two variants onto one program.
    */
-  vc(name: string, make: () => THREE.Material): THREE.Material {
-    const base = this.get(name, make) as THREE.MeshStandardMaterial;
-    if (base.vertexColors) return base;          // our own fallbacks already do
-    const key = name + '|vc';
+  vc(name: string, make: () => THREE.Material, extra?: (m: THREE.Material) => void): THREE.Material {
+    const key = name + (extra ? '|vc+x' : '|vc');
     const hit = this.cache.get(key);
     if (hit) return hit;
+    const base = this.get(name, make) as THREE.MeshStandardMaterial;
+    if (base.vertexColors && !extra) return base; // our own fallbacks already do
     const c = base.clone();
     const before = (base as any).onBeforeCompile;
     if (before && before !== THREE.Material.prototype.onBeforeCompile) {
@@ -239,6 +250,10 @@ class MatLib {
     }
     c.vertexColors = true;
     c.name = (base.name || name) + '-vc';
+    // Track-owned shader work rides on the *clone*, never on the shared original:
+    // the library hands the same material to walls, props and the minimap, and a
+    // road-specific distance fade has no business on any of them.
+    if (extra) extra(c);
     c.needsUpdate = true;
     this.cache.set(key, c);
     this.clones.push(c);
@@ -258,6 +273,55 @@ class MatLib {
     }
     return s;
   }
+}
+
+/**
+ * Fade a high-contrast repeating pattern toward its own tile average with view
+ * distance, on a material clone the track owns.
+ *
+ * The kerb is the noisiest thing in every frame of round 1, and the cause is not
+ * anisotropy — the shared library sets `anisotropy = min(8, maxAnisotropy)` on
+ * every map it bakes, and it mips them all. The cause is that 500 mm red/white
+ * bands are a *full-contrast* signal that stays full-contrast forever: the
+ * library gives the tarmac a `settle` ramp (34→95 m, fading the fine octave into
+ * a high mip) and gives the kerb none, so past ~40 m the stripe is being sampled
+ * well under Nyquist with nothing damping it. Anisotropic filtering actively
+ * makes that worse, because it holds a *low* mip at exactly the grazing angles a
+ * chase camera lives at.
+ *
+ * So: lerp albedo toward the tile mean — a flat pink-grey — over the same
+ * distance band. Near kerbs keep every stripe; far kerbs go smooth instead of
+ * fizzing. Costs one varying and one mix.
+ */
+function injectDistanceFlatten(mat: THREE.Material, near: number, far: number, mean: THREE.Color) {
+  const uFade = { value: new THREE.Vector2(near, far) };
+  const uMean = { value: mean.clone() };
+  const prev = mat.onBeforeCompile;
+  const prevKey = mat.customProgramCacheKey;
+  mat.onBeforeCompile = (shader, renderer) => {
+    if (prev && prev !== THREE.Material.prototype.onBeforeCompile) prev.call(mat, shader, renderer);
+    shader.uniforms.uFlatFade = uFade;
+    shader.uniforms.uFlatMean = uMean;
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying float vFlatD;')
+      // mvPosition is in scope straight after project_vertex, instancing included
+      .replace('#include <project_vertex>', '#include <project_vertex>\nvFlatD = -mvPosition.z;');
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        '#include <common>\nvarying float vFlatD;\nuniform vec2 uFlatFade;\nuniform vec3 uFlatMean;',
+      )
+      // after color_fragment diffuseColor is albedo × vertex colour and nothing
+      // else has happened to it yet, which is exactly where a mip-style fade goes
+      .replace(
+        '#include <color_fragment>',
+        '#include <color_fragment>\n' +
+          'diffuseColor.rgb = mix( diffuseColor.rgb, uFlatMean,\n' +
+          '  smoothstep( uFlatFade.x, uFlatFade.y, vFlatD ) );',
+      );
+  };
+  const tag = `|flat${near}_${far}`;
+  mat.customProgramCacheKey = () => (prevKey ? prevKey.call(mat) : '') + tag;
 }
 
 /** DoubleSide variant that never mutates a material somebody else may own. */
@@ -747,6 +811,13 @@ function buildRoad(track: Track, lib: MatLib, root: THREE.Group) {
       // --- grime gradient off the shoulders --------------------------------
       const edge = ss(0.70, 1.0, Math.abs(L) / hw);
       _c.lerp(C_GRIME, edge * 0.30);
+      // --- pale silt washed into the gutter, in patches ---------------------
+      // The bible asks for dust accumulation near the kerbs, and it earns its
+      // place beyond that: a *lighter* term at the edge against the darker
+      // racing line in the middle is what stops the whole 26 m of road reading
+      // as one value with one noise on it.
+      const gutter = ss(0.84, 1.02, Math.abs(L) / hw);
+      _c.lerp(C_DUST_MUL, gutter * Math.max(0, tn2(_p.x * 0.031 + 5, _p.z * 0.031 + 5)) * 0.55);
       // --- sand drift on the seaward edge of the beach section -------------
       if (sand) {
         const drift = ss(0.34, 0.98, L / hw) * (0.55 + tn2(_p.x * 0.05, _p.z * 0.05) * 0.45);
@@ -828,20 +899,60 @@ function buildRoad(track: Track, lib: MatLib, root: THREE.Group) {
  * structurally cannot — where on the cross-section the dirt sits, and how the
  * rubber varies along a 1600 m run.
  */
-function kerbWear(q: number, dist: number, out: THREE.Color) {
+function kerbWear(q: number, dist: number, hot: number, out: THREE.Color) {
   out.copy(_white);
-  // dirt and rubber packed into the joint where the kerb meets the tarmac
+  // Dirt and rubber packed into the joint, plus a hard 60 mm contact-AO gradient
+  // right at the foot. Without the second term the kerb is a striped object
+  // *resting on* the road rather than bedded into it, which is the "floating"
+  // note — and AO in every contact point is not optional (bible §2).
   out.lerp(C_JOINT_MUL, (1 - ss(0.0, 0.14, q)) * 0.72);
-  // grime gradient up the outer face — the bottom 15% is where it collects
-  out.lerp(C_GRIME, ss(1.40, KERB_W, q) * 0.55);
+  out.multiplyScalar(1 - (1 - ss(0.0, 0.06, q)) * 0.34);
+  // grime gradient up the outer face — the bottom 15% is where it collects, and
+  // the gutter silts up worse on a straight than on a corner nobody misses
+  out.lerp(C_GRIME, ss(1.40, KERB_W, q) * (0.48 + (1 - hot) * 0.26));
   // the bevel and the crown edge get scuffed pale by wheels riding over
   const polish = ss(0.20, 0.30, q) * (1 - ss(0.34, 0.44, q));
-  out.multiplyScalar(1 + polish * 0.10);
-  // black rubber laid on in patches along the run, heavier on the crown
-  const smear = Math.max(0, tn2(dist * 0.031, q * 0.4)) * Math.max(0, tn2(dist * 0.0083 + 17, 5.5));
-  out.multiplyScalar(1 - smear * 0.42 * ss(0.16, 0.30, q) * (1 - ss(1.30, 1.50, q)));
-  // paint sun-bleached in slow patches, so no two kerb runs read identical
-  out.multiplyScalar(1 + tn2(dist * 0.014 + 61, 2.2) * 0.07);
+  out.multiplyScalar(1 + polish * 0.10 * (0.4 + hot));
+  // Black rubber on the crown. `hot` is blurred inside-of-corner curvature, so
+  // an apex kerb karts hammer goes black and a kerb on a straight stays clean —
+  // which is the whole difference the round-1 kerb did not have.
+  const smear = Math.max(0, tn2(dist * 0.031, q * 0.4)) * (0.35 + 0.65 * Math.max(0, tn2(dist * 0.0083 + 17, 5.5)));
+  out.multiplyScalar(1 - smear * (0.16 + hot * 0.62) * ss(0.16, 0.30, q) * (1 - ss(1.30, 1.50, q)));
+  // Paint bleached in slow patches so no two runs of kerb read the same value.
+  // Two octaves at 33 m and 78 m — one alone is a beat you can count.
+  out.multiplyScalar(0.97 + tn2(dist * 0.0302 + 61, 2.2) * 0.075 + tn2(dist * 0.0128 + 7, 5.1) * 0.10);
+  // Ceiling. `#f2ece0` is already 0.89 linear and the map's own grime octave can
+  // put it at 0.96; if the bleach and the bevel polish happen to peak on the same
+  // vertex the product goes over 1.0, and an albedo over 1.0 under a 4.2 key
+  // clips to the flat `#ffffff` the palette table forbids outright.
+  clampMul(out, 0.16, 1.10);
+}
+
+/** Clamp a vertex-colour multiplier so it can neither crush nor clip its map. */
+function clampMul(c: THREE.Color, lo: number, hi: number) {
+  c.r = c.r < lo ? lo : c.r > hi ? hi : c.r;
+  c.g = c.g < lo ? lo : c.g > hi ? hi : c.g;
+  c.b = c.b < lo ? lo : c.b > hi ? hi : c.b;
+}
+
+/**
+ * How hard karts use the kerb at each station, per side, 0..1.
+ *
+ * Signed curvature says which side is the inside of the turn; blurring it over
+ * ~34 m of arc spreads the wear through the entry and out down the exit, the
+ * same reason `raceWear` blurs. The floor keeps a trace of rubber everywhere,
+ * because a kart bouncing off a straight-line kerb still leaves some.
+ */
+function kerbHot(cl: Track['cl'], side: number): Float32Array {
+  const w = new Float32Array(cl.count);
+  for (let i = 0; i < cl.count; i++) {
+    // curv < 0 turns left, so the inside kerb is the left (side = -1) one
+    const inside = side < 0 ? -cl.curv[i] : cl.curv[i];
+    w[i] = Math.min(1, Math.max(0, inside) * 150);
+  }
+  blurStations(w, Math.max(1, Math.round(17 / cl.ds)), 2);
+  for (let i = 0; i < cl.count; i++) w[i] = 0.10 + 0.90 * Math.min(1, w[i] * 1.4);
+  return w;
 }
 
 /**
@@ -851,7 +962,7 @@ function kerbWear(q: number, dist: number, out: THREE.Color) {
  * profile there is flat: all that is left to say is that the edge of a deck
  * collects more dirt than the middle of the road.
  */
-function apronWear(q: number, dist: number, out: THREE.Color) {
+function apronWear(q: number, dist: number, _hot: number, out: THREE.Color) {
   out.copy(_white);
   out.lerp(C_JOINT_MUL, (1 - ss(0.0, 0.20, q)) * 0.40);
   out.lerp(C_GRIME, ss(0.45, KERB_W, q) * 0.44);
@@ -926,20 +1037,23 @@ function buildKerbs(track: Track, lib: MatLib, root: THREE.Group) {
     owns: (si: number) => boolean;
     uvS: number;
     edgeU: boolean;
-    wear: (q: number, dist: number, out: THREE.Color) => void;
+    wear: (q: number, dist: number, hot: number, out: THREE.Color) => void;
     idx: number[];
   }
+
+  const hotL = kerbHot(cl, -1), hotR = kerbHot(cl, 1);
 
   const emitRing = (si: number, side: number, dist: number, p: Pass) => {
     const hw = cl.half[si];
     const ring = b.pos.length / 3;
+    const hot = side < 0 ? hotL[si] : hotR[si];
     // two vertices per breakpoint per band: the crease is the point
     for (let k = 0; k < nk - 1; k++) {
       facetN(si, side, k, N);
       for (let e = 0; e < 2; e++) {
         const q = KERB_QS[k + e];
         track.crossPoint(si, side * (hw + q), _p);
-        p.wear(q, dist, _c);
+        p.wear(q, dist, hot, _c);
         const u = (p.edgeU ? side * (hw + q) : q) / p.uvS;
         pushV(b, _p.x, _p.y, _p.z, N.x, N.y, N.z, u, dist / p.uvS, _c);
       }
@@ -976,8 +1090,16 @@ function buildKerbs(track: Track, lib: MatLib, root: THREE.Group) {
     {
       // the shared kerb map bands red/white along V at 4 stripes per tile, so V
       // must be real arc length over the tile size or the stripes stretch
-      p: { owns: hasKerb, uvS: lib.scale('kerb', 2.0), edgeU: false, wear: kerbWear, idx: [] },
-      mat: () => lib.vc('kerb', () => kerbMaterial(lib)),
+      // 2.0 m of tile is four bands, i.e. 500 mm stripes. Stretched to 2.6 m the
+      // stripe is 650 mm: chunkier (which is the Nintendo read anyway) and a
+      // third of an octave further from Nyquist at the distances that alias.
+      p: { owns: hasKerb, uvS: lib.scale('kerb', 2.0) * 1.3, edgeU: false, wear: kerbWear, idx: [] },
+      mat: () => lib.vc('kerb', () => kerbMaterial(lib), (m) => {
+        // tile mean: half red, half white, knocked back by the grime and chip
+        // the map averages in. This is the value a distant kerb resolves to.
+        _c2.copy(C_KERB_R).lerp(C_KERB_W, 0.5).multiplyScalar(0.72);
+        injectDistanceFlatten(m, 26, 105, _c2);
+      }),
     },
     {
       p: {
@@ -1012,7 +1134,16 @@ function buildKerbs(track: Track, lib: MatLib, root: THREE.Group) {
 
   const mesh = new THREE.Mesh(geo, mats.length === 1 ? mats[0] : mats);
   mesh.name = 'kerbs';
-  mesh.castShadow = true;
+  // No shadow. A kerb stands about 50 mm proud of the apron, and although the
+  // key light is low enough (14 degrees) to stretch that into a ~200 mm smear,
+  // the smear lands on tarmac already inside the kerb's own form shading and
+  // baked AO — an A/B of the hero and corner frames with this flag both ways is
+  // indistinguishable in the kerb region. It is not free, either: this is a
+  // multi-material mesh, so it costs one shadow draw PER GROUP, three every
+  // near cascade and three more every far one, for 3.9 draw calls a frame out
+  // of a budget of 250. The profile's own shading is what reads here, and it
+  // stays.
+  mesh.castShadow = false;
   mesh.receiveShadow = true;
   root.add(mesh);
 }
@@ -1069,16 +1200,84 @@ function buildMarkings(track: Track, lib: MatLib, root: THREE.Group) {
     const si = ((fl % cl.count) + cl.count) % cl.count;
     return put(si, L, u, v, col, a, (raw - fl) * cl.ds);
   };
-  /** axis-aligned patch in (arc length, lateral), subdivided to follow the crown */
+  /**
+   * Axis-aligned patch in (arc length, lateral), subdivided to follow the crown.
+   *
+   * `uvS`, when given, parameterises UV in *metres of world per tile* instead of
+   * stretching one tile over the whole quad. Painted furniture (a checker square,
+   * a grid-box side) is happy either way because it is one flat colour; anything
+   * that is supposed to look like *road* is not, because the paint map carries
+   * aggregate at a physical size and a 0..1 stretch across 8 m blows a 36 mm
+   * chipping up to 300 mm. That is why the round-1 patches were visibly grainier
+   * than the tarmac they sat on.
+   */
   const strip = (s0: number, s1: number, l0: number, l1: number,
-    col: THREE.Color, a: number, segs = 4) => {
+    col: THREE.Color, a: number, segs = 4, uvS = 0) => {
+    const uu = (x: number) => (uvS > 0 ? x / uvS : x);
     for (let k = 0; k < segs; k++) {
       const t0 = l0 + (l1 - l0) * (k / segs), t1 = l0 + (l1 - l0) * ((k + 1) / segs);
-      const v = putD(s0, t0, 0, 0, col, a);
-      putD(s0, t1, 1, 0, col, a);
-      putD(s1, t1, 1, 1, col, a);
-      putD(s1, t0, 0, 1, col, a);
+      const u0 = uvS > 0 ? uu(t0) : 0, u1 = uvS > 0 ? uu(t1) : 1;
+      const v0 = uvS > 0 ? uu(s0) : 0, v1 = uvS > 0 ? uu(s1) : 1;
+      const v = putD(s0, t0, u0, v0, col, a);
+      putD(s0, t1, u1, v0, col, a);
+      putD(s1, t1, u1, v1, col, a);
+      putD(s1, t0, u0, v1, col, a);
       quad(b, v, v + 1, v + 2, v + 3);
+    }
+  };
+
+  /**
+   * A road repair, as opposed to a rectangle of paint.
+   *
+   * Round 1 drew these with `strip()`: one quad, four exact 90° corners, constant
+   * vertex alpha and a stretched UV, in a colour six times the linear albedo of
+   * the tarmac. It read as a broken decal, and it was the loudest thing in the
+   * frame. Four things fix it, and all four are needed:
+   *
+   *  • **Value.** A fresh binder patch is *darker* than the road it replaces, not
+   *    lighter. The vertex colour here multiplies the near-white thermoplastic of
+   *    the paint map, so the number that lands at `#3e3e48` is around 0.07, not
+   *    the 0.46 that shipped.
+   *  • **Edge.** The perimeter ring carries alpha 0 and sits `FEA` metres outside
+   *    the cut, so the patch dissolves into the tarmac over a third of a metre
+   *    instead of terminating on a razor.
+   *  • **Shape.** The cut line wanders ±0.24 m on a smooth noise. A saw cut in a
+   *    road is never square, and four exact right angles is the tell.
+   *  • **Scale.** World UVs, so the aggregate inside the patch is the same
+   *    physical size as the aggregate outside it.
+   */
+  const softPatch = (d: number, lenP: number, lat: number, wP: number,
+    col: THREE.Color, a: number, seed: number) => {
+    const NC = 5, NR = 7;      // interior divisions across and along
+    const FEA = 0.34;          // metres of alpha rolloff past the cut
+    const UVS = 1.15;          // metres per paint tile
+    const cols = NC + 3, rows = NR + 3;
+    const l0 = lat - wP * 0.5;
+    const base = b.pos.length / 3;
+    // a cut wanders, it does not zigzag: one smooth octave per edge
+    const wob = (t: number, k: number) => tn2(t * 2.4 + k * 37.1 + seed * 0.013, k * 5.3 + 0.5) * 0.24;
+    for (let j = 0; j < rows; j++) {
+      const fv = j === 0 ? 0 : j === rows - 1 ? 1 : (j - 1) / NR;
+      for (let i = 0; i < cols; i++) {
+        const fu = i === 0 ? 0 : i === cols - 1 ? 1 : (i - 1) / NC;
+        let L = l0 + wP * fu;
+        let s = d + lenP * fv;
+        if (i <= 1) L += wob(fv, 0) - (i === 0 ? FEA : 0);
+        else if (i >= cols - 2) L += wob(fv, 1) + (i === cols - 1 ? FEA : 0);
+        if (j <= 1) s += wob(fu, 2) - (j === 0 ? FEA : 0);
+        else if (j >= rows - 2) s += wob(fu, 3) + (j === rows - 1 ? FEA : 0);
+        const rim = i === 0 || i === cols - 1 || j === 0 || j === rows - 1;
+        // the inside of a repair is blotchy, not uniformly lit
+        const n = tn2(s * 0.62 + seed * 0.07, L * 0.62);
+        _c2.copy(col).multiplyScalar(0.86 + n * 0.26);
+        putD(s, L, L / UVS, s / UVS, _c2, rim ? 0 : a * (0.80 + n * 0.20));
+      }
+    }
+    for (let j = 0; j < rows - 1; j++) {
+      for (let i = 0; i < cols - 1; i++) {
+        const v0 = base + j * cols + i;
+        quad(b, v0, v0 + 1, v0 + cols + 1, v0 + cols);
+      }
     }
   };
 
@@ -1146,7 +1345,7 @@ function buildMarkings(track: Track, lib: MatLib, root: THREE.Group) {
     for (const [s0, s1, t0, t1] of edges) strip(s0, s1, t0, t1, C_PAINT, 0.82, 1);
   }
 
-  buildRoadDecals(track, strip, (v) => { lift = v; });
+  buildRoadDecals(track, strip, softPatch, (v) => { lift = v; });
   lift = LIFT_PAINT;
 
   const mesh = new THREE.Mesh(finish(b), lib.own('road-paint', () => paintMaterial(lib)));
@@ -1156,7 +1355,9 @@ function buildMarkings(track: Track, lib: MatLib, root: THREE.Group) {
 }
 
 type StripFn = (s0: number, s1: number, l0: number, l1: number,
-  col: THREE.Color, a: number, segs?: number) => void;
+  col: THREE.Color, a: number, segs?: number, uvS?: number) => void;
+type PatchFn = (d: number, lenP: number, lat: number, wP: number,
+  col: THREE.Color, a: number, seed: number) => void;
 
 /**
  * The decal layer: tar seams, patch repairs and faded corner arrows.
@@ -1171,12 +1372,30 @@ type StripFn = (s0: number, s1: number, l0: number, l1: number,
  * All of it stays inside the edge lines and clear of the start/finish, so no
  * two families of decal ever fight for the same square metre of z-buffer.
  */
-function buildRoadDecals(track: Track, strip: StripFn, setLift: (v: number) => void) {
+function buildRoadDecals(track: Track, strip: StripFn, softPatch: PatchFn, setLift: (v: number) => void) {
   const cl = track.cl;
   const len = cl.length;
   const rnd = mulberry32(70726);
-  const C_TAR = new THREE.Color(0.30, 0.29, 0.32);
-  const C_PATCH = new THREE.Color(0.46, 0.45, 0.49);
+  /**
+   * These two multiply the *paint* map, whose albedo is warm thermoplastic
+   * cream (`#f2ece0`, sampling to ≈(0.733, 0.693, 0.617) linear once the
+   * aggregate bleed and road film are in). So the number written here is not the
+   * colour of the decal — it is the colour of the decal *divided* by that, which
+   * is also why blue runs highest: the multiplier has to take the warmth back
+   * out of the paint map before the palette's cool grey-violet can land.
+   *
+   * Round 1 read these as absolute colours and shipped a patch at ≈0.35 linear
+   * against a `#4a4a52` road at 0.070 — five times too bright, and the reason it
+   * read as a rendering bug rather than as a road feature.
+   *
+   *   tar seam  → ≈`#2a2a32`, well under half the road: hot bitumen, near-black
+   *   patch     → ≈`#3e3e48`, the bible's worn-line value: fresh binder, a shade
+   *               darker than the road and — via the paint material's 0.44 base
+   *               roughness against the tarmac's 0.72 — visibly smoother, which
+   *               is the half of "reads as a repair" that albedo cannot do
+   */
+  const C_TAR = new THREE.Color(0.033, 0.035, 0.054);
+  const C_PATCH = new THREE.Color(0.068, 0.070, 0.111);
 
   const clear = (d: number) => {
     // keep off the start/finish furniture and out of the cobbled village
@@ -1188,59 +1407,115 @@ function buildRoadDecals(track: Track, strip: StripFn, setLift: (v: number) => v
   const halfAt = (d: number) => cl.half[Math.floor((((d % len) + len) % len) / cl.ds) % cl.count];
 
   // --- transverse construction joints, one every ~31 m ---------------------
+  //  Thin, dark and world-UV'd. The joint itself carries the aggregate at its
+  //  authored size, so the seam reads as a groove in the road rather than as a
+  //  ribbon of something else laid on top of it.
   setLift(LIFT_SEAM);
   for (let d = 40; d < len - 40; d += 31 + rnd() * 9) {
     if (!clear(d)) continue;
     const hw = halfAt(d) - 1.1;
     // a joint is never dead square to the road, and never dead straight
     const skew = (rnd() - 0.5) * 1.6;
-    const th = 0.07 + rnd() * 0.05;
-    const segs = 7;
+    // 90–160 mm rather than 60–110. Vertex alpha cannot be mip-filtered, so a
+    // decal thinner than this goes sub-pixel by 60 m and shimmers — the same
+    // failure mode as the kerb stripe, one family down.
+    const th = 0.09 + rnd() * 0.07;
+    const segs = 9;
     for (let k = 0; k < segs; k++) {
       const l0 = -hw + (2 * hw) * (k / segs), l1 = -hw + (2 * hw) * ((k + 1) / segs);
-      const s = d + skew * ((l0 + l1) * 0.5) / hw + (rnd() - 0.5) * 0.06;
-      strip(s, s + th, l0, l1, C_TAR, 0.34 + rnd() * 0.16, 1);
+      const lc = (l0 + l1) * 0.5;
+      const s = d + skew * lc / hw + tn2(d * 0.05, lc * 0.5) * 0.09;
+      // fades out toward the road edges, where a seam is under kerb silt anyway
+      const fade = 1 - ss(0.62, 1.0, Math.abs(lc) / hw) * 0.55;
+      strip(s, s + th, l0, l1, C_TAR, (0.52 + rnd() * 0.22) * fade, 1, 1.15);
     }
   }
 
-  // --- patch repairs: darker, smoother rectangles of fresh binder ----------
+  // --- patch repairs: darker, smoother, soft-edged cuts of fresh binder -----
   setLift(LIFT_PATCH);
   for (let n = 0; n < 16; n++) {
     const d = 40 + rnd() * (len - 90);
+    const seed = 1 + n * 977;
     if (!clear(d)) continue;
     const hw = halfAt(d) - 1.6;
-    const lenP = 2.6 + rnd() * 5.5;
-    const wP = 1.4 + rnd() * 2.8;
+    // Smaller than round 1 (which reached 8.1 × 4.2 m — a patch that size is a
+    // resurfaced lane, and at 8 m across it was reading as a whole extra road
+    // surface). A trench cut over a service run is 2–6 m by 1–2.5 m.
+    const lenP = 1.9 + rnd() * 4.2;
+    const wP = 1.0 + rnd() * 1.6;
     const lat = (rnd() * 2 - 1) * Math.max(0, hw - wP * 0.5);
-    _c.copy(C_PATCH).multiplyScalar(0.82 + rnd() * 0.3);
-    strip(d, d + lenP, lat - wP * 0.5, lat + wP * 0.5, _c, 0.46 + rnd() * 0.16, 3);
-    // the seam of hot tar poured around the edge of the cut
-    strip(d - 0.08, d, lat - wP * 0.5, lat + wP * 0.5, C_TAR, 0.5, 2);
-    strip(d + lenP, d + lenP + 0.08, lat - wP * 0.5, lat + wP * 0.5, C_TAR, 0.5, 2);
+    _c.copy(C_PATCH).multiplyScalar(0.86 + rnd() * 0.26);
+    softPatch(d, lenP, lat, wP, _c, 0.74 + rnd() * 0.18, seed);
+    // The bead of hot tar poured along the ends of the cut. Inset, so it lands
+    // on the patch's own full-alpha interior rather than floating out past the
+    // feathered edge — and therefore lifted to the seam plane, because two
+    // coplanar alpha-blended quads in the same buffer z-fight.
+    setLift(LIFT_SEAM);
+    strip(d + 0.06, d + 0.16, lat - wP * 0.44, lat + wP * 0.44, C_TAR, 0.62, 2, 1.15);
+    strip(d + lenP - 0.16, d + lenP - 0.06, lat - wP * 0.44, lat + wP * 0.44, C_TAR, 0.62, 2, 1.15);
+    setLift(LIFT_PATCH);
   }
 
-  // --- faded direction arrows on the approach to the hardest corners -------
+  // -------------------------------------------------------------------------
+  //  Corner telegraph
+  // -------------------------------------------------------------------------
+  //  The road crests and vanishes into sky with no cue which way it goes. The
+  //  full answer is vertical scenery on the outside of the turn (see the report
+  //  — that is Scenery's to place), but the *track* owns the part that lives on
+  //  the tarmac, and it costs no draw call: a tiered set of braking boards
+  //  painted across the outer third of the road, counting down into the corner,
+  //  followed by a direction chevron aimed at the exit.
+  //
+  //  Painted markers work here for the same reason they work in real life: they
+  //  are man-made hard shapes on an organic surface, they read at a grazing
+  //  angle where an upright board is edge-on, and they are the last thing still
+  //  visible when the road is cresting away from you.
   setLift(LIFT_ARROW);
-  const curvy: { d: number; sign: number }[] = [];
+  const curvy: { d: number; sign: number; k: number }[] = [];
   for (let i = 0; i < cl.count; i += 8) {
-    if (Math.abs(cl.curv[i]) > 0.0135) curvy.push({ d: i * cl.ds, sign: Math.sign(cl.curv[i]) });
+    if (Math.abs(cl.curv[i]) > 0.0125) {
+      curvy.push({ d: i * cl.ds, sign: Math.sign(cl.curv[i]), k: Math.abs(cl.curv[i]) });
+    }
   }
   let lastD = -1e9;
   for (const c of curvy) {
     if (c.d - lastD < 150) continue;
-    const d = c.d - 46;                       // out at the braking board
-    if (!clear(d)) continue;
+    if (!clear(c.d - 46)) continue;
     lastD = c.d;
-    // on the outside of the corner, where a kart on the ideal line is aimed
-    const lat = -c.sign * (halfAt(d) - 3.4);
-    const a = 0.30;
-    // shaft
-    strip(d, d + 3.2, lat - 0.28, lat + 0.28, C_PAINT, a, 1);
-    // head, as a stack of narrowing bands: a chevron without an alpha map
-    for (let k = 0; k < 5; k++) {
-      const u = k / 5, u1 = (k + 1) / 5;
-      const w = 1.15 * (1 - u1);
-      strip(d + 3.2 + u * 1.5, d + 3.2 + u1 * 1.5, lat - w, lat + w, C_PAINT, a, 1);
+    // Outside of the turn: `curv < 0` is a left-hander, whose outside is the
+    // right-hand side, which is also where a kart on the ideal line is pointed.
+    const outSign = -c.sign;
+
+    // --- tiered braking boards: 3 / 2 / 1 bars, 100 / 70 / 40 m out ---------
+    const marks = [
+      [100, 3], [70, 2], [40, 1],
+    ] as const;
+    for (const [back, bars] of marks) {
+      const dm = c.d - back;
+      if (!clear(dm)) continue;
+      const hwm = halfAt(dm);
+      // hugs the outside kerb, clear of the edge line
+      const inner = hwm - 1.15;
+      for (let bi = 0; bi < bars; bi++) {
+        const s0 = dm + bi * 1.35;
+        const l0 = outSign > 0 ? inner - 3.0 : -inner;
+        const l1 = outSign > 0 ? inner : -inner + 3.0;
+        strip(s0, s0 + 0.62, l0, l1, C_PAINT, 0.58, 3, 1.15);
+      }
+    }
+
+    // --- direction chevron at the braking board -----------------------------
+    const d = c.d - 46;
+    const lat = outSign * (halfAt(d) - 3.6);
+    // brighter and bigger than round 1's 0.30 — at 0.30 over a dark road under a
+    // 14° key it was inside the tarmac's own noise floor and simply did not read
+    const a = 0.62;
+    const gain = 1 + Math.min(1, c.k * 90) * 0.35;   // tighter corner, bolder mark
+    strip(d, d + 3.6 * gain, lat - 0.36, lat + 0.36, C_PAINT, a, 1, 1.15);
+    for (let k = 0; k < 6; k++) {
+      const u = k / 6, u1 = (k + 1) / 6;
+      const w = 1.5 * gain * (1 - u1);
+      strip(d + 3.6 * gain + u * 1.9, d + 3.6 * gain + u1 * 1.9, lat - w, lat + w, C_PAINT, a, 1, 1.15);
     }
   }
 }
@@ -1514,17 +1789,49 @@ function tunnelProfile(p: number, W: number, H: number): [number, number] {
   return [-W * Math.cos(a), 2.6 + (H - 2.6) * Math.sin(a)];
 }
 
+/** metres between lamp fixtures; the lit/dark rhythm keys off this everywhere */
+const LIGHT_PITCH = 21;
+/** warm sodium tint, as an albedo multiplier under the pools */
+const C_SODIUM_MUL = new THREE.Color(1.24, 0.98, 0.72);
+/** cold damp rock at the springline, where nothing dries out */
+const C_DAMP_MUL = new THREE.Color(0.62, 0.66, 0.74);
+
+/**
+ * The bore.
+ *
+ * Round 1 drew this with `cliff-rock`, and that is the whole reason it read as
+ * brown carpet. The shared library ships a purpose-built `tunnel-bore` set —
+ * fresher, darker, with the arcs a boring head leaves, a damp floor line against
+ * a dry crown, and a triplanar projection at `sharpness: 8` rather than the
+ * cliff's 7 (the library's own comment says a low sharpness cross-fades two
+ * copies of a directional noise past each other, "the fur in the tunnel bore").
+ * Asking for the right material is a one-word change and it fixes the streaking,
+ * the stretch at the curvature change and the missing relief in one go.
+ *
+ * The second half is the lighting rhythm. Six warm point lights on a 21 m pitch
+ * give real quadratic pools, but six lights cannot carry a 140 m tube on their
+ * own without either blowing the light budget or washing flat. So the *same*
+ * 21 m rhythm is also baked into the bore's vertex colours — hot under each
+ * fixture, falling away between, dropping down the walls, and going cold and
+ * damp at the springline. Albedo modulation is not lighting, but at 21 m
+ * intervals in a tube it is indistinguishable from it and it costs nothing.
+ */
 function buildTunnel(track: Track, lib: MatLib, root: THREE.Group) {
   const cl = track.cl;
   const i0 = Math.floor((TUNNEL_T0 - 0.005) * cl.count);
   const i1 = Math.floor((TUNNEL_T1 + 0.005) * cl.count);
-  const step = 4;
-  const NP = 22;
+  const step = 3;
+  const NP = 26;
   const b = newBuf();
-  const uvS = lib.scale('cliff-rock', 5);
+  const uvS = lib.scale('tunnel-bore', 3.2);
   const lights: THREE.Matrix4[] = [];
   let prev = -1;
-  let sinceLight = 1e9;
+
+  const d0 = i0 * cl.ds, d1 = i1 * cl.ds;
+  // first and last fixture kept a clear span in from each mouth
+  const dLight0 = d0 + 12;
+  const nLight = Math.max(2, Math.floor((d1 - 12 - dLight0) / LIGHT_PITCH) + 1);
+  const lightAt = (n: number) => dLight0 + n * LIGHT_PITCH;
 
   for (let i = i0; i <= i1; i += step) {
     const si = ((i % cl.count) + cl.count) % cl.count;
@@ -1532,60 +1839,114 @@ function buildTunnel(track: Track, lib: MatLib, root: THREE.Group) {
     const dist = i * cl.ds;
     const ring = b.pos.length / 3;
     track.crossPoint(si, 0, _p2);
+    const cx = _p2.x, cy = _p2.y, cz = _p2.z;
+
+    // where this ring sits in the lamp rhythm: 1 directly under a fixture,
+    // 0 exactly between two
+    const phase = (dist - dLight0) / LIGHT_PITCH;
+    const pool = 0.5 + 0.5 * Math.cos(2 * Math.PI * phase);
+    // the mouths take a big cool wash of sky, which is what stops the exit
+    // reading as a flat rectangle punched in a black wall
+    const mouth = Math.max(1 - ss(0, 26, dist - d0), 1 - ss(0, 26, d1 - dist));
+
     let arc = 0;
     for (let k = 0; k < NP; k++) {
-      const [lat, up] = tunnelProfile(k / (NP - 1), W, H);
+      const p = k / (NP - 1);
+      const [lat, up] = tunnelProfile(p, W, H);
       if (k > 0) {
         const [pl, pu] = tunnelProfile((k - 1) / (NP - 1), W, H);
         arc += Math.hypot(lat - pl, up - pu);
       }
-      const x = _p2.x + cl.bx[si] * lat + cl.nx[si] * up;
-      const y = _p2.y + cl.by[si] * lat + cl.ny[si] * up;
-      const z = _p2.z + cl.bz[si] * lat + cl.nz[si] * up;
+      const x = cx + cl.bx[si] * lat + cl.nx[si] * up;
+      const y = cy + cl.by[si] * lat + cl.ny[si] * up;
+      const z = cz + cl.bz[si] * lat + cl.nz[si] * up;
       // normal points back toward the bore axis
       const ax = -(cl.bx[si] * lat + cl.nx[si] * (up - H * 0.42));
       const ay = -(cl.by[si] * lat + cl.ny[si] * (up - H * 0.42));
       const az = -(cl.bz[si] * lat + cl.nz[si] * (up - H * 0.42));
       const inv = 1 / Math.hypot(ax, ay, az);
-      pushV(b, x, y, z, ax * inv, ay * inv, az * inv, arc / uvS, dist / uvS, _white);
+
+      // 0 at the springline, 1 at the crown — the lamps are at the crown, so
+      // this is both the light falloff and the dry/damp split
+      const hf = Math.min(1, Math.max(0, (up + 1.4) / (H + 1.4)));
+      _c.copy(_white);
+      // damp, sooty, unlit lower walls
+      _c.lerp(C_DAMP_MUL, (1 - ss(0.06, 0.52, hf)) * 0.72);
+      // the pool of sodium: strongest at the crown, gone by the floor line
+      _c.lerp(C_SODIUM_MUL, pool * (0.22 + 0.78 * hf) * 0.85);
+      // and the value rhythm that goes with it
+      _c.multiplyScalar(0.54 + 0.62 * pool * (0.24 + 0.76 * hf) + 0.14 * hf);
+      // mouth bounce, cool against the sodium
+      _c.lerp(_c2.setRGB(1.15, 1.18, 1.24), mouth * (0.30 + 0.34 * hf));
+      // per-metre breakup so the rhythm never reads as a clean sine
+      _c.multiplyScalar(1 + tn2(dist * 0.09, arc * 0.11) * 0.10);
+      // 4:1 between a lit crown and an unlit springline is a strong rhythm; past
+      // that it stops reading as light and starts reading as paint
+      clampMul(_c, 0.34, 1.42);
+
+      pushV(b, x, y, z, ax * inv, ay * inv, az * inv, arc / uvS, dist / uvS, _c);
     }
     // wound so the front face is the one you see from inside the bore
     if (prev >= 0) {
       for (let k = 0; k < NP - 1; k++) quad(b, prev + k, ring + k, ring + k + 1, prev + k + 1);
     }
     prev = ring;
+  }
 
-    sinceLight += step * cl.ds;
-    if (sinceLight >= 9 && i > i0 + step * 2 && i < i1 - step * 2) {
-      sinceLight = 0;
-      _p2.set(_p2.x + cl.nx[si] * (H - 0.5), _p2.y + cl.ny[si] * (H - 0.5), _p2.z + cl.nz[si] * (H - 0.5));
-      _q.setFromAxisAngle(_yAxis, Math.atan2(cl.tx[si], cl.tz[si]));
-      lights.push(new THREE.Matrix4().compose(_p2, _q, _sc));
-    }
+  // place the fixtures on the same rhythm the shading was baked from
+  for (let n = 0; n < nLight; n++) {
+    const d = lightAt(n);
+    const si = Math.round(d / cl.ds) % cl.count;
+    const H = 8.6;
+    track.crossPoint(si, 0, _p2);
+    _p2.set(_p2.x + cl.nx[si] * (H - 0.55), _p2.y + cl.ny[si] * (H - 0.55), _p2.z + cl.nz[si] * (H - 0.55));
+    _q.setFromAxisAngle(_yAxis, Math.atan2(cl.tx[si], cl.tz[si]));
+    lights.push(new THREE.Matrix4().compose(_p2, _q, _sc));
   }
 
   // wound to face inward, so plain front-face culling is exactly right here
-  const bore = new THREE.Mesh(finish(b), lib.get('cliff-rock', () => rockMaterial(lib)));
+  const bore = new THREE.Mesh(finish(b), lib.vc('tunnel-bore', () => rockMaterial(lib)));
   bore.name = 'tunnel-bore';
   bore.castShadow = true;
   bore.receiveShadow = true;
   root.add(bore);
 
   if (lights.length) {
-    const lg = new THREE.BoxGeometry(0.42, 0.14, 3.4);
-    const inst = new THREE.InstancedMesh(lg, lib.get('tunnel-light', () => lightMaterial()), lights.length);
-    for (let i = 0; i < lights.length; i++) inst.setMatrixAt(i, lights[i]);
-    inst.instanceMatrix.needsUpdate = true;
-    inst.name = 'tunnel-lights';
-    inst.frustumCulled = false;
-    root.add(inst);
-    // A rock tube with nothing in it is a black hole on screen. Five short-
-    // range warm point lights is the minimum that makes the section readable.
-    const every = Math.max(1, Math.floor(lights.length / 5));
-    for (let i = 0; i < lights.length; i += every) {
-      const l = new THREE.PointLight(0xffb35a, 260, 42, 2);
+    // housing + diffuser rather than one bare emissive slab: the housing gives
+    // the fixture a silhouette and an unlit underside, which is what makes the
+    // diffuser look like a lit object instead of a floating white quad
+    const housing = new THREE.BoxGeometry(0.60, 0.22, 5.0);
+    const hInst = new THREE.InstancedMesh(
+      housing, lib.get('metal-painted', () => metalMaterial(lib)), lights.length,
+    );
+    const diffuser = new THREE.BoxGeometry(0.44, 0.10, 4.6);
+    const dInst = new THREE.InstancedMesh(
+      diffuser, lib.get('tunnel-light', () => lightMaterial()), lights.length,
+    );
+    const m = new THREE.Matrix4();
+    const drop = new THREE.Matrix4().makeTranslation(0, -0.15, 0);
+    for (let i = 0; i < lights.length; i++) {
+      hInst.setMatrixAt(i, lights[i]);
+      dInst.setMatrixAt(i, m.multiplyMatrices(lights[i], drop));
+    }
+    hInst.instanceMatrix.needsUpdate = true;
+    dInst.instanceMatrix.needsUpdate = true;
+    hInst.name = 'tunnel-light-housings';
+    dInst.name = 'tunnel-lights';
+    hInst.frustumCulled = false;
+    dInst.frustumCulled = false;
+    root.add(hInst);
+    root.add(dInst);
+
+    // One real light per fixture, ranged so it dies well before the next one:
+    // the interval going dark is what sells a tunnel, and a light that reaches
+    // its neighbour produces the flat ambient wash round 1 shipped. Range is
+    // 1.15 × pitch, not 2 × as before, and the count is the fixture count — the
+    // rhythm is only legible if every visible fixture actually lights something.
+    for (let i = 0; i < lights.length; i++) {
+      const l = new THREE.PointLight(0xffb35a, 210, LIGHT_PITCH * 1.15, 2);
       l.position.setFromMatrixPosition(lights[i]);
-      l.position.y -= 1.4;
+      l.position.y -= 1.6;
       l.name = 'tunnel-light';
       root.add(l);
     }

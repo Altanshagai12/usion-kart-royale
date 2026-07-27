@@ -91,6 +91,88 @@ const DRIFT_TIMEOUT = 120;
  */
 const AI_CRUISE = 36;
 
+/**
+ * A capture is a screenshot plus a check that the screenshot is whole.
+ *
+ * `Page.captureScreenshot` reads the compositor's copy of the canvas, and on
+ * SwiftShader that copy is not always a complete frame: roughly one capture in
+ * five comes back as a vertical split, with the left band holding the previous
+ * frame and everything right of the seam holding a scene buffer that was never
+ * drawn into — grain, vignette and speed lines composited over black. It is not
+ * a rendering bug (the same tear shows up on the pre-round tree, and the frame
+ * is fine again the moment you re-shoot it), but the harness used to write it to
+ * disk regardless and exit clean, which is the worst possible outcome: the
+ * report says ten shots and one of them is a black rectangle.
+ *
+ * What separates the two cases is simply how much of the frame is unwritten.
+ * Measured over 24 rapid captures plus both rounds of the shot set: every intact
+ * frame sits between 0.0% and 1.4% of pixels below `DARK_LEVEL` (the 1.4% is
+ * `closeup`, which is mostly kart in shadow), and every torn one between 11.5%
+ * and 28.7%. An eight-fold gap with nothing in it is a threshold worth trusting,
+ * so `TORN_DARK_FRAC` sits in the middle of the gap.
+ *
+ * A seam-detecting version of this was tried first — vertical bands, looking for
+ * a step between neighbours — and caught two tears in five. The dark side of the
+ * seam is not actually black (grain, vignette and speed lines lift it to ~20),
+ * and when the tear takes most of the frame there is no bright band left to step
+ * against. The plain area test caught all of them and false-positived on none of
+ * the twenty known-good frames, so the seam test is gone rather than kept as a
+ * second opinion that only ever weakens the first.
+ *
+ * If the art direction ever goes genuinely night-dark this threshold has to move
+ * — that is what the recorded `darkFrac` in the report is for.
+ */
+const CAPTURE_ATTEMPTS = 6;
+/** Fraction of the frame below `DARK_LEVEL` that marks a capture as torn. */
+const TORN_DARK_FRAC = 0.05;
+/** Brightness (0-255 mean of RGB) at or below which a pixel reads as unwritten. */
+const DARK_LEVEL = 8;
+
+/**
+ * Decoding happens in the page because Node has no PNG decoder here. Note the
+ * `Buffer.from` on the way in: puppeteer hands back a plain Uint8Array, and
+ * `Uint8Array.prototype.toString` ignores its argument and returns
+ * "137,80,78,71,...", which decodes to nothing and throws inside the page.
+ */
+async function measure(page, buf) {
+  return page.evaluate(async (b64, darkLevel) => {
+    const img = new Image();
+    img.src = 'data:image/png;base64,' + b64;
+    await img.decode();
+    const c = document.createElement('canvas');
+    c.width = img.width;
+    c.height = img.height;
+    const g = c.getContext('2d', { willReadFrequently: true });
+    g.drawImage(img, 0, 0);
+    const d = g.getImageData(0, 0, c.width, c.height).data;
+
+    let dark = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      if ((d[i] + d[i + 1] + d[i + 2]) / 3 <= darkLevel) dark++;
+    }
+    return { darkFrac: dark / (c.width * c.height) };
+  }, Buffer.from(buf).toString('base64'), DARK_LEVEL);
+}
+
+async function capture(page, file) {
+  let best = null;
+  for (let attempt = 1; attempt <= CAPTURE_ATTEMPTS; attempt++) {
+    const buf = await page.screenshot({ type: 'png' });
+    const m = await measure(page, buf);
+    const torn = m.darkFrac > TORN_DARK_FRAC;
+    if (!best || m.darkFrac < best.darkFrac) best = { ...m, buf, attempts: attempt };
+    if (!torn) {
+      writeFileSync(file, buf);
+      return { ...m, torn: false, attempts: attempt };
+    }
+    // Let the compositor produce a fresh frame before trying again.
+    await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+    await new Promise((r) => setTimeout(r, 120));
+  }
+  writeFileSync(file, best.buf);
+  return { ...best, torn: true, attempts: CAPTURE_ATTEMPTS };
+}
+
 function portOpen(port) {
   return new Promise((res) => {
     const s = createConnection({ port, host: '127.0.0.1' });
@@ -448,11 +530,21 @@ const main = async () => {
     }), { ...shot, hold_still: shot.name === "grid" }, hold);
 
     const file = join(OUT, `${shot.name}.png`);
-    await page.screenshot({ path: file, type: 'png' });
+    const shutter = await capture(page, file);
+    if (shutter.torn) {
+      warnings.push(
+        `${shot.name}: capture still torn after ${shutter.attempts} attempts ` +
+        `(${(shutter.darkFrac * 100).toFixed(1)}% of the frame unwritten)`,
+      );
+    }
     report.shots.push({
       name: shot.name,
       file,
       desc: shot.desc,
+      captureAttempts: shutter.attempts,
+      // Fraction of the written frame that came back unwritten. Near zero on a
+      // good capture; this is the number to re-tune TORN_DARK_FRAC against.
+      darkFrac: +shutter.darkFrac.toFixed(4),
       // Where the kart actually was when the shutter fired, so a shot that
       // drifts off its mark is visible in the report instead of only in the
       // critic's confusion.

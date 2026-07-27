@@ -99,6 +99,40 @@ const J_STEPS = 8;
 export const LUT_WIDTH = 128;
 export const LUT_HEIGHT = 64;
 
+/**
+ * Basis for the azimuthal fit of the horizon haze, evaluated at `c` = the cosine
+ * of the angle between the view azimuth and the sun's.
+ *
+ * Deliberately NOT a polynomial. The function being fitted is the low-elevation
+ * radiance: nearly flat across the whole anti-solar half of the compass and then
+ * rising hard over the last 40° into the sun. Monomials fit that with visible
+ * ringing (0.09 absolute in blue, which is 40% of blue's value out on the flat
+ * part, and it alternates sign — exactly the wobble that would show up as bands
+ * of hue in the haze). Two Cornette-Shanks lobes plus a linear base fits the
+ * same data an order of magnitude better, because the sun-ward shoulder IS a
+ * Mie phase function; this is the physics written down rather than approximated.
+ */
+const HAZE_LOBE_G = [0.55, 0.82];
+export const HAZE_TERMS = 2 + HAZE_LOBE_G.length;
+
+/** Normalised Cornette-Shanks lobe. GLSL twin lives in `hazeGlsl`. */
+function hazeLobe(c: number, g: number): number {
+  const g2 = g * g;
+  const d = Math.max(1 + g2 - 2 * g * c, 1e-4);
+  return (1 - g2) / ((2 + g2) * d * Math.sqrt(d));
+}
+
+/** Fill `out` with the fit basis at `c`. Must match the GLSL exactly. */
+function hazeBasis(c: number, out: number[]): void {
+  out[0] = 1;
+  out[1] = c;
+  for (let k = 0; k < HAZE_LOBE_G.length; k++) out[2 + k] = hazeLobe(c, HAZE_LOBE_G[k]);
+}
+/** Elevation the haze is probed at: the first sliver of sky above the horizon,
+ *  which is what a fragment at aerial-perspective infinity actually converges
+ *  on. Not exactly 0 — the model's ground blend starts biting below it. */
+const HAZE_MU = 0.012;
+
 const CLOUD_NOISE_SIZE = 256;
 /** Cycles-per-tile baked into R,G,B,A of the cloud noise. */
 const CLOUD_NOISE_OCTAVES = [2, 4, 8, 16];
@@ -110,6 +144,7 @@ const _rayScratch = new Float64Array(3);
 const _mieScratch = new Float64Array(3);
 const _dir = new THREE.Vector3();
 const _shBasis: number[] = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+const _hazeBasis: number[] = [0, 0, 0, 0];
 const UP_AXIS = new THREE.Vector3(0, 1, 0);
 
 function mulberry32(seed: number): () => number {
@@ -175,6 +210,46 @@ function inverseAces(target: Float64Array, exposure: number, out: Float64Array):
   }
 }
 
+/**
+ * Solve `M x = b` for several right-hand sides at once. `M` is the (small,
+ * symmetric, positive-definite) normal-equations matrix of a least-squares fit,
+ * so plain Gaussian elimination with partial pivoting is both sufficient and
+ * far less code than a Cholesky. Row-major, n×n, destroyed in place.
+ */
+function solveMulti(M: number[], rhs: number[][], n: number): number[][] {
+  const a = M.slice();
+  const x = rhs.map((r) => r.slice());
+  for (let col = 0; col < n; col++) {
+    let piv = col;
+    for (let r = col + 1; r < n; r++) {
+      if (Math.abs(a[r * n + col]) > Math.abs(a[piv * n + col])) piv = r;
+    }
+    if (piv !== col) {
+      for (let k = 0; k < n; k++) {
+        const t = a[col * n + k]; a[col * n + k] = a[piv * n + k]; a[piv * n + k] = t;
+      }
+      for (const v of x) { const t = v[col]; v[col] = v[piv]; v[piv] = t; }
+    }
+    const d = a[col * n + col];
+    if (Math.abs(d) < 1e-18) continue;
+    for (let r = col + 1; r < n; r++) {
+      const f = a[r * n + col] / d;
+      if (f === 0) continue;
+      for (let k = col; k < n; k++) a[r * n + k] -= f * a[col * n + k];
+      for (const v of x) v[r] -= f * v[col];
+    }
+  }
+  for (let col = n - 1; col >= 0; col--) {
+    const d = a[col * n + col];
+    for (const v of x) {
+      let s = v[col];
+      for (let k = col + 1; k < n; k++) s -= a[col * n + k] * v[k];
+      v[col] = Math.abs(d) < 1e-18 ? 0 : s / d;
+    }
+  }
+  return x;
+}
+
 function hexToLinear(hex: number, out: Float64Array): void {
   for (let i = 0; i < 3; i++) {
     const s = ((hex >> (16 - i * 8)) & 255) / 255;
@@ -237,6 +312,27 @@ export class AtmosphereModel {
    * bible's #ffd0a0.
    */
   readonly hazeColor = new THREE.Vector3();
+
+  /** Horizontal unit vector toward the sun, in world XZ. */
+  readonly sunAzimuth = new THREE.Vector2();
+  /**
+   * The haze as a function of *view azimuth* rather than a single constant:
+   * polynomial coefficients (ascending powers) in
+   * `c = dot( normalize( viewDir.xz ), sunAzimuth )`, one Vector3 per term.
+   *
+   * This is the fix for the flat white sea. Aerial perspective converges on the
+   * sky's own radiance at the horizon, and at 14° elevation that radiance swings
+   * from a hot #ffc98a straight down-sun to a cool dusty violet at the anti-solar
+   * azimuth — a factor of ~3 in the red channel. Feeding ONE colour to the fog,
+   * as this did, guarantees that in most camera directions the sea meets the sky
+   * at a hard value/hue step, because the sky is drawn from the real model and
+   * the water is drawn from the average. Sampled per view direction the two
+   * converge by construction and the horizon seam has nothing left to be.
+   *
+   * Fitted, not tabulated, so the same five constants can be baked as literals
+   * into the fog ShaderChunk — which has no way to receive a uniform.
+   */
+  readonly hazePoly: THREE.Vector3[] = [];
 
   /** How bright the disc core is. High on purpose: it must clip and bloom. */
   sunDiscIntensity = 42;
@@ -423,6 +519,71 @@ export class AtmosphereModel {
 
     // Aerial perspective, from the same calibrated horizon the dome uses.
     AtmosphereModel.compressHighlights(this.horizonColor, this.hazeColor);
+    this.fitHaze();
+  }
+
+  /**
+   * Fit `hazePoly` by least squares against the model's own low-elevation
+   * radiance, sampled uniformly in azimuth from the sun round to the anti-sun.
+   * Rolled off first, for exactly the reason `hazeColor` is: an asymptote above
+   * display white drags every distant surface over the ACES knee.
+   *
+   * `weld = false` on the probe, or this would be fitting itself.
+   */
+  private fitHaze(): void {
+    const sh = new THREE.Vector3(this.sun.x, 0, this.sun.z).normalize();
+    this.sunAzimuth.set(sh.x, sh.z);
+
+    const N = 65;
+    const horiz = Math.sqrt(1 - HAZE_MU * HAZE_MU);
+    const dir = new THREE.Vector3();
+    const rad = new THREE.Vector3();
+    const rolled = new THREE.Vector3();
+
+    const n = HAZE_TERMS;
+    const M = new Array<number>(n * n).fill(0);
+    const rhs: number[][] = [
+      new Array<number>(n).fill(0), new Array<number>(n).fill(0), new Array<number>(n).fill(0),
+    ];
+    const basis = new Array<number>(n).fill(0);
+    const sample: number[] = [0, 0, 0];
+
+    for (let i = 0; i < N; i++) {
+      const a = (Math.PI * i) / (N - 1);          // 0 = looking straight down-sun
+      const ca = Math.cos(a), sa = Math.sin(a);
+      dir.set((sh.x * ca - sh.z * sa) * horiz, HAZE_MU, (sh.z * ca + sh.x * sa) * horiz);
+      this.radiance(dir, rad, false);
+      AtmosphereModel.compressHighlights(rad, rolled);
+      sample[0] = rolled.x; sample[1] = rolled.y; sample[2] = rolled.z;
+
+      hazeBasis(ca, basis);
+      for (let r = 0; r < n; r++) {
+        for (let c = 0; c < n; c++) M[r * n + c] += basis[r] * basis[c];
+        for (let ch = 0; ch < 3; ch++) rhs[ch][r] += basis[r] * sample[ch];
+      }
+    }
+
+    const sol = solveMulti(M, rhs, n);
+    this.hazePoly.length = 0;
+    for (let k = 0; k < n; k++) {
+      this.hazePoly.push(new THREE.Vector3(sol[0][k], sol[1][k], sol[2][k]));
+    }
+  }
+
+  /**
+   * The fitted haze in a horizontal direction. `c` is the cosine of the angle
+   * between that direction's azimuth and the sun's; +1 is straight down-sun.
+   * The GLSL twin lives in `hazeGlsl` below and must stay identical.
+   */
+  hazeAt(c: number, out: THREE.Vector3): THREE.Vector3 {
+    const t = Math.min(Math.max(c, -1), 1);
+    hazeBasis(t, _hazeBasis);
+    out.set(0, 0, 0);
+    for (let k = 0; k < this.hazePoly.length; k++) {
+      out.addScaledVector(this.hazePoly[k], _hazeBasis[k]);
+    }
+    out.set(Math.max(out.x, 0.008), Math.max(out.y, 0.008), Math.max(out.z, 0.008));
+    return out;
   }
 
   /** Transmittance of the whole atmosphere along the sun ray. */
@@ -644,6 +805,43 @@ export class AtmosphereModel {
 // Shaders
 // ---------------------------------------------------------------------------
 
+function gf(x: number): string {
+  return Number.isFinite(x) ? x.toFixed(7) : '0.0';
+}
+
+/**
+ * Emit the GLSL twin of `AtmosphereModel.hazeAt` with the fitted coefficients
+ * baked in as literals.
+ *
+ * Literals rather than uniforms because the primary consumer is three's
+ * `fog_pars_fragment` ShaderChunk, which is shared by every material in the
+ * game and has no uniform channel of its own: `UniformsLib.fog` is merged into
+ * `ShaderLib` at three's module-init time, so nothing added later reaches a
+ * MeshStandardMaterial. The sky dome uses the same generated source so the dome
+ * and the fog can never disagree about what colour the horizon is.
+ */
+export function hazeGlsl(model: AtmosphereModel, name: string): string {
+  const p = model.hazePoly;
+  const v = (c: THREE.Vector3) => `vec3( ${gf(c.x)}, ${gf(c.y)}, ${gf(c.z)} )`;
+  const terms = [`${v(p[0])}`, `${v(p[1])} * c`];
+  for (let k = 0; k < HAZE_LOBE_G.length; k++) {
+    terms.push(`${v(p[2 + k])} * ${name}Lobe( c, ${gf(HAZE_LOBE_G[k])} )`);
+  }
+  return /* glsl */`
+float ${name}Lobe( float c, float g ) {
+	float g2 = g * g;
+	float d = max( 1.0 + g2 - 2.0 * g * c, 1e-4 );
+	return ( 1.0 - g2 ) / ( ( 2.0 + g2 ) * d * sqrt( d ) );
+}
+
+vec3 ${name}( vec2 dirXZ ) {
+	float l = length( dirXZ );
+	float c = l > 1e-5 ? clamp( dot( dirXZ / l, vec2( ${gf(model.sunAzimuth.x)}, ${gf(model.sunAzimuth.y)} ) ), -1.0, 1.0 ) : 0.0;
+	return max( ${terms.join('\n\t\t+ ')}, vec3( 0.008 ) );
+}
+`;
+}
+
 /**
  * Classic infinite-skybox vertex: strip the translation from the model-view so
  * the box is always centred on the eye, then force z = w so it lands exactly on
@@ -660,7 +858,14 @@ void main() {
 }
 `;
 
-export const SKY_FRAGMENT_SHADER = /* glsl */ `
+/**
+ * The dome's fragment stage. Built per-model rather than being a constant so it
+ * can inline the same baked haze fit the fog chunk uses — the sky and the aerial
+ * perspective have to converge on the *same* colour in the *same* direction or
+ * the horizon is a seam, and the only way to guarantee that is one source.
+ */
+export function buildSkyFragmentShader(model: AtmosphereModel): string {
+  return /* glsl */ `
 uniform sampler2D uLut;
 uniform sampler2D uNoise;
 uniform vec3 uSunDir;
@@ -671,7 +876,6 @@ uniform vec3 uMieTint;
 uniform vec3 uSunDisc;
 uniform vec3 uGroundColor;
 uniform vec3 uHorizonColor;
-uniform vec3 uHazeColor;
 uniform vec3 uCloudSun;
 uniform vec3 uCloudAmbient;
 uniform vec2 uCameraXZ;
@@ -685,6 +889,16 @@ uniform float uSunRadius;
 uniform float uCloudAmount;
 
 varying vec3 vDir;
+
+${hazeGlsl(model, 'krHaze')}
+
+/**
+ * The haze in THIS fragment's azimuth. Written once at the top of main() and
+ * read by the horizon weld and by every cloud layer, all of which used to
+ * converge on a single constant and therefore flattened the whole compass into
+ * one cream band.
+ */
+vec3 gHaze;
 
 // Twin of the CPU rayleighPhase above — the two MUST stay identical or the
 // calibrated gains stop meaning anything. uRayBack kills the anti-solar
@@ -717,13 +931,13 @@ vec3 atmosphere(vec3 dir, float gamma) {
   // env map has a lower hemisphere; on screen it is under the terrain.
   col = mix(col, uGroundColor, smoothstep(0.0, 0.16, -mu));
 
-  // Take the kink out of the sky/ground join. This used to be a 0.75 weld over
-  // ±2.6° toward a superwhite constant in every azimuth — the blown band that
-  // wrapped the whole horizon in all ten shots and gave drift.png its straight
-  // seam. With the backscatter fixed the model's own horizon is already
-  // consistent around the compass and the fog converges on the same rolled-off
-  // haze, so all this has left to do is soften the join.
-  col = mix(col, uHazeColor, 0.34 * (1.0 - smoothstep(0.0, 0.030, abs(mu))));
+  // Take the kink out of the sky/ground join, and — more importantly — put the
+  // last degree of sky on exactly the value the fog is converging on. gHaze IS
+  // this direction's own low-elevation radiance with the highlight rolloff
+  // applied, so the weld now only compresses the top end; it no longer drags a
+  // warm horizon toward a cool average (or the reverse) the way a single
+  // constant did, which is what welded a hard line between bay and sky.
+  col = mix(col, gHaze, 0.34 * (1.0 - smoothstep(0.0, 0.030, abs(mu))));
   return col;
 }
 
@@ -788,7 +1002,9 @@ vec4 cloudLayer(vec3 dir, float gamma, float height, float scale,
   // rolled-off haze, not the clipping horizon constant: at 0.85 toward a
   // superwhite the whole lower cloud deck turned into one featureless cream
   // smear about 40% up frame, which is what deleted the background layer.
-  col = mix(col, uHazeColor, (1.0 - fade) * 0.70);
+  // Per-azimuth now, so the deck reddens down-sun and cools away from it
+  // instead of ending in the same band of cream all the way round.
+  col = mix(col, gHaze, (1.0 - fade) * 0.70);
   return vec4(col, a * alphaMul * fade * uCloudAmount);
 }
 
@@ -805,6 +1021,7 @@ float hash12(vec2 p) {
 void main() {
   vec3 dir = normalize(vDir);
   float gamma = dot(dir, uSunDir);
+  gHaze = krHaze(dir.xz);
 
   vec3 col = atmosphere(dir, gamma);
 
@@ -842,3 +1059,4 @@ void main() {
   #include <colorspace_fragment>
 }
 `;
+}

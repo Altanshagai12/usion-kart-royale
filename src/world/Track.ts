@@ -17,8 +17,8 @@ import type { Ctx, ITrack, SurfaceProbe, TrackSample } from '../types';
 import { Surface } from '../types';
 import {
   buildCenterline, terrainDetail, smoothstep as ss, BOOST_PADS, CHECKPOINTS,
-  CROWN, KERB_END, KERB_HS, KERB_QS, KERB_W, SEA_Y, SKIRT_W, WALL_HEIGHT,
-  WALL_NONE, ZONES,
+  CROWN, KERB_CROWN0, KERB_CROWN1, KERB_END, KERB_HS, KERB_QS, KERB_W, SEA_Y,
+  SKIRT_W, WALL_HEIGHT, WALL_NONE, ZONES,
   type Centerline,
 } from './TrackLayout';
 import { buildTrackGeometry } from './TrackGeometry';
@@ -226,8 +226,10 @@ export class Track implements ITrack {
     const h = KERB_HS[k - 1] + (KERB_HS[k] - KERB_HS[k - 1]) * ((q - a) / (bq - a));
     // 3.2 m period: long enough that the 1.5 m kerb rings resolve it cleanly.
     // Confined to the crown so it never disturbs the face or the bevel angle —
-    // those two facets are the whole point of the profile.
-    const crown = ss(KERB_QS[2], KERB_QS[3], q) * (1 - ss(KERB_QS[4], KERB_QS[5], q));
+    // those two facets are the whole point of the profile. Bounded by the named
+    // crown constants, not by positions in the breakpoint table: the table gains
+    // and loses chamfers, and the ripple must not move when it does.
+    const crown = ss(KERB_CROWN0 - 0.10, KERB_CROWN0, q) * (1 - ss(KERB_CROWN1, KERB_CROWN1 + 0.14, q));
     return h + 0.016 * Math.sin(i * this.cl.ds * 1.963) * crown;
   }
 

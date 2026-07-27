@@ -18,9 +18,11 @@ import {
   Shared,
   bevelBox,
   card,
+  clamp,
   lerp,
   loft,
   patchLod,
+  patchRoughFromTint,
   patchTint,
   patchTranslucency,
   patchWind,
@@ -34,6 +36,8 @@ const _quat = new THREE.Quaternion();
 const _pos = new THREE.Vector3();
 const _scl = new THREE.Vector3();
 const _col = new THREE.Color();
+
+const clamp01 = (v: number) => clamp(v, 0, 1);
 
 /** Local trunk height of the unit palm; fronds attach here. */
 const PALM_H = 7.2;
@@ -50,6 +54,7 @@ export class Foliage {
   private cypressTuft!: InstSet;
   private shrub!: InstSet;
   private grass!: InstSet;
+  private grassHi!: InstSet;
   private marram!: InstSet;
   private depthMats!: { frond: THREE.Material; pine: THREE.Material; shrub: THREE.Material };
 
@@ -166,7 +171,52 @@ export class Foliage {
     g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
     g.setIndex(idx);
     g.computeVertexNormals();
+    // Volumetric canopy shading. A frond's true normal is the ribbon's, which
+    // means every frond in a crown shades almost identically and the whole
+    // canopy resolves to one flat plate — the "solid silhouette blob" note. Bend
+    // each frond's normal outward and upward from the crown centre (the frond
+    // runs along +X from the attach point) and the crown shades like a sphere
+    // instead: lit on the sun side, transmitting on the far side, with real
+    // internal value structure between the two.
+    {
+      const nAttr = g.getAttribute('normal') as THREE.BufferAttribute;
+      const pAttr = g.getAttribute('position') as THREE.BufferAttribute;
+      const v = new THREE.Vector3();
+      const out = new THREE.Vector3();
+      for (let i = 0; i < nAttr.count; i++) {
+        v.set(pAttr.getX(i), pAttr.getY(i), pAttr.getZ(i));
+        // outward along the rachis, lifted: the crown's own surface normal
+        out.set(v.x / L, 0.55 + v.y * 0.12, v.z * 1.4).normalize();
+        v.set(nAttr.getX(i), nAttr.getY(i), nAttr.getZ(i));
+        // 45% toward the crown normal keeps the frond's own form readable
+        v.lerp(out, 0.45).normalize();
+        nAttr.setXYZ(i, v.x, v.y, v.z);
+      }
+      nAttr.needsUpdate = true;
+    }
     return g;
+  }
+
+  /**
+   * A clump of grass: crossed alpha cards, each leaning a different way, with
+   * the fan splayed so the clump has a silhouette from every azimuth rather
+   * than reading as a card edge-on. `n` cards per clump; 3 is the honest
+   * minimum for a clump that never disappears as you drive past it.
+   */
+  private clumpGeo(w: number, h: number, n: number, rng: RNG): THREE.BufferGeometry {
+    const acc = new GeoAccum();
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI + rng() * 0.5;
+      const s = 0.72 + rng() * 0.6;
+      // a slight outward lean per card turns a flat cross into a fountain
+      const lean = (rng() - 0.5) * 0.34;
+      acc.add(
+        card(w * s, h * s),
+        trs((rng() - 0.5) * w * 0.45, 0, (rng() - 0.5) * w * 0.45, a, 1, 1, 1, lean * Math.cos(a), lean * Math.sin(a)),
+        new THREE.Color(1, 1, 1)
+      );
+    }
+    return acc.build()!;
   }
 
   private pineTrunkGeo(): THREE.BufferGeometry {
@@ -272,6 +322,9 @@ export class Foliage {
     const pineMat = this.mats.foliage(T.pineCluster(), { alphaTest: 0.42, trans: 0.9, color: 0xdfe8d8 });
     const shrubMat = this.mats.foliage(T.shrubLeaves(), { alphaTest: 0.44, trans: 0.75 });
     const grassMat = this.mats.foliage(T.grassBlades(), { alphaTest: 0.34, trans: 1.0 });
+    // Fresh growth is waxy, dry patches are matte — driven by the same clump
+    // mask that set the instance's colour, so the two never disagree (§4).
+    patchRoughFromTint(grassMat, 0.55, 0.88);
     // The cypress body is solid geometry, so it takes an opaque needle
     // surface rather than a cut-out sheet; cards break its silhouette instead.
     const cypMat = new THREE.MeshStandardMaterial({ ...(T.needleSurface() as any), roughness: 1, metalness: 0 });
@@ -286,6 +339,9 @@ export class Foliage {
     // cast solid rectangles. The wind patch goes on too so shadows sway.
     const depthFor = (map: THREE.Texture, alphaTest: number) => {
       const d = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking, map, alphaTest });
+      // Matches the colour pass: without it the shadow silhouette cuts on a
+      // different edge from the lit one and leaves a bright rim inside the leaf.
+      d.alphaToCoverage = true;
       this.mats.register(d);
       patchWind(d, this.u);
       patchLod(d, this.u);
@@ -300,6 +356,12 @@ export class Foliage {
     this.cypressTuft = new InstSet(this.canopyCard(1.5, 2.4, 0.2), pineMat, 'cypress-tuft');
     this.shrub = new InstSet(this.tuftGeo(1.5, 1.1, 3, rng), shrubMat, 'shrub');
     this.grass = new InstSet(this.tuftGeo(0.62, 0.5, 3, rng), grassMat, 'grass');
+    // The hero grass band. Round 1's verge had only the small `grass` tuft on
+    // it (0.5 m tall, LOD 48) so nothing ever broke the kerb line or the
+    // skyline, and the terrain sheet underneath was doing all the work — which
+    // is why it read as painted moss. These are 4x the volume, sit in the 12 m
+    // band either side of the road, and are one InstancedMesh for the lot.
+    this.grassHi = new InstSet(this.clumpGeo(0.95, 1.05, 4, rng), grassMat, 'grass-clump');
     this.marram = new InstSet(this.tuftGeo(0.5, 0.95, 3, rng), grassMat, 'marram');
 
     this.depthMats = {
@@ -337,7 +399,13 @@ export class Foliage {
     const bend = 0.16;
     const crownLocal = new THREE.Vector3(PALM_H * bend, PALM_H - 0.15, PALM_H * bend * 0.35);
     const crownWorldH = PALM_H * scale;
-    const n = 9 + ((rng() * 3) | 0);
+    // Two rings. The outer ring is the mature crown — long fronds, heavy droop,
+    // spread nearly flat. The inner ring is the spear growth, short and near
+    // vertical. Round 1 had one ring, which from below or side-on presented the
+    // whole crown edge-on as a single band; the inner ring is what stops the
+    // canopy reading as a plate at any angle and gives the backlit transmission
+    // two depths of leaf to burn through.
+    const n = 11 + ((rng() * 4) | 0);
     for (let i = 0; i < n; i++) {
       const a = (i / n) * Math.PI * 2 + rng() * 0.3;
       // Younger fronds stand up, old ones hang almost vertically.
@@ -351,6 +419,23 @@ export class Foliage {
         wind: new THREE.Vector4(phase, 1.5, crownWorldH, 1.0),
         lod: 0,
         color: _col.setHSL(0.23 + rng() * 0.04, 0.16 + rng() * 0.14, 0.66 + rng() * 0.2).clone(),
+      });
+    }
+    const inner = 4 + ((rng() * 2) | 0);
+    for (let i = 0; i < inner; i++) {
+      const a = (i / inner) * Math.PI * 2 + rng() * 0.8;
+      const fs = 0.42 + rng() * 0.22;
+      const local = new THREE.Matrix4().compose(
+        crownLocal,
+        new THREE.Quaternion().setFromEuler(new THREE.Euler(-0.95 - rng() * 0.45, -a, (rng() - 0.5) * 0.4, 'YXZ')),
+        new THREE.Vector3(fs, fs, fs)
+      );
+      this.palmFrond.add(_mat.multiplyMatrices(trunkM, local).clone(), {
+        wind: new THREE.Vector4(phase, 1.5, crownWorldH, 0.7),
+        lod: 0,
+        // spear growth is the palest thing on the tree and it is what catches
+        // the rim when the sun sits behind the crown
+        color: _col.setHSL(0.24 + rng() * 0.03, 0.2 + rng() * 0.12, 0.78 + rng() * 0.16).clone(),
       });
     }
     this.shadows.push({ p: p.clone(), r: 2.3 * scale, t });
@@ -426,6 +511,39 @@ export class Foliage {
     if (scale > 0.9) this.shadows.push({ p: p.clone(), r: 0.9 * scale, t });
   }
 
+  /**
+   * A hero grass clump for the 12 m band either side of the road.
+   *
+   * `dry` in 0..1 is the clump mask Scenery samples off a 6 m world-space
+   * field: 0 is fresh growth at #6f9b47, 1 is a sun-bleached patch at #9aa858.
+   * It drives hue AND value together, because a verge whose only variation is
+   * hue still reads as one flat carpet — the thing that kills astroturf is
+   * light and dark clumps next to each other, not green and yellow ones.
+   */
+  clump(p: THREE.Vector3, scale: number, yaw: number, dry: number, lean = 0) {
+    const rng = this.rng;
+    const d = clamp01(dry);
+    // #6f9b47 -> #9aa858 in HSL: hue drifts warm, saturation drops, value lifts
+    const h = lerp(0.245, 0.155, d) + (rng() - 0.5) * 0.022;
+    const s = lerp(0.24, 0.16, d) + (rng() - 0.5) * 0.09;
+    // the value spread is deliberately wide — that is the clumping read
+    const l = lerp(0.52, 0.80, d) + (rng() - 0.5) * 0.17;
+    this.grassHi.add(
+      _mat
+        .compose(
+          p,
+          _quat.setFromEuler(_euler.set(lean * Math.cos(yaw), yaw, lean * Math.sin(yaw), 'YXZ')),
+          _scl.set(scale * (0.8 + rng() * 0.5), scale * (0.72 + rng() * 0.7), scale * (0.8 + rng() * 0.5))
+        )
+        .clone(),
+      {
+        wind: new THREE.Vector4(rng() * 100, 1.05, 0, 1.15),
+        lod: 45,
+        color: _col.setHSL(h, clamp01(s), clamp01(l)).clone(),
+      }
+    );
+  }
+
   tuft(p: THREE.Vector3, scale: number, yaw: number, beach = false) {
     const rng = this.rng;
     const set = beach ? this.marram : this.grass;
@@ -457,6 +575,7 @@ export class Foliage {
     emit(this.shrub, true, d.shrub);
     // Grass casting shadows is pure cost for no read at this scale.
     emit(this.grass, false);
+    emit(this.grassHi, false);
     emit(this.marram, false);
     return this.meshes;
   }

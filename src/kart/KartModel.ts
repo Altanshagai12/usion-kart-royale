@@ -32,8 +32,8 @@
 import * as THREE from 'three';
 import type { KartStats } from '../types';
 import {
-  Mesher, PANEL_SIZE, PANEL_UV, Role, WHEEL_UV, contactBlob, getLivery, kartMaterials,
-  liveryGeometry, mat, syncKartEnv,
+  Mesher, PANEL_SIZE, PANEL_UV, Role, WHEEL_UV, contactBlob, getLivery, heroPaint,
+  impostorMaterial, kartMaterials, liveryGeometry, mat, shadowOnlyMaterial, syncKartEnv,
   type Built, type Livery, type Section,
 } from './Liveries';
 import { buildDriver, driverTriangles, DriverRig } from './Driver';
@@ -535,8 +535,11 @@ function buildWheel(): Built {
   // DOWN the atlas's baked AO ramp as the surface goes deeper into the wheel:
   // 0.06 on the outboard lip, 0.16-0.19 on the barrel wall, 0.24 on the back
   // plate you see between the spokes. That is the occlusion term the spoke
-  // recesses were missing. 20 radial, not 26 — it lives inside the tyre bead
-  // and never contributes to a silhouette.
+  // recesses were missing. 16 radial, not 26 — the whole revolve lives inside
+  // the tyre bead, so it never reaches a silhouette; all it ever has to do is
+  // be a continuous surface behind five spoke gaps. (Round 2 spent its budget
+  // on the driver's hands, which are on the hero silhouette. This is where it
+  // came from, and the difference is not visible at any camera the game has.)
   W.addRevolve(
     [
       -hw * 0.78, 0.000, 0.245,
@@ -545,7 +548,7 @@ function buildWheel(): Built {
       hw * 0.78, 0.203, 0.150,
       hw * 0.68, 0.174, 0.060,
     ],
-    20, Role.Rim, undefined, RF[2], RF[0],
+    16, Role.Rim, undefined, RF[2], RF[0],
   );
   // Spokes: five chunky blades from the hub out to the lip. corner 2 rounds the
   // blade's long edges and a 2-segment cap chamfers the outboard END, which was
@@ -583,7 +586,7 @@ function buildWheel(): Built {
       hw * 0.455, 0.062, 0.279,
       hw * 0.320, 0.072, 0.284,
     ],
-    10, Role.Hub, undefined, WHEEL_UV.nut[2] * 0.25, 0.1,
+    8, Role.Hub, undefined, WHEEL_UV.nut[2] * 0.25, 0.1,
   );
 
   // Brake disc, drilled, sitting behind the spokes where you can actually see
@@ -595,7 +598,7 @@ function buildWheel(): Built {
       0.012, 0.152, 0.24,
       0.012, 0.082, 0.02,
     ],
-    8, Role.Disc, mat(-hw * 0.22, 0, 0), DC[2], DC[0],
+    6, Role.Disc, mat(-hw * 0.22, 0, 0), DC[2], DC[0],
   );
 
   _wheel = W.finish();
@@ -633,6 +636,163 @@ function liveryGeos(l: Livery) {
   return hit;
 }
 
+// ---------------------------------------------------------------------------
+// Far LOD / shadow proxy
+// ---------------------------------------------------------------------------
+
+/** Parts the merged mesh must not swallow. */
+const IMPOSTOR_SKIP = new Set(['shadowBlob']);
+
+const _im = new THREE.Matrix3();
+const _iv = new THREE.Vector3();
+const _ic = new THREE.Color();
+
+/**
+ * Downsampled, linear-space copy of a base-colour map, for baking into the
+ * merged mesh's colour attribute.
+ *
+ * The wheel is the reason this exists. `C_RUBBER` is deliberately pure white —
+ * "albedo comes from the wheel atlas" — so a merge that only reads the colour
+ * attribute produces a kart on four cream doughnuts. The impostor carries no
+ * maps (see `impostorMaterial`), so whatever the map was contributing has to
+ * end up in the vertices instead.
+ *
+ * 64 px, not 1024: the browser's own downscale box-filters the whole atlas for
+ * free, which is exactly what is wanted. Sampling the full-resolution tread at
+ * a vertex is a coin toss between a groove and a block, and the merged mesh
+ * would inherit that noise as per-vertex mottling. What it should inherit is
+ * the average, because the average is all that survives at 20 m.
+ */
+const SAMPLE_RES = 64;
+const _mapCache = new WeakMap<THREE.Texture, Float32Array | null>();
+
+function mapSamples(t: THREE.Texture): Float32Array | null {
+  const hit = _mapCache.get(t);
+  if (hit !== undefined) return hit;
+  let out: Float32Array | null = null;
+  try {
+    const src = t.image as CanvasImageSource & { width?: number; height?: number };
+    if (src && (src.width || 0) > 0) {
+      const c = document.createElement('canvas');
+      c.width = c.height = SAMPLE_RES;
+      const g = c.getContext('2d', { willReadFrequently: true })!;
+      g.drawImage(src, 0, 0, SAMPLE_RES, SAMPLE_RES);
+      const d = g.getImageData(0, 0, SAMPLE_RES, SAMPLE_RES).data;
+      const srgb = t.colorSpace === THREE.SRGBColorSpace;
+      out = new Float32Array(SAMPLE_RES * SAMPLE_RES * 3);
+      for (let i = 0, n = SAMPLE_RES * SAMPLE_RES; i < n; i++) {
+        for (let k = 0; k < 3; k++) {
+          const v = d[i * 4 + k] / 255;
+          // Vertex colours are consumed in linear working space, so an sRGB
+          // map has to be decoded here or the tyres come out two stops light.
+          out[i * 3 + k] = srgb
+            ? (v < 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4))
+            : v;
+        }
+      }
+    }
+  } catch {
+    // A cross-origin or not-yet-decoded image is not worth failing a build for;
+    // the part just keeps its authored vertex colour.
+    out = null;
+  }
+  _mapCache.set(t, out);
+  return out;
+}
+
+/** Multiplies `out` by the map's colour at (u, v), honouring flipY/repeat. */
+function sampleMap(s: Float32Array, t: THREE.Texture, u: number, v: number, out: THREE.Color) {
+  let x = u * t.repeat.x + t.offset.x;
+  let y = v * t.repeat.y + t.offset.y;
+  // The upload flips the image when flipY is on, so an unflipped read has to
+  // undo it. The wheel atlas is authored flipY off; the surface details are not.
+  if (t.flipY) y = 1 - y;
+  x -= Math.floor(x);
+  y -= Math.floor(y);
+  const ix = Math.min(SAMPLE_RES - 1, (x * SAMPLE_RES) | 0);
+  const iy = Math.min(SAMPLE_RES - 1, (y * SAMPLE_RES) | 0);
+  const i = (iy * SAMPLE_RES + ix) * 3;
+  out.r *= s[i];
+  out.g *= s[i + 1];
+  out.b *= s[i + 2];
+}
+
+/**
+ * Bakes every mesh hanging off a freshly built kart into one buffer, in the
+ * root's frame and at rest pose.
+ *
+ * Rest pose is the whole approximation: the wheels are unsteered and unspun,
+ * the body is unrolled and the driver is sitting up straight. That is exactly
+ * as wrong as it sounds and exactly as invisible as it needs to be — this mesh
+ * is only ever seen from 26 m (where a 4 degree body roll is a pixel) or as a
+ * shadow caster under a sun 63 degrees up (where the kart's own shadow is a
+ * short blob mostly hidden by the kart standing on it).
+ *
+ * The source geometries are shared per livery, so nothing here is mutated; the
+ * merge reads them and writes a new buffer.
+ */
+function mergeToImpostor(root: THREE.Object3D): THREE.BufferGeometry | null {
+  root.updateMatrixWorld(true);
+  const pos: number[] = [];
+  const nrm: number[] = [];
+  const uv: number[] = [];
+  const col: number[] = [];
+  const idx: number[] = [];
+  let base = 0;
+
+  root.traverse((o) => {
+    const m = o as THREE.Mesh;
+    if (!(m as unknown as { isMesh?: boolean }).isMesh) return;
+    if (IMPOSTOR_SKIP.has(m.name)) return;
+    const g = m.geometry;
+    const p = g.getAttribute('position') as THREE.BufferAttribute | undefined;
+    if (!p) return;
+    const n = g.getAttribute('normal') as THREE.BufferAttribute | undefined;
+    const u = g.getAttribute('uv') as THREE.BufferAttribute | undefined;
+    const c = g.getAttribute('color') as THREE.BufferAttribute | undefined;
+    // The part's own base colour and base-colour map, folded into the vertices.
+    // Both matter: the visor's whole albedo is `material.color` (it has no
+    // colour attribute at all), and the tyre's is `material.map` (`C_RUBBER` is
+    // pure white on purpose, because the atlas is supposed to supply it).
+    const src = m.material as THREE.MeshStandardMaterial;
+    const baseCol = src?.color;
+    const baseMap = src?.map ?? null;
+    const samples = baseMap ? mapSamples(baseMap) : null;
+    _im.getNormalMatrix(m.matrixWorld);
+    for (let i = 0; i < p.count; i++) {
+      _iv.fromBufferAttribute(p, i).applyMatrix4(m.matrixWorld);
+      pos.push(_iv.x, _iv.y, _iv.z);
+      if (n) {
+        _iv.fromBufferAttribute(n, i).applyMatrix3(_im).normalize();
+        nrm.push(_iv.x, _iv.y, _iv.z);
+      } else nrm.push(0, 1, 0);
+      const tu = u ? u.getX(i) : 0;
+      const tv = u ? u.getY(i) : 0;
+      uv.push(tu, tv);
+
+      if (c) _ic.setRGB(c.getX(i), c.getY(i), c.getZ(i));
+      else _ic.setRGB(1, 1, 1);
+      if (baseCol) _ic.multiply(baseCol);
+      if (samples && baseMap) sampleMap(samples, baseMap, tu, tv, _ic);
+      col.push(_ic.r, _ic.g, _ic.b);
+    }
+    const index = g.getIndex();
+    if (index) for (let i = 0; i < index.count; i++) idx.push(base + index.getX(i));
+    else for (let i = 0; i < p.count; i++) idx.push(base + i);
+    base += p.count;
+  });
+
+  if (!base) return null;
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  out.setAttribute('normal', new THREE.Float32BufferAttribute(nrm, 3));
+  out.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  out.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  out.setIndex(base > 65535 ? new THREE.Uint32BufferAttribute(idx, 1) : new THREE.Uint16BufferAttribute(idx, 1));
+  out.computeBoundingSphere();
+  return out;
+}
+
 /** Anchor whose +Z points along `dir` — VFX emits along an anchor's forward. */
 function anchor(name: string, x: number, y: number, z: number, dir?: THREE.Vector3): THREE.Object3D {
   const o = new THREE.Object3D();
@@ -642,9 +802,19 @@ function anchor(name: string, x: number, y: number, z: number, dir?: THREE.Vecto
   return o;
 }
 
-export function buildKart(stats: KartStats): { root: THREE.Group; wheels: THREE.Object3D[] } {
+/**
+ * @param hero  build the player's kart. Identical geometry; the bodywork gets
+ *              the hot sun-side rim (see `heroPaint`) so the subject holds its
+ *              silhouette against the tarmac at chase-camera size. Optional and
+ *              defaulting to false, so existing callers are unaffected — Kart.ts
+ *              should pass `isPlayer` here when it next changes.
+ */
+export function buildKart(
+  stats: KartStats, hero = false,
+): { root: THREE.Group; wheels: THREE.Object3D[] } {
   const livery = getLivery(stats);
   const mats = kartMaterials();
+  const paint = hero ? heroPaint() : mats.paint;
   const geos = liveryGeos(livery);
   const chassis = buildChassis();
 
@@ -671,13 +841,13 @@ export function buildKart(stats: KartStats): { root: THREE.Group; wheels: THREE.
   // the reciprocal means the karts stay correct if the sky is ever retuned —
   // and in round 1 the sky's 0.40 global is precisely what turned eight
   // clearcoated karts into eight matte clay toys. One float compare per frame.
-  add(geos.paint, mats.paint, 'bodyPaint').onBeforeRender = (_r, scene) => {
+  add(geos.paint, paint, 'bodyPaint').onBeforeRender = (_r, scene) => {
     syncKartEnv(scene.environmentIntensity);
   };
   add(chassis.decal.geo, livery.decalMat, 'bodyLivery');
   add(geos.chrome, mats.chrome, 'bodyChrome');
   add(geos.plastic, mats.plastic, 'bodyPlastic');
-  const fenders = add(geos.fender, mats.paint, 'bodyFenders');
+  const fenders = add(geos.fender, paint, 'bodyFenders');
 
   // --- driver -------------------------------------------------------------
   const driver: DriverRig = buildDriver(livery);
@@ -767,13 +937,44 @@ export function buildKart(stats: KartStats): { root: THREE.Group; wheels: THREE.
   for (const s of sparks) root.add(s);
 
   // --- fake contact shadow -------------------------------------------------
-  const blob = contactBlob();
+  // The blob is shaped from the axle layout, so its four dark lobes land on the
+  // four contact patches rather than smearing one oval over the whole footprint
+  // — that is the contact AO the bible calls mandatory, and it is what stops
+  // the kart reading as a body hovering over a grey oval.
+  const blob = contactBlob({ trackX: TRACK_X, frontZ: FRONT_Z, rearZ: REAR_Z });
   const shadowBlob = new THREE.Mesh(blob.geo, blob.mat);
   shadowBlob.name = 'shadowBlob';
   shadowBlob.position.y = 0.012;
   shadowBlob.renderOrder = -1;
   root.add(shadowBlob);
 
+  // --- far LOD / shadow proxy ----------------------------------------------
+  // Built last, after every part is in place and posed, because it is just a
+  // bake of the assembled model. See `mergeToImpostor`. The detail meshes stop
+  // casting shadows at the same time: from here on this one mesh is the kart's
+  // entire contribution to both cascades, near or far, and DrawBudget decides
+  // per frame whether it is also what the camera sees.
+  const impostorGeo = mergeToImpostor(root);
+  let impostor: THREE.Mesh | null = null;
+  if (impostorGeo) {
+    impostor = new THREE.Mesh(impostorGeo, shadowOnlyMaterial());
+    impostor.name = 'kartImpostor';
+    impostor.castShadow = true;
+    impostor.receiveShadow = true;
+    // after the opaque queue, so the shadow-only pose is killed at early-Z
+    impostor.renderOrder = 4;
+    root.add(impostor);
+    root.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if ((m as unknown as { isMesh?: boolean }).isMesh && m !== impostor) m.castShadow = false;
+    });
+  }
+
+  root.userData.impostor = impostor;
+  root.userData.impostorMat = impostorMaterial();
+  root.userData.shadowOnlyMat = shadowOnlyMaterial();
+  /** everything DrawBudget hides when the kart collapses to its impostor */
+  root.userData.detailNodes = [body, ...wheels];
   root.userData.body = body;
   root.userData.driver = driver;
   root.userData.exhausts = exhausts;

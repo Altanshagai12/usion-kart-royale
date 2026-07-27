@@ -36,7 +36,11 @@ const HEAD_POS = new THREE.Vector3(0, 0.60, -0.01);
 const SHOULDER = 0.252;
 /** Steering wheel rim radius. The hands are derived FROM this, never beside it. */
 const RIM_R = 0.155;
-/** Rim tube radius — the fist has to be fatter than this to look wrapped. */
+/**
+ * Rim tube radius. The glove straddles this: the palm mass sits 26 mm outboard
+ * of the rim's centreline and the finger roll 34 mm inboard of it, so the tube
+ * runs between them and the wheel visibly enters and leaves the hand.
+ */
 const RIM_TUBE = 0.030;
 
 /** A point on the steering-wheel rim, in hips space. phi = 0 is 12 o'clock. */
@@ -148,15 +152,26 @@ function torsoAndLegs(): Built {
       { z: 0.515, hw: 0.096, hh: 0.090, r: 0.044 },
       { z: 0.605, hw: 0.088, hh: 0.082, r: 0.040 },
     ],
-    Role.Plastic,
+    // Role.Shadowed, not Role.Plastic: round 2 called this "a bare black
+    // cylinder", and half of that was the colour. #2b2d34 on a figure whose
+    // every other surface carries the livery reads as a hole between the head
+    // and the body; the darkened base coat reads as a balaclava under a collar.
+    Role.Shadowed,
     mat(0, 0, 0.005, -Math.PI / 2),
     { corner: 2, closeStart: false, capEnd: 0.02, capSeg: 1 },
   );
-  // collar ring in the team trim, sitting on the shoulders
+  // COLLAR / HANS. Round 1 put this at y 0.395-0.455 — entirely inside the
+  // torso tub, whose own top ring is at y ~0.48, so it was invisible and the
+  // throat was left bare from 0.50 up to the helmet's lower edge at 0.570.
+  // It now starts on the shoulder line and climbs to 0.572, where the shell
+  // takes over, with the top ring narrow enough (0.106) to stay inside the
+  // shell's cross-section once the head leans (max lateral shell travel at full
+  // lean is 42 mm, and the shell is 107 mm wide at y = 0.60).
   m.addLoft(
     [
-      { z: 0.395, hw: 0.134, hh: 0.124, r: 0.058 },
-      { z: 0.455, hw: 0.122, hh: 0.113, r: 0.054 },
+      { z: 0.452, hw: 0.152, hh: 0.142, r: 0.062 },
+      { z: 0.510, hw: 0.130, hh: 0.122, r: 0.056 },
+      { z: 0.572, hw: 0.106, hh: 0.100, r: 0.046 },
     ],
     Role.Trim,
     mat(0, 0, 0.005, -Math.PI / 2),
@@ -210,93 +225,139 @@ function torsoAndLegs(): Built {
 }
 
 /**
- * Shoulder ball, upper arm, forearm, cuff and fist — per side, in hips space,
- * then baked into the steering column's frame.
+ * Arm and glove — per side, in hips space, then baked into the steering
+ * column's frame.
  *
- * Two round-1 notes land here and only one of them was about geometry.
+ * ROUND 2: "the arms are separate capsules with an unblended break at shoulder
+ * and elbow" and "the hands are featureless pale pills with no fingers,
+ * floating with a visible gap between glove and sleeve".
  *
- *  - "no forearm geometry between the gloves and the shoulders at all": the
- *    tubes WERE there, but they ran from a shoulder buried inside the torso,
- *    through the torso's own volume, in Role.Suit — which for the red livery
- *    is a dark red against a dark red tub. Two limbs of identical value
- *    crossing in the same depth range read as one mass. So the arm is now
- *    routed OUTBOARD and ABOVE the side rails where it silhouettes cleanly,
- *    and the forearm is in the livery coat rather than the suit, which gives
- *    the limb a hard value break from the torso it crosses.
- *  - "gloves hover 15 cm from a wheel they are not connected to": they were
- *    actually within a centimetre of the rim, but a rounded box floating
- *    *beside* a torus does not read as a grip. The fist is now a fat capsule
- *    swept ALONG the rim tangent and centred on the rim itself, so the wheel
- *    visibly enters and leaves the hand. Both the grip point and the tangent
- *    are derived from RIM_R, so neither can drift if the wheel is retuned.
+ * Both are true and both come from the same decision: the limb was FOUR tubes
+ * (upper arm / forearm / cuff / fist) butted end to end, each with its own
+ * domed cap. Two domes meeting at an angle leave a crease you cannot shade
+ * away, and the round-1 fix for the colour break — putting the forearm in a
+ * different role from the upper arm — forced the split to exist.
  *
- * The shoulder ball moved here from the torso: `armRig` counter-steers about
- * the column axis, and a socket that stays behind while the arm swings is a
- * tear. Carried with the arm, it slides over the torso like a real shoulder.
+ * The limb is now ONE continuous swept tube from shoulder to wrist with a
+ * monotonically tapering radius: parallel-transport frames mean it has no seam
+ * at the elbow at all, because there is no join. The value break the round-1
+ * note asked for is still there, but it is now a SLEEVE — a short concentric
+ * tube 8 mm fatter, laid over the forearm section of the arm that continues
+ * underneath it. A larger tube over a smaller one changes the colour without
+ * touching the silhouette, and its own domed end reads as the edge of a sleeve
+ * rather than as a cut.
+ *
+ * The hand is a mitten, not a pill:
+ *   - the palm mass sits OUTBOARD of the rim,
+ *   - a separate finger roll sits INBOARD of it,
+ *   - so the rim physically passes between the two and the hand reads as
+ *     wrapped rather than adjacent, from any angle,
+ *   - a thumb runs up the rim tangent from the palm, which is the single
+ *     silhouette cue that says "hand" at 130 px,
+ *   - and the cuff overlaps BOTH the sleeve end and the palm, so there is no
+ *     gap to see through however the arm is posed.
+ * Every one of those points is derived from RIM_R / RIM_TUBE, so retuning the
+ * wheel moves the whole grip with it.
  */
 function arms(): Built {
   const m = new Mesher();
   const col = columnMatrix();
   const hub = new THREE.Vector3(0, 0, 0).applyMatrix4(col);
+  // the rim's own plane normal, in hips space: the axis fingers curl about
+  const axis = new THREE.Vector3(0, 1, 0).transformDirection(col).normalize();
   const wrist = new THREE.Vector3();
   const pa = new THREE.Vector3();
   const pb = new THREE.Vector3();
   const tan = new THREE.Vector3();
   const radial = new THREE.Vector3();
-  const fistA = new THREE.Vector3();
-  const fistB = new THREE.Vector3();
-  const cuffA = new THREE.Vector3();
-  const cuffB = new THREE.Vector3();
+  const a0 = new THREE.Vector3();
+  const a1 = new THREE.Vector3();
+  const a2 = new THREE.Vector3();
 
   for (const s of [-1, 1]) {
     const phi = s * 1.05; // ten-to-two, 60 deg either side of the rim's crown
     rimPoint(phi, col, wrist);
     rimPoint(phi + 0.14, col, pa);
     rimPoint(phi - 0.14, col, pb);
-    tan.subVectors(pa, pb).normalize();
+    // phi = 0 is 12 o'clock, so increasing phi runs AWAY from the crown on the
+    // right hand and toward it on the left. Negating by `s` makes +tan mean
+    // "toward the crown" on both sides — which is what the thumb has to follow:
+    // a hand at ten-to-two hooks its thumb over the top of the rim, and getting
+    // this sign wrong points both thumbs at the floor.
+    tan.subVectors(pa, pb).normalize().multiplyScalar(-s);
     radial.subVectors(wrist, hub).normalize();
 
     const shoulder = new THREE.Vector3(s * SHOULDER, 0.420, 0.030);
     const elbow = new THREE.Vector3(s * 0.318, 0.370, 0.226);
+    // the arm stops just short of the rim; the palm covers the last 30 mm
+    const wristIn = new THREE.Vector3(
+      THREE.MathUtils.lerp(wrist.x, elbow.x, 0.13),
+      THREE.MathUtils.lerp(wrist.y, elbow.y, 0.09),
+      THREE.MathUtils.lerp(wrist.z, elbow.z, 0.09),
+    );
 
-    // shoulder ball, squashed into a deltoid
+    // deltoid: squashed ball wide enough to swallow the tube's start dome
     m.addGeometry(
-      new THREE.SphereGeometry(0.108, 10, 7),
+      new THREE.SphereGeometry(0.108, 8, 6),
       Role.Trim,
       mat(shoulder.x, shoulder.y, shoulder.z, 0, 0, 0, 1, 0.92, 1.06),
       1.2,
     );
-    // upper arm: out over the side rail, then down to the elbow
-    m.addTube(
-      [shoulder, new THREE.Vector3(s * 0.300, 0.394, 0.126), elbow],
-      (t) => 0.082 - t * 0.020,
-      9, Role.Suit,
-    );
-    // forearm, in the livery coat so the limb separates from the dark tub
-    const fore = [
+    // ONE limb, shoulder -> elbow -> wrist. Six control points, so the sweep
+    // has enough samples to round the elbow without mitring it.
+    const limb = [
+      shoulder,
+      new THREE.Vector3(s * 0.300, 0.394, 0.126),
       elbow,
       new THREE.Vector3(s * 0.288, 0.424, 0.318),
       new THREE.Vector3(s * 0.214, 0.482, 0.398),
-      new THREE.Vector3(
-        THREE.MathUtils.lerp(wrist.x, elbow.x, 0.14),
-        THREE.MathUtils.lerp(wrist.y, elbow.y, 0.10),
-        THREE.MathUtils.lerp(wrist.z, elbow.z, 0.10),
-      ),
+      wristIn,
     ];
-    m.addTube(fore, (t) => 0.064 - t * 0.018, 9, Role.Base);
-    // cuff band in the trim colour, right where the sleeve meets the glove
-    cuffA.lerpVectors(wrist, fore[2], 0.36);
-    cuffB.lerpVectors(wrist, fore[2], 0.08);
-    m.addTube([cuffA, cuffB], 0.056, 9, Role.Trim);
-    // fist: a fat capsule swept along the rim tangent, sitting ON the rim and
-    // nudged a touch outboard so the knuckles stand proud of the tube
-    fistA.copy(wrist).addScaledVector(radial, 0.010).addScaledVector(tan, -0.062);
-    fistB.copy(wrist).addScaledVector(radial, 0.010).addScaledVector(tan, 0.062);
+    m.addTube(limb, (t) => 0.086 - 0.036 * Math.pow(t, 0.85), 9, Role.Suit);
+    // Sleeve of the livery coat from the elbow down — the value break that
+    // separates the limb from the dark tub it crosses. It is a CONCENTRIC tube
+    // ~9 mm fatter than the limb running underneath it, so the colour changes
+    // without the silhouette changing: no join, nothing to crease.
+    m.addTube(limb.slice(2), (t) => 0.078 - t * 0.022, 8, Role.Base);
+    // cuff: overlaps the sleeve's end dome AND the palm, so no pose can open a
+    // gap between glove and sleeve
+    a0.lerpVectors(wristIn, limb[4], 0.34);
+    a1.lerpVectors(wristIn, wrist, 0.55);
+    m.addTube([a0, a1], 0.058, 9, Role.Trim);
+
+    // --- glove ------------------------------------------------------------
+    // palm / back of hand: outboard of the rim, swept along it
+    a0.copy(wrist).addScaledVector(radial, 0.022).addScaledVector(tan, -0.058);
+    a1.copy(wrist).addScaledVector(radial, 0.026);
+    a2.copy(wrist).addScaledVector(radial, 0.022).addScaledVector(tan, 0.052);
     m.addTube(
-      [fistA, new THREE.Vector3().lerpVectors(fistA, fistB, 0.5), fistB],
-      (t) => RIM_TUBE + 0.030 - Math.abs(t - 0.5) * 0.052,
+      [a0, a1, a2],
+      (t) => 0.052 - Math.abs(t - 0.45) * 0.040,
       9, Role.Glove,
     );
+    // finger roll: inboard of the rim, so the rim runs THROUGH the hand
+    a0.copy(wrist).addScaledVector(radial, -0.030).addScaledVector(tan, -0.046)
+      .addScaledVector(axis, 0.012);
+    a1.copy(wrist).addScaledVector(radial, -0.034).addScaledVector(axis, 0.014);
+    a2.copy(wrist).addScaledVector(radial, -0.030).addScaledVector(tan, 0.040)
+      .addScaledVector(axis, 0.012);
+    m.addTube([a0, a1, a2], (t) => 0.024 - Math.abs(t - 0.5) * 0.012, 7, Role.Glove);
+    // thumb: off the top of the palm, laid along the rim toward the crown
+    a0.copy(wrist).addScaledVector(radial, 0.020).addScaledVector(tan, 0.030)
+      .addScaledVector(axis, 0.016);
+    a1.copy(wrist).addScaledVector(radial, 0.006).addScaledVector(tan, 0.070)
+      .addScaledVector(axis, 0.020);
+    a2.copy(wrist).addScaledVector(radial, -0.012).addScaledVector(tan, 0.098)
+      .addScaledVector(axis, 0.014);
+    m.addTube([a0, a1, a2], (t) => 0.020 - t * 0.006, 6, Role.Glove);
+    // knuckle strap: a dark band across the back of the hand. One thin tube,
+    // and it is what stops the glove reading as a featureless pale pill.
+    a0.copy(wrist).addScaledVector(radial, 0.040).addScaledVector(tan, -0.030)
+      .addScaledVector(axis, -0.030);
+    a1.copy(wrist).addScaledVector(radial, 0.046).addScaledVector(tan, -0.026);
+    a2.copy(wrist).addScaledVector(radial, 0.040).addScaledVector(tan, -0.030)
+      .addScaledVector(axis, 0.030);
+    m.addTube([a0, a1, a2], 0.011, 5, Role.Plastic);
   }
   const b = m.finish();
   // Bake into the steering-column frame so the whole assembly can counter-steer
@@ -319,11 +380,14 @@ function steeringWheel(): Built {
   const R = RIM_R;
   // 18 segments, not 12: at hero distance a 12-gon rim silhouettes as a
   // dodecagon and the hands sit right on top of it.
-  const rim = new THREE.TorusGeometry(R, RIM_TUBE, 5, 16);
+  // 4 radial, not 5: the rim's tube is 30 mm across and the hands now cover a
+  // third of it, so the extra ring bought nothing the glove does not hide.
+  const rim = new THREE.TorusGeometry(R, RIM_TUBE, 4, 16);
   rim.rotateX(-Math.PI / 2); // torus axis +Z -> +Y
   m.addGeometry(rim, Role.Plastic, undefined, 1.6);
   // three spokes in the trim colour; the loft runs along +Z so a plain yaw
-  // fans them out inside the wheel plane
+  // fans them out inside the wheel plane. The inboard end is left open — it is
+  // buried inside the boss below and can never be seen.
   for (let i = 0; i < 3; i++) {
     m.addLoft(
       [
@@ -332,7 +396,7 @@ function steeringWheel(): Built {
       ],
       Role.Trim,
       mat(0, 0, 0, 0, Math.PI + (i * Math.PI * 2) / 3, 0),
-      { corner: 1, capStart: 0.01, capEnd: 0.01, capSeg: 1 },
+      { corner: 1, closeStart: false, capEnd: 0.01, capSeg: 1 },
     );
   }
   // boss with the team badge colour
@@ -348,12 +412,17 @@ function steeringWheel(): Built {
   return m.finish();
 }
 
-// Eye port: 134 deg of yaw, straddling the helmet equator so the chin bar
+// Eye port: 128 deg of yaw, straddling the helmet equator so the chin bar
 // closes under it. Bezel and glass share these so they can never disagree.
-const VISOR_YAW = 1.17;
-const VISOR_PITCH = 0.13;
-const VISOR_HALF = 0.30;
+// The pitch half came down from 0.30 to 0.255 in round 2: a port that tall on a
+// 205 mm shell is most of the front of the head, which is why the visor read as
+// "a hole" rather than as a shield set into a helmet.
+const VISOR_YAW = 1.12;
+const VISOR_PITCH = 0.145;
+const VISOR_HALF = 0.255;
 const VISOR_COLS = 22;
+/** Shell radius; every face element is authored against it. */
+const SHELL_R = 0.205;
 
 /** Full-face helmet, authored in head-local space (origin = neck pivot). */
 function helmet(): { helmet: Built; visor: Built } {
@@ -365,24 +434,44 @@ function helmet(): { helmet: Built; visor: Built } {
   // silhouette — and with the Mesher no longer de-indexing primitives it is
   // smooth-shaded now, so the extra rings actually buy curvature rather than
   // just more flat facets.
-  m.addGeometry(new THREE.SphereGeometry(0.205, 22, 14), Role.Base, shell, 1.5);
+  m.addGeometry(new THREE.SphereGeometry(SHELL_R, 22, 14), Role.Base, shell, 1.5);
   // crown stripe
   m.addGeometry(
-    new THREE.SphereGeometry(0.207, 6, 14, Math.PI / 2 - 0.19, 0.38, 0, Math.PI),
+    // 3 width segments across a 0.38 rad band: the stripe's WIDTH is 22 deg, so
+    // more than three chords along it is triangles spent on a straight line.
+    new THREE.SphereGeometry(0.207, 3, 14, Math.PI / 2 - 0.19, 0.38, 0, Math.PI),
     Role.Trim,
     mat(0, cy, 0.005, 0, 0, 0, 1.0, 0.985, 1.045),
     1.5,
   );
-  // chin bar
+  // CHIN BAR. Round 2: "the visor is a flat dark quad ... with a strange white
+  // X-shaped seam crossing the face". Two separate faults, and this primitive
+  // owned both halves of the second one.
+  //
+  //  - It was Role.Trim. On a livery whose trim is a pale mint that is a BRIGHT
+  //    bar laid across the lower half of the face, and with the brow peak doing
+  //    the same above it the eye port was squeezed into a dark slot between two
+  //    pale bars. It is now Role.Shadowed: the chin reads as a form on the
+  //    helmet, and the mint is left to the crown stripe alone, where it is a
+  //    stripe rather than a stripe-plus-two-bars.
+  //  - `addLoft` ALWAYS closes an end with a flat centroid fan, chamfer or no.
+  //    With hh 0.055 and capEnd 0.03 the fan left a 170 x 60 mm FLAT DISC on
+  //    the front of the chin, pointed straight down the camera in the hero
+  //    shot, and a centroid fan over a rounded rect seen face-on is precisely
+  //    an X-shaped star of shading. capEnd is now 0.052 against hh 0.055, so
+  //    the residual disc is 6 mm across: the end is a dome, not a plate.
+  //
+  // It also sits 25 mm lower and 20 mm further back so it closes UNDER the eye
+  // port instead of crowding into it.
   m.addLoft(
     [
-      { z: -0.05, hw: 0.10, hh: 0.055, r: 0.03 },
-      { z: 0.06, hw: 0.115, hh: 0.062, r: 0.035 },
-      { z: 0.16, hw: 0.095, hh: 0.055, r: 0.03 },
+      { z: -0.05, hw: 0.100, hh: 0.062, r: 0.034 },
+      { z: 0.055, hw: 0.112, hh: 0.068, r: 0.038 },
+      { z: 0.140, hw: 0.092, hh: 0.058, r: 0.032 },
     ],
-    Role.Trim,
-    mat(0, cy - 0.10, 0.06, -0.22),
-    { corner: 2, capStart: 0.03, capEnd: 0.03, capSeg: 1 },
+    Role.Shadowed,
+    mat(0, cy - 0.140, 0.040, -0.20),
+    { corner: 2, capStart: 0.05, capEnd: 0.056, capSeg: 2 },
   );
   // Visor bezel: a rounded-rectangle ring that rises 7 mm proud of the glass
   // and sinks back under the shell on its outer edge. The glass therefore sits
@@ -391,10 +480,11 @@ function helmet(): { helmet: Built; visor: Built } {
   // makes the whole assembly read as a shield rather than a decal.
   m.addGeometry(
     spherePatch(VISOR_YAW, VISOR_PITCH, VISOR_HALF, [
-      [1.000, 0.2085],
-      [1.045, 0.2160],
-      [1.105, 0.2148],
-      [1.200, 0.2035],
+      [0.930, 0.2035],   // inner lip, tucked BEHIND the glass edge
+      [0.985, 0.2110],
+      [1.045, 0.2158],
+      [1.105, 0.2146],
+      [1.200, 0.2030],
     ], VISOR_COLS),
     Role.Plastic, shell, 1.5,
   );
@@ -408,27 +498,38 @@ function helmet(): { helmet: Built; visor: Built } {
     mat(0, cy + 0.10, -0.15, 0.55),
     { corner: 1, capStart: 0.012, capEnd: 0.012, capSeg: 1 },
   );
-  // brow peak
+  // Brow peak: 25 mm higher and 25 mm further back than round 1, and slimmer.
+  // It used to cross the top third of the eye port in the hero framing, which
+  // is what made the port read as a slot with a pale bar through it.
   m.addLoft(
     [
-      { z: 0.0, hw: 0.13, hh: 0.022, r: 0.012 },
-      { z: 0.055, hw: 0.115, hh: 0.016, r: 0.01 },
+      { z: 0.0, hw: 0.118, hh: 0.019, r: 0.011 },
+      { z: 0.048, hw: 0.100, hh: 0.014, r: 0.009 },
     ],
     Role.Trim,
-    mat(0, cy + 0.085, 0.15, -0.5),
-    { corner: 1, capStart: 0.012, capEnd: 0.012, capSeg: 1 },
+    mat(0, cy + 0.112, 0.125, -0.62),
+    { corner: 1, capStart: 0.013, capEnd: 0.013, capSeg: 2 },
   );
 
-  // The glass itself: a true spherical cap filling the bezel's aperture, at a
-  // constant radius so it is optically a piece of a sphere and the reflected
-  // sun sweeps across it cleanly as the head turns.
+  // THE GLASS. A true spherical cap at a constant radius, so it is optically a
+  // piece of a sphere and the reflected sun sweeps across it cleanly as the
+  // head turns.
+  //
+  // Round 1 ended it at scale 1.000 / R 0.2085 — the same ring, to seven
+  // figures, as the bezel's inner edge. Two surfaces sharing an edge exactly
+  // is a z-fight along the whole aperture, and a z-fight on a 22-segment ring
+  // is exactly the "jagged aliased boundary" round 2 reported. The glass now
+  // stops at 0.965 / 0.2072, 2 mm proud of the bezel's inner lip (0.930 /
+  // 0.2035) and 6 mm under its crest, so the lip visibly overlaps the glass:
+  // a real recess, and nothing coplanar anywhere near it.
   const v = new Mesher();
   v.addGeometry(
     spherePatch(VISOR_YAW, VISOR_PITCH, VISOR_HALF, [
-      [0.00, 0.2085],
-      [0.42, 0.2085],
-      [0.76, 0.2085],
-      [1.00, 0.2085],
+      [0.000, 0.2072],
+      [0.400, 0.2072],
+      [0.700, 0.2072],
+      [0.880, 0.2072],
+      [0.965, 0.2072],
     ], VISOR_COLS),
     Role.Plastic, shell, 1,
   );

@@ -47,6 +47,8 @@ const C_TIER = [
 const C_HOT = new THREE.Color(0xfff2d4);
 const C_FLAME_MID = new THREE.Color(0xff9a2e);
 const C_FLAME_COOL = new THREE.Color(0xc4331a);
+/** blue-white root of a boost flame — hotter and cooler-hued than C_HOT */
+const C_FLAME_ROOT = new THREE.Color(0xdcefff);
 const C_SMOKE = new THREE.Color(0xb9b4ac);
 const C_SMOKE_DARK = new THREE.Color(0x6a655e);
 const C_WATER = new THREE.Color(0xbfe6ff);
@@ -90,6 +92,7 @@ attribute vec4 aDrift; // xyz centre velocity, w drag (1/s)
 varying vec3 vCol;
 varying float vA;
 varying float vR;
+varying float vViewZ;
 
 vec3 rotq(vec4 q, vec3 v) { return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v); }
 
@@ -97,7 +100,7 @@ void main() {
   float age = uTime - aCen.w;
   float u = age / max(aRad.z, 1e-4);
   if (age < 0.0 || u >= 1.0) {
-    vCol = vec3(0.0); vA = 0.0; vR = 0.0;
+    vCol = vec3(0.0); vA = 0.0; vR = 0.0; vViewZ = 1.0;
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
     return;
   }
@@ -115,18 +118,42 @@ void main() {
   vCol = aCol.rgb;
   vA = aCol.a * (1.0 - u) * (1.0 - u) * smoothstep(0.0, 0.10, u);
   vR = uv.x;
-  gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
+  vec4 mv = viewMatrix * vec4(wp, 1.0);
+  vViewZ = -mv.z;
+  gl_Position = projectionMatrix * mv;
 }
 `;
 
 const RING_FRAG = /* glsl */ `
 uniform float uGain;
+#ifdef SOFT_DEPTH
+uniform sampler2D uDepth;
+uniform vec2 uInvRes;
+uniform vec2 uCamPlanes;
+uniform float uSoft;
+#endif
 varying vec3 vCol;
 varying float vA;
 varying float vR;
+varying float vViewZ;
 void main() {
-  float edge = sin(vR * 3.14159265);
-  float a = vA * edge * edge;
+  // Two-lobe radial profile across the annulus: a narrow bright band riding a
+  // wide soft body, reaching exactly zero at BOTH rims. The old sin^2 was
+  // effectively a fat plateau — with an additive colour authored above 1.0 it
+  // saturated across most of its width, and a saturated band with a fast
+  // shoulder is indistinguishable from an opaque matte torus. This keeps a
+  // legible core while spending most of the annulus in visible falloff.
+  float e = sin(vR * 3.14159265);
+  float a = vA * (0.34 * pow(e, 1.7) + 0.66 * pow(e, 5.5));
+#ifdef SOFT_DEPTH
+  // Depth fade. A shockwave punched out of a kart necessarily intersects the
+  // kart; without this it terminates on a hard curve exactly where it enters
+  // the bodywork, which is the "welded plastic prop" read.
+  float d = texture2D(uDepth, gl_FragCoord.xy * uInvRes).x;
+  float nz = uCamPlanes.x, fz = uCamPlanes.y;
+  float sceneZ = (2.0 * nz * fz) / (fz + nz - (d * 2.0 - 1.0) * (fz - nz));
+  a *= clamp((sceneZ - vViewZ) / uSoft, 0.0, 1.0);
+#endif
   if (a < 0.004) discard;
   gl_FragColor = vec4(vCol * uGain, a);
   #include <tonemapping_fragment>
@@ -182,11 +209,20 @@ class Rings {
     this.geo.instanceCount = 0;
 
     this.material = new THREE.ShaderMaterial({
-      uniforms: { uTime: { value: 0 }, uGain: { value: 1 } },
+      uniforms: {
+        uTime: { value: 0 }, uGain: { value: 1 },
+        uDepth: { value: null },
+        uInvRes: { value: new THREE.Vector2(1 / 1920, 1 / 1080) },
+        uCamPlanes: { value: new THREE.Vector2(0.2, 3000) },
+        // ~0.7 m of intersection distance: long enough to swallow a wheel or a
+        // roll bar, short enough that a ring against the road still reads.
+        uSoft: { value: 0.7 },
+      },
       vertexShader: RING_VERT,
       fragmentShader: RING_FRAG,
       transparent: true,
       depthWrite: false,
+      depthTest: true,
       blending: THREE.AdditiveBlending,
       side: THREE.DoubleSide,
     });
@@ -197,6 +233,20 @@ class Rings {
   }
 
   set gain(v: number) { this.material.uniforms.uGain.value = v; }
+
+  resize(w: number, h: number) { this.material.uniforms.uInvRes.value.set(1 / w, 1 / h); }
+
+  setDepthTexture(tex: THREE.Texture | null, near: number, far: number) {
+    const m = this.material;
+    const had = m.defines.SOFT_DEPTH !== undefined;
+    const want = !!tex;
+    m.uniforms.uDepth.value = tex;
+    m.uniforms.uCamPlanes.value.set(near, far);
+    if (want !== had) {
+      if (want) m.defines.SOFT_DEPTH = ''; else delete m.defines.SOFT_DEPTH;
+      m.needsUpdate = true;
+    }
+  }
 
   /**
    * `drift` (optional) is the velocity the ring's centre inherits, decayed by
@@ -605,6 +655,93 @@ class StarShells {
 }
 
 // ===========================================================================
+//  Effect lights — a tiny fixed pool of point lights that bright effects can
+//  claim for a frame.
+// ===========================================================================
+//
+//  Every additive effect in this file used to be pure emission: sparks, flame
+//  and boost pads glowed but lit nothing, so they floated in front of the world
+//  instead of being part of it. Coloured light pooling under the tier is what
+//  sells the drift read at a glance in a shipped arcade racer.
+//
+//  The pool is allocated ONCE and the lights stay in the scene for the lifetime
+//  of the process with intensity 0 when idle. That matters: three.js keys shader
+//  permutations on the light counts, so adding, removing or hiding a light
+//  forces every material in the scene to recompile. A fixed count costs a few
+//  ALU per lit fragment and never hitches.
+//
+//  Claims are re-issued every frame and ranked by importance, so the player's
+//  drift always outranks a rival's and the pool degrades by dropping the least
+//  important claimant rather than by flickering between them.
+class EffectLights {
+  private readonly lights: THREE.PointLight[] = [];
+  /** importance of whatever currently owns each slot, this frame */
+  private readonly score: number[] = [];
+  private readonly owner: number[] = [];
+
+  constructor(count: number) {
+    for (let i = 0; i < count; i++) {
+      const l = new THREE.PointLight(0xffffff, 0, 8, 2);
+      l.castShadow = false;
+      // Never culled out of the light list: see the note above on recompiles.
+      l.matrixAutoUpdate = false;
+      this.lights.push(l);
+      this.score.push(-1);
+      this.owner.push(-1);
+    }
+  }
+
+  get meshes(): THREE.PointLight[] { return this.lights; }
+
+  begin() {
+    for (let i = 0; i < this.score.length; i++) this.score[i] = -1;
+  }
+
+  /**
+   * Ask for a light. `key` identifies the claimant so the same emitter keeps
+   * the same slot frame to frame (a light that hops between karts strobes).
+   */
+  request(key: number, importance: number, p: THREE.Vector3, colour: THREE.Color,
+          intensity: number, distance: number) {
+    if (this.lights.length === 0 || intensity <= 0) return;
+    let slot = -1;
+    for (let i = 0; i < this.owner.length; i++) {
+      if (this.owner[i] === key) { slot = i; break; }
+    }
+    if (slot < 0) {
+      let worst = 0;
+      for (let i = 1; i < this.score.length; i++) if (this.score[i] < this.score[worst]) worst = i;
+      if (this.score[worst] >= importance) return;
+      slot = worst;
+    } else if (this.score[slot] >= importance) {
+      return; // this claimant already placed something more important
+    }
+    this.owner[slot] = key;
+    this.score[slot] = importance;
+    const l = this.lights[slot];
+    l.position.copy(p);
+    l.updateMatrix();
+    l.color.copy(colour);
+    l.intensity = intensity;
+    l.distance = distance;
+  }
+
+  /** Anything not claimed this frame goes dark (but stays in the light list). */
+  end(dt: number) {
+    const k = Math.min(1, dt * 18);
+    for (let i = 0; i < this.lights.length; i++) {
+      if (this.score[i] < 0) {
+        const l = this.lights[i];
+        if (l.intensity > 0.001) l.intensity -= l.intensity * k;
+        else { l.intensity = 0; this.owner[i] = -1; }
+      }
+    }
+  }
+
+  dispose() { for (const l of this.lights) l.removeFromParent(); }
+}
+
+// ===========================================================================
 //  Per-kart effect state
 // ===========================================================================
 
@@ -616,9 +753,14 @@ class KartFx {
   sparkleAcc = 0;
   exhaustAcc = 0;
   scorchAcc = 0;
+  poolAcc = 0;
+  rollAcc = 0;
+  padAcc = 0;
   starAcc = 0;
   trail = -1;
   lastTier = 0;
+  /** seconds left of the ignition flash, drives the boost light's overshoot */
+  igniteT = 0;
   wasBoosting = false;
   stunPhase = 0;
   /** squash-and-stretch: signed impulse plus its velocity, a critically-ish
@@ -653,6 +795,7 @@ export class Effects implements System {
   private gulls: Gulls | null = null;
   private shimmer: Shimmer | null = null;
   private shells!: StarShells;
+  private lights!: EffectLights;
   private unsubscribe: (() => void) | null = null;
 
   private fx: KartFx[] = [];
@@ -686,9 +829,15 @@ export class Effects implements System {
     this.rings = new Rings(28);
     this.shells = new StarShells(12);
 
+    this.rings.resize(ctx.width, ctx.height);
+
+    // 3 / 2 / 0 by quality. Three is enough for the player's drift or boost
+    // plus the two nearest rivals, which is every case the pack shot has.
+    this.lights = new EffectLights(q >= Quality.High ? 3 : q >= Quality.Medium ? 2 : 0);
+
     this.group.add(
       this.particles.group, this.trails.mesh, this.decals.mesh,
-      this.rings.mesh, this.shells.mesh,
+      this.rings.mesh, this.shells.mesh, ...this.lights.meshes,
     );
 
     if (q >= Quality.Medium) {
@@ -729,6 +878,7 @@ export class Effects implements System {
 
   resize(w: number, h: number) {
     this.particles?.resize(w, h);
+    this.rings?.resize(w, h);
   }
 
   // -------------------------------------------------------------------------
@@ -761,33 +911,45 @@ export class Effects implements System {
         this.burstSparks(this.skidLRef, col, n, boost);
         this.burstSparks(this.skidRRef, col, n, boost);
 
-        _fwd.copy(e.kart.forward);
-        _p.copy(e.kart.position).addScaledVector(_fwd, -0.55);
-        _p.y = fx.groundY + 0.42;
-        // Vertical shockwave punched out of the back of the kart, riding along
-        // with it. A ground-plane ring outline reads as a dropped hula hoop:
-        // it has no volume and it detaches the instant the kart moves.
-        this.rings.spawn(_p, _fwd, 0.25, 1.25 + tier * 0.22, 0.26, 0.34,
-          col, 1.7 + 0.4 * tier, now, e.kart.velocity, 0.6);
-
-        // ...backed by a soft radial ground GLOW, not an annulus. It has to
-        // survive the chassis hiding both rear wheels from a chase camera, so
-        // it needs area and no silhouette of its own.
+        // NO ANNULUS. A 1.7 m-radius vertical torus spawned inside the chassis
+        // is geometrically *inside* the kart for its whole life: it cuts through
+        // the rear wheels, exits the far side of the bodywork and reads as a
+        // plastic hoop welded to the car. The comment this replaces warned that
+        // a ground-plane ring reads as a dropped hula hoop and then shipped the
+        // same object rotated ninety degrees. Per the art bible §6 the drift
+        // signature is *emitted sparks plus a soft ground glow* — no ring at
+        // all. Rings are kept for boost ignition and impacts, where they are
+        // punched clear of the body along the direction of travel.
+        //
+        // The flash is a ground-projected radial pool instead: it has area, no
+        // silhouette of its own, cannot intersect anything, and it puts the tier
+        // colour on the tarmac where the sparks are actually landing.
         _q.copy(e.kart.position); _q.y = fx.groundY + 0.05;
         const p = this.particles.reset();
         p.tile = PTile.Glow; p.mode = PMode.Ground;
-        p.life = 0.34; p.lifeJitter = 0.1;
-        p.size0 = 1.6; p.size1 = 4.4; p.sizeJitter = 0.1;
-        // Carries the kart's velocity, otherwise a 0.34 s flash on a kart doing
+        p.life = 0.40; p.lifeJitter = 0.1;
+        p.size0 = 2.0; p.size1 = 6.2; p.sizeJitter = 0.1;
+        // Carries the kart's velocity, otherwise a 0.4 s flash on a kart doing
         // 25 m/s is stranded eight metres back down the road by the time it
         // fades — which is precisely how the pack shot ended up with a drift
         // ring sitting on empty tarmac next to nothing.
-        p.fadeIn = 0.06; p.drag = 0.6; p.count = 1; p.softness = 0;
+        p.fadeIn = 0.05; p.drag = 0.6; p.count = 1; p.softness = 0;
         this.particles.at(_q.x, _q.y, _q.z);
         this.particles.vel(e.kart.velocity.x, 0, e.kart.velocity.z);
-        this.particles.colorA(col, 0.85, 0.85);
-        this.particles.colorB(col, 0.30, 0);
+        this.particles.colorA(col, 1.5 + 0.25 * tier, 0.9);
+        this.particles.colorB(col, 0.35, 0);
         this.particles.emit(true);
+
+        // A tight hot kiss under each rear wheel on top of the wide pool, so
+        // the promotion has a point of origin rather than a vague wash.
+        p.life = 0.26; p.size0 = 0.7; p.size1 = 2.4; p.count = 1;
+        for (let s = 0; s < 2; s++) {
+          const at = s === 0 ? this.skidLRef : this.skidRRef;
+          this.particles.at(at.x, fx.groundY + 0.06, at.z);
+          this.particles.colorA(C_HOT, 1.6, 0.9);
+          this.particles.colorB(col, 0.5, 0);
+          this.particles.emit(true);
+        }
 
         // scorch under the burst, so the tier change leaves a mark on the road
         this.decals.blot(_q, fx.groundN, 0.9, DecalTile.Smudge, now, 7, 0.5);
@@ -893,10 +1055,17 @@ export class Effects implements System {
     _fwd.copy(k.forward);
     _p.copy(k.position).addScaledVector(_fwd, -0.9);
     _p.y += 0.45;
-    // rings face along the direction of travel, so they read as being punched
-    // out of the back of the kart rather than laid on the floor
-    this.rings.spawn(_p, _fwd, 0.35, 2.1 + tier * 0.35, 0.38, 0.20, col, 2.0, now, k.velocity, 0.6);
-    this.rings.spawn(_p, _fwd, 0.15, 1.35, 0.26, 0.45, C_HOT, 1.4, now, k.velocity, 0.6);
+    // Rings face along the direction of travel, so they read as being punched
+    // out of the back of the kart rather than laid on the floor.
+    //
+    // Intensity is well down from where it was. An annulus authored at 2.0x a
+    // saturated primary is above the highlight knee across its whole width once
+    // the gain is applied, so the falloff the profile describes never survives
+    // into the frame — it arrives as a flat saturated band with a hard shoulder,
+    // i.e. as a solid disc. 1.15 / 0.95 keeps the peak just under the knee so
+    // the ring blooms at the core and *visibly* falls off at both rims.
+    this.rings.spawn(_p, _fwd, 0.35, 2.1 + tier * 0.35, 0.40, 0.16, col, 1.15, now, k.velocity, 0.6);
+    this.rings.spawn(_p, _fwd, 0.15, 1.35, 0.26, 0.30, C_HOT, 0.95, now, k.velocity, 0.6);
 
     const p = this.particles.reset();
     p.tile = PTile.Flame; p.mode = PMode.Stretch; p.stretch = 0.9;
@@ -905,12 +1074,27 @@ export class Effects implements System {
     p.drag = 7; p.gravity = 2.2; p.velJitter = 2.4; p.fadeIn = 0.06; p.count = 16;
     p.groundY = fx.groundY; p.softness = 0.6;
     this.particles.at(_p.x, _p.y, _p.z);
-    // Biased up and away rather than straight down the barrel of the chase cam.
-    this.particles.vel(-_fwd.x * 5.5, 3.0, -_fwd.z * 5.5);
-    this.particles.colorA(C_HOT, 1.5, 0.95);
-    this.particles.colorB(C_FLAME_COOL, 0.45, 0);
+    // Biased up and away rather than straight down the barrel of the chase cam,
+    // and carrying most of the kart's velocity so the burst stays with the car
+    // instead of being stranded on the tarmac (see boostPlume for why).
+    this.particles.vel(
+      k.velocity.x * 0.85 - _fwd.x * 3.5, k.velocity.y * 0.85 + 2.6, k.velocity.z * 0.85 - _fwd.z * 3.5);
+    this.particles.colorA(C_FLAME_ROOT, 1.6, 0.95);
+    this.particles.colorB(C_FLAME_MID, 0.55, 0);
     this.particles.emit(true);
 
+    // Ground flash under the ignition — the thing that makes the boost read as
+    // an event that happened *on the road* rather than a sprite over it.
+    p.tile = PTile.Glow; p.mode = PMode.Ground; p.stretch = 0;
+    p.life = 0.3; p.size0 = 1.8; p.size1 = 6.5; p.sizeJitter = 0.1;
+    p.drag = 0.7; p.gravity = 0; p.velJitter = 0; p.count = 1; p.softness = 0;
+    this.particles.at(k.position.x, fx.groundY + 0.05, k.position.z);
+    this.particles.vel(k.velocity.x, 0, k.velocity.z);
+    this.particles.colorA(col, 1.6, 0.85);
+    this.particles.colorB(col, 0.3, 0);
+    this.particles.emit(true);
+
+    fx.igniteT = 0.30;
     this.tyreSmokePuff(k, fx, 8, 1.4);
     if (k.isPlayer) this.ctx.shake(0.16 + 0.05 * tier, 0.22);
     this.blastLoad = Math.max(this.blastLoad, 0.5);
@@ -956,6 +1140,7 @@ export class Effects implements System {
   setDepthTexture(tex: THREE.Texture | null, near: number, far: number) {
     this.lastDepth = tex;
     this.particles.setDepthTexture(tex, near, far);
+    this.rings.setDepthTexture(tex, near, far);
   }
 
   // -------------------------------------------------------------------------
@@ -984,9 +1169,11 @@ export class Effects implements System {
     }
     this.particles.setLighting(ctx.sunDirection, this.sunColor, this.skyColor, this.bounceColor);
 
+    this.lights.begin();
     if (karts) {
       for (let i = 0; i < karts.length; i++) this.updateKart(ctx, karts[i], dt, now);
     }
+    this.lights.end(dt);
 
     this.updateAmbient(ctx, dt, now);
     this.updateSignals(ctx, dt);
@@ -1026,6 +1213,7 @@ export class Effects implements System {
     const depth = (ctx as any).depthTexture as THREE.Texture | undefined;
     if (depth !== this.lastDepth) {
       this.lastDepth = depth ?? null;
+      this.rings.setDepthTexture(this.lastDepth, ctx.camera.near, ctx.camera.far);
       this.particles.setDepthTexture(this.lastDepth, ctx.camera.near, ctx.camera.far);
     }
   }
@@ -1066,6 +1254,10 @@ export class Effects implements System {
         if (k.boostTime > 0) load += 1.0 * w;
         if (k.driftTier > 0) load += (0.3 + 0.35 * k.driftTier) * w;
         if (k.starTime > 0) load += 0.85 * w;
+        // A kart standing on a boost pad is sitting on the brightest surface in
+        // the game with its own blue wash on top. This is the third term of the
+        // exact worst case §6 names: boost + drift + tunnel-exit bloom.
+        if (this.fx[k.id]?.surface === Surface.Boost) load += 0.7 * w;
       }
     }
     this.blastLoad = Math.max(0, this.blastLoad - dt * 1.4);
@@ -1197,44 +1389,91 @@ export class Effects implements System {
     if (drifting && k.driftTier > 0) {
       const tier = Math.min(3, k.driftTier);
       const col = C_TIER[tier];
-      fx.sparkAcc += dt * (42 + 16 * tier) * lod;
+      fx.sparkAcc += dt * (58 + 22 * tier) * lod;
       const n = Math.floor(fx.sparkAcc);
       if (n > 0) {
         fx.sparkAcc -= n;
         this.emitSparks(this.skidLRef, k, col, n, tier, -1);
         this.emitSparks(this.skidRRef, k, col, n, tier, 1);
       }
-      // scorch under the tyres once the sparks are really biting
-      if (tier >= 2) {
-        fx.scorchAcc += dt * 7;
-        if (fx.scorchAcc >= 1) {
-          fx.scorchAcc = 0;
-          this.decals.blot(this.skidLRef, fx.groundN, 0.42, DecalTile.Smudge, now, 5.5, 0.4);
-        }
+
+      // Coloured light pool on the road under the sparks. Sparks that light
+      // nothing float in front of the world; this is the single change that
+      // makes the tier read at a glance in a moving frame. Two cheap ground
+      // quads carry it on every kart...
+      fx.poolAcc += dt * 26 * lod;
+      const np = Math.floor(fx.poolAcc);
+      if (np > 0) {
+        fx.poolAcc -= np;
+        this.groundPool(k, fx, col, tier);
+      }
+      // ...and the nearest few karts additionally get a real point light, so
+      // the tarmac, the kerb and the kart's own underbody all pick the tier up.
+      if (dist < 45) {
+        _p.copy(k.position).addScaledVector(k.forward, -0.7);
+        _p.y = fx.groundY + 0.55;
+        // Candela: three is physically-correct, so this is divided by r^2 at the
+        // shading point. The pool sits ~0.55 m off the tarmac, so 0.6 lands
+        // around 2 lx under a tier-1 drift against a 4.2 key — a clear coloured
+        // wash, not a blowout.
+        this.lights.request(
+          k.id, (k.isPlayer ? 100 : 10) + tier - dist * 0.05, _p, col,
+          (0.25 + 0.35 * tier) * (1 - dist / 45) * this.gain, 5.0);
+      }
+
+      // Scorch under the tyres. Was gated to tier 2+, which meant the entire
+      // blue tier — the one every drift passes through — left nothing behind.
+      fx.scorchAcc += dt * (5 + 2 * tier);
+      if (fx.scorchAcc >= 1) {
+        fx.scorchAcc = 0;
+        const at = Math.random() < 0.5 ? this.skidLRef : this.skidRRef;
+        this.decals.blot(at, fx.groundN, 0.42, DecalTile.Smudge, now, 5.5, 0.25 + 0.12 * tier);
       }
     } else {
       fx.sparkAcc = 0;
+      fx.poolAcc = 0;
+    }
+
+    // Lateral slip, 0..1, from the actual velocity rather than the drift flag.
+    // The drift button is not the only way to end up sideways, and more to the
+    // point a kart that has just released a drift is still sliding — gating the
+    // rubber on `driftDir` is why the hero corner had a kart mid-slide over
+    // perfectly clean tarmac with no trace of the line it took.
+    let slip = 0;
+    if (grounded && speed > 3) {
+      _side.crossVectors(UP, k.forward).normalize();
+      const lat = Math.abs(k.velocity.dot(_side));
+      slip = THREE.MathUtils.clamp((lat / Math.max(speed, 1) - 0.10) / 0.30, 0, 1);
     }
 
     if (drifting) {
       // Smoke is the only thing that gives a drift mass. It has to scale with
       // the charge, or a tier-3 drift looks exactly like a tier-0 one.
       const tier = Math.min(3, k.driftTier);
-      fx.smokeAcc += dt * (20 + 12 * tier) * lod;
+      fx.smokeAcc += dt * (26 + 14 * tier) * lod;
       const n = Math.floor(fx.smokeAcc);
       if (n > 0) {
         fx.smokeAcc -= n;
         this.tyreSmoke(k, fx, this.skidLRef, n, props.dustColor);
         this.tyreSmoke(k, fx, this.skidRRef, n, props.dustColor);
       }
-      // Skid marks are only worth the ring slot where you can actually see
-      // them; further out the mark is sub-pixel and would have faded by the
-      // time the camera got there.
-      if (dist < 70) this.layStrip(fx, now, THREE.MathUtils.clamp(speed / 18, 0.35, 1));
-      else fx.skidding = false;
     } else {
       fx.smokeAcc = 0;
-      if (fx.skidding) { fx.skidding = false; fx.skidStrength = 0; }
+    }
+
+    // Rubber. Laid for anything actually sliding, drifting or not, and out to
+    // 95 m so the pack in front of you leaves a readable line too. Clean tarmac
+    // behind a drifting kart costs the frame its whole sense of history; the
+    // decal ring is 3200 quads and a segment is 0.55 m, so a kart can lay ~40 m
+    // of continuous mark before it starts recycling its own oldest slot.
+    const marking = grounded && speed > 5 && dist < 95 &&
+      (drifting || slip > 0.25) &&
+      fx.surface !== Surface.Water;
+    if (marking) {
+      this.layStrip(fx, now, THREE.MathUtils.clamp(
+        Math.max(slip, drifting ? 0.55 : 0) * Math.min(1, speed / 14), 0.25, 1));
+    } else if (fx.skidding) {
+      fx.skidding = false; fx.skidStrength = 0;
     }
 
     // --- surface reaction: dust, spray, sand ------------------------------
@@ -1256,28 +1495,91 @@ export class Effects implements System {
 
     // --- boost: plume, trail, glow ----------------------------------------
     const boosting = k.boostTime > 0;
+    fx.igniteT = Math.max(0, fx.igniteT - dt);
     if (boosting) {
-      fx.flameAcc += dt * 78 * lod;
+      const btier = Math.min(3, Math.max(1, k.driftTier || 1));
+      fx.flameAcc += dt * 105 * lod;
       const n = Math.floor(fx.flameAcc);
       if (n > 0) { fx.flameAcc -= n; this.boostPlume(k, n); }
       if (fx.trail < 0 && dist < 90) {
-        _col.copy(k.stats?.color ?? C_TIER[1]).lerp(C_HOT, 0.45);
-        // Narrow, dim and short. This is a heat ribbon threading the plume
+        // Boost palette, NOT the livery. Deriving the ribbon colour from the
+        // kart's paint is why the hero boost frame trailed a rust-brown streak
+        // that read as a mud smear: a red kart lerped toward cream lands on
+        // exactly the hue of dried dirt. §3 fixes boost at #4fc3ff / #ff9d2e /
+        // #c05cff and the ribbon has to be one of the three, whatever colour
+        // the car is painted.
+        _col.copy(C_TIER[btier]).lerp(C_FLAME_ROOT, 0.18);
+        // Narrow and short. This is a heat ribbon threading the plume
         // together, not the effect itself — at 0.62 m wide, 1.5x intensity and
         // ~11 m long it was the widest, flattest, brightest thing on screen the
         // moment its tail swung past the chase camera. 4.5 m keeps the whole
         // ribbon in front of the lens at every rig distance.
-        fx.trail = this.trails.acquire(0.34, _col, 0.95, 0.42, 0.16, 0.22, 4.5);
+        fx.trail = this.trails.acquire(0.40, _col, 1.5, 0.5, 0.16, 0.22, 4.5);
       }
       if (fx.trail >= 0) {
         _p.copy(k.position).addScaledVector(k.forward, -0.95); _p.y += 0.50;
         this.trails.push(fx.trail, _p.x, _p.y, _p.z);
+      }
+      // The flame has to light the rear bodywork or it floats on top of it.
+      // Ignition overshoots hard for a third of a second, then settles.
+      if (dist < 55) {
+        _p.copy(k.position).addScaledVector(k.forward, -1.0); _p.y += 0.55;
+        _col.copy(C_TIER[btier]).lerp(C_FLAME_MID, 0.45);
+        const kick = 1 + 1.6 * (fx.igniteT / 0.30);
+        this.lights.request(
+          k.id, (k.isPlayer ? 200 : 60) - dist * 0.05, _p, _col,
+          0.7 * kick * (1 - dist / 55) * this.gain, 7.0);
       }
     } else if (fx.trail >= 0) {
       this.trails.release(fx.trail);
       fx.trail = -1;
     }
     fx.wasBoosting = boosting;
+
+    // --- boost pad contact -------------------------------------------------
+    // The pad is the brightest surface on the circuit and it lit nothing at
+    // all: a kart crossing it was graded exactly as it was a metre earlier.
+    // The pad's own material belongs to the track, but the response of a kart
+    // standing on it is ours, and it is most of what sells the pad.
+    if (grounded && fx.surface === Surface.Boost && speed > 6) {
+      const padCol = C_TIER[1];
+      if (dist < 50) {
+        _p.copy(k.position); _p.y = fx.groundY + 0.7;
+        this.lights.request(
+          // Keys must stay clear of the pool's "unowned" sentinel (-1) and of
+          // the drift/boost keys, which are raw kart ids.
+          1000 + k.id, (k.isPlayer ? 150 : 40) - dist * 0.05, _p, padCol,
+          1.0 * (1 - dist / 50) * this.gain, 6.5);
+      }
+      fx.padAcc += dt * 34 * lod;
+      const np = Math.floor(fx.padAcc);
+      if (np > 0) {
+        fx.padAcc -= np;
+        // Rising heat off the strip plus a wash of pad-blue under the kart.
+        const p = this.particles.reset();
+        p.tile = PTile.Glow; p.mode = PMode.Ground;
+        p.life = 0.35; p.lifeJitter = 0.3;
+        p.size0 = 1.5; p.size1 = 4.0; p.sizeJitter = 0.3;
+        p.drag = 1.2; p.count = 1; p.softness = 0; p.fadeIn = 0.15;
+        this.particles.at(k.position.x, fx.groundY + 0.04, k.position.z);
+        this.particles.vel(k.velocity.x * 0.5, 0, k.velocity.z * 0.5);
+        this.particles.colorA(padCol, 0.75, 0.55);
+        this.particles.colorB(padCol, 0.2, 0);
+        this.particles.emit(true);
+
+        p.mode = PMode.Billboard; p.tile = PTile.Core;
+        p.life = 0.3; p.size0 = 0.09; p.size1 = 0.02; p.sizeJitter = 0.5;
+        p.gravity = 1.6; p.drag = 2.0; p.velJitter = 1.4; p.posJitter = 0.5;
+        p.count = Math.max(1, np >> 1); p.fadeIn = 0.05;
+        this.particles.at(k.position.x, fx.groundY + 0.12, k.position.z);
+        this.particles.vel(0, 2.6, 0);
+        this.particles.colorA(padCol, 3.2, 1);
+        this.particles.colorB(padCol, 0.8, 0);
+        this.particles.emit(true);
+      }
+    } else {
+      fx.padAcc = 0;
+    }
 
     // --- idle exhaust ------------------------------------------------------
     // A pack shot has to look like eight running engines. Every other emitter
@@ -1292,6 +1594,25 @@ export class Effects implements System {
       if (n > 0) { fx.exhaustAcc -= n; this.idleExhaust(k, fx, n); }
     } else {
       fx.exhaustAcc = 0;
+    }
+
+    // --- tyre contact at speed --------------------------------------------
+    // Separate from the exhaust and from the off-road dust: this is the thin
+    // veil a hot tyre throws off tarmac. Without it the hero kart at 92 km/h
+    // emitted *nothing at all* and was indistinguishable from a parked one
+    // while the rival two car-lengths away threw sparks and smoke. Speed-scaled
+    // so it disappears at a crawl and never fights the drift smoke.
+    if (grounded && !drifting && dist < 55) {
+      const sr = THREE.MathUtils.clamp((speed - 11) / 16, 0, 1);
+      if (sr > 0) {
+        fx.rollAcc += dt * 15 * sr * lod;
+        const n = Math.floor(fx.rollAcc);
+        if (n > 0) { fx.rollAcc -= n; this.rollDust(k, fx, n, props.dustColor, sr); }
+      } else {
+        fx.rollAcc = 0;
+      }
+    } else {
+      fx.rollAcc = 0;
     }
 
     // --- star power sparkle trail -----------------------------------------
@@ -1337,12 +1658,20 @@ export class Effects implements System {
     const p = this.particles.reset();
     p.tile = PTile.Core;
     p.mode = PMode.Stretch;
-    p.stretch = 1.7;
-    p.life = 0.24; p.lifeJitter = 0.4;
-    p.size0 = 0.15 + 0.03 * tier; p.size1 = 0.02; p.sizeJitter = 0.35;
+    // Sparks must streak along their own velocity or they read as evenly
+    // scattered decorative confetti composited over the scene — which is
+    // exactly what a uniform 1.7 was producing at chase-camera angles.
+    p.stretch = 3.6;
+    p.life = 0.26; p.lifeJitter = 0.5;
+    p.size0 = 0.15 + 0.03 * tier; p.size1 = 0.02;
+    // 0.5..1.5x. Uniformly-sized sparks are the other half of the confetti
+    // read; real ones come off a tyre in a wide spread of masses.
+    p.sizeJitter = 0.5;
     p.gravity = -13; p.drag = 1.5;
-    p.posJitter = 0.09; p.velJitter = 1.9; p.velScatter = 0.4;
-    p.fadeIn = 0.03; p.count = n;
+    p.posJitter = 0.09; p.velJitter = 2.4; p.velScatter = 0.5;
+    p.fadeIn = 0.03;
+    // Bias the count to the loaded outside wheel, not just its speed.
+    p.count = Math.max(1, Math.round(n * (outside > 1 ? 1.35 : 0.7)));
     this.particles.at(at.x, at.y, at.z);
     // A real 3D cone: backwards, outwards along the wheel's own side, and up.
     _r.crossVectors(UP, _fwd);
@@ -1350,8 +1679,11 @@ export class Effects implements System {
       -_fwd.x * sp * 0.75 + (_side.x * sp + _r.x * splay) * outside,
       2.5 + tier * 0.5,
       -_fwd.z * sp * 0.75 + (_side.z * sp + _r.z * splay) * outside);
-    this.particles.colorA(col, 3.0, 1);
-    this.particles.colorB(col, 1.1, 0);
+    // Authored well above 1.0 so the ADDITIVE core-whitening in Particles has
+    // something to clip: the middle of the sprite blows out to neutral white
+    // and blooms, and the tier hue lives in the falloff around it.
+    this.particles.colorA(col, 4.5, 1);
+    this.particles.colorB(col, 1.2, 0);
     this.particles.emit(true);
 
     // Soft halo behind the cores. Without this the sparks read as a handful of
@@ -1359,11 +1691,15 @@ export class Effects implements System {
     // the whole point of the tier colour.
     p.tile = PTile.Glow;
     p.mode = PMode.Billboard;
+    p.stretch = 0;
     p.life = 0.22;
     p.size0 = 0.52 + 0.10 * tier; p.size1 = 0.12;
     p.count = n;
     p.velJitter = 1.2;
-    this.particles.colorA(col, 1.15, 0.8);
+    // Alpha held down: this halo stacks two per spark at 60+ spawns a second,
+    // and at 0.8 a stationary-ish contact patch accumulated into a solid white
+    // blob that swallowed the tier hue it exists to carry.
+    this.particles.colorA(col, 1.15, 0.62);
     this.particles.colorB(col, 0.35, 0);
     this.particles.emit(true);
 
@@ -1378,6 +1714,61 @@ export class Effects implements System {
     this.particles.colorA(col, 0.75, 0.6);
     this.particles.colorB(col, 0.35, 0);
     this.particles.emit(true);
+  }
+
+  /**
+   * The coloured pool the sparks throw onto the road. Ground-aligned additive
+   * quads under each rear contact patch: no silhouette, cannot intersect the
+   * kart, and it works identically whether or not the light budget could take a
+   * real PointLight. Art bible §6 calls for a ground-scorch decal under drift
+   * sparks; the decal layer is multiplicative so it can only darken, which is
+   * why the *bright* half of that note has to be a particle.
+   */
+  private groundPool(k: IKart, fx: KartFx, col: THREE.Color, tier: number) {
+    const p = this.particles.reset();
+    p.tile = PTile.Glow; p.mode = PMode.Ground;
+    p.life = 0.30; p.lifeJitter = 0.25;
+    p.size0 = 1.0 + 0.18 * tier; p.size1 = 2.2 + 0.4 * tier; p.sizeJitter = 0.25;
+    p.drag = 1.4; p.gravity = 0; p.spin = 0.9;
+    p.posJitter = 0.12; p.count = 1; p.softness = 0; p.fadeIn = 0.12;
+    // Inherits the kart's velocity so the pool tracks the car instead of being
+    // left behind as a stationary blob of light on empty tarmac.
+    this.particles.vel(k.velocity.x * 0.75, 0, k.velocity.z * 0.75);
+    this.particles.colorA(col, 0.55 + 0.16 * tier, 0.60);
+    this.particles.colorB(col, 0.14, 0);
+    for (let s = 0; s < 2; s++) {
+      const at = s === 0 ? this.skidLRef : this.skidRRef;
+      this.particles.at(at.x, fx.groundY + 0.04, at.z);
+      this.particles.emit(true);
+    }
+  }
+
+  /**
+   * Thin tyre-contact veil under a kart that is simply travelling fast. Every
+   * other emitter in this file needs the kart to be drifting, boosting, stunned
+   * or off-road, so a clean fast lap emitted nothing and the frame had no sense
+   * of speed outside the HUD number.
+   */
+  private rollDust(k: IKart, fx: KartFx, n: number, dust: THREE.Color, sr: number) {
+    const road = fx.surface === Surface.Road || fx.surface === Surface.Boost;
+    _col.copy(road ? C_SMOKE : dust).lerp(this.sunColor, 0.35);
+    _fwd.copy(k.forward);
+    const p = this.particles.reset();
+    p.tile = PTile.Smoke; p.mode = PMode.Billboard;
+    p.life = 0.55; p.lifeJitter = 0.4;
+    p.size0 = 0.16; p.size1 = 0.95 + 0.5 * sr; p.sizeJitter = 0.45;
+    p.gravity = 0.7; p.drag = 2.6; p.spin = 1.3;
+    p.posJitter = 0.14; p.velJitter = 0.9; p.fadeIn = 0.14;
+    p.groundY = fx.groundY; p.softness = 0.9; p.count = n;
+    // Deliberately faint: this is a veil that says "moving", not a smoke screen.
+    this.particles.colorA(_col, 1.0, 0.11 + 0.16 * sr);
+    this.particles.colorB(_col, 0.8, 0);
+    for (let s = 0; s < 2; s++) {
+      const at = s === 0 ? this.skidLRef : this.skidRRef;
+      this.particles.at(at.x, at.y + 0.10, at.z);
+      this.particles.vel(-_fwd.x * 1.6, 0.7, -_fwd.z * 1.6);
+      this.particles.emit(false);
+    }
   }
 
   private burstSparks(at: THREE.Vector3, col: THREE.Color, n: number, intensity: number) {
@@ -1403,11 +1794,16 @@ export class Effects implements System {
     _col2.copy(_col).lerp(C_SMOKE_DARK, 0.5);
     const p = this.particles.reset();
     p.tile = PTile.Smoke; p.mode = PMode.Billboard;
-    p.life = 1.25; p.lifeJitter = 0.3;
-    p.size0 = 0.7; p.size1 = 2.9; p.sizeJitter = 0.3;
-    p.gravity = 1.1; p.drag = 1.7; p.spin = 0.8;
-    p.posJitter = 0.16; p.velJitter = 1.1; p.fadeIn = 0.10;
-    p.groundY = fx.groundY; p.softness = 0.75;
+    p.life = 1.25; p.lifeJitter = 0.35;
+    // Wide per-particle scale and rotation spread: a cloud of identically sized
+    // puffs turning at the same rate has no internal structure and reads as one
+    // flat decal, which is exactly how the drift smoke was landing.
+    p.size0 = 0.62; p.size1 = 2.9; p.sizeJitter = 0.55;
+    p.gravity = 1.1; p.drag = 1.7; p.spin = 1.5;
+    p.posJitter = 0.24; p.velJitter = 1.5; p.velScatter = 0.35; p.fadeIn = 0.10;
+    // Deeper soft fade so the puff dissolves into the tarmac over a metre
+    // instead of terminating on the intersection line.
+    p.groundY = fx.groundY; p.softness = 1.15;
     p.count = n;
     _fwd.copy(k.forward);
     // Spawned clear of the ground plane: at 0.08 m the soft-particle fade was
@@ -1425,11 +1821,11 @@ export class Effects implements System {
     for (let s = 0; s < 2; s++) {
       const at = s === 0 ? this.skidLRef : this.skidRRef;
       const p = this.particles.p;
-      p.tile = PTile.Smoke; p.life = 0.95; p.lifeJitter = 0.3;
-      p.size0 = 0.5 * size; p.size1 = 2.2 * size; p.sizeJitter = 0.3;
-      p.gravity = 0.8; p.drag = 2.2; p.spin = 1.0;
-      p.posJitter = 0.2; p.velJitter = 1.8; p.fadeIn = 0.1;
-      p.groundY = fx.groundY; p.softness = 0.75; p.count = n;
+      p.tile = PTile.Smoke; p.life = 0.95; p.lifeJitter = 0.35;
+      p.size0 = 0.5 * size; p.size1 = 2.2 * size; p.sizeJitter = 0.5;
+      p.gravity = 0.8; p.drag = 2.2; p.spin = 1.6;
+      p.posJitter = 0.24; p.velJitter = 1.8; p.fadeIn = 0.1;
+      p.groundY = fx.groundY; p.softness = 1.1; p.count = n;
       _col.copy(C_SMOKE).lerp(this.sunColor, 0.30);
       this.particles.at(at.x, at.y + 0.28, at.z);
       this.particles.vel(0, 1.7, 0);
@@ -1541,7 +1937,27 @@ export class Effects implements System {
     _fwd.copy(k.forward);
     _side.crossVectors(UP, _fwd).normalize();
     const tier = k.driftTier > 0 ? k.driftTier : 1;
-    _col.copy(C_TIER[Math.min(3, tier)]).lerp(C_HOT, 0.55);
+    _col.copy(C_TIER[Math.min(3, tier)]);
+    // Length is modulated by how much boost is left, so the plume flares on
+    // ignition and shortens as the boost runs out instead of switching off.
+    const burn = THREE.MathUtils.clamp(k.boostTime / 0.9, 0.35, 1);
+
+    // THE reason the boost frame had no flame in it.
+    //
+    // Particles are simulated in WORLD space. A plume emitted with a purely
+    // local velocity is, in world terms, *stationary* — so a kart doing 33 m/s
+    // leaves each puff exactly where it was born and by the end of a 0.24 s life
+    // the "plume" is smeared eight metres down the road behind the car. What
+    // reaches the frame is a scatter of unrelated bright specks along the tarmac,
+    // which is precisely what the review called "no flame plume, just sparks".
+    //
+    // Inheriting most of the kart's velocity and letting drag bleed it off is
+    // what turns that back into a tongue: the flame holds station at the stacks
+    // for the first few hundredths of a second and then falls back over roughly
+    // 1.5 m. `keep` is per-layer, so the hot root stays welded to the exhaust and
+    // the cooling embers stream further back — which is the shape of a real
+    // afterburner and the thing that makes the plume read as attached.
+    const vx = k.velocity.x, vy = k.velocity.y, vz = k.velocity.z;
 
     for (let s = 0; s < 2; s++) {
       const sx = s === 0 ? -0.34 : 0.34;
@@ -1551,38 +1967,63 @@ export class Effects implements System {
       _p.y += 0.58;
 
       const p = this.particles.reset();
-      p.tile = PTile.Flame; p.mode = PMode.Stretch; p.stretch = 0.85;
-      // Short life plus heavy drag caps the plume at roughly 0.5 m of travel,
-      // so it stays a tongue off the stack and never becomes a streamer.
-      p.life = 0.17; p.lifeJitter = 0.25;
-      p.size0 = 0.42; p.size1 = 0.10; p.sizeJitter = 0.22;
-      p.gravity = 3.4; p.drag = 12.0;
-      p.posJitter = 0.05; p.velJitter = 0.9; p.velScatter = 0.22;
-      p.fadeIn = 0.05; p.count = n;
+      p.tile = PTile.Flame; p.mode = PMode.Stretch; p.stretch = 1.6;
+      p.life = 0.16 + 0.08 * burn; p.lifeJitter = 0.25;
+      p.size0 = 0.30 + 0.22 * burn; p.size1 = 0.10; p.sizeJitter = 0.28;
+      p.gravity = 2.6; p.drag = 3.0;
+      p.posJitter = 0.05; p.velJitter = 0.9; p.velScatter = 0.18;
+      p.fadeIn = 0.06; p.count = n;
       p.groundY = fx.groundY; p.softness = 0.6;
       this.particles.at(_p.x, _p.y, _p.z);
       this.particles.vel(
-        -_fwd.x * 6.0 + _side.x * sx * 3.6, 2.5, -_fwd.z * 6.0 + _side.z * sx * 3.6);
-      this.particles.colorA(C_HOT, 1.35, 0.95);
-      this.particles.colorB(C_FLAME_COOL, 0.40, 0);
+        vx * 0.94 - _fwd.x * 3.0 + _side.x * sx * 2.4,
+        vy * 0.94 + 1.8,
+        vz * 0.94 - _fwd.z * 3.0 + _side.z * sx * 2.4);
+      // Blue-white at the root grading to orange at the tip, per §6. The old
+      // ramp went cream -> deep red, which through ACES is a brown smear: it
+      // had no hue anywhere near the flame temperature it was meant to imply,
+      // and the tail landed *below* the bloom threshold so nothing glowed.
+      this.particles.colorA(C_FLAME_ROOT, 2.2, 0.95);
+      this.particles.colorB(C_FLAME_MID, 0.85, 0);
       this.particles.emit(true);
 
-      // Bright core at the stack mouth: small, hot, and NOT stretched, so the
-      // plume has an unambiguous point of origin instead of floating loose.
+      // Bright core at the stack mouth: small, hot, pinned hardest to the kart
+      // and NOT stretched, so the plume has an unambiguous point of origin
+      // instead of floating loose. Authored above the bloom threshold on
+      // purpose — this is the part that must clip to white and bleed.
       p.tile = PTile.Glow; p.mode = PMode.Billboard; p.stretch = 0;
-      p.life = 0.12; p.size0 = 0.30; p.size1 = 0.07;
-      p.count = Math.max(1, n >> 1); p.velJitter = 0.4; p.drag = 14;
-      this.particles.colorA(C_HOT, 2.6, 1);
-      this.particles.colorB(C_FLAME_MID, 0.8, 0);
+      p.life = 0.11; p.size0 = 0.20 + 0.10 * burn; p.size1 = 0.05;
+      p.count = Math.max(1, n >> 1); p.velJitter = 0.4; p.drag = 5;
+      this.particles.vel(vx, vy + 0.6, vz);
+      this.particles.colorA(C_FLAME_ROOT, 3.0, 1);
+      this.particles.colorB(C_FLAME_MID, 1.0, 0);
       this.particles.emit(true);
 
       // Wide, dim tier-coloured halo. This is what carries the mini-turbo
       // colour at a glance; the flame body is too hot to hold a hue.
       p.tile = PTile.Glow; p.life = 0.20;
-      p.size0 = 0.72; p.size1 = 1.15; p.sizeJitter = 0.3;
-      p.count = Math.max(1, n >> 1); p.drag = 9;
-      this.particles.colorA(_col, 0.55, 0.55);
-      this.particles.colorB(_col, 0.16, 0);
+      p.size0 = 0.50; p.size1 = 0.80 * burn + 0.35; p.sizeJitter = 0.3;
+      p.count = Math.max(1, n >> 1); p.drag = 4;
+      this.particles.vel(vx * 0.92 - _fwd.x * 2.0, vy * 0.92 + 1.2, vz * 0.92 - _fwd.z * 2.0);
+      this.particles.colorA(_col, 0.85, 0.5);
+      this.particles.colorB(_col, 0.20, 0);
+      this.particles.emit(true);
+
+      // Erosion at the tail: a sparse scatter of cooling embers, held back
+      // harder so the plume dissipates into the slipstream rather than ending
+      // on a clean edge. Streak, not Core — the core tile's cross flare reads
+      // as a decorative sparkle at this size.
+      p.tile = PTile.Streak; p.mode = PMode.Stretch; p.stretch = 3.0;
+      p.life = 0.24; p.lifeJitter = 0.5;
+      p.size0 = 0.06; p.size1 = 0.015; p.sizeJitter = 0.5;
+      p.gravity = -3.0; p.drag = 1.6; p.velJitter = 2.0; p.velScatter = 0.4;
+      p.count = Math.max(1, n >> 1);
+      this.particles.vel(
+        vx * 0.70 - _fwd.x * 2.5 + _side.x * sx * 1.6,
+        vy * 0.70 + 1.0,
+        vz * 0.70 - _fwd.z * 2.5 + _side.z * sx * 1.6);
+      this.particles.colorA(C_FLAME_MID, 2.4, 1);
+      this.particles.colorB(C_FLAME_COOL, 0.9, 0);
       this.particles.emit(true);
     }
   }
@@ -1607,7 +2048,11 @@ export class Effects implements System {
       _p.copy(k.position).addScaledVector(_fwd, -0.85).addScaledVector(_side, sx);
       _p.y += 0.58;
       this.particles.at(_p.x, _p.y, _p.z);
-      this.particles.vel(-_fwd.x * 2.2, 1.3, -_fwd.z * 2.2);
+      // Partial velocity inheritance: exhaust should trail, but a world-static
+      // wisp on a kart at 25 m/s strings itself over fifteen metres of road and
+      // stops reading as coming out of the stacks at all.
+      this.particles.vel(
+        k.velocity.x * 0.72 - _fwd.x * 1.6, k.velocity.y * 0.72 + 1.1, k.velocity.z * 0.72 - _fwd.z * 1.6);
       this.particles.emit(false);
     }
   }
@@ -1787,10 +2232,16 @@ export class Effects implements System {
     // 3 mm, and it halves how fast a pack fight can churn through the ring.
     if (fx.skidL.distanceToSquared(this.skidLRef) < 0.3) return;
     const life = 13;
-    this.decals.skid(fx.skidL, this.skidLRef, fx.groundN, 0.30,
-      prevS * strength * 0.85, fx.skidStrength * strength * 0.85, now, life);
-    this.decals.skid(fx.skidR, this.skidRRef, fx.groundN, 0.30,
-      prevS * strength * 0.85, fx.skidStrength * strength * 0.85, now, life);
+    // Wider and considerably darker than they were. At 0.30 m and a 0.30 grey
+    // multiplier the mark was a faint smudge that vanished into a tarmac
+    // already at #4a4a52 — reviewers looking at a mid-drift hero frame read the
+    // road as perfectly clean. Hot rubber on tarmac is nearly black.
+    const w = 0.36;
+    const a0 = prevS * strength, a1 = fx.skidStrength * strength;
+    this.decals.skid(fx.skidL, this.skidLRef, fx.groundN, w, a0, a1, now, life,
+      0.17, 0.16, 0.19);
+    this.decals.skid(fx.skidR, this.skidRRef, fx.groundN, w, a0, a1, now, life,
+      0.17, 0.16, 0.19);
     fx.skidL.copy(this.skidLRef);
     fx.skidR.copy(this.skidRRef);
   }
@@ -1898,6 +2349,7 @@ export class Effects implements System {
     this.gulls?.dispose();
     this.shimmer?.dispose();
     this.shells?.dispose();
+    this.lights?.dispose();
     this.group.removeFromParent();
   }
 }

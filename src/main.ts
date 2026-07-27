@@ -4,6 +4,7 @@ import { Bus } from './core/Bus';
 import { createSettings } from './core/Settings';
 import { Input } from './core/Input';
 import { RenderPipeline } from './render/Renderer';
+import { DrawBudget } from './render/DrawBudget';
 import { Sky } from './render/Sky';
 import { Materials } from './render/Materials';
 import { Track } from './world/Track';
@@ -29,6 +30,7 @@ const race = new Race();
 const camera = new ChaseCamera();
 const hud = new HUD();
 const audio = new Audio();
+const drawBudget = new DrawBudget();
 
 const ctx: Ctx = {
   renderer: null as any,
@@ -76,8 +78,11 @@ const ctx: Ctx = {
 //               off Items — the hazard array and the racing line — which are
 //               valid before Items.init runs).
 //   effects / camera / hud / audio — all consume the karts.
+//   drawBudget — LOD and shadow culling, measured from the posed camera, so it
+//               must be last: its lateUpdate has to run after the chase rig's.
 const systems: System[] = [
   pipeline, input, sky, materials, track, scenery, race, items, effects, camera, hud, audio,
+  drawBudget,
 ];
 
 async function boot() {
@@ -126,3 +131,5 @@ boot().catch((err) => {
 
 // Expose for the screenshot harness / debugging.
 (window as any).__ctx = ctx;
+// tools/perf.mjs turns this off to measure the un-LODed field for a before/after.
+(window as any).__drawBudget = drawBudget;

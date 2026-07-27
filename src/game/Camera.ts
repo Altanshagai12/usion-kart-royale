@@ -11,10 +11,30 @@
  *     response is identical at 30, 60 and 144 Hz. There is not one raw
  *     per-frame lerp constant anywhere in this file.
  *
+ *   - It is a LENS before it is a rig. 50 degrees vertical is 79 horizontal at
+ *     16:9 — generous for an arcade racer, and less than half the solid angle
+ *     of the 91-99 degrees this file used to run. Focal length is what decides
+ *     whether the kart is a subject or a dot, whether the kerbs are in frame
+ *     beside it or thirty degrees outside the frustum, and whether the road
+ *     spreads out underneath the camera or compresses toward the horizon. No
+ *     amount of rig tuning survives the wrong lens.
+ *
+ *   - The eye is LOW and the axis is LEVEL. The lens sits under two metres
+ *     above the chassis on a six-and-a-half metre arm, and the aim point sits
+ *     *higher* than the eye, so the view axis runs a fraction of a degree up.
+ *     A chase camera that looks down is a map; the horizon belongs near the
+ *     middle of the frame and the kart belongs at the bottom of it.
+ *
  *   - The arm follows the direction of TRAVEL, not the direction the chassis
  *     points. During a drift it stays behind the velocity heading, so the kart
  *     visibly slides sideways across the frame. That single detail is most of
  *     what makes a kart racer read as a kart racer.
+ *
+ *   - Every corner composes, not just the drifted ones. The arm spring's own
+ *     lag behind the heading is measured and fed back as lean, outside swing
+ *     and a little more lag, so a fast sweeper is never framed identically to
+ *     a straight — which is what "the camera never leans, swings or tilts"
+ *     actually meant.
  *
  *   - A drift is a composition, not a rotation. On top of the travel heading
  *     the rig yaws its aim into the corner, slides laterally toward the outside
@@ -55,17 +75,53 @@ import { BASE_TOP_SPEED, RaceState, type Ctx, type IKart, type System, type Trac
 //  Tuning
 // ---------------------------------------------------------------------------
 
-const FOV_BASE = 60;
+/**
+ * Vertical FOV, degrees.
+ *
+ * This is the single most consequential number in the file and it was the
+ * root cause of round one's "grey wedge with a small red dot": 60 vertical at
+ * 16:9 is **91.5 degrees horizontal**, and speed opened it to 99. At that
+ * focal length a 2 m kart eight metres away subtends 6-9% of frame width, a
+ * 26 m wide road spans thirteen metres at the bottom edge with both kerbs
+ * outside the frustum, and every piece of trackside dressing is squeezed into
+ * the last few percent at the frame edge. Nothing downstream — not scenery
+ * density, not lighting — can beat a lens that wide.
+ *
+ * 50 vertical is 79 degrees horizontal, which is still a generous arcade field
+ * (a shipped kart racer sits around 75-80) but puts the kart at 13-14% of
+ * frame width, cuts the bare road across the bottom edge from ~13 m to ~9 m,
+ * and roughly doubles the apparent size of everything in the midground.
+ */
+const FOV_BASE = 50;
 /** Vertical FOV is derived from this reference aspect whenever the frame is
  *  narrower, so a tall window widens the lens instead of cropping the road. */
 const REF_ASPECT = 16 / 9;
 
-const ARM_DIST = 6.9;        // metres behind the pivot at rest
-const ARM_DIST_SPEED = 2.5;  // extra length at full speed
-const ARM_HEIGHT = 3.02;     // metres above the pivot at rest
-const ARM_HEIGHT_SPEED = -0.5;
+/**
+ * Arm geometry.
+ *
+ * Height is measured from the chassis COM, so the eye sits ARM_HEIGHT +
+ * PIVOT_UP above it and about a third of a metre more above the road. The old
+ * 3.02 + 0.62 put the lens 3.6 m up over an 8-9 m arm — a 21 degree look-down
+ * onto a road that is up to 26 m wide, which is a helicopter shot, not a chase
+ * camera. 1.34 + 0.62 is roughly shoulder height on the roll bar: the road
+ * plane compresses toward the horizon instead of spreading out underneath.
+ */
+const ARM_DIST = 6.6;        // metres behind the pivot at rest
+const ARM_DIST_SPEED = 1.8;  // extra length at full speed
+const ARM_HEIGHT = 1.34;     // metres above the pivot at rest
+const ARM_HEIGHT_SPEED = -0.16;
 const PIVOT_UP = 0.62;       // the arm hangs off a point above the chassis COM
-const AIM_UP = 1.26;
+/**
+ * Aim height above the kart. Sits *above* the eye, so the view axis is level
+ * to a fraction of a degree up rather than the 4+ degrees down it used to be.
+ * That is what lifts the horizon off 0.44 of frame height and stops the lower
+ * half of every frame being tarmac.
+ */
+const AIM_UP = 2.10;
+/** Height of the corner-lead aim point over the road, metres. Paired with
+ *  AIM_UP: the lead is blended in at 0.2, so both set the final pitch. */
+const AIM_LEAD_UP = 2.45;
 
 const POS_SMOOTH = 0.155;    // eye spring — the "weight" of the rig
 const AIM_SMOOTH = 0.095;    // aim spring — stiffer, keeps the kart framed
@@ -87,13 +143,34 @@ const ROLL_GAIN = 0.68;
 const MAX_ROLL = 0.42;       // ~24 degrees — bank plus the drift lean, no more
 
 // --- drift framing -------------------------------------------------------
-/** peak yaw of the aim into the corner, radians (~14 deg at full tier) */
-const DRIFT_YAW = 0.245;
+/** peak yaw of the aim into the corner, radians (~15.5 deg at full tier) */
+const DRIFT_YAW = 0.272;
 /** lateral shift of the eye, metres, toward the outside of the slide */
-const DRIFT_RIG_LAT = 0.85;
-/** extra lean, radians: base plus per-tier, ~4.0 to 7.4 degrees */
-const DRIFT_ROLL = 0.070;
-const DRIFT_ROLL_TIER = 0.058;
+const DRIFT_RIG_LAT = 1.05;
+/** extra lean, radians: base plus per-tier, ~4.6 to 8.0 degrees */
+const DRIFT_ROLL = 0.080;
+const DRIFT_ROLL_TIER = 0.060;
+
+// --- cornering, drifting or not ------------------------------------------
+/**
+ * The rig used to do nothing at all through an ordinary corner: the arm
+ * followed the heading, the up vector followed the road, and a fast sweeping
+ * left-hander was framed exactly like a straight. Only a *drift* changed the
+ * composition, which is why ten screenshots read as one locked shot.
+ *
+ * `turn` is the sine of the angle by which the smoothed arm trails the kart's
+ * actual heading — zero on a straight, and proportional to yaw rate through a
+ * corner, for free, because the arm spring already produces the lag. It drives
+ * three things: the camera leans into the corner, the eye swings wide of the
+ * arc, and the arm lags a little further so the rig arrives late.
+ */
+const CORNER_ROLL = 0.42;        // radians of lean per unit of lag
+const CORNER_ROLL_MAX = 0.078;   // ~4.5 degrees, on top of bank and drift lean
+const CORNER_LAT = 6.0;          // metres of outside swing per unit of lag
+const CORNER_LAT_MAX = 1.15;
+/** extra arm smoothing under cornering — bounded, or the lag feeds itself */
+const CORNER_LAG = 0.25;
+const CORNER_LAG_MAX = 0.05;
 
 // --- vista: how the rig reacts to ground falling away beside the road ----
 /** how far past the road edge the terrain is interrogated, metres */
@@ -102,28 +179,37 @@ const VISTA_PROBE = 26;
 const VISTA_MIN = 2.0;
 const VISTA_MAX = 13.0;
 /**
- * Extra arm height over a full drop. Sized off the geometry it has to beat:
- * on a 20 degree bank with a 13 m half-width the outer kerb crest stands 4.5 m
- * above the centreline, so a 3 m eye is *below* the lip of the corner it is
- * driving and the bay behind it cannot be in frame at any pitch. 5.8 m clears
- * the crest with a usable wedge of sea beyond it.
+ * Extra arm height over a full drop.
+ *
+ * This was 2.75 m on top of a 3 m arm and it was the *other* half of round
+ * one's blocker: the coastal and bay sections — precisely the ones the shot
+ * list calls the money shot — ran the rig at nearly six metres and pitched it
+ * down to match, which is where "bare tarmac occupies the bottom half" came
+ * from. The lift is worth keeping (it does open the bay out from behind the
+ * outer kerb) but it has to be a lift, not a crane: 1.3 m over a 1.34 m arm is
+ * already a near-doubling of eye height, and the aim rises almost as far so
+ * the net extra look-down is about a degree instead of seven.
  */
-const VISTA_HEIGHT = 2.75;
-const VISTA_DIST = 0.6;      // and a touch further back so it isn't top-down
-const VISTA_AIM_UP = 1.0;    // aim rises less than the eye -> ~7 deg of pitch
+const VISTA_HEIGHT = 1.30;
+const VISTA_DIST = 0.35;     // and a touch further back so it isn't top-down
+const VISTA_AIM_UP = 0.72;   // aim rises nearly as far -> ~1 deg of pitch
 /** lean the eye out over the drop — the cheapest metre of sightline there is */
-const VISTA_EYE_LAT = 1.6;
+const VISTA_EYE_LAT = 1.25;
 
 /**
  * How far below the view axis the player's kart is allowed to sit, radians.
- * ~20 degrees, which at the stock 64 degree vertical FOV lands it a fifth of
- * the way up from the bottom edge: low in frame, the way a chase camera should
- * sit, but clear of the speedo and unambiguously *in* the frame.
+ * ~16.3 degrees. This is a screen-space limit expressed as an angle, so it had
+ * to come down with the lens: at the old 60-66 degree vertical FOV 0.35 rad
+ * left the kart at 0.78 of frame height, at 50-55 it would put it at 0.85 and
+ * into the speedo. 0.285 holds it at 0.78-0.81 across the speed range.
  */
-const MAX_SUBJECT_DROP = 0.35;
+const MAX_SUBJECT_DROP = 0.285;
 
 const CAM_RADIUS = 0.55;     // collision probe radius
-const GROUND_CLEAR = 0.85;   // minimum metres between the eye and the ground
+/** Minimum metres between the eye and the ground. Lower than it was, because
+ *  the arm itself is now less than half as tall — at 0.85 the sweep tripped on
+ *  every crest between the lens and the kart and the rig pumped. */
+const GROUND_CLEAR = 0.68;
 const ARM_RECOVER = 0.55;    // seconds for the arm to ease back out after a hit
 
 const INTRO_DUR = 3.55;      // countdown fly-in length
@@ -238,6 +324,10 @@ export class ChaseCamera implements System {
   private driftVel = { v: 0 };
   private tierAmt = 0;       // 0..1, smoothed mini-turbo charge tier
   private tierVel = { v: 0 };
+  private turn = 0;          // signed cornering lag: +1 side = turning right
+  private turnVel = { v: 0 };
+  private boostAmt = 0;      // 0..1, smoothed "boost is live"
+  private boostVel = { v: 0 };
   private vista = 0;         // 0..1, how much the ground falls away beside us
   private vistaVel = { v: 0 };
   private vistaSide = 0;     // signed: +1 the drop is to the right, -1 left
@@ -272,6 +362,8 @@ export class ChaseCamera implements System {
   private smp: TrackSample | null = null;
   private smpV: TrackSample | null = null;
   private blockers: THREE.Mesh[] = [];
+  /** built lazily, and only ever in the `wide` harness mode (see poseWide) */
+  private wideBlockers: THREE.Object3D[] | null = null;
   private blockerBox = new THREE.Box3();
   private hasBlockers = false;
   private ray = new THREE.Raycaster();
@@ -383,6 +475,11 @@ export class ChaseCamera implements System {
     this.tierAmt = damp1(this.tierAmt, drifting ? clamp(k.driftTier / 3, 0, 1) : 0, this.tierVel, 0.22, dt);
     const braking = ctx.input.state.brake > 0.4 && k.forwardSpeed > 5 ? 1 : 0;
     this.brakeAmt = damp1(this.brakeAmt, braking, this.brakeVel, 0.2, dt);
+    // Boost drops the rig rather than pitching it: a lower eye already puts
+    // more road under the kart, and a nose-down camera at 45 m/s is the exact
+    // frame the composition notes are trying to get rid of.
+    const boosting = k.boostTime > 0 ? 1 : 0;
+    this.boostAmt = damp1(this.boostAmt, boosting, this.boostVel, boosting ? 0.11 : 0.30, dt);
 
     // lookBack is specified as a rising edge but plays naturally as a held
     // button; a short hold window makes both spellings behave sensibly.
@@ -468,8 +565,20 @@ export class ChaseCamera implements System {
     // Extra lean into the drift, deepening with the mini-turbo tier. On top of
     // a banked corner this is what takes the horizon past twenty degrees on the
     // money shot; on a flat one it is the only thing that says "sideways".
+    //
+    // The cornering lean underneath it is the same idea for the eighty percent
+    // of corners nobody drifts through: a couple of degrees of tilt into the
+    // arc, so a sweeping left-hander is never framed identically to a straight.
+    // Both are gated to the chase rig — an establishing plate wants a level
+    // horizon, and the hero shot is composed about the chassis, not the corner.
+    let lean = 0;
+    if (mode === 'chase') {
+      lean = clamp(this.turn * CORNER_ROLL, -CORNER_ROLL_MAX, CORNER_ROLL_MAX);
+    }
     if (this.driftAmt > 1e-3) {
-      const lean = (DRIFT_ROLL + DRIFT_ROLL_TIER * this.tierAmt) * this.driftSigned;
+      lean += (DRIFT_ROLL + DRIFT_ROLL_TIER * this.tierAmt) * this.driftSigned;
+    }
+    if (Math.abs(lean) > 1e-4) {
       _q.setFromAxisAngle(this.arm, lean);
       _up.applyQuaternion(_q);
     }
@@ -524,10 +633,25 @@ export class ChaseCamera implements System {
     }
     if (w > 0) _face.lerp(_vel, Math.min(w, 0.92)).normalize();
 
+    // How far the settled arm trails the heading, signed about the camera up.
+    // On a straight this is zero; through a corner it is yaw rate times the
+    // arm's own smoothing time, which is exactly the "the camera is late"
+    // quantity the composition wants. Measured before the spring is advanced,
+    // so it describes the lag the frame is about to be rendered with.
+    _right.crossVectors(this.arm, this.upSm);
+    if (_right.lengthSq() > 1e-6) {
+      _right.normalize();
+      this.turn = damp1(this.turn, clamp(_face.dot(_right), -0.35, 0.35), this.turnVel, 0.17, dt);
+    } else {
+      this.turn = damp1(this.turn, 0, this.turnVel, 0.17, dt);
+    }
+
     // Look-back is applied later as a yaw offset on the settled arm: springing
     // the direction vector itself through an antipode is degenerate, and
     // orbiting the arm is what gives the whip-round its arc.
-    damp3(this.arm, _face, this.armVel, 0.12 + this.driftAmt * 0.05, dt);
+    const lag = 0.12 + this.driftAmt * 0.05
+      + Math.min(CORNER_LAG_MAX, Math.abs(this.turn) * CORNER_LAG);
+    damp3(this.arm, _face, this.armVel, lag, dt);
     // Insurance against a degenerate spin-out passing through the antipode.
     if (this.arm.lengthSq() < 1e-6) { this.arm.copy(_face); this.armVel.set(0, 0, 0); }
     this.arm.normalize();
@@ -537,11 +661,13 @@ export class ChaseCamera implements System {
   //  Vista — "is there anything to look at out there?"
   // =======================================================================
   //
-  //  The round-one coastal frames failed on geometry, not on dressing: an eye
-  //  three metres above a twenty-six metre wide banked road sees tarmac to the
-  //  horizon and nothing else, because the road plane subtends the entire lower
-  //  frame and the outer kerb is above the eyeline. No amount of scenery fixes
-  //  that; the rig has to get above the road.
+  //  Careful with this one: it is a *lift*, and round one proved that a lift
+  //  sized like a crane is worse than no lift at all. Hoisting the eye and
+  //  pitching down to compensate is exactly how the coastal sections — the
+  //  money shot — ended up as half a frame of tarmac with the bay squeezed
+  //  into a strip. The gain below is now a fraction of what it was, and the
+  //  aim rises almost as far as the eye, so the drop enters frame by parallax
+  //  rather than by pointing the camera at the floor.
   //
   //  So: measure. Probe the ground a fixed distance outboard of each kerb and
   //  compare it with the centreline. A drop means there is a view — the sea off
@@ -653,10 +779,10 @@ export class ChaseCamera implements System {
     // Looking back is the one time the view must not be hoisted over a cliff:
     // the point of it is the kart behind you.
     const vista = this.vista * (1 - this.lookAmt);
-    let dist = ARM_DIST + ARM_DIST_SPEED * sp + surge * 2.4 - this.brakeAmt * 0.85 - this.lookAmt * 1.4
-      + VISTA_DIST * vista;
+    let dist = ARM_DIST + ARM_DIST_SPEED * sp + surge * 2.0 - this.brakeAmt * 0.85 - this.lookAmt * 1.4
+      - this.boostAmt * 0.25 + VISTA_DIST * vista;
     let height = ARM_HEIGHT + ARM_HEIGHT_SPEED * sp - this.brakeAmt * 0.3 + this.lookAmt * 0.25
-      + VISTA_HEIGHT * vista;
+      - this.boostAmt * 0.30 + VISTA_HEIGHT * vista;
     if (k.airborne) height += 0.35;
 
     // Sweep the arm for obstructions and pull it in on a hit. Recovery is
@@ -664,7 +790,10 @@ export class ChaseCamera implements System {
     const hit = this.sweepArm(ctx, k, _pivot, _dir, dist, height);
     if (hit < this.armFrac) { this.armFrac = hit; this.armFracVel.v = 0; }
     else this.armFrac = damp1(this.armFrac, hit, this.armFracVel, ARM_RECOVER, dt);
-    const f = clamp(this.armFrac, 0.28, 1);
+    // Floor raised with the shorter arm: 0.28 of 6.9 m still cleared the roll
+    // bar, 0.28 of 6.6 m at a third of the height does not. 0.38 keeps the eye
+    // outside the driver in the worst pinch the sweep can produce.
+    const f = clamp(this.armFrac, 0.38, 1);
 
     _eye.copy(_pivot).addScaledVector(_dir, -dist * f).addScaledVector(this.upSm, height * f);
 
@@ -682,24 +811,38 @@ export class ChaseCamera implements System {
     // the kart simply rotating in place.
     if (this.driftAmt > 1e-3) _eye.addScaledVector(_right, -this.driftSigned * DRIFT_RIG_LAT);
 
+    // Swing wide of the arc. Same sign convention as the drift offset — the
+    // eye goes to the *outside* of the corner — but it needs no drift to fire,
+    // so an ordinary fast sweeper stops being framed like a straight. Faded
+    // out under look-back, where the whole point is what is behind you.
+    const swing = clamp(this.turn * CORNER_LAT, -CORNER_LAT_MAX, CORNER_LAT_MAX) * (1 - this.lookAmt);
+    if (Math.abs(swing) > 1e-3) _eye.addScaledVector(_right, -swing);
+
     // Both offsets are lateral, so the arm sweep (which only walks the arm
     // itself) cannot see them. One analytic wall query resolves it — and it is
     // a resolve, not a bail-out, so the composition survives a brush past a
     // guardrail instead of snapping back to centre.
-    if (vista > 1e-3 || this.driftAmt > 1e-3) {
+    if (vista > 1e-3 || this.driftAmt > 1e-3 || Math.abs(swing) > 1e-3) {
       const w = ctx.track.collideWalls(_eye, CAM_RADIUS, k.t);
       if (w) _eye.add(w.push);
     }
 
     // Aim ahead along the arm, plus a lead into the coming corner so the apex
     // is on screen before the kart gets there.
-    _aim.copy(k.position).addScaledVector(this.upSm, AIM_UP - this.brakeAmt * 0.42);
+    //
+    // The aim now sits *above* the eye, which is the whole recomposition: the
+    // view axis runs level to a fraction of a degree up instead of four
+    // degrees down, so the horizon leaves the upper third and the road stops
+    // owning the bottom half of the frame. Braking and boost are the two times
+    // it is allowed to nose over, and both by about a degree.
+    _aim.copy(k.position)
+      .addScaledVector(this.upSm, AIM_UP - this.brakeAmt * 0.42 - this.boostAmt * 0.25);
     _aim.addScaledVector(_dir, (5.2 + 4.6 * sp) * (1 - 0.35 * this.lookAmt));
 
     if (this.lookAmt < 0.5) {
       const ahead = (24 + 30 * sp) / Math.max(1, ctx.track.length);
       const s = this.sampleFn!(k.t + ahead, this.smp!);
-      _tmp.copy(s.pos).addScaledVector(s.normal, 1.6);
+      _tmp.copy(s.pos).addScaledVector(s.normal, AIM_LEAD_UP);
       _aim.lerp(_tmp, 0.2 * (1 - this.lookAmt * 2));
     }
 
@@ -776,9 +919,14 @@ export class ChaseCamera implements System {
       const s = i / SAMPLES;
       _tmp.copy(pivot).addScaledVector(dir, -dist * s).addScaledVector(this.upSm, height * s);
       const pr = ctx.track.probe(_tmp, k.t);
+      // Clearance is relaxed near the pivot. The arm is barely two metres tall
+      // now, so a station a metre behind the kart legitimately sits low; a flat
+      // clearance there means every crest between the lens and the chassis
+      // slams the arm in and the rig pumps down a rolling road.
+      const clear = GROUND_CLEAR * (0.45 + 0.55 * s);
       // Rising ground behind (village climb, cliff cutting) or a barrier the
       // eye is low enough to hit: stop at the previous station.
-      if (_tmp.y < pr.y + GROUND_CLEAR || ctx.track.collideWalls(_tmp, CAM_RADIUS, k.t)) {
+      if (_tmp.y < pr.y + clear || ctx.track.collideWalls(_tmp, CAM_RADIUS, k.t)) {
         frac = (i - 1) / SAMPLES;
         break;
       }
@@ -879,23 +1027,125 @@ export class ChaseCamera implements System {
 
   // --- harness modes ------------------------------------------------------
 
+  /**
+   * The establishing plate.
+   *
+   * Round one put this at 80 m back and 30 m up, which sounds like a helicopter
+   * and is in fact *inside the village roofline*: the depression angle was 20
+   * degrees, the terraced houses on the seaward side of the road are 15-20 m
+   * tall, and every one of them stood between the lens and the road. The plate
+   * showed terracotta, and the two saturated objects in the scene — the karts —
+   * were both behind it.
+   *
+   * Three changes, in order of importance:
+   *
+   *  1. A steep enough descent that foreground geometry cannot reach the
+   *     sightline, *verified rather than assumed*. The rig starts at 35 degrees
+   *     and climbs in 7 degree steps until a ray from the subject to the lens
+   *     is clear. That is the regression guard: the shot cannot silently go
+   *     back inside a roofline when the village grows a storey.
+   *  2. A long lens from a short range instead of a wide lens from a long one.
+   *     36 degrees vertical at 55 m puts the karts at ~3.2% of frame width
+   *     instead of 1.2%, i.e. sixty pixels of saturated red instead of twenty.
+   *     A 200 m plate that shows the whole S-curve *cannot* also show a kart —
+   *     at that range a kart is four pixels — so the shot picks a subject.
+   *  3. The bearing is yawed 45 degrees off the racing axis and the aim is
+   *     pushed down-track, so the road enters low and leaves high rather than
+   *     vanishing up the middle.
+   */
   private poseWide(ctx: Ctx, k: IKart) {
-    // High three-quarter establishing plate: far enough back that the ribbon of
-    // circuit reads diagonally through frame, yawed off the racing axis so it
-    // isn't a symmetric postcard.
-    _q.setFromAxisAngle(WORLD_UP, 0.62);
+    this.ensureWideBlockers(ctx);
+
+    // Subject first: the player, with the ribbon running away from them.
+    //
+    // The lead has to be read against the frame it is composed into, which is
+    // the one thing the first version of this did not do: it aimed 42% of the
+    // way to a mark 95 m down-track, i.e. 40 m ahead of the kart, while a 36
+    // degree lens at 55 m sees a ground footprint about 36 m tall. The subject
+    // was a frame and a half below the bottom edge — measured at four points
+    // round the circuit it was off-screen at every one of them, so the plate
+    // that exists to show a kart on a circuit showed neither. Aim a third of a
+    // frame ahead instead: the road still enters low and leaves high, and the
+    // kart sits in the lower third rather than outside the picture.
+    //
+    // Lerping toward the sampled centreline rather than adding a raw offset is
+    // deliberate — it also pulls the aim back onto the ribbon when the player is
+    // out wide, which is what keeps the kart off the frame edge through corners.
+    const LEAD = 13;
+    const s = this.sampleFn!(k.t + LEAD / Math.max(1, ctx.track.length), this.smp!);
+    _aim.copy(k.position).lerp(s.pos, 0.8).addScaledVector(WORLD_UP, 2.2);
+
+    _q.setFromAxisAngle(WORLD_UP, 0.78);
     _dir.copy(this.arm).applyQuaternion(_q);
     _dir.y = 0;
     if (_dir.lengthSq() < 1e-6) _dir.set(0, 0, 1); else _dir.normalize();
 
-    _eye.copy(k.position).addScaledVector(_dir, -80).addScaledVector(WORLD_UP, 30);
+    const RANGE = 55;
+    let elev = 0.61;                       // ~35 degrees
+    for (let i = 0; i < 6; i++) {
+      _eye.copy(_aim)
+        .addScaledVector(_dir, -RANGE * Math.cos(elev))
+        .addScaledVector(WORLD_UP, RANGE * Math.sin(elev));
+      // Terrain is not in the blocker list (it is the one thing the track can
+      // answer analytically), so clear it here.
+      const pr = ctx.track.probe(_eye, k.t);
+      if (_eye.y < pr.y + 8) _eye.y = pr.y + 8;
+      if (!this.occluded()) break;
+      elev += 0.122;                       // ~7 degrees
+      if (elev > 1.25) break;              // 72 degrees is already a map view
+    }
+  }
 
-    // Aim well ahead of the player rather than at them: the resulting ~14
-    // degree pitch puts the sea horizon in the upper third, so the plate keeps
-    // its band of golden-hour sky instead of staring at the floor.
-    const ahead = 70 / Math.max(1, ctx.track.length);
-    const s = this.sampleFn!(k.t + ahead, this.smp!);
-    _aim.copy(k.position).lerp(s.pos, 0.4).addScaledVector(WORLD_UP, 4);
+  /**
+   * Is anything standing between `_eye` and `_aim`? Cast from the subject
+   * outward, so the near clip skips the subject's own geometry and the far
+   * clip stops short of the lens.
+   *
+   * Only ever called from the `wide` harness mode. Gameplay pays nothing —
+   * neither the traversal below nor this ray runs on a chase frame.
+   */
+  private occluded(): boolean {
+    const list = this.wideBlockers;
+    if (!list || list.length === 0) return false;
+    _tmp.copy(_eye).sub(_aim);
+    const len = _tmp.length();
+    if (len < 8) return false;
+    _tmp.multiplyScalar(1 / len);
+    this.ray.set(_aim, _tmp);
+    this.ray.near = 4;
+    this.ray.far = len - 2;
+    this.hits.length = 0;
+    this.ray.intersectObjects(list, false, this.hits);
+    return this.hits.length > 0;
+  }
+
+  /**
+   * Flatten the scene into a list of things that can plausibly block a
+   * sightline. Built once, lazily, on the first wide-mode frame.
+   *
+   * Excluded: the sky dome and the sea (they are the backdrop, and an inward-
+   * facing dome is hit by every ray), anything whose bounds are landscape
+   * scale (terrain — handled by track.probe instead), and dense instanced
+   * fields like foliage and crowd, where a ray test costs more than the shot
+   * is worth and a palm frond is not an occluder worth craning for.
+   */
+  private ensureWideBlockers(ctx: Ctx) {
+    if (this.wideBlockers) return;
+    const list: THREE.Object3D[] = [];
+    ctx.scene.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (!(m as any).isMesh || !m.visible || !m.geometry) return;
+      if (/sky|cloud|sea|water|ocean|backdrop|horizon|fog|terrain|ground/i.test(m.name)) return;
+      const inst = m as unknown as THREE.InstancedMesh;
+      if ((inst as any).isInstancedMesh && inst.count > 1500) return;
+      if (!m.geometry.boundingSphere) m.geometry.computeBoundingSphere();
+      const r = m.geometry.boundingSphere?.radius ?? 0;
+      m.updateWorldMatrix(true, false);
+      const scale = _tmp2.setFromMatrixScale(m.matrixWorld).length() * 0.5774;
+      if (r * scale > 500) return;
+      list.push(m);
+    });
+    this.wideBlockers = list;
   }
 
   private poseClose(k: IKart) {
@@ -913,11 +1163,16 @@ export class ChaseCamera implements System {
     _q.setFromAxisAngle(this.upSm, 0.66 * side);
     _dir.copy(_face).applyQuaternion(_q);
 
-    // Lifting the eye tips the background down out of the sky and into the
-    // landscape — the same trick as the chase rig's vista lift, at hero scale.
-    const lift = 1.02 + 0.62 * this.vista;
-    _eye.copy(k.position).addScaledVector(_dir, 3.9 + 0.35 * this.vista).addScaledVector(this.upSm, lift);
-    _aim.copy(k.position).addScaledVector(this.upSm, 0.5).addScaledVector(_face, 0.25);
+    // Get *under* the roll bar and tilt up. The round-one plate stood a metre
+    // above the chassis and looked slightly down, which fills everything behind
+    // the subject with receding tarmac — there was literally nothing in that
+    // frame but road, kerb and gradient. Dropping the lens below the top of the
+    // wheels and aiming above the centre of mass swings the horizon up behind
+    // the kart, so the background becomes sky, sea and headland; it also reads
+    // as a low hero angle, which is the whole point of the shot.
+    const lift = 0.62 + 0.30 * this.vista;
+    _eye.copy(k.position).addScaledVector(_dir, 3.6 + 0.3 * this.vista).addScaledVector(this.upSm, lift);
+    _aim.copy(k.position).addScaledVector(this.upSm, 0.86).addScaledVector(_face, 0.2);
   }
 
   // =======================================================================
@@ -953,7 +1208,8 @@ export class ChaseCamera implements System {
     let omega = 11;
     let zeta = 0.62;
 
-    if (mode === 'wide') { target = 44; omega = 8; zeta = 1; }
+    // The plate is a long lens now, not a wide one — see poseWide.
+    if (mode === 'wide') { target = 36; omega = 8; zeta = 1; }
     else if (mode === 'close') { target = 34; omega = 8; zeta = 1; }
     else if (ctx.race.state === RaceState.Results || ctx.race.state === RaceState.Menu) {
       target = 40; omega = 7; zeta = 1;
@@ -964,11 +1220,11 @@ export class ChaseCamera implements System {
     } else {
       target = clamp(
         FOV_BASE
-        + sp * 7.2               // speed opens the frame
+        + sp * 6.4               // speed opens the frame
         + ctx.fovPunch * 0.95    // boost punch, pre-smoothed upstream
         + this.lookAmt * 3.0     // slightly wider over the shoulder
         - this.brakeAmt * 2.2,   // and tighter under braking
-        40, 84,
+        36, 74,
       );
     }
     target *= this.fovAspectMul;

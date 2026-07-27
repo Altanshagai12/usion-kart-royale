@@ -86,6 +86,174 @@ function finish(c: HTMLCanvasElement, srgb: boolean, aniso: number, repeat = tru
   return t;
 }
 
+// ---------------------------------------------------------------------------
+// Alpha cut-out pipeline
+// ---------------------------------------------------------------------------
+//  Round 1's leaf edges had a black fringe halo and crawled badly. Both are the
+//  same bug and neither is fixed by a bigger texture:
+//
+//  1. A 2D canvas stores premultiplied alpha, so every fully transparent texel
+//     reads back as (0,0,0,0). Bilinear filtering and mip generation then
+//     average that BLACK into the leaf edge, which is the dark fringe. The fix
+//     is to flood the leaf's own colour outward into the transparent region
+//     before upload — the alpha still cuts the shape, but whatever the filter
+//     drags in from outside is now leaf-coloured. Because putImageData would
+//     re-premultiply and throw the dilated colour away again, the result has to
+//     be uploaded as a DataTexture, not a CanvasTexture.
+//
+//  2. Box-filtering alpha halves the number of texels above alphaTest at every
+//     mip level, so fronds thin out and dissolve into shimmer with distance.
+//     Castano's fix is to rescale each level's alpha so the fraction of texels
+//     that survive the SAME alphaTest matches level 0.
+// ---------------------------------------------------------------------------
+
+export interface MipLevel {
+  data: Uint8Array;
+  width: number;
+  height: number;
+}
+
+/** Flood the RGB of an alpha cut-out outward into its transparent region. */
+function dilateRGB(px: Uint8Array, size: number, passes = 8) {
+  const known = new Uint8Array(size * size);
+  for (let i = 0; i < size * size; i++) known[i] = px[i * 4 + 3] > 6 ? 1 : 0;
+  const next = new Uint8Array(known);
+  for (let p = 0; p < passes; p++) {
+    let grew = false;
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const i = y * size + x;
+        if (known[i]) continue;
+        let r = 0,
+          g = 0,
+          b = 0,
+          n = 0;
+        for (let k = 0; k < 4; k++) {
+          const nx = x + (k === 0 ? -1 : k === 1 ? 1 : 0);
+          const ny = y + (k === 2 ? -1 : k === 3 ? 1 : 0);
+          if (nx < 0 || ny < 0 || nx >= size || ny >= size) continue;
+          const j = ny * size + nx;
+          if (!known[j]) continue;
+          r += px[j * 4];
+          g += px[j * 4 + 1];
+          b += px[j * 4 + 2];
+          n++;
+        }
+        if (!n) continue;
+        px[i * 4] = (r / n) | 0;
+        px[i * 4 + 1] = (g / n) | 0;
+        px[i * 4 + 2] = (b / n) | 0;
+        next[i] = 1;
+        grew = true;
+      }
+    }
+    known.set(next);
+    if (!grew) break;
+  }
+  // Anything the flood never reached — the far corners of a sparse sheet — gets
+  // the mean colour rather than staying black. Those texels only surface in the
+  // bottom mips, where a whole quadrant is averaged into one texel, and that is
+  // precisely where a leftover black would darken the leaf.
+  let r = 0,
+    g = 0,
+    b = 0,
+    n = 0;
+  for (let i = 0; i < size * size; i++) {
+    if (!known[i]) continue;
+    r += px[i * 4];
+    g += px[i * 4 + 1];
+    b += px[i * 4 + 2];
+    n++;
+  }
+  if (!n) return;
+  r = (r / n) | 0;
+  g = (g / n) | 0;
+  b = (b / n) | 0;
+  for (let i = 0; i < size * size; i++) {
+    if (known[i]) continue;
+    px[i * 4] = r;
+    px[i * 4 + 1] = g;
+    px[i * 4 + 2] = b;
+  }
+}
+
+/**
+ * Coverage-preserving mip chain. Colour is averaged weighted by alpha so the
+ * dilated skirt never washes out the leaf; alpha is averaged flat and then
+ * rescaled so `alphaTest` keeps the same silhouette area at every level.
+ */
+function coverageMips(base: Uint8Array, size: number, ref: number): MipLevel[] {
+  const out: MipLevel[] = [{ data: base, width: size, height: size }];
+  const refB = ref * 255;
+  let target = 0;
+  for (let i = 0; i < size * size; i++) if (base[i * 4 + 3] >= refB) target++;
+  target /= size * size;
+  let prev = base;
+  let pw = size;
+  while (pw > 1) {
+    const w = pw >> 1;
+    const dst = new Uint8Array(w * w * 4);
+    for (let y = 0; y < w; y++) {
+      for (let x = 0; x < w; x++) {
+        let r = 0,
+          g = 0,
+          b = 0,
+          a = 0,
+          wsum = 0;
+        for (let dy = 0; dy < 2; dy++) {
+          for (let dx = 0; dx < 2; dx++) {
+            const s = ((y * 2 + dy) * pw + (x * 2 + dx)) * 4;
+            const av = prev[s + 3];
+            const wgt = av + 1;
+            r += prev[s] * wgt;
+            g += prev[s + 1] * wgt;
+            b += prev[s + 2] * wgt;
+            a += av;
+            wsum += wgt;
+          }
+        }
+        const o = (y * w + x) * 4;
+        dst[o] = (r / wsum) | 0;
+        dst[o + 1] = (g / wsum) | 0;
+        dst[o + 2] = (b / wsum) | 0;
+        dst[o + 3] = (a / 4) | 0;
+      }
+    }
+    // Castano alpha-test rescale. The bracket has to reach well below 1: a 2x2
+    // box over a thin frond leaflet RAISES the fraction of texels above the
+    // test as often as it lowers it, so the correction runs both ways.
+    if (target > 0 && w >= 1) {
+      let lo = 0.02,
+        hi = 40;
+      for (let it = 0; it < 14; it++) {
+        const mid = (lo + hi) * 0.5;
+        let cov = 0;
+        for (let i = 0; i < w * w; i++) if (Math.min(255, dst[i * 4 + 3] * mid) >= refB) cov++;
+        if (cov / (w * w) < target) lo = mid;
+        else hi = mid;
+      }
+      const sc = (lo + hi) * 0.5;
+      let peak = 0;
+      for (let i = 0; i < w * w; i++) {
+        const a = Math.min(255, (dst[i * 4 + 3] * sc) | 0);
+        dst[i * 4 + 3] = a;
+        if (a > peak) peak = a;
+      }
+      // At 4² and below the coverage quantum is 6%, so the search can round a
+      // real silhouette down to nothing and the card pops out of existence on
+      // the last mip. Guarantee the strongest texel always survives the test.
+      if (peak < refB) {
+        const lift = refB / Math.max(1, peak);
+        for (let i = 0; i < w * w; i++) dst[i * 4 + 3] = Math.min(255, Math.ceil(dst[i * 4 + 3] * lift));
+      }
+    }
+    out.push({ data: dst, width: w, height: w });
+    prev = dst;
+    pw = w;
+  }
+  return out;
+}
+
 /**
  * Integer-lattice value noise with an explicit period per axis, so every
  * texture wraps exactly and can have anisotropic grain (wood stretches along
@@ -606,7 +774,7 @@ export class TexLib {
     });
   }
 
-  sponsorAtlas(size = 1024): MatMaps {
+  sponsorAtlas(size = 2048): MatMaps {
     return this.memo('sponsor', () => {
       const [c, g] = cv(size);
       const w = size / 2,
@@ -644,30 +812,49 @@ export class TexLib {
           g.fill();
         }
         g.globalAlpha = 1;
-        g.fillStyle = fg;
+        // Legibility at gameplay distance is a MIP problem, not a font problem:
+        // once the board is 40 px wide the letterform and its background have
+        // averaged together and the word turns into a coloured smear. Two things
+        // buy it back — texel density (this atlas is 2048², so each board is
+        // 1024 x 512 for a 4 m x 1 m panel ≈ 4 mm/texel), and a hard contrast
+        // ring around every glyph so what the mip chain averages toward is still
+        // a light-on-dark edge rather than mud.
         g.font = `800 ${h0 * 0.42}px "Helvetica Neue", Helvetica, Arial, sans-serif`;
         g.textAlign = 'center';
         g.textBaseline = 'middle';
-        g.letterSpacing = '2px';
+        g.letterSpacing = `${Math.round(h0 * 0.012)}px`;
+        g.lineJoin = 'round';
+        g.strokeStyle = 'rgba(20,16,14,0.55)';
+        g.lineWidth = h0 * 0.055;
+        g.strokeText(text, cx + w / 2, cy + h0 / 2, w * 0.86);
+        g.fillStyle = fg;
         g.fillText(text, cx + w / 2, cy + h0 / 2, w * 0.86);
-        g.strokeStyle = 'rgba(0,0,0,0.35)';
-        g.lineWidth = 6;
-        g.strokeRect(cx + 3, cy + 3, w - 6, h0 - 6);
+        // frame: a dark keyline plus a light inner line, so the board's own
+        // outline survives to the distance the lettering does not
+        g.strokeStyle = 'rgba(0,0,0,0.4)';
+        g.lineWidth = h0 * 0.035;
+        g.strokeRect(cx + h0 * 0.018, cy + h0 * 0.018, w - h0 * 0.036, h0 - h0 * 0.036);
+        g.strokeStyle = 'rgba(255,255,255,0.22)';
+        g.lineWidth = h0 * 0.016;
+        g.strokeRect(cx + h0 * 0.055, cy + h0 * 0.055, w - h0 * 0.11, h0 - h0 * 0.11);
         g.restore();
       }
-      const hf = new Float32Array(size * size);
-      const rf = new Float32Array(size * size);
-      for (let y = 0; y < size; y++)
-        for (let x = 0; x < size; x++) {
-          const i = y * size + x;
-          const n = fbm(109, x / size, y / size, 192, 192, 3);
+      // Only the lettering needs the texel density; the vinyl's surface noise is
+      // low frequency and stays at 512 so the atlas costs one big map, not three.
+      const ns = 512;
+      const hf = new Float32Array(ns * ns);
+      const rf = new Float32Array(ns * ns);
+      for (let y = 0; y < ns; y++)
+        for (let x = 0; x < ns; x++) {
+          const i = y * ns + x;
+          const n = fbm(109, x / ns, y / ns, 192, 192, 3);
           hf[i] = n;
-          rf[i] = 0.34 + n * 0.16 + (Math.sin(y * 0.02) * 0.5 + 0.5) * 0.06;
+          rf[i] = 0.34 + n * 0.16 + (Math.sin(y * 0.08) * 0.5 + 0.5) * 0.06;
         }
       return {
         map: finish(c, true, this.aniso, false),
-        normalMap: normalFromHeight(hf, size, 5, this.aniso),
-        roughnessMap: greyFromField(rf, size, this.aniso),
+        normalMap: normalFromHeight(hf, ns, 5, this.aniso),
+        roughnessMap: greyFromField(rf, ns, this.aniso),
       };
     });
   }
@@ -844,7 +1031,7 @@ export class TexLib {
       g.quadraticCurveTo(s * 0.5, midY + s * 0.02, s * 0.99, midY + s * 0.06);
       g.stroke();
       void rng;
-    });
+    }, 0.38);
   }
 
   /** Umbrella-pine needle cluster. */
@@ -866,7 +1053,7 @@ export class TexLib {
           g.stroke();
         }
       }
-    });
+    }, 0.42);
   }
 
   /** Broadleaf shrub / hedge mass. */
@@ -889,27 +1076,50 @@ export class TexLib {
         g.fill();
         g.restore();
       }
-    });
+    }, 0.44);
   }
 
-  /** Tuft of grass blades, rooted at the bottom edge. */
-  grassBlades(size = 256): THREE.Texture {
+  /**
+   * Tuft of grass blades, rooted at the bottom edge.
+   *
+   * Drawn per blade in three passes — root, mid, tip — so a blade darkens at
+   * the base (#4e7534, where a clump self-shadows) and bleaches toward the tip
+   * (#87b356 fresh / #9aa858 dry). One flat green stroke per blade is what made
+   * the round-1 verge read as astroturf: real grass has its whole value range
+   * inside a single blade, not just between clumps.
+   */
+  grassBlades(size = 512): THREE.Texture {
     return this.alpha('grass', size, (g, s) => {
       const rng = mulberry32(2424);
-      for (let i = 0; i < 26; i++) {
-        const x = s * (0.08 + rng() * 0.84);
-        const hgt = s * (0.45 + rng() * 0.5);
-        const bend = (rng() - 0.5) * s * 0.42;
-        const t = rng();
-        g.strokeStyle = `rgb(${(88 + t * 52) | 0},${(126 + t * 62) | 0},${(58 + t * 34) | 0})`;
-        g.lineWidth = s * (0.016 + rng() * 0.014);
-        g.lineCap = 'round';
-        g.beginPath();
-        g.moveTo(x, s);
-        g.quadraticCurveTo(x + bend * 0.3, s - hgt * 0.55, x + bend, s - hgt);
-        g.stroke();
+      g.lineCap = 'round';
+      const blades = 44;
+      for (let i = 0; i < blades; i++) {
+        const x = s * (0.05 + rng() * 0.9);
+        const hgt = s * (0.42 + rng() * 0.56);
+        const bend = (rng() - 0.5) * s * 0.46;
+        const dry = rng() < 0.28;
+        const lw = s * (0.011 + rng() * 0.011);
+        // three tapering segments, each a shade lighter than the last
+        const segs = 3;
+        for (let k = 0; k < segs; k++) {
+          const t0 = k / segs;
+          const t1 = (k + 1) / segs;
+          const p = (u: number): [number, number] => [x + bend * u * u, s - hgt * u];
+          const [x0, y0] = p(t0);
+          const [x1, y1] = p(t1);
+          const sh = t0 * 0.85 + rng() * 0.15;
+          const r = dry ? 118 + sh * 46 : 66 + sh * 66;
+          const gr = dry ? 130 + sh * 46 : 108 + sh * 71;
+          const bl = dry ? 62 + sh * 34 : 44 + sh * 42;
+          g.strokeStyle = `rgb(${r | 0},${gr | 0},${bl | 0})`;
+          g.lineWidth = lw * (1.25 - t0 * 0.75);
+          g.beginPath();
+          g.moveTo(x0, y0);
+          g.lineTo(x1, y1);
+          g.stroke();
+        }
       }
-    });
+    }, 0.34);
   }
 
   /** Geranium / bougainvillea blossom cluster for window boxes. */
@@ -929,7 +1139,7 @@ export class TexLib {
           g.fill();
         }
       }
-    });
+    }, 0.40);
   }
 
   /**
@@ -1002,7 +1212,7 @@ export class TexLib {
         g.arc(x, y, s * 0.012, 0, 7);
         g.fill();
       }
-    });
+    }, 0.35);
   }
 
   /** Laundry: shirts and sheets on a line, as an alpha strip of 4 cells. */
@@ -1049,20 +1259,41 @@ export class TexLib {
         g.fillRect(x0, 0, cell, s);
         g.globalCompositeOperation = 'source-over';
       }
-    });
+    }, 0.45);
   }
 
   private alphaCache = new Map<string, THREE.Texture>();
-  private alpha(key: string, size: number, draw: (g: CanvasRenderingContext2D, s: number) => void): THREE.Texture {
+  /**
+   * `ref` is the alphaTest the material will use; the mip chain is built to
+   * preserve coverage at exactly that threshold. Pass the real value or fronds
+   * will still thin out at range.
+   */
+  private alpha(key: string, size: number, draw: (g: CanvasRenderingContext2D, s: number) => void, ref = 0.4): THREE.Texture {
     let t = this.alphaCache.get(key);
     if (t) return t;
     const [c, g] = cv(size);
     g.clearRect(0, 0, size, size);
     draw(g, size);
-    t = finish(c, true, this.aniso, false);
-    // premultiply-free alpha edges: keep default; alphaTest handles the cut.
-    this.alphaCache.set(key, t);
-    return t;
+    const src = g.getImageData(0, 0, size, size).data;
+    // A DataTexture uploads with flipY = false, so the rows are flipped here to
+    // keep the canvas's top-left origin pointing the same way it always did.
+    const px = new Uint8Array(size * size * 4);
+    const row = size * 4;
+    for (let y = 0; y < size; y++) px.set(src.subarray((size - 1 - y) * row, (size - y) * row), y * row);
+    dilateRGB(px, size);
+    const mips = coverageMips(px, size, ref);
+    const tex = new THREE.DataTexture(mips[0].data, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
+    tex.mipmaps = mips as unknown as THREE.Texture['mipmaps'];
+    tex.generateMipmaps = false;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.minFilter = THREE.LinearMipmapLinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.anisotropy = this.aniso;
+    tex.flipY = false;
+    tex.needsUpdate = true;
+    this.alphaCache.set(key, tex);
+    return tex;
   }
 }
 
@@ -1802,29 +2033,69 @@ export function patchWind(mat: THREE.Material, u: Shared, flutterAxis = 0) {
  * less in the yellow-green, so a backlit leaf is never just a brighter version
  * of its own albedo.
  */
+const SAP = new THREE.Color(0xa8c85a).convertSRGBToLinear();
+
 export function patchTranslucency(mat: THREE.Material, u: Shared, strength = 1.0) {
   patch(mat, 'trans', (sh) => {
     sh.uniforms.uSunView = u.uSunView;
     sh.uniforms.uSunCol = u.uSunCol;
     sh.uniforms.uTransStrength = { value: strength };
+    // §4's warm yellow-green. Round 1 hard-coded the sRGB triple straight into
+    // the shader, where everything is linear — so the sap read a full stop too
+    // bright and washed toward white instead of glowing green.
+    sh.uniforms.uSap = { value: SAP };
     sh.vertexShader = 'varying vec2 vLeafUv;\n' + sh.vertexShader.replace('#include <uv_vertex>', '#include <uv_vertex>\n  vLeafUv = uv;');
     sh.fragmentShader =
-      'uniform vec3 uSunView; uniform vec3 uSunCol; uniform float uTransStrength;\nvarying vec2 vLeafUv;\n' +
+      'uniform vec3 uSunView; uniform vec3 uSunCol; uniform float uTransStrength; uniform vec3 uSap;\nvarying vec2 vLeafUv;\n' +
       sh.fragmentShader.replace(
         '#include <lights_fragment_end>',
         `#include <lights_fragment_end>
          {
+           // vViewPosition points from the fragment TOWARD the eye, so -V is the
+           // view direction and dot(-V, L) fires only when the leaf sits between
+           // the camera and the sun — which is exactly the backlit-palm case.
            vec3 V = normalize(vViewPosition);
-           const float W = 0.5;
-           float wrap = clamp((dot(normal, uSunView) + W) / (1.0 + W), 0.0, 1.0);
-           float back = pow(clamp(dot(-V, uSunView), 0.0, 1.0), 4.0);
+           float wrap = clamp((dot(normal, uSunView) + 0.55) / 1.55, 0.0, 1.0);
+           float back = pow(clamp(dot(-V, uSunView), 0.0, 1.0), 3.0);
            // clamped so solid-geometry foliage (uv tiles past 1) stays neutral
            float lu = clamp(vLeafUv.x, 0.0, 1.0);
            float lv = clamp(vLeafUv.y, 0.0, 1.0);
-           float thin = mix(0.42, 1.0, lu) * mix(0.55, 1.0, abs(lv - 0.5) * 2.0);
-           vec3 sap = mix(diffuseColor.rgb, vec3(0.722, 0.847, 0.290), 0.55);
-           reflectedLight.directDiffuse += uSunCol * sap * back * 2.2 * thin * uTransStrength;
-           reflectedLight.directDiffuse += uSunCol * diffuseColor.rgb * wrap * 0.34 * uTransStrength;
+           // thin toward the frond tip and toward the leaflet edges: that is the
+           // part of a palm that actually goes translucent
+           float thin = mix(0.42, 1.0, lu) * mix(0.5, 1.0, abs(lv - 0.5) * 2.0);
+           vec3 sap = mix(diffuseColor.rgb, uSap, 0.62);
+           reflectedLight.directDiffuse += uSunCol * sap * back * 3.4 * thin * uTransStrength;
+           reflectedLight.directDiffuse += uSunCol * mix(diffuseColor.rgb, uSap, 0.25) * wrap * 0.42 * uTransStrength;
+         }`
+      );
+  });
+}
+
+/**
+ * Roughness driven off the per-instance tint's value.
+ *
+ * The clump mask that decides whether a patch of verge is fresh growth or
+ * sun-bleached already rides in on `aTint`; this reads it back out so the dry
+ * patches are also the matte ones (0.88) and the fresh growth keeps a waxy
+ * sheen (0.55). §4 wants roughness to vary spatially and this gets it for the
+ * cost of one dot product, with the variation locked to the albedo variation
+ * rather than floating free of it.
+ *
+ * Requires `patchTint` on the same material — it reads that patch's `vTintI`
+ * varying rather than redeclaring the attribute, which would be a duplicate
+ * declaration and fail to compile.
+ */
+export function patchRoughFromTint(mat: THREE.Material, lo = 0.55, hi = 0.88) {
+  patch(mat, 'roughtint', (sh) => {
+    sh.uniforms.uRtRange = { value: new THREE.Vector2(lo, hi) };
+    sh.fragmentShader =
+      'uniform vec2 uRtRange;\n' +
+      sh.fragmentShader.replace(
+        '#include <roughnessmap_fragment>',
+        `#include <roughnessmap_fragment>
+         {
+           float v = dot(vTintI, vec3(0.2126, 0.7152, 0.0722));
+           roughnessFactor = mix(uRtRange.x, uRtRange.y, clamp((v - 0.28) / 0.55, 0.0, 1.0));
          }`
       );
   });
@@ -2095,8 +2366,18 @@ export class MatLib {
     this.wall = this.shared('stucco', 'scenery-wall', vcN(2.1)) ?? this.std(T.plaster(), { vertexColors: true }, 2.1);
     this.roof = this.shared('roof-tile', 'scenery-roof', vcN(1.9)) ?? this.std(T.roofTile(), { vertexColors: true }, 1.9);
     this.trim = this.shared('marble', 'scenery-trim', vcN(1.5)) ?? this.std(T.stone(), { vertexColors: true }, 1.5);
-    patchRoughVary(this.wall, 0.62, 1.28, 8.5);
-    patchRoughVary(this.roof, 0.8, 1.15, 6.0);
+    // The village had ONE surface response across every wall, roof and tower,
+    // which is why wide.png reads as a single extruded mass: at a 14° sun a
+    // fired terracotta tile and a lime-plaster wall are two completely different
+    // materials, and that difference is most of what separates roof from wall
+    // at silhouette distance. Split them properly (§4):
+    //   plaster — matte, effectively no environment contribution
+    //   tile    — noticeably glossier, and it samples the env so the low sun
+    //             runs a sheen down every pan
+    patchRoughVary(this.wall, 0.78, 1.3, 8.5);
+    patchRoughVary(this.roof, 0.5, 0.86, 6.0);
+    this.wall.envMapIntensity = 0.25;
+    this.roof.envMapIntensity = 0.9;
 
     this.wood = this.shared('wood-plank', 'scenery-wood', vcN(2.2)) ?? this.std(T.wood(), { vertexColors: true }, 2.2);
     patchRoughVary(this.wood, 0.66, 1.3, 3.2);
@@ -2171,6 +2452,7 @@ export class MatLib {
 
     const lt = T.laundry();
     this.laundry = new THREE.MeshStandardMaterial({ map: lt, alphaTest: 0.45, side: THREE.DoubleSide, roughness: 0.88, metalness: 0 });
+    this.laundry.alphaToCoverage = true;
     this.all.push(this.laundry);
     patchInstUv(this.laundry);
     patchCloth(this.laundry, this.u, 0.5);
@@ -2208,6 +2490,7 @@ export class MatLib {
 
     this.flowerMat = this.foliage(T.flowers(), { alphaTest: 0.4, trans: 0.9, wind: true });
     this.netMat = new THREE.MeshStandardMaterial({ map: T.netWeave(), alphaTest: 0.35, side: THREE.DoubleSide, roughness: 0.92, metalness: 0 });
+    this.netMat.alphaToCoverage = true;
     this.all.push(this.netMat);
     patchTint(this.netMat);
     patchLod(this.netMat, this.u);
@@ -2255,6 +2538,12 @@ export class MatLib {
       // whichever side the sun is actually on.
       shadowSide: THREE.DoubleSide,
     });
+    // MSAA is on (Renderer.msaaSamples) but a plain alphaTest discards whole
+    // fragments and never touches the coverage mask, so every leaf edge came
+    // out of round 1 as a 1-bit stair-step that crawled. alphaToCoverage hands
+    // the cut to the sample mask instead, which is what makes MSAA antialias a
+    // cut-out at all. It is free — no sorting, no transparency pass.
+    m.alphaToCoverage = true;
     this.all.push(m);
     patchTint(m);
     patchTranslucency(m, this.u, opts.trans ?? 1);
@@ -2388,12 +2677,23 @@ function gableWedge(halfZ: number, rise: number, thick: number): THREE.BufferGeo
 }
 
 /** Warm terracotta multipliers for the roof map — never the wall pastel. */
+/**
+ * Roof tint multipliers over the barrel-tile map.
+ *
+ * These used to spread lightness 0.66–0.94 per house, which sounds like variety
+ * and is actually the opposite: it put roofs across the same value range as the
+ * pastel walls, so wall and roof stopped separating and the whole hillside
+ * collapsed into one brown mass. A Mediterranean hill town is legible because
+ * the roofs are ONE constant band — §3's #b5643f — and the walls carry all the
+ * variety underneath it. So the spread here is now ±7% of a single terracotta,
+ * which is weathering, not colour.
+ */
 const ROOF_MULT: [number, number, number][] = [
-  [0.040, 0.16, 0.86],
-  [0.028, 0.24, 0.74],
-  [0.055, 0.13, 0.94],
-  [0.020, 0.28, 0.66],
-  [0.045, 0.20, 0.80],
+  [0.038, 0.20, 0.70],
+  [0.034, 0.22, 0.66],
+  [0.042, 0.18, 0.73],
+  [0.036, 0.24, 0.68],
+  [0.040, 0.20, 0.71],
 ];
 
 /**
@@ -2432,11 +2732,70 @@ export function buildHouse(out: HouseParts, rng: RNG, xform: THREE.Matrix4, w: n
   const rearAndSides = new GeoAccum();
   const back = bevelBox(w, h, 0.3, 0.05, 0.42);
   rearAndSides.add(back, trs(0, h / 2, -d / 2 + 0.15, 0), undefined, wAO);
+  // Side elevations get real openings too.
+  //
+  // Round 1 punched only the street facade and left the other three faces as
+  // plain boxes, which is fine looking down a street and catastrophic looking
+  // ALONG one — drift.png's foreground building is a side wall, and it read as
+  // a 500x400 px slab of flat red because there was genuinely nothing on it. A
+  // Mediterranean gable end is sparser than the facade, never blank: one or two
+  // small windows a floor, no balconies, no shutters.
   const side = bevelBox(0.3, h, d - 0.3, 0.05, 0.42);
-  rearAndSides.add(side, trs(-w / 2 + 0.15, h / 2, 0, 0), undefined, wAO);
-  rearAndSides.add(side, trs(w / 2 - 0.15, h / 2, 0, 0), undefined, wAO);
+  const sideCols = Math.max(1, Math.round((d - 1.4) / 3.1));
+  for (const sx of [-1, 1]) {
+    const ops: Opening[] = [];
+    const glassAt: { z: number; y: number; w: number; h: number }[] = [];
+    for (let f = 0; f < floors; f++) {
+      for (let c = 0; c < sideCols; c++) {
+        if (rng() < 0.4) continue;
+        const zc = ((c + 0.5) / sideCols) * d;
+        const ow = 0.72 + rng() * 0.22;
+        const oh = 1.1 + rng() * 0.3;
+        const oy = f * floorH + 1.15;
+        ops.push({ x: zc - ow / 2, y: oy, w: ow, h: oh });
+        // yaw sx*PI/2 maps the wall's local x onto world z = sx * (d/2 - x)
+        glassAt.push({ z: sx * (d / 2 - zc), y: oy, w: ow, h: oh });
+      }
+    }
+    if (!ops.length) {
+      rearAndSides.add(side, trs(sx * (w / 2 - 0.15), h / 2, 0, 0), undefined, wAO);
+      continue;
+    }
+    // The punched wall is authored facing +Z spanning x in [0, d]; a ±90° yaw
+    // turns it into the ±X elevation with its local x running along the depth.
+    const sw = wallWithOpenings(d, h, ops, 0.19, 0.42);
+    const rot = new THREE.Matrix4().makeRotationY((sx * Math.PI) / 2);
+    const mv = new THREE.Matrix4().makeTranslation(sx * (w / 2), 0, (sx * d) / 2);
+    rearAndSides.add(sw, mv.multiply(rot), undefined, wAO);
+    // a thin backing pier so the punched face still has a wall behind it
+    rearAndSides.add(bevelBox(0.16, h, d - 0.3, 0.04, 0.42), trs(sx * (w / 2 - 0.27), h / 2, 0, 0), undefined, wAO);
+    for (const gq of glassAt) {
+      out.glass.push(
+        _m
+          .multiplyMatrices(
+            xform,
+            new THREE.Matrix4().compose(
+              new THREE.Vector3(sx * (w / 2 - 0.18), gq.y + gq.h / 2, gq.z),
+              new THREE.Quaternion().setFromEuler(new THREE.Euler(0, (sx * Math.PI) / 2, 0)),
+              new THREE.Vector3(gq.w * 0.94, gq.h * 0.94, 1)
+            )
+          )
+          .clone()
+      );
+    }
+  }
   // interior floor slab so you never see through an opening into nothing
   rearAndSides.add(bevelBox(w - 0.4, 0.2, d - 0.4, 0.02, 0.42), trs(0, h - 0.4, 0, 0), undefined, () => 0.32);
+
+  // Corner arrises. `wallWithOpenings` produces flat faces meeting at a hard
+  // 90°, and §9.6 calls an unchamfered edge the second-biggest amateur tell for
+  // a reason: at a 14° sun a true 90° corner catches no specular at all, so two
+  // adjacent walls at different angles to the key meet on a hairline instead of
+  // on a lit edge. A 6 cm post turned 45° gives every corner a 4 cm facet that
+  // takes a highlight and separates the two elevations.
+  for (const sx of [-1, 1])
+    for (const sz of [-1, 1])
+      rearAndSides.add(bevelBox(0.06, h, 0.06, 0.014, 0.42), trs(sx * (w / 2 - 0.02), h / 2, sz * (d / 2 - 0.02), Math.PI / 4), undefined, wAO);
 
   out.walls.add(facade, xform, tint, wAO);
   const rs = rearAndSides.build();
@@ -2454,7 +2813,7 @@ export function buildHouse(out: HouseParts, rng: RNG, xform: THREE.Matrix4, w: n
   const slopeLen = Math.hypot(halfZ, rise);
   const thick = 0.3;
   const rm = ROOF_MULT[(rng() * ROOF_MULT.length) | 0];
-  const roofCol = new THREE.Color().setHSL(rm[0], rm[1] * (0.7 + rng() * 0.6), rm[2] * (0.82 + rng() * 0.26));
+  const roofCol = new THREE.Color().setHSL(rm[0], rm[1] * (0.9 + rng() * 0.2), rm[2] * (0.95 + rng() * 0.1));
   // Gable ends first: they close the triangular void the two slopes leave.
   const gab = gableWedge(halfZ - 0.04, rise, 0.26);
   for (const s of [-1, 1]) out.walls.add(gab, _m.multiplyMatrices(xform, trs((s * w) / 2, h, 0, 0)).clone(), tint, () => 0.62);
@@ -3133,21 +3492,52 @@ export function spectatorGeo(variant = 0): THREE.BufferGeometry {
   // Deliberately cheap: there are several hundred of these and they are never
   // closer than a couple of metres behind a barrier. Colour variety, outline
   // variety and the cheer animation carry the read, not the mesh.
-  const torso = loft((t, o) => o.set(0, (0.62 + t * 0.56) * sc, 0), 3, 6, (t) => (0.19 + Math.sin(t * Math.PI) * 0.035 - t * 0.02) * build * sc, 1, true, true);
+  //
+  // What DID have to change after round 1: the arms were the same tint as the
+  // torso and hung at 0.16 rad against a 0.19 m body, so they welded into the
+  // silhouette and every spectator read as a coloured pill. Now the torso necks
+  // in at the shoulders, the arms swing out clear of it, and the forearm is
+  // untinted skin — the value break is what separates limb from body at 40 m,
+  // not the extra 40 triangles.
+  const torso = loft(
+    (t, o) => o.set(0, (0.62 + t * 0.56) * sc, 0),
+    4,
+    6,
+    // shoulder taper: widest at the chest, necked in at the collar
+    (t) => (0.185 + Math.sin(Math.min(t * 1.35, 1) * Math.PI) * 0.045 - Math.pow(t, 3) * 0.07) * build * sc,
+    1,
+    true,
+    true
+  );
   setUv(torso, 1, 0.5);
   acc.add(torso, trs(0, 0, 0, 0), white);
-  const legG = loft((t, o) => o.set(0, t * 0.64 * sc, 0), 1, 5, () => 0.072 * sc, 1, true, true);
+  // legs, set wider apart with a visible gap between them
+  const legG = loft((t, o) => o.set(0, t * 0.66 * sc, 0), 2, 5, (t) => (0.078 - t * 0.014) * sc, 1, true, true);
   setUv(legG, 0, 0.4);
-  for (const s of [-1, 1]) acc.add(legG, trs(s * 0.085 * sc, 0, 0, 0), dark);
+  const stance = variant === 3 ? 0.125 : 0.105;
+  for (const s of [-1, 1]) acc.add(legG, trs(s * stance * sc, 0, 0, 0, 1, 1, 1, 0, s * 0.05), dark);
+  const shoulderX = 0.235 * sc * build;
   if (variant === 1) {
     // arms straight up — this is the silhouette that reads "crowd" at 60 m
-    const up = loft((t, o) => o.set(0, (1.1 + t * 0.62) * sc, 0), 1, 4, () => 0.052 * sc, 1, true, true);
-    setUv(up, 1, 0.96);
-    for (const s of [-1, 1]) acc.add(up, trs(s * 0.21 * sc, 0, 0, 0, 1, 1, 1, 0, s * 0.2), white);
+    const sleeve = loft((t, o) => o.set(0, (1.06 + t * 0.3) * sc, 0), 1, 4, () => 0.054 * sc, 1, true, true);
+    setUv(sleeve, 1, 0.96);
+    const fore = loft((t, o) => o.set(0, (1.34 + t * 0.4) * sc, 0), 1, 4, (t) => (0.048 - t * 0.008) * sc, 1, true, true);
+    setUv(fore, 0, 0.96);
+    for (const s of [-1, 1]) {
+      acc.add(sleeve, trs(s * shoulderX, 0, 0, 0, 1, 1, 1, 0, s * 0.24), white);
+      acc.add(fore, trs(s * (shoulderX + 0.09 * sc), 0, 0, 0, 1, 1, 1, 0, s * 0.12), skin);
+    }
   } else {
-    const armG = loft((t, o) => o.set(0, (1.12 - t * 0.42) * sc, 0), 1, 4, () => 0.055 * sc, 1, true, true);
-    setUv(armG, 1, 0.96);
-    for (const s of [-1, 1]) acc.add(armG, trs(s * 0.23 * sc * build, 0, 0, 0, 1, 1, 1, 0, s * (variant === 3 ? 0.3 : 0.16)), white);
+    // Arms hang OUT from the body: upper arm swung clear, forearm bare.
+    const swing = variant === 3 ? 0.34 : 0.26;
+    const sleeve = loft((t, o) => o.set(0, (1.12 - t * 0.26) * sc, 0), 1, 4, () => 0.057 * sc, 1, true, true);
+    setUv(sleeve, 1, 0.96);
+    const fore = loft((t, o) => o.set(0, (0.9 - t * 0.24) * sc, 0), 1, 4, (t) => (0.046 - t * 0.006) * sc, 1, true, true);
+    setUv(fore, 0, 0.96);
+    for (const s of [-1, 1]) {
+      acc.add(sleeve, trs(s * shoulderX, 0, 0, 0, 1, 1, 1, 0, s * swing), white);
+      acc.add(fore, trs(s * (shoulderX + 0.075 * sc), 0, 0.02 * sc, 0, 1, 1, 1, -0.22, s * (swing * 0.55)), skin);
+    }
   }
   const head = loft((t, o) => o.set(0, (1.2 + t * 0.2) * sc, 0), 2, 6, (t) => Math.sin((0.18 + t * 0.72) * Math.PI) * 0.115 * sc, 1, true, true);
   setUv(head, 0, 0.5);
@@ -3292,11 +3682,9 @@ export function windmillGeo(): { tower: THREE.BufferGeometry; trim: THREE.Buffer
  * A landmass silhouette: a noise-displaced dome. Used for the offshore islands
  * and the receding headlands that keep the horizon from ever being empty.
  */
-export function landmassGeo(radius: number, height: number, seed: number, seaY: number, jag = 1): THREE.BufferGeometry {
+export function landmassGeo(radius: number, height: number, seed: number, seaY: number, jag = 1, segs = 40, rings = 12): THREE.BufferGeometry {
   const rng = mulberry32(seed);
   const n1 = createNoise2D(rng);
-  const segs = 40,
-    rings = 12;
   const pos: number[] = [],
     uv: number[] = [],
     idx: number[] = [];

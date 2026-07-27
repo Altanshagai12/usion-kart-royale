@@ -140,7 +140,7 @@ const WORLD_SCALE: Record<string, number> = {
   sand: 4,
   grass: 3.2,
   dirt: 3,
-  'cliff-rock': 4.0, // 1024 over 4 m ≈ 4 mm/texel, with a 4.3× macro octave for metre-scale form
+  'cliff-rock': 4.0, // 1024 over 4 m ≈ 4 mm/texel; ×2.9 and ×8.5 bands carry the 12 m and 34 m form
   'tunnel-bore': 3.2,
   'stone-wall': 3, // 5 × 8 → 600 × 375 mm ashlar blocks
   stucco: 3,
@@ -280,6 +280,17 @@ export interface BreakupOpts {
    */
   variantTint?: number;
   variantAmount?: number;
+  /**
+   * How hard a *darkening* in the mesh's vertex colours also polishes the
+   * surface. The track owns the racing line, the wheel tracks and the shoulder
+   * grime as vertex-colour masks, and it can only multiply albedo with them — so
+   * a racing line laid down that way is a tint and nothing else. At exposure
+   * 1.05 an 8% tint through a corner apex is invisible; the same mask taken to
+   * roughness under a 14° key is a sheen you cannot miss. 0 leaves it off, which
+   * is right for grass and sand, where a dark vertex colour means wet or shaded,
+   * not polished.
+   */
+  wearGloss?: number;
 }
 
 /**
@@ -311,8 +322,24 @@ function injectBreakup(mat: THREE.Material, o: BreakupOpts): void {
     const c = new THREE.Color(o.variantTint).convertSRGBToLinear();
     uVariant.value.set(c.r, c.g, c.b, o.variantAmount ?? 0.5);
   }
+  const uWear = { value: o.wearGloss ?? 0 };
   const jitters = (o.instUv ?? 0) > 0;
   const settles = !!o.settle;
+  const wears = (o.wearGloss ?? 0) > 0;
+
+  const WEAR_GLOSS = wears
+    ? /* glsl */ `
+          #if defined( USE_COLOR ) || defined( USE_COLOR_ALPHA )
+            // luminance the mesh has taken *out* of the surface = how polished it
+            // is. Racing line and wheel tracks come down the same channel.
+            float kPolish = clamp( 1.0 - dot( vColor.rgb, vec3( 0.2126, 0.7152, 0.0722 ) ), 0.0, 1.0 );
+            // ...breathed along its own length by the two world bands, because a
+            // wear mask laid down at a constant lateral coordinate is a straight
+            // line, and a straight line of constant gloss is a UV seam, not wear.
+            float kPolishAmt = uWearGloss * ( 0.72 + ( gBreak + gBreak2 ) * 0.34 );
+            roughnessFactor *= 1.0 - clamp( kPolish * kPolishAmt, 0.0, 0.55 );
+          #endif`
+    : '';
   // Compiled in only where it is asked for: a second variant costs a texture
   // fetch and most surfaces do not need one.
   const VARIANT_BLEND =
@@ -339,6 +366,7 @@ function injectBreakup(mat: THREE.Material, o: BreakupOpts): void {
     shader.uniforms.uInstJit = uInst;
     shader.uniforms.uSettle = uSettle;
     shader.uniforms.uVariant = uVariant;
+    shader.uniforms.uWearGloss = uWear;
 
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', '#include <common>\n' + WORLD_PARS + (jitters ? INST_PARS : ''))
@@ -355,7 +383,8 @@ function injectBreakup(mat: THREE.Material, o: BreakupOpts): void {
           (jitters ? INST_PARS : '') +
           WORLD_HASH +
           'uniform vec2 uBreak;\nuniform vec2 uInstJit;\nuniform vec3 uSettle;\nuniform vec4 uVariant;\n' +
-          'float gBreak = 0.0;\nfloat gSettle = 0.0;\nvec2 gUvJit = vec2( 0.0 );\n',
+          'uniform float uWearGloss;\n' +
+          'float gBreak = 0.0;\nfloat gBreak2 = 0.0;\nfloat gSettle = 0.0;\nvec2 gUvJit = vec2( 0.0 );\n',
       )
       .replace(
         '#include <map_fragment>',
@@ -366,13 +395,20 @@ function injectBreakup(mat: THREE.Material, o: BreakupOpts): void {
           gSettle = smoothstep( uSettle.x, uSettle.y, vViewDist );
           #ifdef USE_ROUGHNESSMAP
             gBreak = ( texture2D( roughnessMap, kWorldPlane( vWorldP, uBreak.x ) ).a - 0.5 ) * 2.0 * uBreak.y;
+            // Second world band at 0.319× the first — non-integer, so the two
+            // never come back into phase. One band at ~27 m leaves consecutive
+            // 3.5 m tiles in the near field identical to each other; this is the
+            // ~9 m decade that stops that, and it is the one the camera is
+            // actually close enough to read.
+            gBreak2 = ( texture2D( roughnessMap, kWorldPlane( vWorldP, uBreak.x * 0.319 ) + 0.63 ).a - 0.5 )
+                      * 2.0 * uBreak.y;
           #endif
           #ifdef USE_MAP
             vec4 sampledDiffuseColor = texture2D( map, vMapUv + gUvJit );
             // settle: past the ramp the fine octave is replaced by its own local
             // mean, so the far field resolves to a clean value instead of crawling
             sampledDiffuseColor = mix( sampledDiffuseColor, textureLod( map, vMapUv + gUvJit, 5.5 ), gSettle );
-            sampledDiffuseColor.rgb *= 1.0 + gBreak * 0.30;
+            sampledDiffuseColor.rgb *= 1.0 + gBreak * 0.26 + gBreak2 * 0.16;
             sampledDiffuseColor.rgb *= vec3( 1.0 ) + ( kIH.zxy - 0.5 ) * vec3( 1.0, 0.55, 0.8 ) * uInstJit.y;
 ${VARIANT_BLEND}
             diffuseColor *= sampledDiffuseColor;
@@ -384,9 +420,15 @@ ${VARIANT_BLEND}
         /* glsl */ `
         float roughnessFactor = roughness;
         #ifdef USE_ROUGHNESSMAP
-          roughnessFactor *= texture2D( roughnessMap, vRoughnessMapUv + gUvJit ).g * ( 1.0 + gBreak * 0.26 );
+          roughnessFactor *= texture2D( roughnessMap, vRoughnessMapUv + gUvJit ).g;
           roughnessFactor = mix( roughnessFactor, uSettle.z, gSettle );
-        #endif`,
+          // The world bands are applied AFTER the settle, not before it. Before
+          // it, the far field converged on one constant roughness — which on the
+          // largest surface in frame, lit by a 14° key, is exactly the uniform
+          // plastic sheet the bible names as the #1 amateur tell, and it killed
+          // the long grazing sun sheen down the road in every frame.
+          roughnessFactor *= 1.0 + gBreak * 0.26 + gBreak2 * 0.16;
+        #endif${WEAR_GLOSS}`,
       );
 
     if (jitters || settles) {
@@ -408,7 +450,7 @@ ${VARIANT_BLEND}
 
   const key =
     `brk${o.period}_${o.strength}_${o.instUv ?? 0}_${o.instTint ?? 0}` +
-    `_${settles ? settle.join(',') : 'x'}_${o.variantTint ?? 'x'}`;
+    `_${settles ? settle.join(',') : 'x'}_${o.variantTint ?? 'x'}_${o.wearGloss ?? 0}`;
   mat.customProgramCacheKey = () => key;
 }
 
@@ -431,6 +473,32 @@ export interface TriplanarOpts {
   macro: number;
   /** how hard the macro octave tips the surface normal */
   macroRelief: number;
+  /**
+   * Middle band multiple. A 40 m cliff built from a 4 m tile and a 34 m macro
+   * has a hole in its frequency ladder exactly where a boulder, a bedding step
+   * or a shadowed recess would live — and a surface with nothing between 60 cm
+   * and 30 m reads as sandpaper on a ramp no matter how good either end is.
+   * Omit to skip the band entirely (three taps).
+   */
+  mid?: number;
+  midRelief?: number;
+  /**
+   * Amplitude of the detail octave relative to the form bands, 0..1.
+   *
+   * This is the ratio that decides whether a rock face reads as rock or as
+   * sandpaper, and it is not "how much detail" — it is "how much detail
+   * *against* the form". A 4 mm octave at full strength on a 40 m face wins the
+   * eye outright no matter how much metre-scale relief sits under it, because
+   * its per-pixel contrast is an order higher. Under 1 the form bands lead and
+   * the detail becomes what it should be: the last decade of scale.
+   */
+  detailRelief?: number;
+  /**
+   * Crown/haunch/springline separation for a bore, driven by the *geometric*
+   * normal's world Y — a tunnel ceiling faces down, its floor faces up, and no
+   * noise field knows that. x = albedo swing, y = roughness swing.
+   */
+  boreGradient?: [number, number];
   /** [near, far] metres over which the detail octave settles */
   settle?: [number, number];
 }
@@ -440,24 +508,55 @@ export interface TriplanarOpts {
  * scales. Used on cliff rock and the tunnel bore, where the geometry has no
  * sane UV layout and any planar mapping smears down a 40 m rock face.
  *
- * The second (macro) octave is the part that makes rock read as rock. One
- * 1024² tile at a few metres can only carry centimetre-to-decimetre detail;
- * everything larger mips away by 15 m, and a cliff with no feature bigger than
- * a hand catches no form shading from a 14° key — it is sandpaper wallpaper.
- * Sampling the same normal map again at `macro`× the scale costs three taps and
- * buys metre-scale relief that the low sun can actually rake across.
+ * Three bands, not one. A 1024² tile at 4 m carries 4 mm to ~60 cm and nothing
+ * else; a 40 m sea cliff wearing only that is sandpaper on a low-poly ramp, and
+ * because the only spatial frequency present sits above the mip cutoff it also
+ * dissolves into flat tinted mush by 25 m. Resampling the *same* normal map at
+ * `mid`× (~10 m) and `macro`× (~34 m) the scale costs six taps and supplies the
+ * two missing decades — the boulder and the bedding step — so the same material
+ * has structure at 4 mm, 30 cm, 10 m and 34 m and the 14° key has something to
+ * rake across at every one of them.
  */
 function injectTriplanar(mat: THREE.Material, o: TriplanarOpts): void {
   const uScale = { value: 1 / o.worldScale };
   const uSharp = { value: o.sharpness };
   const uMacro = { value: new THREE.Vector3(1 / (o.worldScale * o.macro), o.macroRelief, o.period) };
+  const uMid = {
+    value: new THREE.Vector3(1 / (o.worldScale * (o.mid ?? 1)), o.midRelief ?? 0, o.detailRelief ?? 1),
+  };
+  const bore = o.boreGradient ?? [0, 0];
+  const uBore = { value: new THREE.Vector2(bore[0], bore[1]) };
   const settle = o.settle ?? [1e6, 1e6 + 1];
   const uSettle = { value: new THREE.Vector2(settle[0], settle[1]) };
+  const hasMid = o.mid !== undefined && (o.midRelief ?? 0) > 0;
+  const hasBore = bore[0] !== 0 || bore[1] !== 0;
+
+  // The middle band is three taps, so it is compiled in only where it is asked
+  // for. Both extra bands deliberately skip the distance settle: settling the
+  // form octave is what left the far cliff as flat tinted mush, because the only
+  // thing surviving to 60 m was the band that carries no shape.
+  const MID_BAND = hasMid
+    ? /* glsl */ `
+          tnX.xy += ( texture2D( normalMap, gTriX * dScale ).xy * 2.0 - 1.0 ) * uTriMid.y;
+          tnY.xy += ( texture2D( normalMap, gTriY * dScale ).xy * 2.0 - 1.0 ) * uTriMid.y;
+          tnZ.xy += ( texture2D( normalMap, gTriZ * dScale ).xy * 2.0 - 1.0 ) * uTriMid.y;`
+    : '';
+
+  const BORE_ALBEDO = hasBore
+    ? /* glsl */ `
+          sampledDiffuseColor.rgb *= 1.0 + ( gCrown * 0.17 - gFloorLine * 0.30 ) * uBore.x;`
+    : '';
+  const BORE_ROUGH = hasBore
+    ? /* glsl */ `
+          roughnessFactor *= 1.0 + ( gCrown * 0.13 - gFloorLine * 0.36 ) * uBore.y;`
+    : '';
 
   mat.onBeforeCompile = (shader) => {
     shader.uniforms.uTriScale = uScale;
     shader.uniforms.uTriSharp = uSharp;
     shader.uniforms.uTriMacro = uMacro;
+    shader.uniforms.uTriMid = uMid;
+    shader.uniforms.uBore = uBore;
     shader.uniforms.uSettle = uSettle;
 
     shader.vertexShader = shader.vertexShader
@@ -481,8 +580,10 @@ function injectTriplanar(mat: THREE.Material, o: TriplanarOpts): void {
           WORLD_PARS +
           WORLD_HASH +
           TRI_COMMON +
-          '\nuniform vec3 uTriMacro;\nuniform vec2 uSettle;\n' +
-          'float gBreak = 0.0;\nfloat gSettle = 0.0;\nfloat gCavity = 1.0;\nvec3 gTriW = vec3( 0.0, 1.0, 0.0 );\n' +
+          '\nuniform vec3 uTriMacro;\nuniform vec3 uTriMid;\nuniform vec2 uBore;\nuniform vec2 uSettle;\n' +
+          'float gBreak = 0.0;\nfloat gBreak2 = 0.0;\nfloat gSettle = 0.0;\nfloat gCavity = 1.0;\n' +
+          'float gFace = 1.0;\nfloat gCrown = 0.0;\nfloat gFloorLine = 0.0;\n' +
+          'vec3 gTriW = vec3( 0.0, 1.0, 0.0 );\n' +
           'vec2 gTriX = vec2( 0.0 );\nvec2 gTriY = vec2( 0.0 );\nvec2 gTriZ = vec2( 0.0 );\n',
       )
       .replace(
@@ -493,14 +594,27 @@ function injectTriplanar(mat: THREE.Material, o: TriplanarOpts): void {
         gTriY = vWorldP.xz * uTriScale;
         gTriZ = vWorldP.xy * uTriScale;
         gSettle = smoothstep( uSettle.x, uSettle.y, vViewDist );
+        // 1 head-on, 0 edge-on. A detail octave held at full amplitude where the
+        // surface runs away from the camera is the crawl on the tunnel wall: the
+        // texel footprint is a long thin sliver the mip chain cannot represent.
+        vec3 kTriN = normalize( vTriN );
+        gFace = abs( dot( kTriN, normalize( cameraPosition - vWorldP ) ) );
+        // Crown faces down, floor faces up. This is geometry, not noise, and it
+        // is the only thing that can tell a bore's ceiling from its floor line.
+        gCrown = smoothstep( 0.0, 0.7, -kTriN.y );
+        gFloorLine = smoothstep( 0.0, 0.7, kTriN.y );
         #ifdef USE_ROUGHNESSMAP
           gBreak = ( texture2D( roughnessMap, kWorldPlane( vWorldP, uTriMacro.z ) ).a - 0.5 ) * 2.0;
+          // second world band at a deliberately non-integer fraction of the
+          // first: this is the ~7-9 m decade, the one that makes a rock cut read
+          // as having zones rather than as one tone with texture on it
+          gBreak2 = ( texture2D( roughnessMap, kWorldPlane( vWorldP, uTriMacro.z * 0.29 ) + 0.41 ).a - 0.5 ) * 2.0;
         #endif
         #ifdef USE_MAP
           vec4 sampledDiffuseColor =
             texture2D( map, gTriX ) * gTriW.x + texture2D( map, gTriY ) * gTriW.y + texture2D( map, gTriZ ) * gTriW.z;
           sampledDiffuseColor = mix( sampledDiffuseColor, textureLod( map, gTriY, 5.5 ), gSettle * 0.65 );
-          sampledDiffuseColor.rgb *= 1.0 + gBreak * 0.30;
+          sampledDiffuseColor.rgb *= 1.0 + gBreak * 0.34 + gBreak2 * 0.22;${BORE_ALBEDO}
           diffuseColor *= sampledDiffuseColor;
         #endif`,
       )
@@ -512,27 +626,34 @@ function injectTriplanar(mat: THREE.Material, o: TriplanarOpts): void {
           vec4 triR = texture2D( roughnessMap, gTriX ) * gTriW.x + texture2D( roughnessMap, gTriY ) * gTriW.y +
                       texture2D( roughnessMap, gTriZ ) * gTriW.z;
           gCavity = triR.r;
-          roughnessFactor *= triR.g * ( 1.0 + gBreak * 0.24 );
+          roughnessFactor *= triR.g * ( 1.0 + gBreak * 0.24 + gBreak2 * 0.16 );
           // damp collects low and in the shade: the floor line of a rock cut is
           // always darker and glossier than its crown, and that split is most of
           // what tells you the surface is stone and not carpet
-          roughnessFactor *= 1.0 - ( 1.0 - gCavity ) * 0.30;
+          roughnessFactor *= 1.0 - ( 1.0 - gCavity ) * 0.30;${BORE_ROUGH}
         #endif`,
       )
       .replace(
         '#include <normal_fragment_maps>',
         /* glsl */ `
         #ifdef USE_NORMALMAP_TANGENTSPACE
+          vec2 mScale = vec2( uTriMacro.x / uTriScale );
+          vec2 dScale = vec2( uTriMid.x / uTriScale );
+          // Detail octave. This is the ONLY band allowed to fade — with distance
+          // and with grazing angle — because it is the only one small enough to
+          // alias. Fading the form bands with it is what collapsed everything
+          // past 25 m into flat tinted mush.
+          float kDet = uTriMid.z * ( 1.0 - gSettle * 0.72 ) * mix( 0.40, 1.0, smoothstep( 0.10, 0.46, gFace ) );
           vec3 tnX = texture2D( normalMap, gTriX ).xyz * 2.0 - 1.0;
           vec3 tnY = texture2D( normalMap, gTriY ).xyz * 2.0 - 1.0;
           vec3 tnZ = texture2D( normalMap, gTriZ ).xyz * 2.0 - 1.0;
+          tnX.xy *= kDet; tnY.xy *= kDet; tnZ.xy *= kDet;${MID_BAND}
           // macro octave: the same map at a non-integer multiple of the scale,
           // supplying the metre-scale form the detail tile is too small to hold
-          vec2 mScale = vec2( uTriMacro.x / uTriScale );
           tnX.xy += ( texture2D( normalMap, gTriX * mScale ).xy * 2.0 - 1.0 ) * uTriMacro.y;
           tnY.xy += ( texture2D( normalMap, gTriY * mScale ).xy * 2.0 - 1.0 ) * uTriMacro.y;
           tnZ.xy += ( texture2D( normalMap, gTriZ * mScale ).xy * 2.0 - 1.0 ) * uTriMacro.y;
-          vec2 nsc = normalScale * ( 1.0 - gSettle * 0.5 );
+          vec2 nsc = normalScale;
           tnX.xy *= nsc; tnY.xy *= nsc; tnZ.xy *= nsc;
           vec3 gN = normalize( vTriN );
           // whiteout blend: add the geometric normal in, keep z positive, reswizzle per axis
@@ -545,7 +666,126 @@ function injectTriplanar(mat: THREE.Material, o: TriplanarOpts): void {
       );
   };
   mat.customProgramCacheKey = () =>
-    `tri${o.worldScale}_${o.sharpness}_${o.macro}_${o.macroRelief}_${o.period}_${o.settle ? o.settle.join(',') : 'x'}`;
+    `tri${o.worldScale}_${o.sharpness}_${o.macro}_${o.macroRelief}_${o.period}` +
+    `_${o.mid ?? 'x'}_${o.midRelief ?? 0}_${o.detailRelief ?? 1}_${bore.join(',')}` +
+    `_${o.settle ? o.settle.join(',') : 'x'}`;
+}
+
+export interface EnvGroundOpts {
+  /** reflected colour straight down */
+  ground: number;
+  /** reflected colour just below the horizon line */
+  horizon: number;
+  /** how completely the ground replaces the probe's lower hemisphere, 0..1 */
+  amount: number;
+  /** terminator half-width in reflection-vector Y, before the roughness widening */
+  soft?: number;
+}
+
+/**
+ * A ground half and a horizon terminator for the environment probe.
+ *
+ * The probe is baked from the sky dome alone, so its lower hemisphere is more
+ * sky. A mirror with nothing but a smooth gradient to reflect looks matte no
+ * matter what its roughness says — that is why a `metalness 1.0, roughness 0.15`
+ * roll bar comes out of the frame as a flat pink tube and a `clearcoat 1`
+ * bonnet shows one broad diffuse falloff and no horizon line. The material is
+ * not the problem; there is nothing in the world for it to reflect.
+ *
+ * The honest fix is to bake the cube from the real scene, which belongs to the
+ * sky system. This is the part that can be done from here: intercept the IBL
+ * radiance fetch and mix the lower hemisphere toward a ground value with a
+ * *sharp* edge at y = 0. A sharp edge is the whole point — the terminator is
+ * the feature. It widens with roughness, so a polished bonnet gets a hard
+ * horizon and a satin panel gets a soft one, which is what separates the two
+ * materials from each other.
+ */
+function injectEnvGround(mat: THREE.Material, o: EnvGroundOpts): void {
+  const g = new THREE.Color(o.ground).convertSRGBToLinear();
+  const h = new THREE.Color(o.horizon).convertSRGBToLinear();
+  const uGround = { value: new THREE.Vector4(g.r, g.g, g.b, o.amount) };
+  const uHorizon = { value: new THREE.Vector4(h.r, h.g, h.b, o.soft ?? 0.035) };
+  const prev = mat.onBeforeCompile;
+  const prevKey = mat.customProgramCacheKey;
+  const FROM = 'return envMapColor.rgb * envMapIntensity;';
+  const TO = /* glsl */ `
+			float kBelow = -reflectVec.y;
+			float kSoft = uEnvHorizon.w + roughness * 0.65;
+			vec3 kGround = mix( uEnvHorizon.rgb, uEnvGround.rgb, smoothstep( 0.0, 0.5, kBelow ) );
+			envMapColor.rgb = mix( envMapColor.rgb, kGround,
+				smoothstep( -kSoft, kSoft, kBelow ) * uEnvGround.w );
+			return envMapColor.rgb * envMapIntensity;`;
+
+  mat.onBeforeCompile = (shader, renderer) => {
+    prev?.call(mat, shader, renderer);
+    shader.uniforms.uEnvGround = uGround;
+    shader.uniforms.uEnvHorizon = uHorizon;
+    // `#include` directives are still unresolved at this point, so the chunk has
+    // to be pulled in and inlined by hand. Read it *now*, not at module load:
+    // the sky system installs its own override of this same chunk during init,
+    // and inlining a stale snapshot would quietly undo their diffuse-IBL scale.
+    const chunk = (THREE.ShaderChunk as unknown as Record<string, string>)
+      .envmap_physical_pars_fragment;
+    if (!chunk || !chunk.includes(FROM)) {
+      console.warn('[materials] getIBLRadiance signature moved; env ground half skipped');
+      return;
+    }
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        '#include <common>\nuniform vec4 uEnvGround;\nuniform vec4 uEnvHorizon;',
+      )
+      .replace('#include <envmap_physical_pars_fragment>', chunk.split(FROM).join(TO));
+  };
+  const key = `envg${o.ground}_${o.horizon}_${o.amount}_${o.soft ?? 0.035}`;
+  mat.customProgramCacheKey =
+    prevKey && prevKey !== THREE.Material.prototype.customProgramCacheKey
+      ? () => prevKey.call(mat) + key
+      : () => key;
+}
+
+/** The bay and the warm stone under it, as a metal or a lacquer sees them. */
+const ENV_GROUND = { ground: 0x6d5b4a, horizon: 0xb08a63, amount: 0.88 } as const;
+
+/**
+ * Emissive clamp and LOD bias for the boost pad.
+ *
+ * A racing camera meets a boost pad at about ten degrees off the surface, which
+ * is the worst case a mip chain has: the texel footprint is a long thin sliver
+ * and hardware anisotropy holds a *low* mip to serve it. On a hard-edged stripe
+ * pattern that is a crawling white smear, and because the stripes are also the
+ * brightest thing in frame, the crawl is what the eye goes to first. Forcing a
+ * higher mip with range is the only thing that resolves it — the chevrons are
+ * meant to read as a flowing band at distance, not as individually sampled
+ * edges.
+ *
+ * The clamp is the other half. The intensity of a boost pad belongs in bloom,
+ * not in the base pixel: past ~2.2× white the tone map has nothing left to
+ * work with and the emissive stops being a colour at all.
+ */
+function injectBoostPad(mat: THREE.Material): void {
+  const uBias = { value: new THREE.Vector3(0.35, 1.6, 2.2) };
+  const prev = mat.onBeforeCompile;
+  mat.onBeforeCompile = (shader, renderer) => {
+    prev?.call(mat, shader, renderer);
+    shader.uniforms.uPadBias = uBias;
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\n' + WORLD_PARS)
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\n' + WORLD_VERTEX);
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\n' + WORLD_PARS + 'uniform vec3 uPadBias;\n')
+      .replace(
+        '#include <emissivemap_fragment>',
+        /* glsl */ `
+        #ifdef USE_EMISSIVEMAP
+          float kPadBias = uPadBias.x + smoothstep( 5.0, 45.0, vViewDist ) * uPadBias.y;
+          vec4 emissiveColor = texture2D( emissiveMap, vEmissiveMapUv, kPadBias );
+          totalEmissiveRadiance *= emissiveColor.rgb;
+          totalEmissiveRadiance = min( totalEmissiveRadiance, vec3( uPadBias.z ) );
+        #endif`,
+      );
+  };
+  mat.customProgramCacheKey = () => 'boostpad2';
 }
 
 /**
@@ -568,14 +808,24 @@ function injectFoliageSSS(mat: THREE.Material, color: THREE.Color, strength: num
         #if ( NUM_DIR_LIGHTS > 0 )
           vec3 sssV = normalize( vViewPosition );
           vec3 sssL = directionalLights[ 0 ].direction;
-          float sssBack = pow( max( 0.0, dot( sssV, -sssL ) ), 3.0 );
-          float sssWrap = max( 0.0, dot( normal, sssL ) * 0.5 + 0.5 );
+          // pow 3 was a pinhole: it only fired when the camera was looking almost
+          // exactly down the sun vector, so in practice the fronds were never
+          // caught doing it and read as opaque cardboard. 1.6 turns it into a
+          // broad lobe covering most of the beach section's viewing angles.
+          float sssBack = pow( max( 0.0, dot( sssV, -sssL ) ), 1.6 );
+          // Wrap diffuse: NdotL remapped to (NdotL + w)/(1 + w). A leaf is one
+          // cell thick and the light does not stop at its terminator.
+          float sssND = dot( normal, sssL );
+          float sssWrap = max( 0.0, ( sssND + 0.5 ) / 1.5 );
+          // Transmission is a back-face event — the light has come through the
+          // blade, so it is strongest where the surface faces away from the sun.
+          float sssThru = sssBack * max( 0.0, 0.25 - sssND * 0.75 ) * 2.4;
           reflectedLight.indirectDiffuse += directionalLights[ 0 ].color * uSSSColor * diffuseColor.rgb *
-            ( sssBack * 1.35 + sssWrap * 0.22 ) * uSSSStrength;
+            ( sssThru + sssBack * 0.55 + sssWrap * 0.30 ) * uSSSStrength;
         #endif`,
       );
   };
-  mat.customProgramCacheKey = () => `foliagesss${strength}`;
+  mat.customProgramCacheKey = () => `foliagesss2_${strength}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -746,7 +996,9 @@ export class Materials implements System {
     if (this.boostEmissive) {
       // chevrons flow in +V, i.e. the direction of travel across the pad
       this.boostEmissive.offset.y = (this.boostEmissive.offset.y - dt * 0.85) % 1;
-      this.boostMat!.emissiveIntensity = 1.15 + Math.sin(this.clock * 7.5) * 0.28;
+      // The pulse rides *under* the shader clamp, so the chevrons breathe in
+      // bloom instead of pumping the whole quad in and out of pure white.
+      this.boostMat!.emissiveIntensity = 1.6 + Math.sin(this.clock * 7.5) * 0.25;
     }
     if (this.waterTime) this.waterTime.value = this.clock;
     if (this.neonMat) this.neonMat.emissiveIntensity = 2.1 + Math.sin(this.clock * 3.1) * 0.12;
@@ -916,8 +1168,16 @@ export class Materials implements System {
       // pulled down to a value break, the normal is now what has to make a
       // 36 mm chipping legible at 1 m under a 14° key.
       const h = grit[i] * 0.09 + stone * 0.5 + (1 - clamp01(agg.f1[i] * 1.6)) * 0.04 - edge * 0.4;
+      // Every term here except `macro` and `patch` lives below half a metre, so
+      // it averages out the moment the road is more than a few metres away and
+      // the surface goes to one constant value — which under a 14° key is the
+      // difference between a road and a sheet of plastic. `macro` at freq 2 is a
+      // 1.75 m polish band and `patch` a 23 cm one; both now reach roughness and
+      // not only albedo, and the world-space bands in the injection carry the
+      // same job out to the horizon.
       const rough = clamp(
-        baseRough + (grit[i] - 0.5) * 0.2 + (wear[i] - 0.5) * 0.22 - stone * 0.16 - tarBleed * 0.24 - rub * 0.14,
+        baseRough + (grit[i] - 0.5) * 0.2 + (wear[i] - 0.5) * 0.22 - stone * 0.16 - tarBleed * 0.24 -
+          rub * 0.14 + (macro[i] - 0.5) * 0.26 + (patch[i] - 0.5) * 0.12,
         0.24,
         0.97,
       );
@@ -937,7 +1197,13 @@ export class Materials implements System {
       // Aggregate that keeps full contrast to the horizon crawls on a moving
       // frame; past ~34 m the road resolves to its own local mean instead.
       settle: [34, 95],
-      settleRough: racingLine ? 0.66 : 0.78,
+      // The mean the far road converges on is now glossier. 0.78 was above the
+      // bible's 0.72 base, so the one part of the road at the grazing angle that
+      // produces a sun sheen was also the least reflective part of it.
+      settleRough: racingLine ? 0.56 : 0.70,
+      // The racing line is a vertex-colour mask on the track's own mesh; this is
+      // what turns it from an invisible 8% tint into a specular event.
+      wearGloss: 1.55,
     });
     this.envConsumers.push(mat);
     return { mat, textures: m.all };
@@ -989,7 +1255,12 @@ export class Materials implements System {
 
     const m = this.maps(f, { normalStrength: 0.9 });
     const mat = this.std(m, { envMapIntensity: 0.9 });
-    injectBreakup(mat, { period: 12.7, strength: 0.7, settle: [40, 110], settleRough: 0.8 });
+    injectBreakup(mat, {
+      period: 12.7, strength: 0.7, settle: [40, 110], settleRough: 0.78,
+      // the village's cobbles carry a wear mask on the mesh too, and a polished
+      // sett crown is glossier as well as lighter
+      wearGloss: 1.1,
+    });
     this.envConsumers.push(mat);
     return { mat, textures: m.all };
   }
@@ -1120,6 +1391,11 @@ export class Materials implements System {
     const bare = fbmField(size, { freq: 4, octaves: 4, seed: 75, warp: 0.05 });
     const macro = fbmField(size, { freq: 2, octaves: 3, seed: 76, warp: 0.04 });
     const grain = grainField(size, 77);
+    // Tussocks: 1.6 m mounds at 3.2 m per tile. A turf field whose only relief is
+    // a 35 cm clump octave is isotropic bobble at one frequency — cottage cheese
+    // — and it stays cottage cheese at 3 m and at 30 m because there is nothing
+    // else in it. This is the band that gives a hillside its lie.
+    const tussock = fbmField(size, { freq: 2, octaves: 2, seed: 78, warp: 0.09 });
 
     const dark = rgb(0x4e7434);
     const mid = rgb(0x6f9b47);
@@ -1137,7 +1413,7 @@ export class Materials implements System {
       mixRGB(_a, tip, smoothstep(0.55, 0.95, b), _b);
       mixRGB(_b, dryC, dryMask * 0.7, _c);
       mixRGB(_c, soil, soilMask * 0.7, _a);
-      const tone = 0.88 + clump[i] * 0.22 + (grain[i] - 0.5) * 0.09;
+      const tone = 0.88 + clump[i] * 0.14 + (tussock[i] - 0.5) * 0.30 + (grain[i] - 0.5) * 0.09;
       f.set(i, _a.r * tone, _a.g * tone, _a.b * tone);
 
       // The 3 cm blade octave stays OUT of the height field. At 3.2 m per tile
@@ -1145,11 +1421,16 @@ export class Materials implements System {
       // that is the crawl on the left bank, not the tile repeat. Only the clump
       // and the coarse stretched octave carry relief; the fine blades live in
       // albedo and roughness, where mipping resolves them to a clean value.
-      const h = clump[i] * 0.62 + blade2[i] * 0.34 - soilMask * 0.3;
-      const rough = clamp(0.86 - smoothstep(0.6, 1.0, b) * 0.16 + soilMask * 0.08 - dryMask * 0.04, 0.55, 0.99);
-      const ao = 1 - (1 - height) * 0.34 - soilMask * 0.1;
+      const h = clump[i] * 0.40 + blade2[i] * 0.26 + tussock[i] * 2.2 - soilMask * 0.3;
+      const rough = clamp(
+        0.86 - smoothstep(0.6, 1.0, b) * 0.16 + soilMask * 0.08 - dryMask * 0.04 +
+          (tussock[i] - 0.5) * 0.16,
+        0.55,
+        0.99,
+      );
+      const ao = 1 - (1 - height) * 0.26 - soilMask * 0.1 - (1 - tussock[i]) * 0.16;
       f.surf(i, h, ao, rough);
-      f.macro(i, macro[i]);
+      f.macro(i, clamp01(macro[i] * 0.6 + tussock[i] * 0.4));
     }
 
     const m = this.maps(f, { normalStrength: 0.85 });
@@ -1220,6 +1501,17 @@ export class Materials implements System {
     const fine = fbmField(size, { freq: Math.round(size / 10), octaves: 2, seed: 96 });
     const macro = fbmField(size, { freq: 2, octaves: 3, seed: 97, warp: 0.06 });
     const grain = grainField(size, 98);
+    // Tile-scale form: a 1.3 m craggy mass and a 2 m bedding step. These are the
+    // two features that were missing outright, and their absence is why the face
+    // had nothing bigger than a hand to throw a silhouette break or a shadowed
+    // recess. Resampled by the mid and macro bands they become the 4 m and 11 m
+    // masses and the 17 m benching a 40 m sea cliff is actually made of.
+    //
+    // Ridged fbm, deliberately NOT a Voronoi: a cell field is a recognisable
+    // motif, and repeating one recognisable motif at three scales reads as
+    // cauliflower rather than as rock.
+    const mass = fbmField(size, { freq: 3, octaves: 2, seed: 99, mode: 'ridged', warp: 0.10, warpFreq: 2 });
+    const bench = fbmField(size, { freq: 2, octaves: 2, seed: 100, stretchY: 3.6, warp: 0.05 });
 
     const stone = rgb(0xa8927a);
     const shade = rgb(0x7a6957);
@@ -1235,46 +1527,79 @@ export class Materials implements System {
       const flakeEdge = smoothstep(0.035, 0.0, flake.f2[i] - flake.f1[i]);
       const face = smoothstep(0.3, 0.85, ridge[i]);
       const lich = smoothstep(0.62, 0.85, lichen[i]) * (1 - fracture) * smoothstep(0.35, 0.7, band);
+      const crag = mass[i];
+      const gully = smoothstep(0.30, 0.04, crag);
 
       mixRGB(shade, stone, clamp01(band * 1.3), _a);
-      mixRGB(_a, bleach, face * 0.45, _b);
+      mixRGB(_a, bleach, face * 0.33, _b);
       mixRGB(_b, lichenC, lich * 0.6, _c);
       // Most of the form has to come from the normal and not from baked value,
-      // or the rock is a painting of a cliff that ignores where the sun is.
-      const bedding = 0.84 + Math.pow(band, 0.8) * 0.28;
-      const tone = bedding + (fine[i] - 0.5) * 0.1 + (grain[i] - 0.5) * 0.05 - fracture * 0.1;
+      // or the rock is a painting of a cliff that ignores where the sun is. The
+      // boulder/bench terms are the exception: a 1 m mass needs a value break as
+      // well as a normal break or it vanishes the moment it faces away from the
+      // key, which is what left the face reading as one hue at one frequency.
+      const bedding = 0.82 + Math.pow(band, 0.8) * 0.22;
+      const tone =
+        bedding + (fine[i] - 0.5) * 0.1 + (grain[i] - 0.5) * 0.05 - fracture * 0.1 +
+        (crag - 0.5) * 0.09 + (bench[i] - 0.5) * 0.13 - gully * 0.10;
       f.set(i, _c.r * tone, _c.g * tone, _c.b * tone);
 
       // Height, not albedo, is where the strata and the fracture planes belong.
       // Deepened across the board: a rock cut has to throw micro-shadow under a
-      // raking key or it is wallpaper.
+      // raking key or it is wallpaper. `fine` is pulled back hard — it was the
+      // per-texel term that made the whole 40 m face one grade of oatmeal.
       const h =
-        ridge[i] * 0.95 + band * 0.62 + fine[i] * 0.16 - fracture * 0.85 - flakeEdge * 0.34;
+        ridge[i] * 0.72 + band * 0.5 + fine[i] * 0.07 - fracture * 0.55 - flakeEdge * 0.14 +
+        // These two are deliberately huge next to the detail terms. A Sobel is a
+        // 3x3 finite difference, so a 1.3 m dome spread over 340 texels needs an
+        // amplitude an order above a 4 mm chip to tip the normal by the same few
+        // degrees — an amplitude that "looks wrong" in the height field is what a
+        // metre-scale feature costs.
+        crag * 1.2 + bench[i] * 2.6 - gully * 0.6;
       // Genuinely bimodal: dry exposed faces near 0.62, damp shaded crevices
       // near 0.95. A constant roughness is the #1 amateur tell and 0.89 ± 0.08
       // was effectively constant.
+      // Dry limestone is matte everywhere. The old floor of 0.55 let the exposed
+      // faces go glossy enough that the normal-mapped microfacets threw a sun
+      // sparkle across the whole cliff — a 40 m sea cliff that glitters reads as
+      // wet plastic. 0.72-0.99 is still a 27% spread, which is the spatial
+      // variation the bible asks for; it just no longer includes "polished".
       const rough = clamp(
-        0.93 - face * 0.30 - band * 0.06 + fracture * 0.05 + lich * 0.06 + (fine[i] - 0.5) * 0.14,
-        0.55,
+        0.93 - face * 0.14 - band * 0.06 + fracture * 0.05 + lich * 0.06 + (fine[i] - 0.5) * 0.14 -
+          crag * 0.08 + gully * 0.05,
+        0.72,
         0.99,
       );
-      const ao = 1 - fracture * 0.55 - flakeEdge * 0.2 - (1 - ridge[i]) * 0.3;
+      const ao = 1 - fracture * 0.42 - flakeEdge * 0.12 - (1 - ridge[i]) * 0.22 - gully * 0.26 -
+        (1 - crag) * 0.10;
       f.surf(i, h, ao, rough);
-      f.macro(i, macro[i]);
+      // The world-space band gets the boulder mass folded into it too, so the
+      // ±34% albedo swing the shader applies at 30 m lands on real form rather
+      // than on an unrelated blob field.
+      f.macro(i, clamp01(macro[i] * 0.78 + crag * 0.22));
     }
 
-    const m = this.maps(f, { normalStrength: 1.25 });
-    const mat = this.std(m, { envMapIntensity: 0.8 });
-    mat.normalScale.set(1.15, 1.15);
+    const m = this.maps(f, { normalStrength: 1.0 });
+    const mat = this.std(m, { envMapIntensity: 0.62 });
+    // Three bands sum before normalScale, so the gain that was right for one
+    // band is three times too much for three: over-tipped normals on a 40 m face
+    // under a 14° key are salt-and-pepper sparkle, not form.
+    mat.normalScale.set(0.95, 0.95);
     injectTriplanar(mat, {
       worldScale: WORLD_SCALE['cliff-rock'],
       // 5 was low enough that X and Z cross-faded across most of a curved face,
       // sliding two copies of the same directional noise past each other — the
-      // "fur" in the tunnel bore. At 7 one projection dominates almost anywhere.
-      sharpness: 7,
+      // "fur" in the tunnel bore. At 9 one projection dominates almost anywhere.
+      sharpness: 9,
       period: 31.7,
-      macro: 3.3,
-      macroRelief: 0.72,
+      // 3.3× of a 4 m tile is a 13 m macro, far too tight for a 40 m sea cliff:
+      // it put the largest feature in the material at about a metre and a half.
+      // 8.5× = 34 m, which is the height of the face itself.
+      macro: 8.5,
+      macroRelief: 0.95,
+      mid: 2.9,
+      midRelief: 0.55,
+      detailRelief: 0.45,
       settle: [70, 220],
     });
     this.envConsumers.push(mat);
@@ -1289,9 +1614,12 @@ export class Materials implements System {
    */
   private buildTunnelBore(size: number): Entry {
     const f = new Fields(size);
-    // Chisel/bore arcs: the tool signature, at a slight stretch so the arcs run
-    // across the bore rather than along it under either projection.
-    const arcs = fbmField(size, { freq: 15, octaves: 2, seed: 301, stretchY: 0.3, mode: 'ridged' });
+    // Chisel/bore arcs: the tool signature. At freq 15 with a 0.3 stretch this
+    // was a hairbrush — 21 cm ridges elongated 3:1 and repeated identically from
+    // crown to floor is the definition of corduroy, and no amount of macro band
+    // rescues it. Dropped to 4 (80 cm) and de-stretched to 0.62 the same field
+    // reads as the broad sweeps a boring head actually leaves.
+    const arcs = fbmField(size, { freq: 4, octaves: 2, seed: 301, stretchY: 0.62, mode: 'ridged' });
     const blast = fbmField(size, { freq: 7, octaves: 4, seed: 302, mode: 'ridged', warp: 0.06 });
     const frac = voronoiField(size, 9, 9, 0.95, 303, 2);
     const spall = voronoiField(size, 22, 22, 0.9, 304, 2);
@@ -1300,6 +1628,10 @@ export class Materials implements System {
     const fine = fbmField(size, { freq: Math.round(size / 12), octaves: 2, seed: 307 });
     const macro = fbmField(size, { freq: 2, octaves: 3, seed: 308, warp: 0.06 });
     const grain = grainField(size, 309);
+    // Tile-scale mass: ~1 m benching left by the cut, so the bore has something
+    // for the sodium strip to throw a shadow terminator across. Ridged fbm, not a
+    // cell field — see buildCliffRock.
+    const bench = fbmField(size, { freq: 3, octaves: 2, seed: 310, mode: 'ridged', warp: 0.09, warpFreq: 2 });
 
     const cut = rgb(0x9c8974);
     const deep = rgb(0x6a5b4c);
@@ -1313,35 +1645,56 @@ export class Materials implements System {
       const spalled = smoothstep(0.05, 0.0, spall.f2[i] - spall.f1[i]) * smoothstep(0.4, 0.75, blast[i]);
       const wetM = smoothstep(0.52, 0.86, damp[i]);
       const sooty = smoothstep(0.45, 0.8, soot[i]);
+      const mass = bench[i];
+      const recess = smoothstep(0.28, 0.03, mass);
 
       mixRGB(deep, cut, clamp01(face * 1.25), _a);
-      mixRGB(_a, dust, arc * 0.18 * (1 - wetM), _b);
+      mixRGB(_a, dust, arc * 0.24 * (1 - wetM), _b);
       mixRGB(_b, wet, wetM * 0.55 + sooty * 0.18, _c);
-      const tone = 0.86 + face * 0.2 + (fine[i] - 0.5) * 0.1 + (grain[i] - 0.5) * 0.05 - fracture * 0.14;
+      const tone =
+        0.86 + face * 0.15 + (fine[i] - 0.5) * 0.08 + (grain[i] - 0.5) * 0.04 - fracture * 0.12 +
+        (mass - 0.5) * 0.13 - recess * 0.10;
       f.set(i, _c.r * tone, _c.g * tone, _c.b * tone);
 
-      const h = blast[i] * 0.95 + arc * 0.2 + fine[i] * 0.14 - fracture * 0.95 - spalled * 0.45;
+      const h =
+        blast[i] * 0.8 + arc * 0.34 + fine[i] * 0.06 - fracture * 0.6 - spalled * 0.24 +
+        mass * 1.8 - recess * 0.6;
       // Dry blasted crown near 0.60, damp shaded floor line near 0.85 — carried
       // on the wet mask so the split follows the surface rather than a hard band.
+      // Blasted rock, floored higher for the same reason as the cliff. The damp
+      // floor line still gets its gloss, but from the bore gradient in the
+      // shader, where it follows the geometry rather than a noise field.
       const rough = clamp(
-        0.60 + wetM * 0.2 + (1 - face) * 0.22 + fracture * 0.08 + (fine[i] - 0.5) * 0.12,
-        0.42,
+        0.66 + wetM * 0.18 + (1 - face) * 0.20 + fracture * 0.08 + (fine[i] - 0.5) * 0.12 - mass * 0.08,
+        0.55,
         0.97,
       );
-      const ao = 1 - fracture * 0.62 - spalled * 0.28 - (1 - blast[i]) * 0.3 - wetM * 0.12;
+      const ao = 1 - fracture * 0.46 - spalled * 0.2 - (1 - blast[i]) * 0.22 - wetM * 0.12 -
+        recess * 0.24 - (1 - mass) * 0.10;
       f.surf(i, h, ao, rough);
-      f.macro(i, macro[i]);
+      f.macro(i, clamp01(macro[i] * 0.76 + mass * 0.24));
     }
 
-    const m = this.maps(f, { normalStrength: 1.35 });
-    const mat = this.std(m, { envMapIntensity: 0.5 });
-    mat.normalScale.set(1.2, 1.2);
+    const m = this.maps(f, { normalStrength: 1.1 });
+    const mat = this.std(m, { envMapIntensity: 0.42 });
+    mat.normalScale.set(1.0, 1.0);
     injectTriplanar(mat, {
       worldScale: WORLD_SCALE['tunnel-bore'],
-      sharpness: 8,
+      // On a curved bore 8 is soft enough that the X and Z projections cross-fade
+      // right across the haunch, which is two copies of the same field sliding
+      // past each other — the smear. 12 keeps one projection dominant.
+      sharpness: 12,
       period: 23.3,
-      macro: 3.7,
-      macroRelief: 0.6,
+      // The bore is ~8 m tall; a 3.7× macro of a 3.2 m tile topped out around a
+      // metre, so there was nothing at bore scale at all. 8× = 26 m, which puts
+      // the blast field's own features at ~3.5 m and the benching at ~8 m.
+      macro: 8.0,
+      macroRelief: 0.95,
+      mid: 2.6,
+      midRelief: 0.55,
+      detailRelief: 0.45,
+      // Crown dry and pale, springline mid, floor line damp, dark and glossier.
+      boreGradient: [1.0, 1.0],
       settle: [55, 180],
     });
     this.envConsumers.push(mat);
@@ -1598,13 +1951,24 @@ export class Materials implements System {
     const m = this.maps(f, { normalStrength: 0.35 });
     const mat = this.phys(m, {
       metalness: 0,
+      // The base roughness map runs 0.14–0.85; three multiplies clearcoatRoughness
+      // by clearcoatRoughnessMap.g, so binding the same ORM here lands the lacquer
+      // at ~0.05 on clean panel centres and ~0.10 where the paint has scratched,
+      // dusted or chipped. One uniform clearcoat roughness over a whole kart gives
+      // one uniform highlight; this is the breakup that makes it read as lacquer
+      // over metal rather than as a shiny decal, and it costs no extra texture.
+      clearcoatRoughnessMap: m.ormMap,
       clearcoat: 1,
-      clearcoatRoughness: 0.06,
+      clearcoatRoughness: 0.19,
       // The lacquer lobe is only as tight as the environment it samples; at 1.15
       // against a 0.40 scene intensity the second specular lobe never appears and
       // the paint reads as matte plastic.
       envMapIntensity: 1.5,
     });
+    // Without a ground half in the probe the bonnet has no horizon line to carry
+    // and the clearcoat lobe has nothing but a smooth gradient to sharpen — which
+    // is exactly what closeup.png shows.
+    injectEnvGround(mat, ENV_GROUND);
     this.envConsumers.push(mat as unknown as THREE.MeshStandardMaterial);
     return { mat, textures: m.all };
   }
@@ -1635,6 +1999,12 @@ export class Materials implements System {
     // environmentIntensity of 0.40 an envMapIntensity of 1.6 leaves the roll bar
     // reading as pale blue-grey paint rather than a mirror carrying the horizon.
     const mat = this.std(m, { envMapIntensity: 2.3 });
+    // A roll bar is nothing but what it reflects, and the probe's lower half is
+    // more sky — so the bar came out as a smooth pink gradient with no structure
+    // and no horizon. The ground half is what turns it back into metal: the
+    // terminator sweeping around a tube is the single feature that reads as
+    // "mirror" rather than "painted plastic pipe".
+    injectEnvGround(mat, { ...ENV_GROUND, amount: 0.92, soft: 0.02 });
     this.envConsumers.push(mat);
     return { mat, textures: m.all };
   }
@@ -1708,6 +2078,7 @@ export class Materials implements System {
       depthWrite: false,
       side: THREE.DoubleSide,
     });
+    injectEnvGround(mat, { ...ENV_GROUND, amount: 0.8 });
     this.envConsumers.push(mat as unknown as THREE.MeshStandardMaterial);
     return { mat, textures: m.all };
   }
@@ -1843,17 +2214,30 @@ export class Materials implements System {
   // Emissive
   // =========================================================================
 
-  /** Boost strip: dark tread plate under animated cyan chevrons that flow forward in +V. */
+  /**
+   * Boost strip: a glossy poured-resin panel under animated cyan chevrons that
+   * flow forward in +V.
+   *
+   * It is the brightest object in the frame, so it has to be the best resolved.
+   * Two things were fighting that. The substrate carried a 12 cm noise octave in
+   * albedo *and* height, which at a grazing angle is aggregate crawling straight
+   * through the emissive — you could not tell whether the pad was paint, plastic
+   * or a light panel. And the chevrons were a hard-edged high-contrast stripe
+   * pattern minified to nothing with no LOD bias, which is the crawl. So: a
+   * smooth resin substrate that still reads as a surface where it is not lit,
+   * and the stripe pattern deliberately biased into a higher mip at range.
+   */
   private buildBoostPad(size: number): Entry {
     const f = new Fields(size);
     const emissive = new Uint8ClampedArray(size * size * 4);
-    const tread = fbmField(size, { freq: Math.round(size / 10), octaves: 2, seed: 211 });
-    const wear = fbmField(size, { freq: 6, octaves: 3, seed: 212, warp: 0.05 });
+    // 6 cells over a 6 m tile ≈ 1 m swirl in the resin, not 12 cm gravel
+    const tread = fbmField(size, { freq: 6, octaves: 3, seed: 211, warp: 0.06 });
+    const wear = fbmField(size, { freq: 4, octaves: 3, seed: 212, warp: 0.05 });
     const rivet = voronoiField(size, 8, 8, 0.2, 213);
     const grain = grainField(size, 214);
 
-    const plate = rgb(0x2b3140);
-    const plateWorn = rgb(0x424a5b);
+    const plate = rgb(0x27303f);
+    const plateWorn = rgb(0x39445a);
     const glow = rgb(0x4fc3ff);
     const glowHot = rgb(0xdcf4ff);
 
@@ -1871,41 +2255,60 @@ export class Materials implements System {
         const riv = smoothstep(0.16, 0.08, rivet.f1[i]) * margin;
 
         mixRGB(plate, plateWorn, wear[i] * 0.7, _a);
-        mixRGB(_a, glow, chevron * 0.55, _b);
-        const tone = 0.92 + tread[i] * 0.14 + (grain[i] - 0.5) * 0.05 + riv * 0.2;
+        // The albedo only tints toward the glow — it must not try to *be* the
+        // glow, or the lit pixels clip before the emissive has said anything.
+        mixRGB(_a, glow, chevron * 0.3, _b);
+        const tone = 0.94 + tread[i] * 0.08 + (grain[i] - 0.5) * 0.03 + riv * 0.16;
         f.set(i, _b.r * tone, _b.g * tone, _b.b * tone);
 
-        mixRGB(glow, glowHot, core * 0.8, _c);
+        mixRGB(glow, glowHot, core * 0.55, _c);
         const k = i * 4;
-        const e = chevron;
+        // A flat-topped band at full value is a solid white bar the moment bloom
+        // touches it, and a solid white bar has no material. Shaped into a dim
+        // cyan flank and a hot narrow core, the same chevron keeps its hue and
+        // its edge under the same bloom.
+        const e = chevron * (0.34 + core * 0.82);
         emissive[k] = _c.r * e;
         emissive[k + 1] = _c.g * e;
         emissive[k + 2] = _c.b * e;
         emissive[k + 3] = 255;
 
-        const h = tread[i] * 0.14 + riv * 0.5 - chevron * 0.12;
-        const rough = clamp(0.5 - chevron * 0.26 + (tread[i] - 0.5) * 0.18 - wear[i] * 0.08, 0.1, 0.9);
-        f.surf(i, h, 1 - riv * 0.15, rough, 0.15 + riv * 0.4);
+        // Relief stays in the rivets and the chevron lip only. Resin is poured,
+        // it is not gravel, and a height field full of 12 cm noise is what put
+        // the tarmac's own aggregate response on top of a light panel.
+        const h = tread[i] * 0.05 + riv * 0.5 - chevron * 0.1;
+        const rough = clamp(0.18 + (tread[i] - 0.5) * 0.14 + (1 - chevron) * 0.06 - wear[i] * 0.05, 0.08, 0.4);
+        f.surf(i, h, 1 - riv * 0.15, rough, 0.05 + riv * 0.45);
         f.macro(i, wear[i]);
       }
     }
 
-    const m = this.maps(f, { normalStrength: 0.8 });
+    const m = this.maps(f, { normalStrength: 0.45 });
     const emissiveMap = new THREE.CanvasTexture(this.bytesCanvas(size, emissive));
     emissiveMap.colorSpace = THREE.SRGBColorSpace;
     emissiveMap.wrapS = emissiveMap.wrapT = THREE.RepeatWrapping;
     emissiveMap.anisotropy = this.aniso;
+    emissiveMap.generateMipmaps = true;
+    emissiveMap.minFilter = THREE.LinearMipmapLinearFilter;
+    emissiveMap.magFilter = THREE.LinearFilter;
     emissiveMap.needsUpdate = true;
 
-    const mat = this.std(m, {
+    const mat = this.phys(m, {
+      // a glossy resin substrate, so the unlit half of the pad is still a
+      // material and not an absence. metalness comes off the ORM blue channel:
+      // dielectric resin with metal rivets down the margins.
+      clearcoat: 1,
+      clearcoatRoughness: 0.08,
       emissive: 0xffffff,
       emissiveMap,
-      emissiveIntensity: 1.15,
-      envMapIntensity: 1.0,
+      emissiveIntensity: 1.6,
+      envMapIntensity: 1.2,
     });
+    injectBoostPad(mat);
+    injectEnvGround(mat, ENV_GROUND);
     this.boostEmissive = emissiveMap;
     this.boostMat = mat;
-    this.envConsumers.push(mat);
+    this.envConsumers.push(mat as unknown as THREE.MeshStandardMaterial);
     return { mat, textures: [...m.all, emissiveMap] };
   }
 
@@ -2022,11 +2425,19 @@ export class Materials implements System {
           // deep body; looking down into it shows the shallow colour. Driven by
           // the *flat* plane normal so the ramp reads as depth and not as chop.
           #ifndef FLAT_SHADED
-            float wFacing = pow( clamp( dot( normalize( vViewPosition ), normalize( vNormal ) ), 0.0, 1.0 ), 0.55 );
+            float wCos = clamp( dot( normalize( vViewPosition ), normalize( vNormal ) ), 0.0, 1.0 );
+            float wFacing = pow( wCos, 0.55 );
             // near water is measurably darker than the horizon band: without this
             // the bay sits in the sky's value range and there is no horizon line
             float wNear = 1.0 - smoothstep( 12.0, 260.0, vViewDist );
             diffuseColor.rgb *= mix( uDeep, uShallow, wFacing ) * ( 1.0 - wNear * 0.45 );
+            // Schlick, F0 = 0.02. Without it the body colour is added at full
+            // strength right out to the horizon and the sea is a matte slab that
+            // happens to be blue; with it the bay goes teal underfoot and
+            // near-mirror at a grazing angle, which at golden hour is the most
+            // valuable specular event on the course.
+            float wFres = 0.02 + 0.98 * pow( 1.0 - wCos, 5.0 );
+            diffuseColor.rgb *= 1.0 - wFres * 0.88;
           #endif`,
         )
         .replace(
@@ -2042,9 +2453,20 @@ export class Materials implements System {
             vec3 mapN = normalize( vec3( wN1.xy + wN2.xy, wN1.z * wN2.z ) );
             // Chop has to fall off toward the horizon or the far bay aliases into
             // a crawling band; near water keeps its full tilt so the troughs read.
-            mapN.xy *= normalScale * ( 1.0 - smoothstep( 90.0, 700.0, vViewDist ) * 0.82 );
+            // But it must fade toward a *statistical* roughness, not toward flat:
+            // wavelets do not stop existing at 200 m, they stop being resolvable,
+            // and a mirror-flat far bay is a sheet of paper with a seam on it.
+            mapN.xy *= normalScale * ( 1.0 - smoothstep( 90.0, 700.0, vViewDist ) * 0.55 );
             normal = normalize( tbn * mapN );
           #endif`,
+        )
+        .replace(
+          '#include <roughnessmap_fragment>',
+          /* glsl */ `
+          #include <roughnessmap_fragment>
+          // the chop the normal map gave up at range comes back as roughness, so
+          // the far bay stays a rough mirror rather than becoming a flat one
+          roughnessFactor = clamp( roughnessFactor + smoothstep( 90.0, 700.0, vViewDist ) * 0.09, 0.02, 0.35 );`,
         )
         .replace(
           '#include <lights_fragment_end>',
@@ -2057,13 +2479,19 @@ export class Materials implements System {
             // clip the look, and it is the single highest-value pixel in the shot.
             vec3 wV = normalize( vViewPosition );
             vec3 wH = normalize( wV + directionalLights[ 0 ].direction );
-            float wSpec = pow( max( 0.0, dot( normal, wH ) ), 900.0 ) * 26.0
-                        + pow( max( 0.0, dot( normal, wH ) ), 90.0 ) * 1.6;
+            float wNH = max( 0.0, dot( normal, wH ) );
+            // Three lobes, not one. An exponent of 900 is a point of light, not a
+            // glitter path — the track has to be broad enough to survive the far
+            // field where the wave normals have already settled, or the single
+            // best specular event at golden hour is one blown pixel.
+            float wSpec = pow( wNH, 620.0 ) * 18.0
+                        + pow( wNH, 120.0 ) * 3.2
+                        + pow( wNH, 22.0 ) * 0.85;
             reflectedLight.directSpecular += directionalLights[ 0 ].color * wSpec;
           #endif`,
         );
     };
-    mat.customProgramCacheKey = () => 'water2';
+    mat.customProgramCacheKey = () => 'water3';
     this.waterTime = uTime;
     this.envConsumers.push(mat as unknown as THREE.MeshStandardMaterial);
     return { mat, textures: m.all };
@@ -2232,7 +2660,10 @@ export class Materials implements System {
       // leaf cards are thin: shadow acne here would look like dirt on the leaf
       shadowSide: THREE.DoubleSide,
     });
-    injectFoliageSSS(mat, new THREE.Color(0.55, 0.85, 0.32), 1.0);
+    // #b8d97a in linear — the colour a golden-hour sun is after it has been
+    // through one leaf. The bible calls backlit palms a hero moment; a frond
+    // between the camera and the sun now goes to it.
+    injectFoliageSSS(mat, new THREE.Color(0xb8d97a).convertSRGBToLinear(), frond ? 1.35 : 1.0);
     this.envConsumers.push(mat);
     return { mat, textures: m.all };
   }

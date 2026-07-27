@@ -8,7 +8,7 @@
  * nothing, and no per-frame object is allocated once the tree is built.
  */
 import './ui.css';
-import { BASE_TOP_SPEED, ItemKind, type Ctx, type System } from '../types';
+import { BASE_TOP_SPEED, ItemKind, RaceState, type Ctx, type System } from '../types';
 import { Minimap } from './Minimap';
 import { Menus } from './Menus';
 import { ItemIconAtlas, ITEM_NAMES, ITEM_TINT, ROULETTE_ORDER } from './ItemIcons';
@@ -18,19 +18,21 @@ import {
 } from './uiUtil';
 
 // --- speedometer dial geometry ---------------------------------------------
-// All fractions are of the canvas *width*; the element's 1:0.95 aspect ratio
-// then guarantees the 252° sweep and its housing fit with margin to spare, and
-// leaves the wedge between the arc ends (which the needle never enters) free
-// for the digital readout.
+// All fractions are of the canvas *width*; the element's 1:0.88 aspect ratio
+// then guarantees the 252° sweep and its housing fit inside the plate rect with
+// margin to spare, and leaves the wedge between the arc ends (which the needle
+// never enters) free for the digital readout.
+//
+// The furthest thing this draws is the outer tick tip at 1.175 * DIAL_R, so
+// DIAL_CY - 1.175 * DIAL_R must stay positive with room for the corner radius.
 const DIAL_CX = 0.5;
-const DIAL_CY = 0.58;
-const DIAL_R = 0.385;
+const DIAL_CY = 0.47;
+const DIAL_R = 0.365;
 const A0 = Math.PI * 0.80;   // 144°
 const A1 = Math.PI * 2.20;   // 396°
-const REDLINE = 0.90;        // fraction of the sweep where the warning band starts
+const REDLINE = 0.90;        // fraction of the sweep where the digit goes hot
 const DIVS = 20;             // 20 steps across the sweep
 const MAJOR_EVERY = 4;       // five majors, four minors between each pair
-const KERB_RED = '224, 69, 63';  // ART_DIRECTION §3 kerb red #e0453f
 
 /**
  * The strongest sustained boost multiplier a kart can hold (tier-3 mini-turbo,
@@ -72,7 +74,14 @@ export class HUD implements System {
   private splitVal!: HTMLSpanElement;
 
   // timer / position
+  private timerWrap!: HTMLDivElement;
   private timerVal!: HTMLDivElement;
+  private bestWrap!: HTMLDivElement;
+  private bestVal!: HTMLSpanElement;
+  private gapKey!: HTMLSpanElement;
+  private gapVal!: HTMLSpanElement;
+  /** throttle on the gap recompute — 10 Hz is well past the eye's read rate */
+  private gapT = 0;
   private posWrap!: HTMLDivElement;
   private posIn!: HTMLDivElement;
   private posNum!: HTMLSpanElement;
@@ -106,11 +115,10 @@ export class HUD implements System {
   private arcGrad: CanvasGradient | null = null;
   /** end of the sweep in km/h, derived from the player's real top speed */
   private speedMax = 150;
-  /** pre-formatted major-tick numerals, so the draw loop never builds a string */
-  private tickText: string[] = [];
 
   // countdown
   private countWrap!: HTMLDivElement;
+  private countVig!: HTMLDivElement;
   private countNum!: HTMLDivElement;
   private countRing!: HTMLDivElement;
   private countShown = -99;
@@ -124,6 +132,8 @@ export class HUD implements System {
   private prevPlace = 0;
   private prevLap = -1;
   private bestLap = Infinity;
+  /** length of race.lapTimes the best-lap readout was last built from */
+  private lapsSeen = -1;
   private driftGlow = 0;
   private tierFlash = 0;
 
@@ -149,13 +159,12 @@ export class HUD implements System {
     const bottom = el('div', 'kr-bottom', this.hud);
     this.toasts = el('div', 'kr-toasts', bottom);
 
-    // The minimap does not. A chase camera parks the player's kart at
-    // bottom-centre, so a permanent panel there covers the one thing the frame
-    // is about — it was sitting on the kart and swallowing the boost flame and
-    // drift sparks outright in the boost, drift, scenery and grid captures.
-    // ART_DIRECTION §7 offers bottom-centre or top-centre; top-centre is the
-    // one that is empty sky in a chase cam.
-    this.minimap = new Minimap(el('div', 'kr-topmid', this.hud));
+    // The minimap does not get the centre column at either end. Bottom-centre
+    // is where the chase camera parks the player's kart; top-centre is the
+    // vanishing point the player is driving toward, which is why the panel kept
+    // landing on the horizon, the tunnel exit, the sun and the village. It is
+    // now a bottom-left plate stacked on the item box — see .kr-map.
+    this.minimap = new Minimap(this.hud);
 
     this.buildCountdown();
     this.flash = el('div', 'kr-flash', this.root);
@@ -175,10 +184,6 @@ export class HUD implements System {
     // mini-turbo, in km/h, rounded up to five clean majors.
     const topMul = player?.stats?.topSpeedMul || 1;
     this.speedMax = dialMax(BASE_TOP_SPEED * topMul * BOOST_PEAK * HEADROOM * 3.6);
-    this.tickText.length = 0;
-    for (let i = 0; i <= DIVS; i++) {
-      this.tickText.push(i % MAJOR_EVERY === 0 ? String(Math.round(this.speedMax * (i / DIVS))) : '');
-    }
     this.needle.snap(0);
   }
 
@@ -190,7 +195,9 @@ export class HUD implements System {
     this.lapWrap = el('div', 'kr-lap', this.hud);
     this.lapIn = el('div', 'kr-lap-in', this.lapWrap);
     el('div', 'kr-label', this.lapIn, 'Lap');
-    const nums = el('div', 'kr-lap-nums kr-ink', this.lapIn);
+    // One gold-clipped word. The casing lives on the container (see ui.css) so
+    // the whole "1/3" takes a single fill and a single outline.
+    const nums = el('div', 'kr-lap-nums kr-gold kr-gold-q', this.lapIn);
     this.lapCur = el('span', 'kr-lap-cur', nums, '1');
     el('span', 'kr-lap-sep', nums, '/');
     this.lapTot = el('span', 'kr-lap-tot', nums, '3');
@@ -202,9 +209,15 @@ export class HUD implements System {
   }
 
   private buildTimer() {
-    const w = el('div', 'kr-timer', this.hud);
-    el('div', 'kr-label', w, 'Time');
-    this.timerVal = el('div', 'kr-timer-v kr-ink', w, '0:00.00');
+    this.timerWrap = el('div', 'kr-timer', this.hud);
+    el('div', 'kr-label', this.timerWrap, 'Time');
+    this.timerVal = el('div', 'kr-timer-v kr-gold kr-gold-q', this.timerWrap, '0:00.00');
+    // Persistent best lap. Total elapsed is the least useful number in a
+    // three-lap race; this is the one the player is racing against.
+    this.bestWrap = el('div', 'kr-best-line', this.timerWrap);
+    const bp = el('div', 'kr-split-pill', this.bestWrap);
+    el('span', 'kr-split-k', bp, 'Best');
+    this.bestVal = el('span', 'kr-split-v', bp, '0:00.000');
   }
 
   private buildPosition() {
@@ -215,6 +228,14 @@ export class HUD implements System {
     this.posSuf = el('span', 'kr-pos-s kr-gold', this.posIn, 'st');
     // absolutely positioned so it cannot shift the lockup when it appears
     this.posArrow = el('span', 'kr-pos-arrow', this.posIn, '▲');
+
+    // Interval to the kart being raced — ahead of the player, or behind when
+    // the player leads. Hangs off the position lockup, on the split pill's
+    // plate, so the two read as one readout rather than a new invention.
+    const gap = el('div', 'kr-gap', this.posWrap);
+    const gp = el('div', 'kr-split-pill', gap);
+    this.gapKey = el('span', 'kr-split-k', gp, 'Gap');
+    this.gapVal = el('span', 'kr-split-v', gp, '+0.00');
   }
 
   private buildItem() {
@@ -226,8 +247,10 @@ export class HUD implements System {
     const motif = el('div', 'kr-item-motif', this.itemWrap);
     motif.innerHTML =
       '<svg viewBox="0 0 100 100" aria-hidden="true">' +
+      // warm, not the cool #9fb0cc it was: bottom-left was the only corner of
+      // the HUD with no colour in it at all
       '<defs><linearGradient id="krMotif" x1="0" y1="0" x2="0" y2="1">' +
-      '<stop offset="0" stop-color="#f8f2e6"/><stop offset="1" stop-color="#9fb0cc"/>' +
+      '<stop offset="0" stop-color="#fffdf6"/><stop offset="1" stop-color="#e0a63c"/>' +
       '</linearGradient></defs>' +
       '<path d="M50 6 94 50 50 94 6 50Z" fill="none" stroke="url(#krMotif)" stroke-width="6" ' +
       'stroke-linejoin="round"/>' +
@@ -241,17 +264,21 @@ export class HUD implements System {
 
   private buildSpeedo() {
     this.speedWrap = el('div', 'kr-speed', this.hud);
-    this.speedCanvas = el('canvas', undefined, this.speedWrap);
+    // The canvas lives in a clipped face box, not directly on the plate: the
+    // two rects used to differ and dial geometry escaped the rounded card.
+    const face = el('div', 'kr-speed-face', this.speedWrap);
+    this.speedCanvas = el('canvas', undefined, face);
     this.speedG = this.speedCanvas.getContext('2d')!;
     const read = el('div', 'kr-speed-read', this.speedWrap);
-    this.speedNum = el('span', 'kr-speed-n kr-ink', read, '0');
-    el('span', 'kr-speed-u', read, 'km/h');
+    this.speedNum = el('span', 'kr-speed-n kr-gold kr-gold-q', read, '0');
   }
 
   private buildCountdown() {
     this.countWrap = el('div', 'kr-count', this.root);
-    this.countRing = el('div', 'kr-count-ring', this.countWrap);
-    this.countNum = el('div', 'kr-count-n kr-gold', this.countWrap, '3');
+    this.countVig = el('div', 'kr-count-vig', this.countWrap);
+    const stage = el('div', 'kr-count-stage', this.countWrap);
+    this.countRing = el('div', 'kr-count-ring', stage);
+    this.countNum = el('div', 'kr-count-n kr-gold', stage, '3');
   }
 
   // ------------------------------------------------------------------ events
@@ -294,6 +321,7 @@ export class HUD implements System {
     setText(this.splitKey, `Lap ${n}`);
     setText(this.splitVal, formatClock(t, 3));
     this.split.classList.toggle('best', isBest);
+    this.bestWrap.classList.toggle('best-new', isBest);
     // once there is a benchmark, the delta is the more interesting number
     if (!isBest && Number.isFinite(prevBest)) {
       setText(this.splitKey, `Lap ${n}  ${formatDelta(t - prevBest)}`);
@@ -306,17 +334,21 @@ export class HUD implements System {
     if (n === this.countShown) return;
     this.countShown = n;
     if (n > 3) return;
+    retrigger(this.countNum, 'run');
+    retrigger(this.countRing, 'run');
+    retrigger(this.countVig, 'run');
     if (n <= 0) {
       setText(this.countNum, 'GO!');
       this.countNum.classList.add('go');
-      retrigger(this.countNum, 'run');
-      retrigger(this.countRing, 'run');
+      // white full-screen flash, GO only
+      this.flash.classList.remove('tick');
       retrigger(this.flash, 'on');
     } else {
       setText(this.countNum, String(n));
       this.countNum.classList.remove('go');
-      retrigger(this.countNum, 'run');
-      retrigger(this.countRing, 'run');
+      // short warm flash on every tick, so the grid is not a static wallpaper
+      this.flash.classList.remove('on');
+      retrigger(this.flash, 'tick');
     }
   }
 
@@ -435,12 +467,18 @@ export class HUD implements System {
     const cx = DIAL_CX * W;
     const cy = DIAL_CY * W;
     const r = DIAL_R * W;
-    const grd = g.createLinearGradient(cx - r, cy + r * 0.2, cx + r, cy - r * 0.6);
-    grd.addColorStop(0.00, '#4fc3ff');
-    grd.addColorStop(0.34, '#7ee0b4');
-    grd.addColorStop(0.60, '#ffd66b');
-    grd.addColorStop(0.82, '#ff9d2e');
-    grd.addColorStop(1.00, '#ff4d3d');
+    // One warm ramp off --gold-ramp, ending on ART_DIRECTION §3 kerb red.
+    // The old cyan -> green -> amber -> red diagnostic ramp was Grafana visual
+    // language in a Mediterranean golden-hour racer, and it shared no colour
+    // with the cased gold numerals 400 px to its left. #4fc3ff survives in this
+    // instrument in exactly one place, where the palette assigns it: the
+    // mini-turbo tier-1 charge ring.
+    const grd = g.createLinearGradient(cx - r, cy + r * 0.35, cx + r, cy - r * 0.55);
+    grd.addColorStop(0.00, '#fffdf6');
+    grd.addColorStop(0.30, '#ffe7ae');
+    grd.addColorStop(0.64, '#f7ae3c');
+    grd.addColorStop(0.87, '#e07c14');
+    grd.addColorStop(1.00, '#e0453f');
     this.arcGrad = grd;
   }
 
@@ -455,6 +493,8 @@ export class HUD implements System {
     const dimmed = !blocked && this.menus.screen === 'pause';
     this.root.classList.toggle('is-blocked', blocked);
     this.root.classList.toggle('is-dimmed', dimmed);
+    // The countdown owns the grid: one large numeral on screen, not two.
+    this.root.classList.toggle('is-counting', race.state === RaceState.Countdown);
     // the countdown belongs to the race, not to the menus
     setNum(this.countWrap, 'opacity', blocked ? 0 : 1, 1);
 
@@ -467,8 +507,24 @@ export class HUD implements System {
     this.lapWrap.classList.toggle('final', lapNow === race.totalLaps && race.totalLaps > 1);
     if (player.lap !== this.prevLap) this.prevLap = player.lap;
 
-    // --- timer -------------------------------------------------------------
+    // --- timer + best lap --------------------------------------------------
     setText(this.timerVal, formatClock(race.raceTime));
+    // Derived from the race's own lap list rather than from the 'lap' event
+    // alone, so the benchmark is right even if the HUD is built mid-race or the
+    // event is missed. Only recomputed when a lap actually lands.
+    const laps = race.lapTimes;
+    if (laps.length !== this.lapsSeen) {
+      this.lapsSeen = laps.length;
+      let best = Infinity;
+      for (let i = 0; i < laps.length; i++) if (laps[i] < best) best = laps[i];
+      this.bestLap = best;
+      if (Number.isFinite(best)) {
+        setText(this.bestVal, formatClock(best, 3));
+        this.timerWrap.classList.add('has-best');
+      } else {
+        this.timerWrap.classList.remove('has-best');
+      }
+    }
 
     // --- position ----------------------------------------------------------
     // One position readout, in one typographic convention. The direction of
@@ -498,6 +554,34 @@ export class HUD implements System {
     setText(this.posNum, String(place));
     setText(this.posSuf, ordinalSuffix(place));
     this.posWrap.classList.toggle('lead', place === 1);
+
+    // --- interval to the kart being raced ----------------------------------
+    // Distance along the race converted to a time by the closing speed the
+    // player can actually make up, which is what "one and a half seconds back"
+    // means to a driver. Recomputed at 10 Hz: any faster and the last digit is
+    // noise, and the string churn is not free.
+    this.gapT -= dt;
+    if (this.gapT <= 0) {
+      this.gapT = 0.1;
+      // when leading, the interesting number is the cushion over 2nd instead.
+      // Found by place rather than by index so this does not depend on how the
+      // race director happens to order `standings`.
+      const want = place === 1 ? 2 : place - 1;
+      const karts = race.karts;
+      let other: typeof player | null = null;
+      for (let i = 0; i < karts.length; i++) {
+        if (karts[i] !== player && karts[i].place === want) { other = karts[i]; break; }
+      }
+      const has = !!other && !player.finished;
+      this.posWrap.classList.toggle('has-gap', has);
+      if (other && has) {
+        const metres = Math.abs(other.raceDistance - player.raceDistance);
+        const closing = Math.max(6, Math.abs(player.forwardSpeed));
+        const secs = Math.min(99, metres / closing);
+        setText(this.gapKey, place === 1 ? 'Lead' : 'Gap');
+        setText(this.gapVal, (place === 1 ? '' : '+') + secs.toFixed(2));
+      }
+    }
 
     // --- item --------------------------------------------------------------
     this.updateItem(ctx, dt);
@@ -580,21 +664,26 @@ export class HUD implements System {
     g.strokeStyle = housing;
     g.stroke();
 
-    // Warning band, at the channel's own width so the groove stays uniform.
-    // It starts at 90% of a sweep the player can actually complete, so it is a
-    // band you reach under boost rather than permanently dead dial.
-    const redA = A0 + sweep * REDLINE;
+    // The unfilled scale, always present at low alpha. Without it a stationary
+    // dial is a bare grey groove and a boosting one is a full warm wash — the
+    // same widget reading as two different components between states. The ramp
+    // is visible at rest; the value fill adds intensity on top of it, and that
+    // is the only thing that changes.
+    g.save();
+    g.globalAlpha = 0.24;
     g.beginPath();
-    g.arc(cx, cy, r, redA, A1);
+    g.arc(cx, cy, r, A0, A1);
     g.lineWidth = chanW;
-    g.strokeStyle = `rgba(${KERB_RED}, ${boosting ? 0.55 : 0.34})`;
+    g.strokeStyle = this.arcGrad || '#ffd66b';
     g.stroke();
+    g.restore();
 
     // --- value fill --------------------------------------------------------
     const va = A0 + sweep * clamp(this.needle.value, 0, 1);
     if (va > A0 + 0.004) {
       g.save();
-      g.shadowColor = boosting ? 'rgba(255, 150, 60, 0.95)' : 'rgba(120, 190, 255, 0.5)';
+      // one hue, two intensities — boost is a bloom, not a retint
+      g.shadowColor = boosting ? 'rgba(255, 158, 62, 0.95)' : 'rgba(255, 190, 110, 0.45)';
       g.shadowBlur = W * (boosting ? 0.055 : 0.026);
       g.beginPath();
       g.arc(cx, cy, r, A0, va);
@@ -603,21 +692,30 @@ export class HUD implements System {
       g.stroke();
       g.restore();
       g.beginPath();
-      g.arc(cx, cy, r, Math.max(A0, va - 0.055), va);
+      g.arc(cx, cy, r, Math.max(A0, va - 0.075), va);
       g.lineWidth = chanW;
-      g.strokeStyle = 'rgba(255, 252, 236, 0.8)';
+      g.strokeStyle = 'rgba(255, 252, 236, 0.55)';
       g.stroke();
       if (boosting) {
         const p = (time * 1.5) % 1.35 - 0.175;
         const sa = A0 + sweep * clamp(p, 0, 1);
-        g.save();
-        g.globalCompositeOperation = 'lighter';
-        g.beginPath();
-        g.arc(cx, cy, r, Math.max(A0, sa - 0.16), Math.min(va, sa + 0.16));
-        g.lineWidth = chanW;
-        g.strokeStyle = 'rgba(255, 226, 170, 0.30)';
-        g.stroke();
-        g.restore();
+        // These two are NOT ordered by construction: once the sweep head runs
+        // past the value fill, `start` exceeds `end` and canvas arc() takes the
+        // long way round — it painted a translucent warm band across the whole
+        // bottom of the dial, through the empty wedge and out past the plate
+        // corners. That was the "unmasked render layer" in the boost frames.
+        const s0 = Math.max(A0, sa - 0.16);
+        const s1 = Math.min(va, sa + 0.16);
+        if (s1 > s0) {
+          g.save();
+          g.globalCompositeOperation = 'lighter';
+          g.beginPath();
+          g.arc(cx, cy, r, s0, s1);
+          g.lineWidth = chanW;
+          g.strokeStyle = 'rgba(255, 226, 170, 0.30)';
+          g.stroke();
+          g.restore();
+        }
       }
     }
 
@@ -652,34 +750,26 @@ export class HUD implements System {
     g.strokeStyle = 'rgba(4, 7, 16, 0.85)';
     tickPath(true);  g.lineWidth = majorW + casing; g.stroke();
     tickPath(false); g.lineWidth = minorW + casing; g.stroke();
-    g.strokeStyle = 'rgba(255, 248, 232, 0.94)';
+    g.strokeStyle = 'rgba(255, 244, 214, 0.95)';
     tickPath(true);  g.lineWidth = majorW; g.stroke();
-    g.strokeStyle = 'rgba(255, 248, 232, 0.58)';
+    g.strokeStyle = 'rgba(255, 238, 206, 0.5)';
     tickPath(false); g.lineWidth = minorW; g.stroke();
     g.lineCap = 'butt';
 
-    // Numerals at the sweep ends would land in the readout's wedge, so the
-    // scale is labelled from the second major inward only.
-    g.font = `800 ${(W * 0.044).toFixed(1)}px "SF Pro Display", system-ui, sans-serif`;
-    g.textAlign = 'center';
-    g.textBaseline = 'middle';
-    const lr = r - chanW * 0.5 - band * 0.62;
-    g.save();
-    g.shadowColor = 'rgba(4, 7, 16, 0.9)';
-    g.shadowBlur = W * 0.008;
-    g.fillStyle = 'rgba(248, 242, 230, 0.85)';
-    for (let i = MAJOR_EVERY; i < DIVS; i += MAJOR_EVERY) {
-      const a = A0 + sweep * (i / DIVS);
-      g.fillText(this.tickText[i], cx + Math.cos(a) * lr, cy + Math.sin(a) * lr);
-    }
-    g.restore();
+    // No numerals on the scale. They sat on the needle's own ring — the needle
+    // swept straight through them and erased a digit at exactly the speeds the
+    // player drives at ("120" reading ".20", "90" reading "00"). A scale you
+    // cannot read is worse than no scale, and at this size they would have been
+    // 9 px anyway. The digital readout carries the value; the arc carries the
+    // proportion. That is what §7 asks for.
 
-    // --- mini-turbo charge ring, inside the numerals -----------------------
+    // --- mini-turbo charge ring --------------------------------------------
     // The FILL is the bright element and the track is a dark groove; the old
     // arrangement had a pale full-sweep track reading as the value and the
     // actual charge as a dim nub. At zero charge the ring is not drawn at all,
     // so an idle dial has no unlabelled circle floating in it.
-    const ir = r - chanW * 0.5 - band * 1.55;
+    // moved outward from band*1.55 now that the numeral ring is gone
+    const ir = r - chanW * 0.5 - band * 1.0;
     const driftOn = charge > 0.001 || this.tierFlash > 0;
     if (driftOn) {
       const trackW = band * 0.24;
@@ -721,66 +811,57 @@ export class HUD implements System {
     }
 
     // --- needle ------------------------------------------------------------
+    // A blade, not a hairline: same warm ramp and same heavy ink casing as the
+    // cased type elsewhere in the HUD, so the instrument shares a line weight
+    // and a fill idiom with the numerals instead of importing a second one.
     const na = A0 + sweep * clamp(this.needle.value, -0.02, 1.02);
-    const tip = r - chanW * 0.5 - band * 0.08;
+    const tip = r - chanW * 0.5 - band * 0.10;
     g.save();
     g.translate(cx, cy);
     g.rotate(na);
-    // The tail stops inside the hub radius (0.125r): anything longer pokes out
-    // the back of the hub and reads as a glitch, not as a counterweight.
+    // The tail stops inside the hub radius: anything longer pokes out the back
+    // of the hub and reads as a glitch, not as a counterweight.
     g.beginPath();
     g.moveTo(tip, 0);
-    g.lineTo(tip * 0.86, -r * 0.030);
-    g.lineTo(r * 0.06, -r * 0.082);
-    g.lineTo(-r * 0.055, -r * 0.062);
-    g.lineTo(-r * 0.085, 0);
-    g.lineTo(-r * 0.055, r * 0.062);
-    g.lineTo(r * 0.06, r * 0.082);
-    g.lineTo(tip * 0.86, r * 0.030);
+    g.lineTo(tip * 0.84, -r * 0.042);
+    g.lineTo(r * 0.06, -r * 0.115);
+    g.lineTo(-r * 0.06, -r * 0.088);
+    g.lineTo(-r * 0.095, 0);
+    g.lineTo(-r * 0.06, r * 0.088);
+    g.lineTo(r * 0.06, r * 0.115);
+    g.lineTo(tip * 0.84, r * 0.042);
     g.closePath();
     g.save();
-    g.shadowColor = 'rgba(4, 7, 16, 0.6)';
-    g.shadowBlur = W * 0.022;
+    g.shadowColor = 'rgba(4, 7, 16, 0.65)';
+    g.shadowBlur = W * 0.024;
     g.shadowOffsetY = W * 0.010;
-    const ng = g.createLinearGradient(-r * 0.26, -r * 0.08, tip, r * 0.08);
-    ng.addColorStop(0, '#8c99b6');
-    ng.addColorStop(0.22, '#fffaee');
-    ng.addColorStop(0.55, boosting ? '#ffcf76' : '#ff8a63');
-    ng.addColorStop(1, boosting ? '#fff0c4' : '#ff3f30');
+    const ng = g.createLinearGradient(-r * 0.26, -r * 0.10, tip, r * 0.10);
+    ng.addColorStop(0, '#cfc0a4');
+    ng.addColorStop(0.20, '#fffdf6');
+    ng.addColorStop(0.62, '#ffe7ae');
+    ng.addColorStop(1, boosting ? '#f7ae3c' : '#e07c14');
     g.fillStyle = ng;
     g.fill();
     g.restore();
     g.lineJoin = 'round';
-    g.lineWidth = Math.max(1.5, W * 0.0085);
-    g.strokeStyle = 'rgba(6, 9, 20, 0.92)';
-    g.stroke();
-    // top bevel so the needle has a lit face rather than a flat fill
-    g.beginPath();
-    g.moveTo(tip * 0.84, -r * 0.014);
-    g.lineTo(r * 0.06, -r * 0.052);
-    g.lineTo(-r * 0.04, -r * 0.040);
-    g.lineWidth = Math.max(1, W * 0.004);
-    g.strokeStyle = 'rgba(255, 252, 240, 0.55)';
+    g.lineWidth = Math.max(2, W * 0.014);
+    g.strokeStyle = 'rgba(6, 10, 22, 0.94)';
     g.stroke();
     g.restore();
 
-    // hub
-    const hr = r * 0.125;
+    // hub — a cased gold cap, not a machined chrome boss. The old radial read
+    // as a photoreal metal part next to flat 2D iconography.
+    const hr = r * 0.145;
     g.beginPath();
     g.arc(cx, cy, hr, 0, Math.PI * 2);
-    const hg = g.createRadialGradient(cx - hr * 0.4, cy - hr * 0.45, 0, cx, cy, hr);
-    hg.addColorStop(0, '#f8fbff');
-    hg.addColorStop(0.38, '#a8b6d0');
-    hg.addColorStop(0.74, '#3c4762');
-    hg.addColorStop(1, '#121828');
-    g.fillStyle = hg;
+    g.fillStyle = '#ffe7ae';
     g.fill();
-    g.lineWidth = Math.max(1.2, W * 0.006);
-    g.strokeStyle = 'rgba(8, 11, 24, 0.8)';
+    g.lineWidth = Math.max(2, W * 0.014);
+    g.strokeStyle = 'rgba(6, 10, 22, 0.94)';
     g.stroke();
     g.beginPath();
-    g.arc(cx, cy, hr * 0.42, 0, Math.PI * 2);
-    g.fillStyle = 'rgba(12, 17, 32, 0.85)';
+    g.arc(cx, cy, hr * 0.38, 0, Math.PI * 2);
+    g.fillStyle = 'rgba(10, 15, 28, 0.9)';
     g.fill();
   }
 

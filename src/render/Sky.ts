@@ -22,7 +22,10 @@
  *    the backdrop stays a stack of silhouettes rather than one plate. The fog
  *    colour is the model's own horizon radiance with a highlight rolloff, NOT
  *    the raw superwhite the dome uses — feeding an above-display-white constant
- *    into fog is what pushed everything past 60 m over the ACES knee.
+ *    into fog is what pushed everything past 60 m over the ACES knee. And it is
+ *    sampled PER VIEW AZIMUTH, not once: the sky is drawn from the real model,
+ *    so aerial perspective that converges on an average of it can only meet it
+ *    at a seam. That seam was the bay.
  *
  *  · Environment intensity is 1.0, i.e. materials get the envMapIntensity they
  *    were authored with, so chrome and clearcoat actually mirror the sky. The
@@ -30,15 +33,17 @@
  *    because that is the term that flattens key/fill, and it is the only reason
  *    the old code had to hold the whole environment down to 0.40.
  *
- *  · Shadows are two cascades built from two directional lights sharing the
- *    sun's direction and splitting its energy. Every point in the near frustum
- *    is also inside the far one, so near shadows composite to full darkness.
- *    Outside the near frustum only the far map is testing, so the near cascade's
- *    share leaks as light: the split is weighted hard toward the near map and
- *    every cascade fades its own shadow out across its border, so the handoff is
- *    a soft 8 m ramp instead of a straight-edged rectangle painted on the road.
- *    Both frusta are texel-snapped in light space: without that, shadow edges
- *    crawl as the kart moves and the whole frame looks cheap.
+ *  · Shadows are a real two-slice CSM: ONE key light at full energy, TWO shadow
+ *    maps, and the cascade chosen — and cross-faded — on the shadow TEST inside
+ *    a patched `lights_fragment_begin`. The rig this replaced split the sun's
+ *    energy between two independent lights, which cannot work: three lights
+ *    every fragment from both, so outside the near frustum that light's share of
+ *    the key leaks through anything only the far map is shadowing, and the
+ *    cascade border becomes a straight-edged step in brightness. Shrinking the
+ *    share shrinks the step; it never removes it. Now the only thing that
+ *    changes across the border is penumbra width. Both frusta are texel-snapped
+ *    in light space: without that, shadow edges crawl as the kart moves and the
+ *    whole frame looks cheap.
  * ============================================================================
  */
 import * as THREE from 'three';
@@ -46,10 +51,11 @@ import { Quality, type Ctx, type System } from '../types';
 import {
   AtmosphereModel,
   GROUND_BOUNCE_COLOR,
-  SKY_FRAGMENT_SHADER,
   SKY_VERTEX_SHADER,
   SUN_DIRECTION,
   SUN_LIGHT_COLOR,
+  buildSkyFragmentShader,
+  hazeGlsl,
 } from './Atmosphere';
 
 // --- tuning ------------------------------------------------------------------
@@ -93,39 +99,59 @@ const BOUNCE_INTENSITY = 0.30;
 // the harbour instead of 95% / 100% / 100%, and at 45% / 64% / 76% from the
 // cliff apex — three plates at descending contrast, which is the whole point.
 
-/** Density of the low layer, per metre, with the eye at FOG_SEA_LEVEL. */
-const FOG_SEA_DENSITY = 0.00075;
+/** Density of the low layer, per metre, at FOG_SEA_LEVEL. */
+const FOG_SEA_DENSITY = 0.00085;
 /** Scale height of that layer, metres. Density halves every ~42 m of altitude. */
 const FOG_HEIGHT_SCALE = 60;
 /** Altitude the sea-level density is quoted at. */
 const FOG_SEA_LEVEL = 0;
-/** Height-independent term. Also published as `scene.fog.density`. */
-const FOG_GLOBAL_DENSITY = 0.00030;
+/**
+ * Height-independent term. Also published as `scene.fog.density`.
+ *
+ * Down from 0.00030: this is the term that fogs things the height falloff is
+ * supposed to leave alone, and it was the reason a 300 m ridge and a 3 km
+ * headland landed within a few percent of each other in the establishing shot.
+ * The sea-level term carries the difference (and then some), so the bay hazes
+ * harder than before while anything standing out of it separates.
+ */
+const FOG_GLOBAL_DENSITY = 0.00022;
+/**
+ * Distance at which aerial perspective starts. Beer fog from zero puts a couple
+ * of percent of haze on the foreground, which is physically right and
+ * pictorially wrong: it is the first thing to take the saturation off the
+ * village pastels and the kerb red in the near field. 20 m costs nothing at
+ * range (it is a translation, not a scale) and gives the foreground back.
+ */
+const FOG_START = 20;
 /**
  * Hard ceiling on the fog factor. Without it the far plates all converge on the
- * haze colour and the horizon becomes one flat plate again; at 0.88 the most
- * distant thing on the course still carries 12% of its own albedo, which is
- * exactly the residual that keeps three backdrop layers readable as three.
+ * haze colour and the horizon becomes one flat plate again. 0.92 rather than
+ * 0.88: with the haze now sampled per view azimuth the thing distant geometry
+ * converges on is the sky it is actually standing in front of, so convergence
+ * is what we WANT at the horizon line — the residual is only there to keep the
+ * backdrop layers from fusing, and 8% is enough for that.
  */
-const FOG_MAX = 0.88;
+const FOG_MAX = 0.92;
 
-/** Cascade splits, art bible §2. The near map covers 12/45, the far 160/500. */
-const NEAR_EXTENT = 65;
-const FAR_EXTENT = 240;
+/**
+ * Cascade splits, art bible §2. Two maps: the near one carries 12/45, the far
+ * one 160/500. The near extent is smaller than it used to be (65) because it no
+ * longer has to hide a handoff — see `cascadeShadowChunk`.
+ */
+const NEAR_EXTENT = 55;
+const FAR_EXTENT = 220;
+/** Single-cascade fallback (Medium and below): one map has to cover everything. */
+const SOLO_EXTENT = 110;
 const NEAR_DISTANCE = 300;
 const FAR_DISTANCE = 900;
 /**
- * Energy split. Three has no notion of cascades, so both lights light every
- * fragment and only the shadow TEST is per-cascade: outside the near frustum
- * three returns "lit" from the near map, so `1 - NEAR_SHARE` of the key leaks
- * through anything the far map alone is shadowing. At 0.66 that leak was 34% —
- * a shadow crossing the near boundary jumped from black to a third lit along a
- * dead-straight line, which is the "large hard-edged dark quad on the road".
- * At 0.80 the step is 20%, and SHADOW_BORDER_FADE below smears what is left
- * over the last ~8 m of the frustum so it reads as penumbra, not as geometry.
+ * Where the cross-fade from the near cascade to the far one begins, as a
+ * fraction of the near map's normalised extent. 0.80 puts the band in the outer
+ * 20% of the box — about 11 m of light-space travel — which is wide enough that
+ * the change in penumbra width reads as distance rather than as an edge.
  */
-const NEAR_SHARE = 0.80;
-/** The far cascade only redraws every N frames; it is 240 m across and nothing
+const CASCADE_BLEND = 0.80;
+/** The far cascade only redraws every N frames; it is 440 m across and nothing
  *  in it moves fast enough on screen for the staleness to read. */
 const FAR_UPDATE_INTERVAL = 3;
 
@@ -140,11 +166,18 @@ const UP = new THREE.Vector3(0, 1, 0);
 // and restored on dispose so a second Sky in the same page is not a landmine.
 
 const PATCHED_CHUNKS = [
-  'fog_fragment', 'envmap_physical_pars_fragment', 'shadowmap_pars_fragment',
+  'fog_pars_fragment', 'fog_fragment', 'envmap_physical_pars_fragment',
+  'shadowmap_pars_fragment', 'lights_fragment_begin',
 ] as const;
 
-/** How far into a shadow cascade its own contribution starts fading out. */
-const SHADOW_BORDER_FADE = 0.84;
+/**
+ * How far into a shadow map its own contribution starts fading out. This is a
+ * thin safety strip now, not the cascade handoff — the handoff is a real
+ * cross-fade of two shadow tests, see `cascadeShadowChunk`. It still earns its
+ * place on the FAR cascade's outer edge (nothing catches that one) and on the
+ * single-cascade path used below Quality.High.
+ */
+const SHADOW_BORDER_FADE = 0.96;
 
 let _originalChunks: Record<string, string> | null = null;
 
@@ -167,30 +200,80 @@ function glslFloat(x: number): string {
  *  3. The factor is clamped below 1, so nothing ever reaches the fog colour
  *     exactly and the backdrop stays a stack of plates.
  *
+ *  4. The colour is sampled per VIEW AZIMUTH out of the same atmosphere model
+ *     the dome is drawn from, instead of being one constant. See
+ *     `AtmosphereModel.hazePoly`: at 14° elevation the horizon runs from a hot
+ *     #ffc98a down-sun to a cool violet-grey behind, and a single averaged haze
+ *     guarantees that in most camera directions the sea and the sky converge on
+ *     two different colours — which is precisely the hard bay/sky seam. There is
+ *     no uniform channel into this chunk (three merges `UniformsLib.fog` into
+ *     `ShaderLib` at its own module-init time), so the fit is baked in as
+ *     literals by `hazeGlsl`.
+ *
  *  NOTE ON THE SHAPE OF THIS: the obvious implementation integrates the density
- *  profile between the eye and the FRAGMENT, which needs the fragment's world
- *  position — one extra varying. That is not available: `src/world/Water.ts`
- *  hand-rolls its own `vFogDepth` in its vertex shader and then includes
- *  `<fog_pars_fragment>`/`<fog_fragment>`, so any varying this chunk references
- *  that three's own `fog_vertex` writes would be undeclared in the sea's vertex
- *  stage and fail to link. Keying the height term off the eye alone costs
- *  accuracy only where the ray climbs or dives steeply (a 600 m hilltop seen
- *  from the harbour fogs at 46% instead of an ideal 33%) and needs nothing but
- *  `cameraPosition`, which three declares in every fragment prefix.
+ *  profile between the eye and the FRAGMENT, and shades it with the direction
+ *  eye→fragment. Both need the fragment's world position — one extra varying.
+ *  That is not available: `src/world/Water.ts` hand-rolls its own `vFogDepth` in
+ *  its vertex shader and then includes `<fog_pars_fragment>`/`<fog_fragment>`
+ *  without three's `<fog_pars_vertex>`/`<fog_vertex>`, so a varying declared
+ *  here would be undeclared in the sea's vertex stage and fail to link. What IS
+ *  available in every fragment prefix three emits is `viewMatrix` and
+ *  `cameraPosition`, and the camera's world-space forward falls straight out of
+ *  the former. So:
+ *
+ *    · the ray's vertical slope is taken as the camera's forward slope, which
+ *      makes the height integral EXACT for the fragment at the centre of the
+ *      frame and correct in trend everywhere else — and note that `vFogDepth` is
+ *      view-space depth, not ray length, so `fwd.y * vFogDepth` is exactly the
+ *      world-Y that the known component of the view position contributes;
+ *    · the haze is sampled in the camera's forward azimuth, so the horizon
+ *      converges dead-on at frame centre and drifts by at most half the
+ *      horizontal FOV at the edges — where the sky itself has drifted with it.
+ *
+ *  Per-fragment would be strictly better and costs one `varying vec3`; it needs
+ *  Water.ts to stop hand-rolling `vFogDepth`. Flagged, not smuggled.
  */
-function fogChunks(): Record<string, string> {
+function fogChunks(model: AtmosphereModel, stockPars: string): Record<string, string> {
   const K = {
     SEA: glslFloat(FOG_SEA_DENSITY),
+    H: glslFloat(FOG_HEIGHT_SCALE),
     HINV: glslFloat(1 / FOG_HEIGHT_SCALE),
     Y0: glslFloat(FOG_SEA_LEVEL),
     MAX: glslFloat(FOG_MAX),
+    START: glslFloat(FOG_START),
   };
 
   return {
+    // The haze fit is a function, so it cannot live in `fog_fragment` — that
+    // chunk is included inside main(). It goes here, at file scope, in the one
+    // fog chunk every material with fog pulls in (Water.ts included: it rolls
+    // its own vFogDepth in the vertex stage but takes this chunk verbatim).
+    fog_pars_fragment: `${stockPars}
+#ifdef USE_FOG
+${hazeGlsl(model, 'krFogHaze')}
+#endif
+`,
+
     fog_fragment: /* glsl */`
 #ifdef USE_FOG
 
-	float krSea = ${K.SEA} * exp( -clamp( cameraPosition.y - ${K.Y0}, -20.0, 600.0 ) * ${K.HINV} );
+	// world-space camera forward: minus the third ROW of the view rotation
+	vec3 krFwd = -vec3( viewMatrix[ 0 ][ 2 ], viewMatrix[ 1 ][ 2 ], viewMatrix[ 2 ][ 2 ] );
+
+	float krD = max( vFogDepth - ${K.START}, 0.0 );
+
+	// Exact mean of exp( -y / H ) between the ray's clamped start and end
+	// altitudes, which is the analytic Beer integral of the height profile along
+	// the ray. Both ends are clamped before the exponential, so a camera looking
+	// down a long way cannot drive the density to infinity the way integrating
+	// the raw profile below sea level would.
+	float krSlope = clamp( krFwd.y, -0.7, 0.7 );
+	float krY0 = clamp( cameraPosition.y - ${K.Y0}, -20.0, 600.0 );
+	float krY1 = clamp( cameraPosition.y + krSlope * krD - ${K.Y0}, -20.0, 600.0 );
+	float krE0 = exp( -krY0 * ${K.HINV} );
+	float krE1 = exp( -krY1 * ${K.HINV} );
+	float krDy = krY1 - krY0;
+	float krAvg = abs( krDy ) < 0.5 ? 0.5 * ( krE0 + krE1 ) : ( krE0 - krE1 ) * ${K.H} / krDy;
 
 	#ifdef FOG_EXP2
 		float krGlobal = fogDensity;
@@ -198,9 +281,9 @@ function fogChunks(): Record<string, string> {
 		float krGlobal = 0.0;
 	#endif
 
-	float fogFactor = min( 1.0 - exp( -( krSea + krGlobal ) * vFogDepth ), ${K.MAX} );
+	float fogFactor = min( 1.0 - exp( -( ${K.SEA} * krAvg + krGlobal ) * krD ), ${K.MAX} );
 
-	gl_FragColor.rgb = mix( gl_FragColor.rgb, fogColor, fogFactor );
+	gl_FragColor.rgb = mix( gl_FragColor.rgb, krFogHaze( krFwd.xz ), fogFactor );
 
 #endif
 `,
@@ -223,14 +306,15 @@ function envDiffuseChunk(original: string, scale: number): string {
 }
 
 /**
- * Fade a cascade's shadow out across its own frustum border instead of cutting
- * it dead at the edge. Three returns "fully lit" the moment a fragment leaves a
- * shadow map, so with two cascades of unequal energy the handoff is a straight
- * line of constant value across whatever flat surface it lands on — the dark
- * quad painted across the road in scenery.png. Ramping the near map's own
- * contribution to zero over the last 16% of its extent (≈10 m at NEAR_EXTENT 65)
- * turns that line into a gradient, and the far map, which covers the same ground
- * at lower resolution, carries the shadow on.
+ * Fade a shadow map out across its own frustum border instead of cutting it
+ * dead at the edge. Three returns "fully lit" the moment a fragment leaves a
+ * shadow map, which on a flat surface is a straight line of constant value.
+ *
+ * With the cascade cross-fade below doing the real work this is down to a 4%
+ * safety strip, but it still matters in two places: the FAR cascade's outer
+ * border, which nothing catches, and the single-map path used below
+ * Quality.High. It also applies to spot shadows, where a soft frustum edge is
+ * what you want anyway.
  *
  * Applied to all three getShadow variants — the three-tab return is unique to
  * them, getPointShadow is indented one level shallower and is left alone.
@@ -246,10 +330,129 @@ function shadowBorderChunk(original: string): string {
   ].join('\n');
   const count = original.split(from).length - 1;
   if (count !== 3) {
-    console.warn(`[sky] getShadow layout changed (${count} sites); cascade blend skipped`);
+    console.warn(`[sky] getShadow layout changed (${count} sites); border fade skipped`);
     return original;
   }
   return original.split(from).join(to);
+}
+
+/**
+ * Append the cascade resolver to `shadowmap_pars_fragment`.
+ *
+ * THIS IS THE FIX FOR THE HARD-EDGED KEY-LIGHT STEP. The old rig stacked two
+ * DirectionalLights sharing the sun's direction and SPLIT THE SUN'S ENERGY
+ * between them, because three has no notion of a cascade: both lights light
+ * every fragment and only the shadow test is per-map, so outside the near
+ * frustum three returns "lit" from the near map and that light's whole share of
+ * the key leaks through anything the far map alone is shadowing. Every version
+ * of that is a brightness discontinuity along a dead-straight geometric line,
+ * and shrinking the leak (0.66 → 0.80 → …) only makes the step smaller; it never
+ * makes it stop being a step. You cannot hide a hard edge by lowering its
+ * contrast.
+ *
+ * So: light 0 carries 100% of the key. Light 1 is a shadow-only slave — same
+ * direction, intensity 0, skipped entirely in `lights_fragment_begin` — and its
+ * map is read from here. The near map is used inside its own box, the far map
+ * outside, and the two SHADOW TESTS are cross-faded across the border. What
+ * changes at the seam is penumbra width (2.9 cm/texel to 21 cm/texel), which the
+ * eye reads as distance. What does not change is how much key the surface gets.
+ *
+ * Indexing the arrays directly is safe because they are declared at the top of
+ * this same chunk, and because Sky is the only thing in the game that creates a
+ * DirectionalLight and adds the near one first (see `buildLights`).
+ */
+function cascadeShadowChunk(original: string): string {
+  const helper = /* glsl */`
+	#if NUM_DIR_LIGHT_SHADOWS > 1
+
+		float krCascadeShadow() {
+
+			vec4 nc = vDirectionalShadowCoord[ 0 ];
+			vec3 ndc = nc.xyz / max( nc.w, 1e-6 );
+			// distance to the near box's border, 0 at the centre and 1 at the face,
+			// taken over depth as well as the two lateral axes so a fragment leaving
+			// through the back of the frustum hands over just as smoothly
+			vec3 krE = abs( ndc - 0.5 ) * 2.0;
+			float krW = 1.0 - smoothstep( ${glslFloat(CASCADE_BLEND)}, 1.0,
+				max( max( krE.x, krE.y ), krE.z ) );
+
+			float krFar = getShadow(
+				directionalShadowMap[ 1 ], directionalLightShadows[ 1 ].shadowMapSize,
+				directionalLightShadows[ 1 ].shadowIntensity, directionalLightShadows[ 1 ].shadowBias,
+				directionalLightShadows[ 1 ].shadowRadius, vDirectionalShadowCoord[ 1 ] );
+
+			if ( krW <= 0.0 ) return krFar;
+
+			float krNear = getShadow(
+				directionalShadowMap[ 0 ], directionalLightShadows[ 0 ].shadowMapSize,
+				directionalLightShadows[ 0 ].shadowIntensity, directionalLightShadows[ 0 ].shadowBias,
+				directionalLightShadows[ 0 ].shadowRadius, vDirectionalShadowCoord[ 0 ] );
+
+			// Inside the box the near map is authoritative and complete: in LIGHT
+			// space an occluder sits at the same xy as the surface it shadows, so
+			// any caster of a fragment inside the box is also inside the box. There
+			// is nothing for the far map to add here, and mixing it in would only
+			// drag its 21 cm texels and its every-third-frame staleness forward.
+			return mix( krFar, krNear, krW );
+
+		}
+
+	#endif
+`;
+  // Insert at file scope after every getShadow variant has been declared: the
+  // last column-0 `#endif` closes `#ifdef USE_SHADOWMAP`.
+  const at = original.lastIndexOf('\n#endif');
+  if (at < 0) {
+    console.warn('[sky] shadowmap_pars_fragment layout changed; cascade resolver skipped');
+    return original;
+  }
+  return original.slice(0, at) + '\n' + helper + original.slice(at);
+}
+
+/**
+ * Rewrite the directional-light loop in `lights_fragment_begin` so cascade 1 is
+ * shadow-only and cascade 0 resolves both maps. Falls back to stock behaviour
+ * whenever there is only one shadow-casting directional light, so the Medium and
+ * Low paths (and any future third-party light) are untouched.
+ *
+ * `UNROLLED_LOOP_INDEX` and `NUM_DIR_LIGHT_SHADOWS` are both textually
+ * substituted by three before the preprocessor ever sees them, which is what
+ * lets a `#if` pick a different body per unrolled iteration — three's own code
+ * in this chunk relies on exactly that.
+ */
+function cascadeLightsChunk(original: string): string {
+  const head = '\tfor ( int i = 0; i < NUM_DIR_LIGHTS; i ++ ) {\n';
+  const tail = '\n\t}\n\t#pragma unroll_loop_end';
+  const shadowLine = `		directionalLightShadow = directionalLightShadows[ i ];
+		directLight.color *= ( directLight.visible && receiveShadow ) ? getShadow( directionalShadowMap[ i ], directionalLightShadow.shadowMapSize, directionalLightShadow.shadowIntensity, directionalLightShadow.shadowBias, directionalLightShadow.shadowRadius, vDirectionalShadowCoord[ i ] ) : 1.0;`;
+
+  const h = original.indexOf(head);
+  const t = h < 0 ? -1 : original.indexOf(tail, h);
+  if (h < 0 || t < 0 || !original.slice(h, t).includes(shadowLine)) {
+    console.warn('[sky] directional light loop moved; cascade selection skipped');
+    return original;
+  }
+
+  // Cascade 0 resolves both maps itself.
+  const body = original.slice(h + head.length, t).replace(shadowLine, `		directionalLightShadow = directionalLightShadows[ i ];
+		#if ( NUM_DIR_LIGHT_SHADOWS > 1 ) && ( UNROLLED_LOOP_INDEX == 0 )
+		directLight.color *= ( directLight.visible && receiveShadow ) ? krCascadeShadow() : 1.0;
+		#else
+${shadowLine.split('\n')[1]}
+		#endif`);
+
+  // Cascade 1 drops out of the loop completely: no light info, no shadow test,
+  // no RE_Direct. One BRDF evaluation per fragment cheaper than the rig this
+  // replaces, which ran the full shading equation twice for one sun.
+  const guarded = `		#if ( NUM_DIR_LIGHT_SHADOWS > 1 ) && ( UNROLLED_LOOP_INDEX == 1 )
+
+		// shadow-only cascade: no energy, no BRDF; krCascadeShadow() reads its map
+
+		#else
+${body}
+		#endif
+`;
+  return original.slice(0, h + head.length) + guarded + original.slice(t);
 }
 
 // --- module scratch (nothing in the update path allocates) --------------------
@@ -282,9 +485,17 @@ export class Sky implements System {
   /** The physical model. Public so anything can ask what colour the sky is. */
   model!: AtmosphereModel;
 
-  /** Key light — also published as `ctx.sun`. This is the near cascade. */
+  /**
+   * Key light — also published as `ctx.sun`. Carries 100% of the sun's energy
+   * and owns the near shadow cascade. Anything sampling `ctx.sun.intensity` gets
+   * the art bible's 4.2, not a fraction of it.
+   */
   sun!: THREE.DirectionalLight;
-  /** Second cascade; same direction, shares the key's energy. Null on Medium-. */
+  /**
+   * Far cascade. A shadow-only slave: same direction, INTENSITY ZERO, present
+   * purely so three renders and binds its map as `directionalShadowMap[1]` for
+   * `krCascadeShadow` to read. Null below Quality.High.
+   */
   sunFar: THREE.DirectionalLight | null = null;
   /** Unit vector toward the sun; mirrors `ctx.sunDirection`. */
   readonly sunDirection = SUN_DIRECTION.clone();
@@ -383,12 +594,14 @@ export class Sky implements System {
     }
     const stock = _originalChunks;
 
-    const fog = fogChunks();
+    const fog = fogChunks(this.model, stock.fog_pars_fragment);
     for (const name of Object.keys(fog)) chunks[name] = fog[name];
 
     chunks.envmap_physical_pars_fragment =
       envDiffuseChunk(stock.envmap_physical_pars_fragment, DIFFUSE_ENV_INTENSITY);
-    chunks.shadowmap_pars_fragment = shadowBorderChunk(stock.shadowmap_pars_fragment);
+    chunks.shadowmap_pars_fragment =
+      cascadeShadowChunk(shadowBorderChunk(stock.shadowmap_pars_fragment));
+    chunks.lights_fragment_begin = cascadeLightsChunk(stock.lights_fragment_begin);
   }
 
   private buildDome(ctx: Ctx): void {
@@ -418,7 +631,6 @@ export class Sky implements System {
         uSunDisc: { value: m.sunDiscColor.clone() },
         uGroundColor: { value: m.groundColor.clone() },
         uHorizonColor: { value: m.horizonColor.clone() },
-        uHazeColor: { value: m.hazeColor.clone() },
         uCloudSun: { value: m.cloudSunColor.clone() },
         uCloudAmbient: { value: m.cloudAmbientColor.clone() },
         uCameraXZ: { value: new THREE.Vector2() },
@@ -433,7 +645,7 @@ export class Sky implements System {
       },
       defines: { CLOUD_LAYERS: layers },
       vertexShader: SKY_VERTEX_SHADER,
-      fragmentShader: SKY_FRAGMENT_SHADER,
+      fragmentShader: buildSkyFragmentShader(m),
       side: THREE.BackSide,
       depthWrite: false,
       fog: false,
@@ -484,20 +696,27 @@ export class Sky implements System {
     this.axisX.copy(UP).cross(this.axisZ).normalize();
     this.axisY.copy(this.axisZ).cross(this.axisX).normalize();
 
-    // 3072 over a 130 m box is 4.2 cm/texel — enough that a kart wheel lands a
-    // real contact shadow — without spending the 67 MB a 4096 map costs. The
-    // box grew from 110 m so the cascade seam sits further out, where haze and
-    // foreshortening cover the last of it.
+    // The key is ONE light at full intensity. The second DirectionalLight below
+    // is a shadow-only slave: three needs it to exist for its map to be rendered
+    // and bound as `directionalShadowMap[1]`, but it contributes no energy and
+    // `cascadeLightsChunk` skips its RE_Direct entirely. Nothing downstream can
+    // ever see a step in key brightness at a cascade border again — and as a
+    // side effect `ctx.sun.intensity` is finally the bible's 4.2, which is what
+    // src/world/Water.ts scales its sun glitter by.
     const nearMap = q >= Quality.Ultra ? 4096 : q >= Quality.High ? 3072 : 2048;
-    const nearShare = twoCascades ? NEAR_SHARE : 1;
-    this.sun = this.makeCascade(ctx, SUN_INTENSITY * nearShare, NEAR_EXTENT, NEAR_DISTANCE,
-      nearMap, shadows, -0.00004, 0.025, 1);
+    const nearExtent = twoCascades ? NEAR_EXTENT : SOLO_EXTENT;
+    // 3072 over a 110 m box is 3.6 cm/texel — finer than the 4.2 cm the old
+    // 130 m box gave, because the near cascade no longer has to be oversized to
+    // push its own handoff out of frame.
+    this.sun = this.makeCascade(ctx, SUN_INTENSITY, nearExtent, NEAR_DISTANCE,
+      nearMap, shadows, -0.00004, twoCascades ? 0.022 : 0.05, 1, 3.0);
     this.sun.name = 'SunKeyNear';
 
     if (twoCascades) {
-      this.sunFar = this.makeCascade(ctx, SUN_INTENSITY * (1 - NEAR_SHARE), FAR_EXTENT,
-        FAR_DISTANCE, 2048, true, -0.00008, 0.35, FAR_UPDATE_INTERVAL);
-      this.sunFar.name = 'SunKeyFar';
+      this.sunFar = this.makeCascade(ctx, 0, FAR_EXTENT,
+        FAR_DISTANCE, q >= Quality.Ultra ? 3072 : 2048, true,
+        -0.00008, 0.35, FAR_UPDATE_INTERVAL, 3.0);
+      this.sunFar.name = 'SunKeyFarShadowOnly';
     }
 
     // SH ambient projected from our own sky — strictly better than a hemisphere
@@ -519,6 +738,7 @@ export class Sky implements System {
   private makeCascade(
     ctx: Ctx, intensity: number, extent: number, distance: number,
     mapSize: number, shadows: boolean, bias: number, normalBias: number, interval: number,
+    radius: number,
   ): THREE.DirectionalLight {
     const light = new THREE.DirectionalLight(SUN_LIGHT_COLOR, intensity);
     light.position.copy(this.sunDirection).multiplyScalar(distance);
@@ -529,7 +749,7 @@ export class Sky implements System {
       s.mapSize.set(mapSize, mapSize);
       s.bias = bias;
       s.normalBias = normalBias;
-      s.radius = 2.2;
+      s.radius = radius;
       const cam = s.camera;
       cam.left = -extent; cam.right = extent;
       cam.top = extent; cam.bottom = -extent;
@@ -631,7 +851,33 @@ export class Sky implements System {
     }
 
     this.updateSunScreen(ctx.camera);
+    if (this.frame === 1) this.checkCascadeOrder(ctx);
     this.frame++;
+  }
+
+  /**
+   * `krCascadeShadow` reads `directionalShadowMap[0]` as the near cascade and
+   * `[1]` as the far one. Three fills those arrays in scene-traversal order, and
+   * Sky adds the near light first and is the only thing in the game that creates
+   * a DirectionalLight — but that is an invariant, not a guarantee, so say so
+   * out loud the moment anything else joins the list. Runs once, on frame 1,
+   * after every system has finished building.
+   */
+  private checkCascadeOrder(ctx: Ctx): void {
+    if (this.cascades.length < 2) return;
+    const lights: THREE.DirectionalLight[] = [];
+    ctx.scene.traverse((o) => {
+      const l = o as THREE.DirectionalLight;
+      if (l.isDirectionalLight) lights.push(l);
+    });
+    const ok = lights[0] === this.sun && lights[1] === this.sunFar
+      && !lights.slice(2).some((l) => l.castShadow);
+    if (!ok) {
+      console.warn('[sky] directional light order changed. krCascadeShadow reads ' +
+        'directionalShadowMap[0] as the near cascade and [1] as the far one, and three ' +
+        'fills that array in scene-traversal order with shadow casters first. Shadows ' +
+        'will be wrong until the new light is added after Sky\'s two.');
+    }
   }
 
   /**

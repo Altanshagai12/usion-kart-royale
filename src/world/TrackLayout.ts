@@ -46,10 +46,26 @@ export const KERB_W = 1.6;
  * about as steep as a kart can cross at speed without the kerb turning into a
  * launch ramp.
  */
-export const KERB_QS = [0, 0.06, 0.22, 0.34, 1.16, 1.30, 1.46, KERB_W];
-export const KERB_HS = [0, 0, 0.098, 0.128, 0.128, 0.100, 0.012, -0.055];
+export const KERB_QS = [0, 0.06, 0.20, 0.26, 0.34, 1.16, 1.30, 1.46, KERB_W];
+export const KERB_HS = [0, 0, 0.086, 0.112, 0.128, 0.128, 0.100, 0.012, -0.055];
 /** vertical offset the kerb band ends on, so the shoulder joins it cleanly */
 export const KERB_END = KERB_HS[KERB_HS.length - 1];
+/**
+ * Lateral bounds of the flat crown, named rather than indexed.
+ *
+ * Round 1 read them out of `KERB_QS` positionally, which quietly welded the
+ * rumble-ripple mask to the *number of breakpoints* in the profile — add one
+ * chamfer and the ripple silently moves onto the bevel and off the crown.
+ *
+ * The extra breakpoint at 0.20/0.26 is a 60 mm micro-chamfer over what used to
+ * be a single 17.5° crease at the top of the steep inner face. That crease was
+ * the sharpest thing on the whole cross-section, and at 60 m it resolves to a
+ * one-pixel specular highlight running the length of the kerb, which is the
+ * geometry half of the shimmer (§9.6: no hard unchamfered edges). The face angle
+ * itself is unchanged at 31°, so nothing about how the kerb drives moves.
+ */
+export const KERB_CROWN0 = 0.34;
+export const KERB_CROWN1 = 1.16;
 
 /** how far the fine shoulder ribbon reaches past the kerb, metres */
 export const SKIRT_W = 26;

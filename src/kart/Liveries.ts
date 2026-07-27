@@ -296,10 +296,14 @@ const PAINT_NORMAL_SCALE = 0.10;
 /** The coat is quieter still; it only has to disagree, not shout. */
 const COAT_NORMAL_SCALE = 0.055;
 const PLASTIC_NORMAL_SCALE = 0.30;
+/** Nomex is a fine woven cloth: the weave has to be felt, never seen. */
+const CLOTH_NORMAL_SCALE = 0.42;
 /** UVs are authored in metres, so repeat = tiles per metre. */
 const PAINT_REPEAT = 6;    // 167 mm tile -> the fBm cell below is ~2 mm
 const COAT_REPEAT = 1.7;   // 588 mm tile, shares no factor with the base coat
 const PLASTIC_REPEAT = 4;
+/** 128 mm tile over a 256 px map: one weave cell lands at ~2.5 mm. */
+const CLOTH_REPEAT = 7.8;
 
 interface SurfaceDetail {
   paintNormal: THREE.Texture;
@@ -309,6 +313,8 @@ interface SurfaceDetail {
   plasticNormal: THREE.Texture;
   plasticRough: THREE.Texture;
   chromeRough: THREE.Texture;
+  clothNormal: THREE.Texture;
+  clothRough: THREE.Texture;
 }
 let _detail: SurfaceDetail | null = null;
 
@@ -401,8 +407,46 @@ function surfaceDetail(): SurfaceDetail {
   });
   const chromeRough = toksvigTexture(chr, flowSlope, COAT_NORMAL_SCALE, COAT_REPEAT, true, 0.09);
 
+  // ---- race-suit cloth ---------------------------------------------------
+  // The driver shared the moulded-plastic family in round 1, so the suit, the
+  // gloves and the lacquered helmet all answered the sun with one roughness —
+  // and a figure whose cloth is as tight as the car's paint reads as a plastic
+  // toy inside a plastic toy. Nomex is a twill: two interlaced thread runs at
+  // 90 degrees, a *high* roughness (0.80-0.94) and a normal fine enough that at
+  // hero distance it only shows as a soft sheen break across a shoulder.
+  const W = 256;
+  const weave = canvas(W);
+  {
+    const img = weave.createImageData(W, W);
+    const d = img.data;
+    const CELL = 8; // px per thread pair -> ~2.5 mm on the body
+    for (let y = 0; y < W; y++) {
+      for (let x = 0; x < W; x++) {
+        // two sine runs in quadrature; the twill offset makes the over/under
+        // alternate diagonally instead of forming a visible checker
+        const twill = ((Math.floor(x / CELL) + Math.floor(y / CELL)) & 1) ? 1 : -1;
+        const warp = Math.sin((x / CELL) * Math.PI * 2) * 0.5 + 0.5;
+        const weft = Math.sin((y / CELL) * Math.PI * 2) * 0.5 + 0.5;
+        const h = 128 + (warp - weft) * twill * 44 + (warp + weft - 1) * 10;
+        const i = (y * W + x) * 4;
+        d[i] = d[i + 1] = d[i + 2] = h;
+        d[i + 3] = 255;
+      }
+    }
+    weave.putImageData(img, 0, 0);
+  }
+  const weaveSlope = heightSlope(weave, 0.30);
+  const clothNormal = tex(slopeToNormal(weaveSlope, W, W), false, CLOTH_REPEAT);
+  const crg = canvas(W);
+  fbmFill(crg, 0, 0, W, W, 0.02, 3, 6421, (n) => {
+    const v = Math.round((0.80 + n * 0.14) * 255);
+    return [v, v, v];
+  });
+  const clothRough = toksvigTexture(crg, weaveSlope, CLOTH_NORMAL_SCALE, CLOTH_REPEAT, true, 0.78);
+
   _detail = {
     paintNormal, paintRough, coatNormal, coatRough, plasticNormal, plasticRough, chromeRough,
+    clothNormal, clothRough,
   };
   return _detail;
 }
@@ -431,6 +475,10 @@ const ENV_TARGET = {
   wheel: 0.95,
   glass: 2.2,
   character: 0.70,
+  // The distant kart is one merged surface standing in for six, so its env
+  // response is the area-weighted middle of the set it replaces: mostly paint,
+  // with the tyres and the suit pulling it down.
+  impostor: 1.05,
 } as const;
 
 /** Last observed `scene.environmentIntensity`; 0.40 until the sky reports in. */
@@ -456,6 +504,8 @@ export function syncKartEnv(sceneEnvIntensity: number) {
     _mats.glass.envMapIntensity = envFor('glass');
     _mats.character.envMapIntensity = envFor('character');
   }
+  if (_heroPaint) _heroPaint.envMapIntensity = envFor('paint');
+  if (_impostor) _impostor.envMapIntensity = envFor('impostor');
   for (const l of _liveries.values()) l.decalMat.envMapIntensity = envFor('paint');
 }
 
@@ -568,12 +618,16 @@ function wheelMaps() {
   // Road dust picked up on the shoulders only — the crown wipes itself clean
   // every revolution, which is half of why a real tyre reads as two surfaces.
   alb.globalAlpha = 1;
+  // The crown is NOT clean either: a kart running a dusty coastal circuit picks
+  // up a thin warm film everywhere and a heavy one on the shoulders. Round 1
+  // took the crown to exactly zero dust, which left the one band of the tyre
+  // the camera sees most as pure neutral charcoal against a warm-graded frame.
   const shoulder = alb.createLinearGradient(0, tx0, 0, tx0 + th);
-  shoulder.addColorStop(0.00, 'rgba(201,169,126,0.30)');
-  shoulder.addColorStop(0.22, 'rgba(201,169,126,0.06)');
-  shoulder.addColorStop(0.50, 'rgba(201,169,126,0.00)');
-  shoulder.addColorStop(0.78, 'rgba(201,169,126,0.06)');
-  shoulder.addColorStop(1.00, 'rgba(201,169,126,0.30)');
+  shoulder.addColorStop(0.00, 'rgba(201,169,126,0.34)');
+  shoulder.addColorStop(0.22, 'rgba(201,169,126,0.10)');
+  shoulder.addColorStop(0.50, 'rgba(193,158,118,0.05)');
+  shoulder.addColorStop(0.78, 'rgba(201,169,126,0.10)');
+  shoulder.addColorStop(1.00, 'rgba(201,169,126,0.34)');
   alb.fillStyle = shoulder;
   alb.fillRect(0, tx0, S, th);
 
@@ -581,11 +635,14 @@ function wheelMaps() {
   const sw = WHEEL_UV.sidewall;
   const sy = px(sw[1]);
   const sh = px(sw[3]);
-  alb.fillStyle = '#212328';
+  alb.fillStyle = '#26282e';
   alb.fillRect(0, sy, S, sh);
   hgt.fillStyle = '#6a6a6a';
   hgt.fillRect(0, sy, S, sh);
-  // Knurl band, on the outer half of the flank. U is the circumference; the
+  // Knurl band, moved OUT to the shoulder end of the flank (v 0.72-0.94). It
+  // used to sit at 0.60-0.90, straight through the space the moulded lettering
+  // needs once that lettering is clear of the bead AO — see below.
+  // U is the circumference; the
   // band sits at ~0.32 m radius, so 2.0 m of arc across 1024 px, and 220
   // serrations is a ~9 mm pitch — about 4.6 texels. The note asked for 2 mm,
   // which at this texel density is 1/5 of a texel: pure mip fodder that would
@@ -596,7 +653,7 @@ function wheelMaps() {
     const x = (i / 220) * S;
     const v = i % 2 ? 0x86 : 0x50;
     hgt.fillStyle = `rgb(${v},${v},${v})`;
-    hgt.fillRect(x, sy + sh * 0.60, S / 220 - 0.6, sh * 0.30);
+    hgt.fillRect(x, sy + sh * 0.72, S / 220 - 0.6, sh * 0.22);
   }
   // Moulded lettering, four legends around the circumference, drawn mirrored:
   // the revolve winds U the other way on the flank you actually see, so this is
@@ -608,12 +665,18 @@ function wheelMaps() {
     const w = c.measureText(str).width;
     return w > maxW ? Math.round(size * (maxW / w)) : Math.round(size);
   };
+  // Baseline at 0.46 of the flank, not 0.28. The bead AO below paints up to 78%
+  // black over v 0.00-0.20 and its feather reaches ~0.26; a 52 px legend with
+  // its baseline at 0.28 has its whole cap height inside that, which is why
+  // round 2 reported "no sidewall lettering" on a tyre that has had lettering
+  // all along. 0.46 also puts it on the widest part of the carcass, which is
+  // the band actually facing the camera when the wheel is alongside.
   const slot = S / 4;
   for (let i = 0; i < 4; i++) {
     const cx = (i + 0.5) * slot;
     for (const c of [hgt, alb]) {
       c.save();
-      c.translate(cx, sy + sh * 0.28);
+      c.translate(cx, sy + sh * 0.46);
       c.scale(-1, 1);
       c.textAlign = 'center';
       c.textBaseline = 'alphabetic';
@@ -627,8 +690,8 @@ function wheelMaps() {
       c.fillText('SUNSET BAY', 0, 0);
       const small = fitText(c, 'GT 360/R • RADIAL', 26, slot * 0.80);
       c.font = `700 ${small}px "Arial Black", Impact, system-ui, sans-serif`;
-      c.fillStyle = c === hgt ? '#c8c8c8' : '#3b3d45';
-      c.fillText('GT 360/R • RADIAL', 0, 36);
+      c.fillStyle = c === hgt ? '#c8c8c8' : '#42444d';
+      c.fillText('GT 360/R • RADIAL', 0, 32);
       c.restore();
     }
   }
@@ -740,18 +803,23 @@ function wheelMaps() {
   };
 
   zone(0, 0, S, S, 0.9, 0);
-  // Tread: 0.92 on the shoulders falling to 0.55 across the crown. That band is
-  // the contact patch, polished by the road every revolution, and it is the
-  // single cue that separates "tread" from "sidewall" at a glance.
+  // Tread: 0.93 on the shoulders falling to 0.72 across the crown. Round 1 took
+  // the crown to 0.55, which made the CROWN the glossiest rubber on the wheel —
+  // glossier than the flank. That is backwards for reading: the flank is the
+  // part with a large smooth curvature facing the sky, so if the crown out-
+  // glosses it the tyre loses the long sheen band that says "torus" and reads
+  // as one extruded matte shape (round 2's note). The polished contact band is
+  // still there, it just no longer wins.
   roughRamp(0, tx0, S, th, 0, [
-    [0.00, 0.93], [0.16, 0.92], [0.34, 0.68], [0.50, 0.55], [0.66, 0.68], [0.84, 0.92], [1.00, 0.93],
+    [0.00, 0.93], [0.16, 0.92], [0.34, 0.80], [0.50, 0.72], [0.66, 0.80], [0.84, 0.92], [1.00, 0.93],
   ]);
-  // Sidewall: 0.70 at the bead, where the flexing rubber stays clean and keeps
-  // a broad dim sheen right next to the metal rim, rising to 0.88 at the
-  // kerb-scuffed shoulder. Same v orientation as the bead AO above — low v is
-  // the rim end.
+  // Sidewall: glossiest at the mid-flank (0.58), where a real tyre's moulded
+  // rubber is unscuffed and slightly waxy, dulling to 0.66 at the bead and 0.86
+  // at the kerb-rashed shoulder. Same v orientation as the bead AO above — low
+  // v is the rim end. That mid-flank band is what catches the low sun as a
+  // curved highlight running round the wheel.
   roughRamp(0, sy, S, sh, 0, [
-    [0.00, 0.70], [0.18, 0.74], [0.55, 0.82], [1.00, 0.88],
+    [0.00, 0.66], [0.22, 0.60], [0.46, 0.58], [0.72, 0.72], [1.00, 0.86],
   ]);
   zone(rx, ry, rw, rh, 0.30, 1);
   zone(0, px(nb[1]), S, px(nb[3]), 0.10, 1);
@@ -1588,31 +1656,180 @@ export function kartMaterials() {
       metalness: 1,
       envMapIntensity: envFor('wheel'),
     }),
-    // Visor: a mirrored tint with a whisper of iridescence, which is what
-    // makes it swim as the kart turns under the low sun.
+    // VISOR. Round 2 note: "a flat dark quad". It was `metalness: 1`, and a
+    // metal has no diffuse term at all — every photon it shows comes from the
+    // environment. The visor faces forward and slightly DOWN, so at golden hour
+    // it was sampling tarmac and the underside of the sky, and it rendered as a
+    // hole cut in the helmet.
+    //
+    // A visor is a dielectric. As one it keeps a dark tinted body (which is the
+    // point of a tinted shield) but gains three things a metal cannot have: a
+    // Fresnel edge that goes bright silver against the sky wherever the surface
+    // turns away, a real specular glint off the SUN rather than off the env map
+    // alone, and a clearcoat lobe on top of the tint. `reflectivity` is pushed
+    // to glass's F0 (~0.078) rather than the 0.5 default's 0.04.
     glass: new THREE.MeshPhysicalMaterial({
-      color: 0x2b3a52,
-      metalness: 1,
-      roughness: 0.07,
+      color: 0x141d2e,
+      metalness: 0.0,
+      roughness: 0.075,
+      reflectivity: 0.62,
+      specularIntensity: 1,
       clearcoat: 1,
-      clearcoatRoughness: 0.03,
-      iridescence: 0.55,
-      iridescenceIOR: 1.6,
+      clearcoatRoughness: 0.02,
+      iridescence: 0.4,
+      iridescenceIOR: 1.5,
       envMapIntensity: envFor('glass'),
     }),
-    // Race suit: fabric, so it wants the plastic family's roughness (0.52+)
-    // rather than the lacquer's 0.22 — a driver should never out-gloss the car.
+    // RACE SUIT. Its own cloth family, not the moulded-plastic one it borrowed
+    // in round 1: roughness 0.80-0.94 against the lacquer's 0.22 and the
+    // plastic's 0.52, over a 2.5 mm twill weave. Three visibly different
+    // surface responses on the driver alone (lacquered helmet, glass visor,
+    // matte cloth) is most of what stops the figure reading as one moulding.
     character: new THREE.MeshStandardMaterial({
       vertexColors: true,
       roughness: 1,
-      roughnessMap: d.plasticRough,
-      normalMap: d.plasticNormal,
-      normalScale: new THREE.Vector2(0.16, 0.16),
+      roughnessMap: d.clothRough,
+      normalMap: d.clothNormal,
+      normalScale: new THREE.Vector2(CLOTH_NORMAL_SCALE, CLOTH_NORMAL_SCALE),
       metalness: 0,
       envMapIntensity: envFor('character'),
     }),
   };
+  addSunRim(_mats.paint, 0.30);
   return _mats;
+}
+
+// --- hero rim light ----------------------------------------------------------
+//
+// Note 4: "the player kart has no rim separation from the tarmac ... at
+// thumbnail size you lose the subject". A mid-value red object on a mid-value
+// grey plane has no edge, and the fix is the one a lighting cameraman would
+// reach for: a warm kicker on the sun side that traces the silhouette.
+//
+// Doing that properly needs the sun's direction in view space, which would mean
+// a per-frame uniform push from a system that owns the scene. It does not need
+// to: `outgoingLight` is already the surface's answer to the key light, so
+// gating a Fresnel term on its own luminance puts the rim exactly where the sun
+// is and NOWHERE in shadow — self-contained, and it can never light the dark
+// side of the kart, which is the failure mode of a naive fresnel emissive.
+//
+// Cost: ~8 ALU in the fragment shader of two meshes per kart. No extra pass, no
+// extra draw call, no uniform traffic.
+const RIM_TINT = new THREE.Color(0xffd9a8);
+
+function addSunRim(m: THREE.MeshPhysicalMaterial, strength: number) {
+  const uRimStrength = { value: strength };
+  const uRimColor = { value: RIM_TINT };
+  m.onBeforeCompile = (shader) => {
+    shader.uniforms.uRimStrength = uRimStrength;
+    shader.uniforms.uRimColor = uRimColor;
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        'void main() {',
+        'uniform float uRimStrength;\nuniform vec3 uRimColor;\nvoid main() {',
+      )
+      .replace(
+        '#include <opaque_fragment>',
+        [
+          '{',
+          // vViewPosition points fragment -> eye, so this is N.V
+          '  float ndv = abs(dot(normalize(vViewPosition), normal));',
+          '  float fres = pow(1.0 - clamp(ndv, 0.0, 1.0), 4.0);',
+          // gate on what the surface is ALREADY returning: bright = sun side
+          '  float lit = clamp(dot(outgoingLight, vec3(0.2126, 0.7152, 0.0722)) * 2.4, 0.0, 1.0);',
+          '  outgoingLight += uRimColor * (fres * lit * lit * uRimStrength);',
+          '}',
+          '#include <opaque_fragment>',
+        ].join('\n'),
+      );
+  };
+  // two rim strengths share one shader source, so they must not share a program
+  m.customProgramCacheKey = () => `sunrim${strength.toFixed(3)}`;
+  m.needsUpdate = true;
+}
+
+let _impostor: THREE.MeshStandardMaterial | null = null;
+let _shadowOnly: THREE.MeshBasicMaterial | null = null;
+
+/**
+ * The distant kart's single surface.
+ *
+ * A kart is fifteen meshes because it is six materials plus four wheels plus a
+ * driver who moves independently of all of them, and every one of those is a
+ * draw call in the colour pass and another one-and-a-third in the cascades.
+ * Eight of them is 220 draw calls against a 250 budget for the entire frame,
+ * which is the whole reason this file gained a second material.
+ *
+ * Past ~26 m a kart is under a hundred pixels tall and the thing that reads is
+ * its silhouette and its livery, not the disagreement between a lacquer's two
+ * specular lobes. So the far LOD is the same geometry, merged, wearing one
+ * vertex-coloured surface: the livery survives verbatim (it lives in the colour
+ * attribute), the shape survives verbatim, and what is lost is the clearcoat,
+ * the chrome's mirror and the visor's Fresnel — none of which resolve at that
+ * size. No maps at all: a 167 mm orange-peel tile at 26 m is sub-texel noise,
+ * and sampling it is how a distant kart starts to sparkle.
+ */
+export function impostorMaterial(): THREE.MeshStandardMaterial {
+  if (_impostor) return _impostor;
+  _impostor = new THREE.MeshStandardMaterial({
+    vertexColors: true,
+    // Between the lacquer's 0.28 and the tyre's 0.85, biased toward the
+    // bodywork because that is most of the silhouette.
+    roughness: 0.42,
+    metalness: 0.04,
+    envMapIntensity: envFor('impostor'),
+  });
+  return _impostor;
+}
+
+/**
+ * The same merged mesh, wearing nothing.
+ *
+ * three decides what goes in a shadow map from `castShadow` on the object and
+ * `visible` on the object and its material — there is no "cast but do not
+ * draw" flag, and both the colour pass and the shadow pass read the same two
+ * booleans. So a near kart, which must keep all fifteen detail meshes in the
+ * colour pass, gets its shadow from this: the merged mesh stays in the scene
+ * with `castShadow` on and a material that writes no colour and no depth. It
+ * costs one rasterised-but-discarded draw and saves nineteen shadow draws.
+ *
+ * `renderOrder` puts it after the opaque queue so the depth buffer it is tested
+ * against is already full and almost every fragment dies at early-Z.
+ */
+export function shadowOnlyMaterial(): THREE.MeshBasicMaterial {
+  if (_shadowOnly) return _shadowOnly;
+  _shadowOnly = new THREE.MeshBasicMaterial({ colorWrite: false, depthWrite: false });
+  return _shadowOnly;
+}
+
+let _heroPaint: THREE.MeshPhysicalMaterial | null = null;
+
+/**
+ * The player's bodywork. Identical lacquer to the roster's, with the sun-side
+ * rim run 2.4x hotter so the hero kart holds its silhouette against the tarmac
+ * at the 6%-of-frame size the chase camera gives it. Cached, so a second player
+ * kart (split screen, replays) costs nothing.
+ */
+export function heroPaint(): THREE.MeshPhysicalMaterial {
+  if (_heroPaint) return _heroPaint;
+  const src = kartMaterials().paint;
+  const m = new THREE.MeshPhysicalMaterial({
+    vertexColors: true,
+    roughness: 1,
+    roughnessMap: src.roughnessMap,
+    normalMap: src.normalMap,
+    normalScale: src.normalScale.clone(),
+    metalness: 0,
+    clearcoat: 1,
+    clearcoatRoughness: 1,
+    clearcoatRoughnessMap: src.clearcoatRoughnessMap,
+    clearcoatNormalMap: src.clearcoatNormalMap,
+    clearcoatNormalScale: src.clearcoatNormalScale.clone(),
+    envMapIntensity: src.envMapIntensity,
+  });
+  addSunRim(m, 0.72);
+  _heroPaint = m;
+  return m;
 }
 
 // ---------------------------------------------------------------------------
@@ -1676,32 +1893,113 @@ export function liveryGeometry(built: Built, l: Livery | null): THREE.BufferGeom
   return g;
 }
 
-/** Soft contact patch under the kart so it is grounded even with shadows off. */
+/** Half track / front axle Z / rear axle Z, so the lobes land on the tyres. */
+export interface BlobLayout { trackX: number; frontZ: number; rearZ: number; }
+
+const BLOB_W = 2.8;   // plane extent in X
+const BLOB_D = 2.6;   // plane extent in Z
+/** Radius of one wheel's contact darkening, metres. */
+const BLOB_LOBE_R = 0.40;
+
+function smoothstep(a: number, b: number, x: number) {
+  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+}
+
+/**
+ * Soft contact patch under the kart so it is grounded even with shadows off.
+ *
+ * Round 2 raised this as a blocker — "a hard-edged quadrilateral LIGHTER than
+ * the tarmac". The quadrilateral in those frames is not this mesh (it is the
+ * road's own patch-repair decal; see the report), but the note's *diagnosis* of
+ * how a fake shadow can go wrong is correct and the round-1 build was one bad
+ * pipeline change away from it, so this is now built so it cannot happen:
+ *
+ *  - MULTIPLICATIVE, not alpha-lerp. The texture is a darkening FACTOR in
+ *    [0.38, 1] and the blend is dst * src, so the worst case is "no change".
+ *    There is no colour in the material that could ever be added to the road.
+ *    It also means the patch scales with the surface instead of dragging it
+ *    toward a fixed near-black, so it reads the same on lit tarmac, on sand and
+ *    in the tunnel. The map is authored in NoColorSpace because a multiplier is
+ *    not a colour and must not be sRGB-decoded.
+ *  - The field reaches EXACTLY 1.0 (no darkening at all) at 0.78 of the plane's
+ *    half-extent and stays there, so the plane's four straight edges sit in
+ *    dead texture. There is no border texel that can carry a value, whatever
+ *    the filter does.
+ *  - The shape is four wheel lobes plus a body ellipse rather than one blob:
+ *    that is where a kart's occlusion actually is, and it means the darkest
+ *    part of the patch is under the tyres, where the bible asks for contact AO.
+ */
 let _blob: { geo: THREE.PlaneGeometry; mat: THREE.MeshBasicMaterial } | null = null;
-export function contactBlob() {
+export function contactBlob(layout: BlobLayout = { trackX: 0.72, frontZ: 0.72, rearZ: -0.74 }) {
   if (_blob) return _blob;
   const S = 128;
   const c = canvas(S);
-  const g = c.createRadialGradient(S / 2, S / 2, 4, S / 2, S / 2, S / 2);
-  g.addColorStop(0, 'rgba(20,16,24,0.62)');
-  g.addColorStop(0.45, 'rgba(20,16,24,0.36)');
-  g.addColorStop(1, 'rgba(20,16,24,0)');
-  c.fillStyle = g;
-  c.fillRect(0, 0, S, S);
-  const t = tex(c, true);
+  const img = c.createImageData(S, S);
+  const d = img.data;
+  const hw = BLOB_W * 0.5;
+  const hh = BLOB_D * 0.5;
+  const wheels: [number, number][] = [
+    [-layout.trackX, layout.frontZ], [layout.trackX, layout.frontZ],
+    [-layout.trackX, layout.rearZ], [layout.trackX, layout.rearZ],
+  ];
+  for (let py = 0; py < S; py++) {
+    for (let px = 0; px < S; px++) {
+      // `PlaneGeometry(w, h).rotateX(-PI/2)` sends local +Y to world -Z, and
+      // the texture is flipY, so canvas row 0 is the REAR of the kart.
+      const u = ((px + 0.5) / S) * 2 - 1;
+      const v = ((py + 0.5) / S) * 2 - 1;
+      const x = u * hw;
+      const z = v * hh;
+
+      // body: a soft ellipse over the chassis footprint
+      let occ = 0.30 * (1 - smoothstep(0.0, 1.0, Math.hypot(x / 0.80, z / 1.00)));
+      // wheels: tight lobes at each contact patch, taken as a max so two lobes
+      // meeting never stack into a black bar
+      let lobe = 0;
+      for (const [wx, wz] of wheels) {
+        const t = Math.hypot(x - wx, z - wz) / BLOB_LOBE_R;
+        if (t < 1) lobe = Math.max(lobe, 1 - smoothstep(0.0, 1.0, t));
+      }
+      occ = Math.min(0.62, occ + lobe * 0.54);
+
+      // Hard guarantee: no darkening within the outer 22% of the plane, so the
+      // straight edge can never draw a line on the road. Separable, so it bites
+      // the sides and the corners identically.
+      occ *= (1 - smoothstep(0.62, 0.78, Math.abs(u))) * (1 - smoothstep(0.62, 0.78, Math.abs(v)));
+
+      const m = Math.round((1 - occ) * 255);
+      const i = (py * S + px) * 4;
+      d[i] = d[i + 1] = d[i + 2] = m;
+      d[i + 3] = 255;
+    }
+  }
+  c.putImageData(img, 0, 0);
+  const t = tex(c, false);
   t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
-  const geo = new THREE.PlaneGeometry(2.9, 2.4);
+  const geo = new THREE.PlaneGeometry(BLOB_W, BLOB_D);
   geo.rotateX(-Math.PI / 2);
   _blob = {
     geo,
     mat: new THREE.MeshBasicMaterial({
       map: t,
-      transparent: true,
+      color: 0xffffff,
+      transparent: true,     // queues it after the opaque road
+      blending: THREE.MultiplyBlending,
+      // three only wires MultiplyBlending's blend func on the premultiplied
+      // path; on the other one it logs an error and sets no func at all, so the
+      // quad inherits whatever the previous draw left bound. That is how a
+      // patch authored as a darkening FACTOR came out as a white rectangle
+      // under every kart. The alpha channel is a solid 1 here and the shader
+      // never premultiplies anything, so this flag only selects the blend func
+      // (DST_COLOR, ONE_MINUS_SRC_ALPHA) — dst * src, which is what was meant.
+      // Same fix, same reason, as the one in fx/Decals.ts.
+      premultipliedAlpha: true,
       depthWrite: false,
       polygonOffset: true,
       polygonOffsetFactor: -4,
       polygonOffsetUnits: -4,
-      toneMapped: false,
+      toneMapped: false,     // a multiplier must not be tone mapped
     }),
   };
   return _blob;
