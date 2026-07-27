@@ -407,10 +407,24 @@ export class Kart implements IKart {
     }
 
     // --- steering rack ------------------------------------------------------
+    // The input contract is `steer > 0 = the player wants to go RIGHT`, where
+    // right means screen-right: `forward x up`, the same convention types.ts
+    // declares for TrackSample.binormal.
+    //
+    // This chassis, though, is built on the opposite handedness. Heading is
+    // `forward = (sin yaw, 0, cos yaw)`, so a rising yaw swings forward toward
+    // +X — and with forward along +Z, `forward x up` is -X. Rising yaw is
+    // therefore a turn to the LEFT, and every internal quantity derived from it
+    // (steerAngle, yawRate, the tyre lateral axis, driftDir) inherits that.
+    //
+    // So the sign is inverted once, here at the boundary, and everything
+    // downstream stays in the chassis' own left-positive frame. Flipping the
+    // basis instead would be the tidier fix, but it would invert the lateral
+    // term of the tyre solve and every yaw consumer along with it.
     const speed = Math.abs(this.forwardSpeed);
     const speedRatio = clamp(speed / Math.max(6, this.topSpeed), 0, 1);
     const rate = THREE.MathUtils.lerp(STEER_RATE_LOW, STEER_RATE_HIGH, speedRatio);
-    this.steerInput = approach(this.steerInput, steer, rate * dt);
+    this.steerInput = approach(this.steerInput, -steer, rate * dt);
 
     // --- ground under the chassis centre ------------------------------------
     const probe = ctx.track.probe(this.position, this.t);

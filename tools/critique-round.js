@@ -188,7 +188,13 @@ const reviews = await parallel(
 )
 
 const ok = reviews.filter(Boolean)
-const all = ok.flatMap((r, i) => (r.findings || []).map((f) => ({ ...f, critic: CRITICS[i].key })))
+// Seeded findings come from the orchestrator's own read of the previous round —
+// blockers confirmed by eye, and anything whose fix agent died before applying.
+// They are merged in as if a critic had raised them.
+const SEED = (args && args.seed) || []
+const all = ok
+  .flatMap((r, i) => (r.findings || []).map((f) => ({ ...f, critic: CRITICS[i].key })))
+  .concat(SEED.map((f) => ({ ...f, critic: 'seeded' })))
 const scores = ok.map((r, i) => `${CRITICS[i].key}: ${r.score}`)
 const avg = ok.length ? Math.round(ok.reduce((s, r) => s + (r.score || 0), 0) / ok.length) : 0
 
@@ -268,6 +274,39 @@ another subsystem.`,
 
 phase('Verify')
 
+// The draw-call budget is the one quality axis no art critic will ever defend,
+// so it gets its own dedicated pass rather than competing for a fix slot.
+const perf = await agent(
+  `cd ${ROOT}. You are the PERFORMANCE engineer for this Three.js kart racer.
+
+ART_DIRECTION.md section 8 budgets **250 draw calls in a typical frame** at Quality.High/1080p.
+The last measurement was **315 median, 590 peak** — over budget, and ten specialists have just
+added more density on top of that.
+
+1. Measure properly. Instrument with renderer.info (set autoReset = false and reset manually
+   around the scene pass — note that with autoReset on, the composer's final fullscreen quad
+   masks everything and reads as 1 draw call, which is why this was missed). Get a real
+   per-frame draw call count, triangle count and texture/program count across several vantage
+   points. You can drive the game headlessly with:
+     node tools/shot.mjs --only hero,wide,pack --settle 3 --w 1280 --h 720 --out shots/perf
+2. Find where the calls actually go. Group them by subsystem — scenery props, foliage, crowd,
+   track segments, karts, particles, decals, UI. Report the real distribution before changing
+   anything; optimising the wrong thing is worse than not optimising.
+3. Cut it to budget. The tools, in order of preference: merge static geometry that never moves
+   independently, convert repeated meshes to InstancedMesh, share materials so batches are not
+   broken by trivial uniform differences, add LOD and distance culling, and turn off shadow
+   casting on objects whose shadow nobody can see. Do NOT delete content to hit the number —
+   the density is the point. Instance it instead.
+4. Re-measure and report the before/after honestly, including anything you could not fix.
+
+You may edit any rendering or world file, but do not change the art direction, do not remove
+scenery, and do not touch src/types.ts. Verify with npx tsc --noEmit when done.
+
+Report the real numbers. If you cannot reach 250 without cutting content, say so plainly and
+report where you landed and what the remaining cost is.`,
+  { label: 'perf', phase: 'Verify' }
+)
+
 const verify = await agent(
   `cd ${ROOT}. ${owners.length} specialists just applied fixes to the kart racing game in parallel.
 
@@ -294,5 +333,6 @@ return {
   major: all.filter((f) => f.severity === 'major').length,
   minor: all.filter((f) => f.severity === 'minor').length,
   dispatched: owners,
+  perf,
   verify,
 }

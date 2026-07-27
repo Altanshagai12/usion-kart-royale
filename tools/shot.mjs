@@ -54,7 +54,7 @@ const ONLY = (arg('only', '') || '').split(',').filter(Boolean);
  */
 const SHOTS = [
   { name: 'hero',        t: 0.06, speed: 24, desc: 'Signature chase shot on a scenic straight' },
-  { name: 'grid',        t: 0.995, speed: 0,  desc: 'Full grid at the start line during countdown' },
+  { name: 'grid',        t: 0.995, speed: 0, settle: 1.1,  desc: 'Full grid at the start line during countdown' },
   { name: 'drift',       t: 0.74, speed: 26, drift: 1, desc: 'Mid-drift with sparks at tier 2' },
   { name: 'boost',       t: 0.40, speed: 32, boost: 1, desc: 'Boost active — speed lines, bloom, FOV punch' },
   { name: 'corner',      t: 0.58, speed: 22, desc: 'Hard banked corner showing track geometry' },
@@ -191,20 +191,43 @@ const main = async () => {
       // A drift cannot be set from out here: `updateDriftState` releases any
       // slide whose button is no longer held, and releasing a charged one fires
       // the mini-turbo — which is why writing `driftDir` produced a boost flame
-      // and a kart travelling perfectly straight. Hold the button instead and
-      // let the kart drift itself. While the slide has not caught yet, pulse
-      // the button: engaging needs a live hop (0.45 s) coinciding with real
-      // steering lock, so one press on the approach straight is simply missed.
+      // and a kart travelling perfectly straight. The button is the only handle.
       //
-      // Throttle and brake are deliberately left alone. Overriding them takes
-      // the corner away from the AI, and a kart held at full throttle through
-      // the seafront corner leaves the circuit entirely.
+      // But the button is all that should be touched, and only on the release
+      // side. The AI already drifts every corner worth a mini-turbo, and its
+      // entry is the part that is hard to fake: engaging needs a live hop
+      // (0.45 s) landing on a genuinely loaded rack, which `updateDrift` sets
+      // up by deliberately over-steering into the corner for half a second.
+      // Driving the button on a blind pulse instead *overrode* that decision —
+      // it stamped on the AI's entries at the corners and engaged slides out on
+      // the straights, where a drift's built-in yaw bias (0.55 of lock toward
+      // driftDir, with no corner to spend it on) simply drives the kart in a
+      // circle. That is the frame it produced: a kart scribing loops on the
+      // approach road, sideways in the corner of shot, tier stuck at 1.
+      //
+      // What the AI cannot do is hold one long enough. Tier 2 needs 2.0 s of
+      // charge and the AI bails at ~1.3 s — not because the corner ends (the
+      // two long ones here run 239 m and 191 m, ten seconds of road) but
+      // because it runs wide and its own `wide` guard pulls the plug. It runs
+      // wide because a slide halves its steering authority and offsets it by
+      // 0.55 toward driftDir, and its PD gains are not tuned for that. So every
+      // unaided slide on this circuit tops out at tier 1.
+      //
+      // Holding the button alone does not fix it — that was the first attempt,
+      // and without the lock to hold the arc the kart just ran wider until it
+      // was scribing circles on the exit road, backwards. What is missing is
+      // the thing a player supplies and the AI does not: lock held into the
+      // corner for the length of the slide. Bias its steer inward while the
+      // charge builds and the kart holds the angle through the corner it is
+      // already in. Hand it straight back at tier 2 — that is the frame, and
+      // past it the corner runs out.
       if (s.drift) {
-        let phase = 0;
         race.driveOverride = (cmd) => {
-          // ~2 presses a second while hunting, so each hop is allowed to play
-          // out rather than the kart pogoing down the approach straight.
-          cmd.drift = player.driftDir !== 0 ? true : phase++ % 32 < 16;
+          if (player.driftDir === 0 || player.driftTier >= 2) return;
+          cmd.drift = true;
+          cmd.steer = Math.max(-1, Math.min(1, cmd.steer + player.driftDir * 0.5));
+          cmd.throttle = 1;
+          cmd.brake = 0;
         };
       } else {
         race.driveOverride = null;
@@ -215,7 +238,7 @@ const main = async () => {
 
       race.state = s.name === 'grid' ? 1 /* Countdown */ : 2 /* Racing */;
       window.__camMode = s.cam || 'chase';
-    }, { ...shot, settle: SETTLE, cruise: AI_CRUISE, hold_still: shot.name === "grid" }, hold);
+    }, { ...shot, settle: shot.settle ?? SETTLE, cruise: AI_CRUISE, hold_still: shot.name === "grid" }, hold);
 
     // Free running, until the kart is both settled and on its mark. Nothing is
     // forced here, so it stays on the racing line and on the road.
@@ -255,7 +278,7 @@ const main = async () => {
         requestAnimationFrame(tick);
       };
       requestAnimationFrame(tick);
-    }), { ...shot, settle: SETTLE, hold_still: shot.name === "grid" }, hold, APPROACH_TIMEOUT);
+    }), { ...shot, settle: shot.settle ?? SETTLE, hold_still: shot.name === "grid" }, hold, APPROACH_TIMEOUT);
 
     if (!waited.ok) {
       warnings.push(`shot "${shot.name}" never reached its mark: ${waited.why}`);

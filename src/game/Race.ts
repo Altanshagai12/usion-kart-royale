@@ -399,7 +399,12 @@ export class Race implements IRace {
           }
         } else {
           const cmd = this.ai.drive(ctx, k, dt, this.karts, true);
-          steer = cmd.steer;
+          // The AI solves in the chassis' yaw frame (positive = rising yaw =
+          // a turn to the left), while `Kart.step` takes the same input
+          // contract the player uses (positive = screen-right). Convert here,
+          // at the one point an AI command becomes a drive input, so the
+          // driver model can keep reasoning in the space its geometry is in.
+          steer = -cmd.steer;
           throttle = cmd.throttle;
           brake = cmd.brake;
           drift = cmd.drift;
