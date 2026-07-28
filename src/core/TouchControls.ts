@@ -7,13 +7,13 @@
  *  system already reads, so nothing downstream knows or cares that the player
  *  is on a phone.
  *
- *  Three decisions worth recording:
+ *  Six decisions worth recording:
  *
  *  1. **The stick floats.** Its origin is wherever the thumb first lands in the
  *     left half, not a fixed rosette. A fixed stick requires the player to look
  *     down to find it; a floating one is always exactly under the thumb. If the
- *     drag exceeds the radius the base follows, so a long pull never saturates
- *     and then feels dead on the way back.
+ *     drag exceeds the lock radius the base follows, so a long pull never
+ *     saturates and then feels dead on the way back.
  *
  *  2. **Auto-accelerate is on by default**, which is the convention every
  *     shipped mobile kart racer settles on: one thumb steers, the other drifts,
@@ -24,6 +24,27 @@
  *     and tapping an item is three simultaneous touches, and a naive
  *     single-pointer implementation drops two of them. This is the single most
  *     common way on-screen controls are got wrong.
+ *
+ *  4. **Presses are latched, not polled** (round 11). `update()` used to report
+ *     `pointer >= 0`, i.e. "is a finger on this button *right now*". A tap
+ *     shorter than a frame — press and release both landing between two rAFs,
+ *     which at 30 fps on a phone is a 33 ms window and a perfectly ordinary
+ *     stab at the item button — set and cleared the pointer without a single
+ *     frame ever observing it, and the press was silently gone. The keyboard
+ *     had this fixed long ago; touch never did, and touch is the platform the
+ *     player is actually complaining about. Every press now sets a `tapped`
+ *     flag that survives until the next `update()` reads it.
+ *
+ *  5. **Buttons can be slid onto.** A thumb that lands 20 px shy of DRIFT at
+ *     corner entry and then slides on used to do nothing at all, because the
+ *     button was only claimed on `pointerdown`. An unclaimed pointer now keeps
+ *     looking, so a near-miss corrects itself instead of costing the corner.
+ *
+ *  6. **Hit rectangles are cached.** `getBoundingClientRect()` inside a pointer
+ *     handler forces synchronous layout; five of them on every touchdown, on
+ *     the exact event whose latency the player feels, is the wrong place to
+ *     spend milliseconds. They only change on resize / AUTO toggle, so that is
+ *     when they are recomputed.
  * ============================================================================
  */
 
@@ -35,25 +56,49 @@ export interface TouchState {
   item: boolean;
   look: boolean;
   pause: boolean;
+  /** true while a thumb is actually on the steering stick */
+  steering: boolean;
   /** true while the player is actually touching something */
   active: boolean;
 }
 
-/** fraction of the stick radius ignored around centre */
-const DEADZONE = 0.1;
-/** exponent applied past the dead zone — >1 buys fine control near centre */
-const CURVE = 1.35;
+/**
+ * Fraction of the lock radius ignored around centre.
+ *
+ * A *floating* stick has no drift and no calibration error to reject: the
+ * origin is defined as the pixel the thumb landed on, so zero really is zero.
+ * The only thing a dead zone has to absorb here is the two or three pixels a
+ * thumb rolls through while it settles. 0.1 of a 52 px radius was 5.2 px of
+ * nothing — a deliberate small correction on a straight did not move the kart
+ * at all, which reads as the controls ignoring you. 0.055 of a 62 px radius is
+ * 3.4 px: still immune to the settle, but a nudge steers.
+ */
+const DEADZONE = 0.055;
+/**
+ * Exponent applied past the dead zone. >1 buys fine control near centre at the
+ * cost of the mid-range. 1.35 was a hard sell — half a thumb-sweep produced a
+ * third of the lock, so ordinary corners needed most of the travel and there
+ * was nothing left for a correction. 1.22 keeps the fine centre and gives the
+ * mid-range back.
+ */
+const CURVE = 1.22;
 
 type Btn = {
   id: 'drift' | 'item' | 'brake' | 'look' | 'gas';
   el: HTMLElement;
   pointer: number;
+  /** set on press, cleared by `update()` — see note 4 in the header */
+  tapped: boolean;
+  /** cached circular hit test, refreshed by `measure()` */
+  cx: number;
+  cy: number;
+  r2: number;
 };
 
 export class TouchControls {
   readonly state: TouchState = {
     steer: 0, accel: 0, brake: 0, drift: false, item: false,
-    look: false, pause: false, active: false,
+    look: false, pause: false, steering: false, active: false,
   };
 
   /** auto-accelerate — the AUTO chip toggles it */
@@ -65,13 +110,24 @@ export class TouchControls {
   private gasBtn!: HTMLElement;
   private autoChip!: HTMLElement;
   private buttons: Btn[] = [];
+  /** direct handles, so the per-frame `update()` allocates nothing */
+  private bDrift!: Btn;
+  private bItem!: Btn;
+  private bBrake!: Btn;
+  private bLook!: Btn;
+  private bGas!: Btn;
 
   /** -1 when no thumb is steering */
   private stickPointer = -1;
   private originX = 0;
   private originY = 0;
-  private radius = 64;
+  /** thumb travel, in px, that maps to full lock */
+  private radius = 62;
   private mounted = false;
+  /** hit rects are stale until the next test */
+  private dirty = true;
+  /** pointers that went down without claiming anything — may still slide on */
+  private free = new Set<number>();
 
   mount() {
     if (this.mounted) return;
@@ -98,8 +154,14 @@ export class TouchControls {
 
     for (const id of ['drift', 'item', 'brake', 'look', 'gas'] as const) {
       const el = root.querySelector<HTMLElement>(`[data-btn="${id}"]`)!;
-      this.buttons.push({ id, el, pointer: -1 });
+      this.buttons.push({ id, el, pointer: -1, tapped: false, cx: 0, cy: 0, r2: 0 });
     }
+    const byId = (id: Btn['id']) => this.buttons.find((b) => b.id === id)!;
+    this.bDrift = byId('drift');
+    this.bItem = byId('item');
+    this.bBrake = byId('brake');
+    this.bLook = byId('look');
+    this.bGas = byId('gas');
 
     this.autoChip.addEventListener('pointerdown', (e) => {
       e.preventDefault();
@@ -124,6 +186,7 @@ export class TouchControls {
     addEventListener('pointercancel', this.onUp, { passive: false });
     addEventListener('contextmenu', this.onContext);
     addEventListener('resize', this.sizeStick);
+    addEventListener('orientationchange', this.sizeStick);
   }
 
   unmount() {
@@ -135,9 +198,14 @@ export class TouchControls {
     removeEventListener('pointercancel', this.onUp);
     removeEventListener('contextmenu', this.onContext);
     removeEventListener('resize', this.sizeStick);
+    removeEventListener('orientationchange', this.sizeStick);
     document.documentElement.removeAttribute('data-touch');
     this.root?.remove();
     this.root = null;
+    this.free.clear();
+    this.stickPointer = -1;
+    this.state.steer = 0;
+    this.state.steering = false;
   }
 
   private setAuto(on: boolean) {
@@ -147,36 +215,67 @@ export class TouchControls {
     // With auto off the player needs a throttle; with it on that space is dead
     // weight under the thumb, so the pedal is removed rather than just dimmed.
     this.gasBtn.style.display = on ? 'none' : '';
-    if (on) {
-      const b = this.buttons.find((x) => x.id === 'gas')!;
-      b.pointer = -1;
-      b.el.classList.remove('down');
+    if (on && this.bGas) {
+      this.bGas.pointer = -1;
+      this.bGas.tapped = false;
+      this.bGas.el.classList.remove('down');
     }
+    this.dirty = true;
   }
 
   private sizeStick = () => {
-    // Thumb reach, not screen size: a tablet does not want a 200px stick.
-    this.radius = Math.max(52, Math.min(96, Math.min(innerWidth, innerHeight) * 0.13));
+    /**
+     * Thumb reach, not screen size: a tablet does not want a 200 px stick.
+     *
+     * This is the travel that reaches FULL LOCK, and it is also where the base
+     * starts trailing the thumb — the two must be the same number or there is a
+     * band at the edge where pushing further does nothing and pulling back does
+     * nothing either, which is exactly the "saturates and then feels dead"
+     * failure the floating base exists to avoid.
+     *
+     * 0.13 of the short edge gave 52 px on a landscape phone: 1 px of thumb was
+     * 2% of lock, so nothing between "straight" and "committed" was reachable.
+     * 0.16 gives 62 px there — 20% more resolution for a sweep a thumb still
+     * covers without lifting — and is capped at 88 rather than 96 so a tablet
+     * does not demand a whole hand's travel for full lock.
+     */
+    this.radius = Math.max(56, Math.min(88, Math.min(innerWidth, innerHeight) * 0.16));
     const d = this.radius * 2;
     this.stickBase.style.width = this.stickBase.style.height = `${d}px`;
-    this.stickKnob.style.width = this.stickKnob.style.height = `${d * 0.46}px`;
+    this.stickKnob.style.width = this.stickKnob.style.height = `${d * 0.42}px`;
+    this.dirty = true;
   };
 
   private onContext = (e: Event) => e.preventDefault();
 
+  /** Refresh the cached hit circles. Layout is read here and nowhere else. */
+  private measure() {
+    this.dirty = false;
+    for (const b of this.buttons) {
+      const r = b.el.getBoundingClientRect();
+      b.cx = r.left + r.width / 2;
+      b.cy = r.top + r.height / 2;
+      // Generously padded: thumbs are imprecise and a miss on the drift button
+      // at corner entry is felt immediately.
+      const rad = r.width / 2 + 16;
+      b.r2 = r.width === 0 ? 0 : rad * rad;
+    }
+  }
+
   private hitButton(x: number, y: number): Btn | null {
+    if (this.dirty) this.measure();
     for (const b of this.buttons) {
       if (b.id === 'gas' && this.auto) continue;
-      const r = b.el.getBoundingClientRect();
-      if (r.width === 0) continue;
-      // Circular hit test, generously padded: thumbs are imprecise and a miss
-      // on the drift button at corner entry is felt immediately.
-      const cx = r.left + r.width / 2;
-      const cy = r.top + r.height / 2;
-      const rad = r.width / 2 + 14;
-      if ((x - cx) ** 2 + (y - cy) ** 2 <= rad * rad) return b;
+      if (b.r2 === 0 || b.pointer >= 0) continue;
+      if ((x - b.cx) ** 2 + (y - b.cy) ** 2 <= b.r2) return b;
     }
     return null;
+  }
+
+  private claim(b: Btn, id: number) {
+    b.pointer = id;
+    b.tapped = true; // survives until `update()` reads it — see note 4
+    b.el.classList.add('down');
   }
 
   private onDown = (e: PointerEvent) => {
@@ -187,8 +286,7 @@ export class TouchControls {
     const btn = this.hitButton(e.clientX, e.clientY);
     if (btn) {
       e.preventDefault();
-      btn.pointer = e.pointerId;
-      btn.el.classList.add('down');
+      this.claim(btn, e.pointerId);
       return;
     }
 
@@ -198,13 +296,30 @@ export class TouchControls {
       this.stickPointer = e.pointerId;
       this.originX = e.clientX;
       this.originY = e.clientY;
+      this.state.steering = true;
+      this.state.steer = 0;
       this.stickWrap.classList.add('live');
       this.placeStick(0, 0);
+      return;
     }
+
+    // Landed on nothing. Keep watching it — see note 5.
+    this.free.add(e.pointerId);
   };
 
   private onMove = (e: PointerEvent) => {
-    if (e.pointerId !== this.stickPointer) return;
+    if (e.pointerId !== this.stickPointer) {
+      // A thumb that missed the button it was aiming at can still slide on.
+      if (this.free.has(e.pointerId)) {
+        const b = this.hitButton(e.clientX, e.clientY);
+        if (b) {
+          e.preventDefault();
+          this.free.delete(e.pointerId);
+          this.claim(b, e.pointerId);
+        }
+      }
+      return;
+    }
     e.preventDefault();
     let dx = e.clientX - this.originX;
     const dy = e.clientY - this.originY;
@@ -221,13 +336,15 @@ export class TouchControls {
     const mag = Math.abs(raw);
     this.state.steer = mag <= DEADZONE
       ? 0
-      : Math.sign(raw) * Math.pow((mag - DEADZONE) / (1 - DEADZONE), CURVE);
+      : Math.sign(raw) * Math.min(1, Math.pow((mag - DEADZONE) / (1 - DEADZONE), CURVE));
   };
 
   private onUp = (e: PointerEvent) => {
+    this.free.delete(e.pointerId);
     if (e.pointerId === this.stickPointer) {
       this.stickPointer = -1;
       this.state.steer = 0;
+      this.state.steering = false;
       this.stickWrap.classList.remove('live');
     }
     for (const b of this.buttons) {
@@ -244,16 +361,26 @@ export class TouchControls {
       `translate(${this.originX + dx}px, ${this.originY + dy}px) translate(-50%, -50%)`;
   }
 
-  /** Called once per frame by Input, before it reads `state`. */
+  /**
+   * Called once per frame by Input, before it reads `state`.
+   *
+   * `held || tapped` is the whole point of the latch: a press that has already
+   * been released is still reported for the one frame that first sees it, so a
+   * sub-frame stab at DRIFT or ITEM lands instead of vanishing.
+   */
   update() {
-    const held = (id: Btn['id']) => this.buttons.find((b) => b.id === id)!.pointer >= 0;
     const s = this.state;
-    s.drift = held('drift');
-    s.item = held('item');
-    s.look = held('look');
-    s.brake = held('brake') ? 1 : 0;
-    s.accel = this.auto ? (s.brake > 0 ? 0 : 1) : held('gas') ? 1 : 0;
-    s.active = this.stickPointer >= 0 || this.buttons.some((b) => b.pointer >= 0);
+    s.drift = this.bDrift.pointer >= 0 || this.bDrift.tapped;
+    s.item = this.bItem.pointer >= 0 || this.bItem.tapped;
+    s.look = this.bLook.pointer >= 0 || this.bLook.tapped;
+    s.brake = this.bBrake.pointer >= 0 || this.bBrake.tapped ? 1 : 0;
+    const gas = !this.auto && (this.bGas.pointer >= 0 || this.bGas.tapped);
+    s.accel = this.auto ? (s.brake > 0 ? 0 : 1) : gas ? 1 : 0;
+    s.active = this.stickPointer >= 0 ||
+      this.bDrift.pointer >= 0 || this.bItem.pointer >= 0 || this.bBrake.pointer >= 0 ||
+      this.bLook.pointer >= 0 || this.bGas.pointer >= 0 ||
+      s.drift || s.item || s.brake > 0 || gas;
+    for (let i = 0; i < this.buttons.length; i++) this.buttons[i].tapped = false;
   }
 
   /** Input clears this after converting it to a one-frame edge. */
@@ -306,7 +433,7 @@ const CSS = `
 .tc-stick-zone { position: absolute; inset: 0 50% 0 0; }
 .tc-stick-base, .tc-stick-knob {
   position: fixed; top: 0; left: 0; border-radius: 50%;
-  opacity: 0; transition: opacity 140ms ease;
+  opacity: 0; transition: opacity 120ms ease;
   will-change: transform, opacity;
 }
 .tc-stick-base {
@@ -359,7 +486,10 @@ const CSS = `
   box-shadow: 0 5px 18px rgba(0,0,0,.42), inset 0 1px 0 rgba(255,255,255,.22);
   backdrop-filter: blur(5px);
   text-shadow: 0 1px 3px rgba(0,0,0,.75);
-  transition: transform 90ms ease, box-shadow 90ms ease, background 90ms ease;
+  /* 90ms was long enough that a fast tap released before the press state had
+     finished animating in, so a stab at DRIFT looked like it had missed even
+     when it had not. Feedback on a control must not lag the control. */
+  transition: transform 55ms ease, box-shadow 55ms ease, background 55ms ease;
 }
 .tc-btn span { font-size: 2.4vmin; }
 .tc-btn svg { width: 52%; height: 52%; }

@@ -90,6 +90,7 @@ import {
   mixRGB,
   readPixels,
   rgb,
+  textureBudget,
   toImageData,
   type Canvas2D,
   type MapSet,
@@ -141,7 +142,21 @@ export type MaterialName =
   | 'tunnel-light'
   | 'neon';
 
-/** Base texture resolution before the quality scale is applied. */
+/**
+ * Base texture resolution before the quality scale is applied — i.e. the size
+ * a desktop tier gets. `Materials.res()` applies the tier scale and the global
+ * texture cap on top; see the note there.
+ *
+ * THE MOBILE CLAUSE to the art bible's "minimum 1024² within 5 m, 512² beyond".
+ * That rule is a desktop standard and is met verbatim at High and Ultra. It is
+ * NOT met on a handheld and must not be: 1024² over a 3.5 m tarmac tile is 290
+ * texels per metre of world, against a 390 CSS-pixel panel that resolves maybe
+ * 60. The whole top of the mip chain is built, uploaded, charged against a
+ * memory ceiling an iOS tab is killed for crossing, and never sampled. The
+ * measured bill for honouring the desktop rule on a phone was 220 MB of
+ * texture memory against an 80 MB budget, which is the crash. So: base ×1 on
+ * High/Ultra, ×0.5 on Medium, ×0.25 on Low, capped by `textureBudget()`.
+ */
 const BASE_SIZE: Record<string, number> = {
   tarmac: 1024,
   'tarmac-racing-line': 1024,
@@ -1894,10 +1909,30 @@ export class Materials implements System {
 
   // -- internals -----------------------------------------------------------
 
+  /**
+   * The authored size for a material, after the quality tier and the global
+   * texture cap have both had their say.
+   *
+   * Generating small is strictly better than generating big and letting
+   * `setTextureBudget` downsample: it costs a quarter of the fill to build, a
+   * quarter of the transient heap in `Fields`, and it never allocates the large
+   * canvas at all. The cap is still consulted so this can never *exceed* the
+   * process budget — one number decides, in one place, and this is the fast
+   * path to the same answer.
+   *
+   * Tier scales, and why 0.25 on Low is not vandalism: at Low the panel is a
+   * phone's, and `WORLD_SCALE` for tarmac is 3.5 m. 256² over 3.5 m is 73
+   * texels/m; the road fills perhaps 200 of the 390 device pixels the panel
+   * has, at a metre or two of depth. The texel density still exceeds the pixel
+   * density. Halving again would start to show. This does not.
+   */
   private res(name: string): number {
     const base = BASE_SIZE[name] ?? 512;
-    const scale = this.quality <= Quality.Medium ? 0.5 : 1;
-    return Math.max(128, Math.round(base * scale));
+    const scale = this.quality <= Quality.Low ? 0.25 : this.quality <= Quality.Medium ? 0.5 : 1;
+    const cap = textureBudget();
+    let size = Math.max(64, Math.round(base * scale));
+    if (Number.isFinite(cap)) size = Math.min(size, cap);
+    return size;
   }
 
   private maps(f: Fields, o: Parameters<typeof buildMaps>[1] = {}): MapSet {

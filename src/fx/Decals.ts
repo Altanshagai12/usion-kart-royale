@@ -157,12 +157,18 @@ export class Decals {
   private readonly material: THREE.ShaderMaterial;
   private readonly atlas: THREE.DataTexture;
   private head = 0;
+  /** oldest live quad; [tail, tail+used) mod capacity is the live window */
+  private tail = 0;
   private used = 0;
-  private lo = Infinity;
-  private hi = -Infinity;
+  /** wall-clock expiry of each slot, so the ring can retire its own tail */
+  private readonly expire: Float32Array;
+  private frameStart = 0;
+  private frameWrote = 0;
+  private fullDirty = false;
 
-  constructor(readonly capacity: number) {
-    this.atlas = buildAtlas(decalTiles(), 2, 2, 256);
+  constructor(readonly capacity: number, tileSize = 256) {
+    this.atlas = buildAtlas(decalTiles(), 2, 2, tileSize);
+    this.expire = new Float32Array(capacity);
     this.data = new Float32Array(capacity * 4 * VSTRIDE);
     this.buffer = new THREE.InterleavedBuffer(this.data, VSTRIDE);
     this.buffer.setUsage(THREE.DynamicDrawUsage);
@@ -173,11 +179,33 @@ export class Decals {
     this.geo.setAttribute('aLife', new THREE.InterleavedBufferAttribute(this.buffer, 2, 5));
     this.geo.setAttribute('aTint', new THREE.InterleavedBufferAttribute(this.buffer, 4, 7));
 
-    const idx = new Uint16Array(capacity * 6);
+    // TWO COPIES OF THE INDEX BUFFER, AND THIS IS A FRAME-PACING FIX.
+    //
+    // The live set is the ring window [tail, tail + used). `setDrawRange` can
+    // express exactly one span, so when that window straddled the ring's wrap
+    // the only correct single span was the WHOLE RING — every expired quad in
+    // the buffer rasterised, texture-fetched and discarded, on a layer that is
+    // blended and lying flat across the road. With a live set of ~70 quads
+    // against a 1200-quad ring that is a seventeen-fold spike in decal fill,
+    // and it lands on whichever frame the wrap happens to fall on. A single
+    // frame that costs seventeen times its neighbours is exactly the stutter
+    // the player is reporting as a black flash.
+    //
+    // Duplicating the index list makes quad q addressable at BOTH q and
+    // q + capacity, so a window that runs off the end of the ring is still one
+    // contiguous run of indices starting at `tail * 6`. The draw is now always
+    // proportional to what is actually on the road. Cost: capacity * 12 extra
+    // Uint16s — 77 KB at the largest tier, uploaded once, never touched again.
+    //
+    // Uint16 is safe by construction: the largest capacity any tier asks for is
+    // 3200, i.e. 12 800 vertices, a fifth of the 65 536 an index can address.
+    const idx = new Uint16Array(capacity * 12);
     for (let q = 0; q < capacity; q++) {
       const b = q * 4;
-      idx[q * 6] = b; idx[q * 6 + 1] = b + 1; idx[q * 6 + 2] = b + 2;
-      idx[q * 6 + 3] = b; idx[q * 6 + 4] = b + 2; idx[q * 6 + 5] = b + 3;
+      const o = q * 6;
+      idx[o] = b; idx[o + 1] = b + 1; idx[o + 2] = b + 2;
+      idx[o + 3] = b; idx[o + 4] = b + 2; idx[o + 5] = b + 3;
+      idx.copyWithin((capacity + q) * 6, o, o + 6);
     }
     this.geo.setIndex(new THREE.BufferAttribute(idx, 1));
     this.geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e6);
@@ -212,6 +240,7 @@ export class Decals {
     this.mesh = new THREE.Mesh(this.geo, this.material);
     this.mesh.frustumCulled = false;
     this.mesh.matrixAutoUpdate = false;
+    this.mesh.name = 'fx-decals';
     // Decals go down after opaque geometry but before every particle.
     this.mesh.renderOrder = 5;
   }
@@ -244,8 +273,9 @@ export class Decals {
     this.head = this.head + 1;
     if (this.head >= this.capacity) this.head = 0;
     if (this.used < this.capacity) this.used++;
-    if (i < this.lo) this.lo = i;
-    if (i > this.hi) this.hi = i;
+    else this.tail = this.head;   // recycled the oldest: the window slides
+    this.expire[i] = birth + life;
+    this.frameWrote++;
 
     const ox = (tile & 1) * 0.5;
     const oy = (tile >> 1) * 0.5;
@@ -326,25 +356,75 @@ export class Decals {
       0.070 + col.r * k, 0.065 + col.g * k, 0.060 + col.b * k);
   }
 
+  /** Re-upload everything — after a WebGL context restore. */
+  invalidate() { this.fullDirty = true; this.atlas.needsUpdate = true; }
+
   update(time: number) {
+    const cap = this.capacity;
     this.material.uniforms.uTime.value = time;
-    this.geo.setDrawRange(0, this.used * 6);
-    if (this.hi >= this.lo) {
-      const per = 4 * VSTRIDE;
-      this.buffer.clearUpdateRanges();
-      this.buffer.addUpdateRange(this.lo * per, (this.hi - this.lo + 1) * per);
-      this.buffer.needsUpdate = true;
-      this.lo = Infinity; this.hi = -Infinity;
+
+    // --- retire the tail --------------------------------------------------
+    //
+    // `used` only ever grew, so within a couple of laps the layer was drawing
+    // its full 3200 quads on every frame forever — a road's worth of expired
+    // marks, each one still rasterised and each one still fetching the atlas
+    // before the fragment shader could discard it. On a phone that is a few
+    // million wasted blended fragments a frame, and it is invisible in a
+    // profiler because nothing about it changes: it is just permanently slow.
+    //
+    // Marks are laid in time order and recycled oldest-first, so the live set
+    // is the ring window [tail, head). Walking the tail forward past whatever
+    // has expired keeps the draw proportional to what is actually on the road —
+    // typically a few hundred quads instead of the whole ring. The scan is
+    // capped so an expiry cliff (a race reset, a whole field's marks ageing out
+    // together) is amortised over a few frames rather than spent in one.
+    let scan = 256;
+    while (this.used > 0 && scan-- > 0 && this.expire[this.tail] <= time) {
+      this.tail = this.tail + 1 >= cap ? 0 : this.tail + 1;
+      this.used--;
     }
+
+    // One contiguous span, wrap or no wrap — see the doubled index list in the
+    // constructor. A straddling window simply runs on into the second copy.
+    this.geo.setDrawRange(this.tail * 6, this.used * 6);
+
+    // --- upload only what was written -------------------------------------
+    const per = 4 * VSTRIDE;
+    const buf = this.buffer;
+    if (this.fullDirty || this.frameWrote >= cap) {
+      buf.clearUpdateRanges();
+      buf.addUpdateRange(0, cap * per);
+      buf.needsUpdate = true;
+    } else if (this.frameWrote > 0) {
+      buf.clearUpdateRanges();
+      const end = this.frameStart + this.frameWrote;
+      if (end <= cap) {
+        buf.addUpdateRange(this.frameStart * per, this.frameWrote * per);
+      } else {
+        buf.addUpdateRange(this.frameStart * per, (cap - this.frameStart) * per);
+        buf.addUpdateRange(0, (end - cap) * per);
+      }
+      buf.needsUpdate = true;
+    }
+    this.fullDirty = false;
+    this.frameStart = this.head;
+    this.frameWrote = 0;
   }
 
-  /** Wipe every mark — used on race reset. */
+  /**
+   * Wipe every mark — used on race reset.
+   *
+   * No memset and no upload. This used to `fill(0)` 140 000 floats and then
+   * mark the whole 1.4 MB buffer dirty, i.e. a 563 KB clear plus a full-buffer
+   * re-upload on the countdown frame — a hitch on precisely the frame the
+   * player is watching the lights. Resetting the ring pointers is enough: the
+   * draw range collapses to nothing, and the stale floats behind it are
+   * overwritten before they can ever be drawn again.
+   */
   clear() {
-    this.data.fill(0);
-    this.buffer.clearUpdateRanges();
-    this.buffer.needsUpdate = true;
-    this.head = 0; this.used = 0;
-    this.lo = Infinity; this.hi = -Infinity;
+    this.head = 0; this.tail = 0; this.used = 0;
+    this.frameStart = 0; this.frameWrote = 0;
+    this.geo.setDrawRange(0, 0);
   }
 
   dispose() {

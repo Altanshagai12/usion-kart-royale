@@ -1222,7 +1222,14 @@ export class PostFX {
   }
 
   dispose(): void {
-    for (const pass of this.passes) pass.dispose();
+    // Fault-tolerant per pass, and that matters in exactly one place: this is
+    // called from the 'webglcontextlost' handler, against a context that is
+    // already dead. A pass whose `dispose` reaches for a GL object that no
+    // longer exists must not be allowed to abort the loop and leave the rest of
+    // the chain — and the notice the player is waiting to see — half done.
+    for (const pass of this.passes) {
+      try { pass.dispose(); } catch (err) { console.warn('[postfx] pass dispose failed', err); }
+    }
     this.passes.length = 0;
     this.grade = null;
     this.bloom = null;
@@ -1230,6 +1237,14 @@ export class PostFX {
     this.smaa = null;
     this.ao = null;
     this.gradePass = null;
+    // The eased lens state is history, and after a teardown there is none. Left
+    // alone, a chain rebuilt while the player happened to be mid-boost came
+    // back with a full-strength streak and aberration over a frame whose
+    // reprojection history had just been reseeded to "no motion" — a lens that
+    // says 120 km/h over an image that says parked.
+    this.speed = 0;
+    this.punch = 0;
+    this.primed = false;
   }
 
   /** Registers a pass with the composer and tracks it for disposal. */

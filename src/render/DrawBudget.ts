@@ -36,6 +36,7 @@
 import * as THREE from 'three';
 import { Quality, type Ctx, type System } from '../types';
 import { syncKartEnv } from '../kart/Liveries';
+import { registerPrewarm } from '../core/Prewarm';
 
 /**
  * Distance at which a kart collapses to its merged bake, metres.
@@ -81,10 +82,33 @@ interface KartLod {
   root: THREE.Object3D;
   impostor: THREE.Mesh;
   detail: THREE.Object3D[];
+  /**
+   * The two poses of the merged bake, resolved once at bind rather than looked
+   * up out of `userData` on every swap. `shadowMat` is the invisible-but-
+   * casting pose used while the detail meshes are what the camera sees;
+   * `bakeMat` is the lit pose used once the kart has collapsed to the bake.
+   */
+  shadowMat: THREE.Material;
+  bakeMat: THREE.Material;
   /** true while the detail meshes are the ones being drawn */
   near: boolean;
   casting: boolean;
 }
+
+/**
+ * How hard the frame-time governor is allowed to pull the LOD and shadow
+ * distances in, as a fraction of their authored values.
+ *
+ * A quality tier is chosen once, at boot, from a renderer string. It cannot
+ * know that the phone is two laps into a race and thermally throttling, or that
+ * the whole field has just arrived in the tunnel together. When the frame is
+ * consistently over budget the cheapest thing to give up is the distance at
+ * which rivals collapse to their merged bake — the kart at 18 m loses its
+ * clearcoat lobe and nothing else, and it gets it back the moment there is
+ * headroom. Down fast, back slowly, and never past this floor, so a struggling
+ * device degrades instead of stuttering and a healthy one is untouched.
+ */
+const GOVERNOR_FLOOR = 0.55;
 
 const _sphere = new THREE.Sphere();
 const _pos = new THREE.Vector3();
@@ -97,12 +121,46 @@ export class DrawBudget implements System {
    * Identity of the field the LOD list was built from. Not just the count: a
    * rebuilt grid of the same size has to re-bind or this holds handles into
    * models that are no longer in the scene.
+   *
+   * Held as two fields rather than as a joined string. It is compared on every
+   * frame, and building `count + ':' + uuid` to compare it allocated a string
+   * per frame for the whole race — the only allocation left in this file, and
+   * ART_DIRECTION section 8 asks for none.
    */
-  private bound = '';
+  private boundCount = -1;
+  private boundId = '';
   private readonly frustum = new THREE.Frustum();
   private readonly viewProj = new THREE.Matrix4();
+  /** smoothed frame time, seconds; drives the governor. See GOVERNOR_FLOOR. */
+  private smoothDt = 1 / 60;
+  private governor = 1;
 
-  lateUpdate(ctx: Ctx) {
+  /** 1 = the authored distances, GOVERNOR_FLOOR = as tight as it will ever go. */
+  get lodGovernor() { return this.governor; }
+
+  /**
+   * Bind at boot rather than waiting for the first frame, for one reason: the
+   * shader pre-warm runs immediately after every system's `init`, and the two
+   * materials the impostor swaps between are reachable from `root.userData`
+   * only — they hang off no mesh in the scene, so the pre-warm's scene walk
+   * cannot see them.
+   *
+   * Today that is harmless: measured over a 45 s race the program cache holds
+   * flat at 83 and the LOD swap compiles nothing, because the impostor's
+   * program key collides with one the field already has. But that is an
+   * accident of what the karts happen to be made of, not a property anybody
+   * stated, and the failure mode if it ever stops being true is the worst one
+   * in the game — a synchronous compile on the frame a rival crosses 20 m,
+   * which is the "screen flashes black" mechanism Prewarm.ts documents.
+   * Registering costs nothing when the pass finds the program already built,
+   * and it also covers the re-warm after a WebGL context restore.
+   */
+  init(ctx: Ctx) {
+    const karts = ctx.race?.karts;
+    if (karts && karts.length) this.bind(karts, karts.length, karts[0].object.uuid);
+  }
+
+  lateUpdate(ctx: Ctx, dt = ctx.dt) {
     // The kart materials are keyed to the scene's environment intensity by a
     // render hook on `bodyPaint`, which stops firing the moment that mesh is
     // hidden. Drive it from here instead: it early-outs on an unchanged value,
@@ -112,13 +170,27 @@ export class DrawBudget implements System {
     if (!this.enabled) return;
     const karts = ctx.race?.karts;
     if (!karts || !karts.length) return;
-    const id = karts.length + ':' + karts[0].object.uuid;
-    if (this.bound !== id) this.bind(karts, id);
+    const id = karts[0].object.uuid;
+    if (this.boundCount !== karts.length || this.boundId !== id) {
+      this.bind(karts, karts.length, id);
+    }
     if (!this.lods.length) return;
 
+    // --- frame-time governor ------------------------------------------------
+    // `dt` arrives already clamped to 1/20 upstream, which is what we want: this
+    // has to chase a sustained deficit, not a single stall.
+    if (dt > 0) {
+      this.smoothDt += (dt - this.smoothDt) * Math.min(1, dt * 2.5);
+      const HOT = 1 / 55, COOL = 1 / 68;
+      if (this.smoothDt > HOT) this.governor = Math.max(GOVERNOR_FLOOR, this.governor - dt * 0.8);
+      else if (this.smoothDt < COOL) this.governor = Math.min(1, this.governor + dt * 0.06);
+    }
+
     const q = ctx.settings.quality;
-    const swap = q >= Quality.High ? LOD_SWAP : LOD_SWAP_LOW;
-    const keep = q >= Quality.High ? LOD_KEEP : LOD_KEEP_LOW;
+    const g = this.governor;
+    const swap = (q >= Quality.High ? LOD_SWAP : LOD_SWAP_LOW) * g;
+    const keep = (q >= Quality.High ? LOD_KEEP : LOD_KEEP_LOW) * g;
+    const shadowMax = SHADOW_MAX * g;
     const shadows = ctx.settings.shadows;
 
     const cam = ctx.camera;
@@ -135,9 +207,7 @@ export class DrawBudget implements System {
       if (near !== lod.near) {
         lod.near = near;
         for (const n of lod.detail) n.visible = near;
-        lod.impostor.material = near
-          ? (lod.root.userData.shadowOnlyMat as THREE.Material)
-          : (lod.root.userData.impostorMat as THREE.Material);
+        lod.impostor.material = near ? lod.shadowMat : lod.bakeMat;
         // The shadow-only pose wants to be last in the opaque queue so early-Z
         // eats it; the visible pose wants to sort normally with everything else.
         lod.impostor.renderOrder = near ? 4 : 0;
@@ -146,7 +216,7 @@ export class DrawBudget implements System {
       // --- shadow relevance ------------------------------------------------
       // Note this runs on the impostor whether or not it is the visible mesh:
       // it is the kart's only shadow caster in both states.
-      let cast = shadows && d < SHADOW_MAX;
+      let cast = shadows && d < shadowMax;
       if (cast) {
         _sphere.center.copy(_pos);
         _sphere.radius = KART_RADIUS + SHADOW_SLACK;
@@ -164,7 +234,8 @@ export class DrawBudget implements System {
 
   dispose() {
     this.lods = [];
-    this.bound = '';
+    this.boundCount = -1;
+    this.boundId = '';
   }
 
   // -------------------------------------------------------------------------
@@ -176,15 +247,30 @@ export class DrawBudget implements System {
    * picked up off the userData the builder leaves behind rather than by
    * widening a shared interface for a renderer-side concern.
    */
-  private bind(karts: { object: THREE.Object3D }[], id: string) {
+  private bind(karts: { object: THREE.Object3D }[], count: number, id: string) {
     this.lods = [];
-    this.bound = id;
+    this.boundCount = count;
+    this.boundId = id;
     for (const k of karts) {
       k.object.traverse((o) => {
         const imp = o.userData?.impostor as THREE.Mesh | undefined | null;
         const detail = o.userData?.detailNodes as THREE.Object3D[] | undefined;
         if (!imp || !detail) return;
-        this.lods.push({ root: o, impostor: imp, detail, near: true, casting: true });
+        // Both poses have to exist before this kart is allowed into the list.
+        // Assigning `undefined` to `Mesh.material` does not fail here — it
+        // fails inside `WebGLRenderer.render`, part-way through the opaque
+        // queue, and everything after it in that queue is simply never drawn.
+        // A half-drawn frame is indistinguishable from the black partial
+        // renders being reported, so a kart missing either material keeps all
+        // fifteen of its meshes rather than taking the whole frame down.
+        const shadowMat = o.userData?.shadowOnlyMat as THREE.Material | undefined;
+        const bakeMat = o.userData?.impostorMat as THREE.Material | undefined;
+        if (!shadowMat || !bakeMat) return;
+        registerPrewarm(bakeMat, { label: 'kart-impostor-bake' });
+        registerPrewarm(shadowMat, { label: 'kart-impostor-shadow' });
+        this.lods.push({
+          root: o, impostor: imp, detail, shadowMat, bakeMat, near: true, casting: true,
+        });
       });
     }
   }

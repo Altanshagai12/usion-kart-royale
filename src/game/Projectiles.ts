@@ -18,7 +18,7 @@
  * ============================================================================
  */
 import * as THREE from 'three';
-import { ItemKind, Surface, type Ctx, type IKart } from '../types';
+import { ItemKind, Quality, Surface, type Ctx, type IKart } from '../types';
 import { registerPrewarm } from '../core/Prewarm';
 import type { HazardLike, RacingLine } from './AI';
 
@@ -82,6 +82,14 @@ export function normalFromHeight(h: Float32Array, size: number, strength: number
   const t = new THREE.DataTexture(px, size, size, THREE.RGBAFormat);
   t.wrapS = THREE.RepeatWrapping;
   t.wrapT = THREE.ClampToEdgeWrapping;
+  // DataTexture defaults to NearestFilter with no mips. On a body of revolution
+  // spinning past the camera that is a normal map that crawls and sparkles at
+  // every distance — the aliasing tell art bible §9.6 rules out — and it is a
+  // one-line fix that costs a third of a small texture.
+  t.minFilter = THREE.LinearMipmapLinearFilter;
+  t.magFilter = THREE.LinearFilter;
+  t.generateMipmaps = true;
+  t.anisotropy = 4;
   t.needsUpdate = true;
   return t;
 }
@@ -318,8 +326,7 @@ interface MatSet {
 }
 
 /** Painted shell: banded albedo, a spotted height field, spatially varying roughness. */
-function shellArt(base: string, rim: string, spot: string, glow: number): MatSet {
-  const S = 256;
+function shellArt(base: string, rim: string, spot: string, glow: number, S = 256): MatSet {
   const alb = pad(S);
   const rgh = pad(S);
   const g = alb.g;
@@ -423,8 +430,7 @@ function shellArt(base: string, rim: string, spot: string, glow: number): MatSet
   return { geo: lathe(SHELL_PROFILE, 30), mat };
 }
 
-function bananaArt(): MatSet {
-  const S = 128;
+function bananaArt(S = 128): MatSet {
   const alb = pad(S);
   const g = alb.g;
   // v runs along the sweep: brown stem, yellow body, brown nub
@@ -481,8 +487,7 @@ function bananaArt(): MatSet {
   return { geo: crescent(2.3, 0.46, 0.145, 22, 12), mat };
 }
 
-function bombArt(): MatSet {
-  const S = 128;
+function bombArt(S = 128): MatSet {
   const alb = pad(S);
   const g = alb.g;
   const grd = g.createLinearGradient(0, 0, 0, S);
@@ -532,8 +537,7 @@ function bombArt(): MatSet {
   return { geo: lathe(BOMB_PROFILE, 26), mat };
 }
 
-export function mushroomArt(cap: string, spot: string): MatSet {
-  const S = 128;
+export function mushroomArt(cap: string, spot: string, S = 128): MatSet {
   const alb = pad(S);
   const g = alb.g;
   const grd = g.createLinearGradient(0, 0, 0, S);
@@ -601,6 +605,8 @@ const POOL = 16;
 const enum PState { Free = 0, Carried = 1, Live = 2 }
 
 interface Proj {
+  /** its own slot in `pool`, so `spawn` never has to scan for it */
+  index: number;
   kind: ItemKind;
   state: PState;
   owner: number;
@@ -642,14 +648,24 @@ export class Projectiles {
   private art = new Map<number, MatSet>();
   private line: RacingLine | null = null;
   private hazardPool: HazardLike[] = [];
+  private mobile = false;
 
   init(ctx: Ctx) {
     this.group.name = 'projectiles';
+    // Half-resolution art on the mobile tiers. A shell is 0.75 m across and is
+    // almost never nearer than a couple of metres, so 128 is still well over the
+    // texel density anything here resolves at; what it buys is 1.9 MB of the
+    // texture budget back, four times less canvas work at boot (the plate and
+    // pitting passes are O(S^2)) and the same again off the retained JS heap,
+    // which on iOS is charged against the same ceiling as the GPU copy.
+    this.mobile = ctx.settings.quality <= Quality.Medium;
+    const big = this.mobile ? 128 : 256;
+    const small = this.mobile ? 64 : 128;
 
-    this.art.set(ItemKind.GreenShell, shellArt('#3fbf52', '#f2ece0', '#2b8f3d', 0.10));
-    this.art.set(ItemKind.RedShell, shellArt('#e8433f', '#f2ece0', '#a92a2c', 0.16));
-    this.art.set(ItemKind.Banana, bananaArt());
-    this.art.set(ItemKind.Bomb, bombArt());
+    this.art.set(ItemKind.GreenShell, shellArt('#3fbf52', '#f2ece0', '#2b8f3d', 0.10, big));
+    this.art.set(ItemKind.RedShell, shellArt('#e8433f', '#f2ece0', '#a92a2c', 0.16, big));
+    this.art.set(ItemKind.Banana, bananaArt(small));
+    this.art.set(ItemKind.Bomb, bombArt(small));
 
     for (const a of this.art.values()) {
       if (ctx.envMap) a.mat.envMap = ctx.envMap;
@@ -679,12 +695,16 @@ export class Projectiles {
     for (let i = 0; i < POOL; i++) {
       const art = this.art.get(KINDS[i % KINDS.length])!;
       const mesh = new THREE.Mesh(art.geo, art.mat);
-      mesh.castShadow = true;
+      // Set per-frame by distance in `update` — a shell twenty metres away lays
+      // a shadow a few texels across under an object a few pixels across, and
+      // pays a full extra draw call per cascade for it.
+      mesh.castShadow = false;
       mesh.receiveShadow = false;
       mesh.visible = false;
       mesh.frustumCulled = true;
       this.group.add(mesh);
       this.pool.push({
+        index: i,
         kind: ItemKind.None, state: PState.Free, owner: -1, ownerLock: 0,
         pos: new THREE.Vector3(), vel: new THREE.Vector3(), up: new THREE.Vector3(0, 1, 0),
         life: 0, bounces: 0, hintT: 0, spin: 0, scale: 1,
@@ -885,7 +905,7 @@ export class Projectiles {
         break;
     }
     if (carried) p.vel.set(0, 0, 0);
-    return this.pool.indexOf(p);
+    return p.index;
   }
 
   /** Release a carried item. Returns false if the handle is stale. */
@@ -929,6 +949,12 @@ export class Projectiles {
     this.shadows.begin();
     this.hazards.length = 0;
     let hz = 0;
+    // Shadow-casting distance for a 0.75 m prop. Every caster is an extra draw
+    // per shadow cascade, and each of these already carries a blob shadow that
+    // grounds it, so the real shadow only has to survive as far as it is
+    // legible. Tighter on mobile, and off entirely when shadows are.
+    const shadowMax = ctx.settings.shadows ? (this.mobile ? 18 : 34) : -1;
+    const cam = ctx.camera.position;
 
     for (let i = 0; i < this.pool.length; i++) {
       const p = this.pool[i];
@@ -963,6 +989,8 @@ export class Projectiles {
       p.mesh.position.copy(p.pos);
       p.mesh.scale.setScalar(p.scale);
       this.orient(p, dt);
+      const wantCast = shadowMax > 0 && p.pos.distanceToSquared(cam) < shadowMax * shadowMax;
+      if (p.mesh.castShadow !== wantCast) p.mesh.castShadow = wantCast;
       const r = p.kind === ItemKind.Banana ? 0.62 : 0.72;
       this.shadows.add(p.pos.x, p.pos.y - this.groundGap(p), p.pos.z, p.up, r * 2.2);
 

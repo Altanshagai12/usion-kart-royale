@@ -13,6 +13,11 @@
  *  to all three slots — three reads .r for AO, .g for roughness and .b for
  *  metalness, so this is one upload instead of three.
  *
+ *  MEMORY. Every texture in the process — including the ones built by systems
+ *  that never import this file — passes through `setTextureBudget()`'s cap
+ *  before its first upload. See the long note above it; that cap is what keeps
+ *  a phone under the 80 MB of texture memory an iOS tab can survive.
+ *
  *  Normals are derived by a wrapping Sobel over the generator's height field.
  *  Nothing here fakes a normal map out of albedo luminance.
  * ============================================================================
@@ -29,20 +34,272 @@ export interface Canvas2D {
   size: number;
 }
 
+function rawCanvas(w: number, h: number): AnyCanvas {
+  if (HAS_OFFSCREEN) return new OffscreenCanvas(w, h);
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  return c;
+}
+
 export function createCanvas(size: number): Canvas2D {
-  let canvas: AnyCanvas;
-  if (HAS_OFFSCREEN) {
-    canvas = new OffscreenCanvas(size, size);
-  } else {
-    const c = document.createElement('canvas');
-    c.width = c.height = size;
-    canvas = c;
-  }
+  const canvas = rawCanvas(size, size);
   // These canvases exist purely as a CPU staging buffer for putImageData /
   // getImageData; letting the browser back them with a GPU surface turns every
   // readback into a pipeline stall.
   const ctx = canvas.getContext('2d', { willReadFrequently: true }) as unknown as CanvasRenderingContext2D;
   return { canvas, ctx, size };
+}
+
+// ---------------------------------------------------------------------------
+// The global texture budget
+// ---------------------------------------------------------------------------
+/*
+ * WHY THIS EXISTS, and why it is a global rather than a parameter.
+ *
+ * Measured on an emulated iPhone at Quality.Medium: 220 MB of texture memory
+ * across 138 textures, against a mobile budget of 80 MB. iOS Safari jetsams a
+ * tab on *total* process footprint and GPU textures are charged against it, so
+ * that number is the crash the player reported, not a tidiness complaint.
+ *
+ * Only a minority of those bytes are generated in this file. The rest are built
+ * by a dozen systems that each `new THREE.CanvasTexture(...)` directly — kart
+ * liveries, tyres, banners, awnings, sign panels, the crowd, the particle and
+ * decal atlases. A per-generator size argument would have to be plumbed through
+ * every one of them and would be silently forgotten by the next one written.
+ *
+ * So the cap is enforced once, at the only choke point every texture in the
+ * process actually passes through: the `needsUpdate` setter that hands a
+ * texture to the renderer for upload. Anything larger than the cap is
+ * downsampled BEFORE its first upload, so the peak footprint never happens —
+ * this is not a trim after the fact.
+ *
+ * Three properties make this safe rather than clever:
+ *
+ *  1. It runs at most once per texture source. Nothing in this game re-uploads
+ *    a texture (every `Texture.needsUpdate = true` in the codebase is a
+ *    build-time one-shot; the per-frame ones are BufferAttribute, a different
+ *    class), and the claim flag on `Texture.source` guarantees it regardless.
+ *  2. It defers to a microtask rather than acting inline. `CanvasTexture`'s
+ *    constructor sets `needsUpdate` before the caller has had a chance to
+ *    assign `mipmaps`, so acting inline would resample a base level whose
+ *    hand-built mip chain had not been attached yet. Every generator in this
+ *    codebase finishes configuring its texture inside one synchronous block,
+ *    and uploads happen inside a rAF callback, so a microtask sits exactly in
+ *    between: after the texture is complete, before the GPU ever sees it.
+ *  3. A hand-built mip chain is *sliced*, not resampled. Level k of a full
+ *    chain already is the base downsampled by 2^k, so dropping the first k
+ *    levels is exact and free — and it preserves the two chains in this game
+ *    that carry meaning beyond a box filter: the coverage-preserving alpha
+ *    mips on foliage cutouts, and the variance-to-roughness chain on kart
+ *    lacquer. Resampling either of those would have thinned fronds at range
+ *    and flattened the specular lobe on every kart.
+ *
+ * Render targets, depth textures, cube/3D/array textures, compressed textures
+ * and anything that is not 8-bit RGBA are left alone. `userData.noTextureBudget`
+ * is the explicit opt-out for a generator that knows better.
+ */
+
+let budgetMax = Infinity;
+let budgetHooked = false;
+let budgetQueued = false;
+const budgetPending: THREE.Texture[] = [];
+
+/**
+ * Install (or update) the process-wide maximum texture edge length, in texels.
+ * Call this before any system builds a texture — `createSettings()` does, which
+ * is the first thing `main.ts` evaluates. Pass `Infinity` for no cap.
+ */
+export function setTextureBudget(maxSize: number): void {
+  budgetMax = maxSize > 0 ? maxSize : Infinity;
+  if (!Number.isFinite(budgetMax) || budgetHooked) return;
+  const proto = THREE.Texture.prototype;
+  const desc = Object.getOwnPropertyDescriptor(proto, 'needsUpdate');
+  const base = desc?.set;
+  // If three ever stops backing this with an accessor we do nothing rather than
+  // break every upload in the game.
+  if (!base) return;
+  budgetHooked = true;
+  Object.defineProperty(proto, 'needsUpdate', {
+    configurable: true,
+    enumerable: false,
+    set(this: THREE.Texture, value: boolean) {
+      base.call(this, value);
+      if (value === true) enqueueForBudget(this);
+    },
+  });
+}
+
+/** The current cap. Generators that can pick their own size should honour it. */
+export function textureBudget(): number {
+  return budgetMax;
+}
+
+interface ClaimableSource {
+  __budgetClaimed?: boolean;
+}
+
+function enqueueForBudget(t: THREE.Texture): void {
+  const src = t.source as unknown as ClaimableSource | undefined;
+  if (!src || src.__budgetClaimed) return;
+  src.__budgetClaimed = true;
+  budgetPending.push(t);
+  if (budgetQueued) return;
+  budgetQueued = true;
+  queueMicrotask(flushTextureBudget);
+}
+
+function flushTextureBudget(): void {
+  budgetQueued = false;
+  for (let i = 0; i < budgetPending.length; i++) clampTexture(budgetPending[i]);
+  budgetPending.length = 0;
+}
+
+interface ImageLike {
+  width?: number;
+  height?: number;
+  data?: ArrayBufferView;
+}
+
+function clampTexture(t: THREE.Texture): void {
+  const max = budgetMax;
+  if (!Number.isFinite(max)) return;
+  const flags = t as unknown as Record<string, boolean>;
+  if (
+    flags.isRenderTargetTexture || flags.isDepthTexture || flags.isCompressedTexture ||
+    flags.isCubeTexture || flags.isData3DTexture || flags.isDataArrayTexture ||
+    flags.isVideoTexture || flags.isFramebufferTexture
+  ) return;
+  if (t.userData && (t.userData as { noTextureBudget?: boolean }).noTextureBudget) return;
+
+  const img = t.image as ImageLike | null | undefined;
+  if (!img) return;
+  const w = img.width! | 0;
+  const h = img.height! | 0;
+  if (w <= 0 || h <= 0) return;
+  const big = Math.max(w, h);
+  if (big <= max) return;
+
+  // How many halvings to get the long edge inside the cap.
+  let k = 1;
+  while (big >> k > max) k++;
+
+  // 1. A hand-built chain: slice it. Exact, allocation-free, and it keeps
+  //    whatever the chain was authored to preserve.
+  const mips = t.mipmaps as unknown as ImageLike[] | undefined;
+  if (mips && mips.length > k) {
+    t.mipmaps = mips.slice(k) as unknown as THREE.Texture['mipmaps'];
+    t.image = mips[k];
+    return;
+  }
+
+  // 2. A canvas (or bitmap): successive 2× box reductions. A single drawImage
+  //    straight to the target size is a bilinear tap on the full-resolution
+  //    image, which drops three quarters of the texels on the floor at 4× and
+  //    aliases everything it kept; halving repeatedly is a real box filter.
+  if (isDrawable(img)) {
+    t.image = halveDrawable(img as CanvasImageSource, w, h, k);
+    dropStaleMips(t, mips);
+    return;
+  }
+
+  // 3. Raw 8-bit RGBA (DataTexture).
+  const data = img.data;
+  if (
+    (data instanceof Uint8Array || data instanceof Uint8ClampedArray) &&
+    t.format === THREE.RGBAFormat && t.type === THREE.UnsignedByteType
+  ) {
+    t.image = halveBytes(data, w, h, k) as unknown as THREE.Texture['image'];
+    dropStaleMips(t, mips);
+    return;
+  }
+  // Anything else (half-float LUTs, odd formats) is left exactly as authored.
+}
+
+/**
+ * Resampling replaced level 0, so any hand-built chain that came with it is now
+ * the wrong size and must go. Dropping it is not enough on its own: a texture
+ * with a mipmap min-filter, no chain and `generateMipmaps === false` is
+ * mip-INCOMPLETE, and an incomplete texture samples as black. Every generator
+ * that ships its own chain also turns generation off, so turning it back on is
+ * the other half of the same edit.
+ *
+ * (In practice this never fires — every chain in the game runs down to 1×1, so
+ * the slice path above always wins. It exists so that a future generator with a
+ * partial chain degrades to "slightly softer" instead of "black".)
+ */
+function dropStaleMips(t: THREE.Texture, mips: ImageLike[] | undefined): void {
+  if (!mips || !mips.length) return;
+  t.mipmaps = [];
+  t.generateMipmaps = true;
+}
+
+function isDrawable(img: unknown): boolean {
+  if (typeof HTMLCanvasElement !== 'undefined' && img instanceof HTMLCanvasElement) return true;
+  if (HAS_OFFSCREEN && img instanceof OffscreenCanvas) return true;
+  if (typeof ImageBitmap !== 'undefined' && img instanceof ImageBitmap) return true;
+  if (typeof HTMLImageElement !== 'undefined' && img instanceof HTMLImageElement) return true;
+  return false;
+}
+
+function halveDrawable(img: CanvasImageSource, w: number, h: number, times: number): AnyCanvas {
+  let src: CanvasImageSource = img;
+  let cw = w;
+  let ch = h;
+  let out: AnyCanvas | null = null;
+  for (let i = 0; i < times; i++) {
+    const nw = Math.max(1, cw >> 1);
+    const nh = Math.max(1, ch >> 1);
+    const c = rawCanvas(nw, nh);
+    const g = c.getContext('2d') as unknown as CanvasRenderingContext2D;
+    g.imageSmoothingEnabled = true;
+    g.imageSmoothingQuality = 'high';
+    g.drawImage(src, 0, 0, cw, ch, 0, 0, nw, nh);
+    src = c as unknown as CanvasImageSource;
+    out = c;
+    cw = nw;
+    ch = nh;
+  }
+  return out!;
+}
+
+function halveBytes(
+  data: Uint8Array | Uint8ClampedArray,
+  w: number,
+  h: number,
+  times: number,
+): { data: Uint8Array; width: number; height: number } {
+  let cur: Uint8Array | Uint8ClampedArray = data;
+  let cw = w;
+  let ch = h;
+  let out = new Uint8Array(0);
+  for (let i = 0; i < times; i++) {
+    const nw = Math.max(1, cw >> 1);
+    const nh = Math.max(1, ch >> 1);
+    const next = new Uint8Array(nw * nh * 4);
+    for (let y = 0; y < nh; y++) {
+      const y0 = Math.min(ch - 1, y * 2);
+      const y1 = Math.min(ch - 1, y * 2 + 1);
+      for (let x = 0; x < nw; x++) {
+        const x0 = Math.min(cw - 1, x * 2);
+        const x1 = Math.min(cw - 1, x * 2 + 1);
+        const a = (y0 * cw + x0) * 4;
+        const b = (y0 * cw + x1) * 4;
+        const c = (y1 * cw + x0) * 4;
+        const d = (y1 * cw + x1) * 4;
+        const o = (y * nw + x) * 4;
+        next[o] = (cur[a] + cur[b] + cur[c] + cur[d] + 2) >> 2;
+        next[o + 1] = (cur[a + 1] + cur[b + 1] + cur[c + 1] + cur[d + 1] + 2) >> 2;
+        next[o + 2] = (cur[a + 2] + cur[b + 2] + cur[c + 2] + cur[d + 2] + 2) >> 2;
+        next[o + 3] = (cur[a + 3] + cur[b + 3] + cur[c + 3] + cur[d + 3] + 2) >> 2;
+      }
+    }
+    cur = next;
+    out = next;
+    cw = nw;
+    ch = nh;
+  }
+  return { data: out, width: cw, height: ch };
 }
 
 // ---------------------------------------------------------------------------

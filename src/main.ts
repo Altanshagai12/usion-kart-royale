@@ -20,6 +20,31 @@ import { Audio } from './audio/Audio';
 
 const parent = document.getElementById('app')!;
 
+/**
+ * The size the canvas will actually be displayed at, in CSS pixels.
+ *
+ * Measured off `#app` (which is `position: fixed; inset: 0`) rather than read
+ * from `innerWidth`/`innerHeight`, and that is a mobile correctness fix, not a
+ * tidy-up. On iOS Safari `innerHeight` tracks the VISUAL viewport — it shrinks
+ * and grows as the URL bar collapses, mid-gesture, by ~60 px — while a
+ * `position: fixed` element is laid out against the LAYOUT viewport and does
+ * not move. `renderer.setSize(w, h, true)` writes inline `style.width/height`
+ * in pixels, which beats the stylesheet's `width: 100%`, so sizing from
+ * `innerHeight` pinned the canvas to the smaller of the two and left an
+ * unpainted strip along the bottom of the screen: a black band across part of
+ * the frame, appearing and disappearing as the player scrolled their thumb.
+ * That is one of the "black partial renders", and it is invisible on desktop
+ * because there the two viewports are the same thing.
+ *
+ * Measuring the element we are about to fill has no such ambiguity, and on
+ * desktop it returns exactly what `innerWidth`/`innerHeight` did.
+ */
+function viewportSize(): { w: number; h: number } {
+  const w = parent.clientWidth || innerWidth || 1;
+  const h = parent.clientHeight || innerHeight || 1;
+  return { w: Math.max(1, Math.round(w)), h: Math.max(1, Math.round(h)) };
+}
+
 const pipeline = new RenderPipeline(parent);
 const input = new Input();
 const sky = new Sky();
@@ -34,15 +59,17 @@ const hud = new HUD();
 const audio = new Audio();
 const drawBudget = new DrawBudget();
 
+const view0 = viewportSize();
+
 const ctx: Ctx = {
   renderer: null as any,
   scene: new THREE.Scene(),
-  camera: new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.2, 3000),
+  camera: new THREE.PerspectiveCamera(62, view0.w / view0.h, 0.2, 3000),
   time: 0,
   dt: 0,
   frame: 0,
-  width: innerWidth,
-  height: innerHeight,
+  width: view0.w,
+  height: view0.h,
   settings: createSettings(),
   bus: new Bus(),
   input,
@@ -111,8 +138,9 @@ async function boot() {
     await new Promise((r) => requestAnimationFrame(r));
     await systems[i].init?.(ctx);
   }
-  addEventListener('resize', resize);
-  resize();
+  installResizeListeners();
+  installContextRecovery();
+  resize(true);
 
   // Compile every shader before the first frame is presented. Doing it here
   // costs a moment of boot; not doing it costs a dropped frame mid-race every
@@ -146,24 +174,123 @@ function dismissBootScreen() {
   setTimeout(() => boot.remove(), 700);
 }
 
+// ---------------------------------------------------------------------------
+//  Render-loop watchdog
+// ---------------------------------------------------------------------------
+/**
+ * WebGL is not synchronous. `composer.render()` returns as soon as the frame's
+ * commands are queued, not when the GPU has drawn them, so a loop that keeps
+ * calling it regardless of how long the last frame actually took does not
+ * "run slowly" — it runs *ahead*, piling driver-side command buffers on a
+ * device that is already behind. That is how a stall turns into a crash: the
+ * queue is memory, and on a phone the memory is what the browser kills the tab
+ * over. It is also how a frame ends up on screen half-drawn, because the
+ * compositor will present whatever surface is available when its deadline
+ * arrives whether or not the rasteriser has finished with it.
+ *
+ * So the loop is allowed to skip a present. Skipping is cheap and it is
+ * self-correcting: one skipped frame hands the GPU an entire frame's worth of
+ * time with no new work, which is exactly what a backlog needs.
+ */
+/** A single frame this long has already missed a dozen vsyncs. Let it drain. */
+const STALL_MS = 220;
+/** Sustained cost above this (~22 fps) buys nothing by presenting every frame. */
+const SLOW_MS = 45;
+/** Hysteresis, so the cadence does not chatter around the threshold. */
+const RECOVER_MS = 34;
+/** The watchdog stays out of the way until the scene has settled. */
+const WATCHDOG_FROM_FRAME = 30;
+
+/** EMA of the cost of frames we actually presented, milliseconds. */
+let renderCostEma = 16.7;
+/** Frames still to skip presenting. */
+let skipRender = 0;
+/** True while the loop is running at a 2:1 present cadence. */
+let halfRate = false;
+let stallCount = 0;
+let renderFailures = 0;
+/** Set between context loss and a completed restore; nothing runs meanwhile. */
+let suspended = false;
+
 let last = performance.now();
 function frame(now: number) {
   requestAnimationFrame(frame);
+
   const raw = (now - last) / 1000;
   last = now;
+
+  // Context gone, or the tab is not being composited. Do not simulate, do not
+  // draw, do not allocate — just keep the rAF alive so we notice when the world
+  // comes back. (A hidden tab on iOS is the single most likely moment for the
+  // GPU to reclaim our context, and continuing to queue frames into a surface
+  // nobody is presenting is the worst possible way to spend that window.)
+  if (suspended || document.hidden || pipeline.contextLost) return;
+
   // Clamp so a stalled tab or a breakpoint never teleports anything.
   // `__freeze` holds the simulation still while the screenshot harness retries a
   // torn capture: rendering continues, so the compositor can produce a clean
   // frame, but nothing advances — otherwise a retry lands seconds down the road
   // and the shot no longer shows what it was aimed at.
-  const dt = (window as any).__freeze ? 0 : Math.min(raw, 1 / 20);
+  const frozen = (window as any).__freeze === true;
+  const dt = frozen ? 0 : Math.min(raw, 1 / 20);
   ctx.dt = dt;
   ctx.time += dt;
   ctx.frame++;
 
+  const t0 = performance.now();
+
   for (const s of systems) s.update?.(ctx, dt);
   for (const s of systems) s.lateUpdate?.(ctx, dt);
-  pipeline.render(ctx);
+
+  // The harness is entitled to a present on every frozen frame — retrying a
+  // torn capture is the whole reason `__freeze` exists — and so are the first
+  // few frames, which is where `__gameReady` and the boot curtain are decided.
+  const maySkip = !frozen && ctx.frame > WATCHDOG_FROM_FRAME;
+  let presented = false;
+  if (skipRender > 0 && maySkip) {
+    skipRender--;
+  } else {
+    presented = true;
+    try {
+      pipeline.render(ctx);
+      renderFailures = 0;
+    } catch (err) {
+      renderFailures++;
+      console.error(`[frame] render threw (${renderFailures} in a row)`, err);
+      // A chain that throws once per frame is a black rectangle with a busy
+      // CPU. Retreat to the direct render — which is a real, legible frame —
+      // rather than keep failing in a more sophisticated way.
+      if (renderFailures === 4) pipeline.disablePostProcessing('render threw four frames running');
+      if (renderFailures >= 24) {
+        console.error('[frame] renderer is not recoverable; suspending the loop');
+        // The last frame that did draw stays on screen underneath. A stale
+        // picture of the game with an explanation over it is a far better
+        // failure than a black rectangle and a pegged CPU.
+        pipeline.announce('Graphics stopped', 'Reload the page to start again.');
+        suspended = true;
+      }
+    }
+  }
+
+  if (presented) {
+    const cost = performance.now() - t0;
+    renderCostEma += (cost - renderCostEma) * 0.12;
+    if (cost > STALL_MS) {
+      stallCount++;
+      // Log the first few and then go quiet — a stall storm must not turn into
+      // a console-write storm, which is itself a stall.
+      if (stallCount <= 5) {
+        console.warn(`[frame] ${Math.round(cost)}ms frame; skipping the next present to drain`);
+      }
+      skipRender = 1;
+    } else if (!halfRate && renderCostEma > SLOW_MS) {
+      halfRate = true;
+      console.warn(`[frame] sustained ${Math.round(renderCostEma)}ms frames; halving the present rate`);
+    } else if (halfRate && renderCostEma < RECOVER_MS) {
+      halfRate = false;
+    }
+    if (halfRate && skipRender === 0) skipRender = 1;
+  }
 
   if (ctx.frame === 8) {
     (window as any).__gameReady = true;
@@ -171,14 +298,126 @@ function frame(now: number) {
   }
 }
 
-function resize() {
-  const w = innerWidth;
-  const h = innerHeight;
+// ---------------------------------------------------------------------------
+//  Resize
+// ---------------------------------------------------------------------------
+/**
+ * Resize events are coalesced to one per animation frame and dropped entirely
+ * when the size has not moved.
+ *
+ * iOS Safari fires `resize` continuously — dozens of events — while the URL bar
+ * animates, on rotation, and whenever the on-screen keyboard appears. Each one
+ * used to reach `composer.setSize`, which reallocates the HDR input and output
+ * buffers, the AO targets, the entire bloom mip chain, the bokeh targets and
+ * the SMAA buffers. Tens of megabytes of GPU allocation, tens of times, inside
+ * one thumb gesture, on the device the player says crashes after ten seconds.
+ *
+ * `visualViewport` is listened to as well as `window`, because on iOS it is the
+ * one that reports the URL-bar movement — and a `ResizeObserver` on `#app`
+ * catches anything neither of them announces.
+ */
+let resizeQueued = false;
+function queueResize() {
+  if (resizeQueued) return;
+  resizeQueued = true;
+  requestAnimationFrame(() => { resizeQueued = false; resize(); });
+}
+
+function installResizeListeners() {
+  addEventListener('resize', queueResize);
+  addEventListener('orientationchange', queueResize);
+  visualViewport?.addEventListener('resize', queueResize);
+  if (typeof ResizeObserver === 'function') new ResizeObserver(queueResize).observe(parent);
+}
+
+/**
+ * @param force push the size through even when it has not changed. Boot needs
+ *   this: `ctx.width`/`ctx.height` are seeded from the same measurement, so an
+ *   unconditional early-out would mean no system ever received its first
+ *   `resize()` and every layout that is only computed there — the HUD's safe
+ *   area, the minimap box — would keep whatever it guessed at construction.
+ */
+function resize(force = false) {
+  const { w, h } = viewportSize();
+  if (!force && w === ctx.width && h === ctx.height) return;
   ctx.width = w;
   ctx.height = h;
   ctx.camera.aspect = w / h;
   ctx.camera.updateProjectionMatrix();
   for (const s of systems) s.resize?.(w, h);
+}
+
+// ---------------------------------------------------------------------------
+//  WebGL context loss
+// ---------------------------------------------------------------------------
+/**
+ * `RenderPipeline` handles the GL side — `preventDefault()` on the loss event
+ * (without which the browser never offers a restore at all), tearing down the
+ * composer, and rebuilding it against the new context. What is left here is
+ * everything above the pipeline:
+ *
+ *   - the frame loop, which must stop on the same tick the context goes;
+ *   - the PMREM environment probe, which is the one GPU resource in the game
+ *     three cannot re-derive. Its texture is reallocated automatically but
+ *     comes back EMPTY, because its contents were rendered once at boot: every
+ *     metal, every clearcoat and every water surface in the game would have
+ *     come back reflecting black;
+ *   - the shader pre-warm, because the program cache died with the context and
+ *     without it the first thirty seconds after a restore hitch exactly the way
+ *     the first thirty seconds after a cold boot used to.
+ */
+function installContextRecovery() {
+  pipeline.onContextLost = () => {
+    suspended = true;
+  };
+  pipeline.onContextRestored = async () => {
+    // Re-bake the sky into the environment probe. Costs a six-face render plus
+    // a PMREM chain — the same price it pays at boot, and for the same reason.
+    //
+    // The `envRT` clear is a workaround for a latent bug in Sky.ts, which this
+    // round is the first thing ever to call `refreshEnvironment()` on and which
+    // therefore threw the first time it was asked to:
+    //
+    //   `PMREMGenerator._fromTexture` reads
+    //     `const cubeUVRenderTarget = renderTarget || this._allocateTargets();`
+    //   and `_allocateTargets()` is what creates `_lodMeshes`, `_blurMaterial`,
+    //   `_ggxMaterial` and the ping-pong target. `Sky.buildEnvironment` builds a
+    //   FRESH `PMREMGenerator` on every call and hands it the target from last
+    //   time, so on the second call the allocation is skipped and
+    //   `_textureToCubeUV` runs `this._lodMeshes[0].material = material` against
+    //   an empty array — "Cannot set properties of undefined (setting
+    //   'material')", which is exactly what the restore path logged.
+    //
+    // Dropping the cached target makes the generator allocate, which is the
+    // right thing on this path anyway: the old target's GPU allocation died
+    // with the context. The proper fix is in Sky.ts (reuse the generator, or
+    // stop reusing the target) and belongs to whoever owns that file.
+    try {
+      (sky as unknown as { envRT: THREE.WebGLRenderTarget | null }).envRT = null;
+      sky.refreshEnvironment(ctx);
+    } catch (err) {
+      console.error('[restore] environment re-bake failed', err);
+    }
+
+    try {
+      const warm = await prewarm(ctx);
+      console.info(`[restore] re-warmed ${warm.programsBefore} -> ${warm.programsAfter} programs in ${warm.ms}ms`);
+    } catch (err) {
+      console.error('[restore] pre-warm failed; expect compile hitches', err);
+    }
+
+    // Hand the simulation a fresh clock. Without this the first frame back sees
+    // however many seconds the restore took as its delta — the clamp in the
+    // loop stops it teleporting anything, but the watchdog would read that one
+    // frame as a catastrophic stall and start skipping presents on a pipeline
+    // that is in fact perfectly healthy.
+    last = performance.now();
+    renderCostEma = 16.7;
+    skipRender = 0;
+    halfRate = false;
+    renderFailures = 0;
+    suspended = false;
+  };
 }
 
 boot().catch((err) => {
@@ -192,3 +431,14 @@ boot().catch((err) => {
 // tools/perf.mjs turns this off to measure the un-LODed field for a before/after.
 (window as any).__drawBudget = drawBudget;
 (window as any).__camRig = camera; // TEMP-PROBE
+// Watchdog state, for the perf and soak harnesses: how many frames overran, and
+// whether the loop is currently presenting at half rate.
+(window as any).__loopHealth = () => ({
+  frame: ctx.frame,
+  renderCostEma: +renderCostEma.toFixed(2),
+  halfRate,
+  stalls: stallCount,
+  renderFailures,
+  suspended,
+  contextLost: pipeline.contextLost,
+});

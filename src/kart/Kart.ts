@@ -41,6 +41,14 @@ import { FRONT_TYRE, REAR_TYRE, makeTyreResult, solveTyre, type TyreResult } fro
 const GRAVITY = 20;
 const BASE_MASS = 200;
 const SUBSTEP = 1 / 120;
+/**
+ * Accumulator clamp. `step` clamps dt to 1/20 s first, so `ceil(dt / SUBSTEP)`
+ * can never exceed 6 on its own — this is the belt to that braces, and it is
+ * what stops a tab that has been backgrounded for ten seconds from trying to
+ * catch up in one frame and stalling the main thread for a second. When it
+ * bites, time dilates (the kart advances less than the wall clock says); it
+ * never spirals.
+ */
 const MAX_SUBSTEPS = 6;
 
 const KART_RADIUS = 0.86;
@@ -48,9 +56,24 @@ const WHEELBASE = DEFAULT_SUSPENSION.halfBase * 2;
 
 /** peak steering angle at a standstill, radians */
 const MAX_STEER = 0.55;
-/** how fast the virtual steering rack follows the stick, rad/s of input */
-const STEER_RATE_LOW = 8.5;
-const STEER_RATE_HIGH = 4.2;
+/**
+ * How fast the virtual steering rack follows the stick, in units of input per
+ * second. Loading the rack up is deliberately speed-scaled — full lock arriving
+ * instantly at 28 m/s is twitch, not response — but UNLOADING it is not.
+ *
+ * That asymmetry is the whole of "the kart changes direction the instant I ask".
+ * A symmetric 4.2/s rack has to travel the full 2.0 units of input to get from
+ * hard left to hard right, which is 480 ms of the player holding a stick against
+ * a kart that is still turning the other way; measured, the yaw rate took 367 ms
+ * to reach 90% of its new value and essentially all of that was the rack. Making
+ * only the unwind and the cross-over fast leaves the anti-twitch behaviour
+ * exactly where it was — you still cannot slam into a corner — while a
+ * direction change costs about a tenth of a second.
+ */
+const STEER_RATE_LOW = 10.5;
+const STEER_RATE_HIGH = 5.6;
+/** rate used when the rack is unwinding toward centre or crossing over */
+const STEER_RATE_FREE = 15;
 
 const MAX_DRIVE = 3000; // newtons at full throttle, before stat multipliers
 const BRAKE_FORCE = 4200;
@@ -60,18 +83,89 @@ const ROLL_DRAG = 0.95; // m/s^2 of rolling resistance on clean road
 const AERO_DRAG = 0.46; // newtons per (m/s)^2
 
 const HOP_SPEED = 3.05;
-/** grip the rear tyres keep while sliding — the whole feel of the drift */
-const DRIFT_REAR_GRIP_IN = 0.58;
-const DRIFT_REAR_GRIP_OUT = 0.86;
-const DRIFT_TIERS = [0.9, 2.0, 3.2];
+
+/**
+ * ============================================================================
+ *  Which way the stick bends the slide
+ * ============================================================================
+ *  This pair of numbers was inverted, and it was the single biggest thing wrong
+ *  with the game from the driver's seat.
+ *
+ *  The path a drifting kart takes is set by lateral force, not by slip angle:
+ *  curvature is `F_lat / (m v^2)`. Both rear tyres are already well past their
+ *  0.16 rad peak during a slide, so on the falling side of the curve MORE slip
+ *  angle means LESS force means a WIDER line. The old constants gave the stick
+ *  held into the corner the lowest rear grip (0.58) and the deepest slip target
+ *  (0.44 rad) — so the one input a player reaches for to tighten up made the
+ *  kart run wider, and holding it made it run wider still.
+ *
+ *  Measured over the six real corners of this circuit, entered at racing speed
+ *  and driven by a line-following controller: the kart washed a median 10.75 m
+ *  off the centreline, left the road in 6 of 6 corners, dropped from 22 m/s to
+ *  as little as 3.6 m/s, and the slide then broke on its own after about a
+ *  second — up on one wheel in the grass. Nobody could hold a tier-3 mini-turbo
+ *  through that, and nothing about it is a tuning subtlety; the control was
+ *  wired backwards.
+ *
+ *  So: stick INTO the corner now bites (0.90 of normal rear grip) and runs a
+ *  shallower, tighter slide; stick OUT lets go (0.55) and lets the kart run
+ *  wide. That is the Mario Kart contract, and it is the one players already
+ *  have in their hands.
+ * ============================================================================
+ */
+/** rear grip retained with the stick held INTO the drift — bites, tightens */
+const DRIFT_REAR_GRIP_IN = 0.9;
+/** rear grip with the stick held OUT of the drift — lets go, runs wide */
+const DRIFT_REAR_GRIP_OUT = 0.55;
+/**
+ * Seconds of held drift for blue / orange / purple. Shortened from
+ * [0.9, 2.0, 3.2]: the charge clock only runs at 0.72-1.22x real time, so the
+ * old thresholds wanted 2.6-4.4 s of unbroken slide to reach purple, which is
+ * longer than most corners on this circuit last.
+ */
+const DRIFT_TIERS = [0.7, 1.65, 2.75];
 const DRIFT_BOOST_TIME = [0, 0.85, 1.35, 2.1];
 const DRIFT_BOOST_STRENGTH = [1, 1.1, 1.19, 1.3];
 
-/** slip angle the slide controller aims for, at full outward / full inward lock */
-const DRIFT_SLIP_OUT = 0.18;
-const DRIFT_SLIP_IN = 0.44;
+/**
+ * Slip angle the slide controller aims for, at full outward (counter-steer) and
+ * full inward lock. Ordered so that counter-steering STRAIGHTENS the kart out:
+ * the old pair ran the other way, and asking the controller for a deeper slide
+ * at the exact moment the player is trying to escape one is how a drift becomes
+ * a spin. Traced on the harbour sweep, the kart held 2.4 rad/s of yaw — a nine
+ * metre corner radius at 23 m/s — for most of a second with the stick pinned at
+ * full opposite lock, and put itself into the barrier.
+ */
+const DRIFT_SLIP_OUT = 0.15;
+const DRIFT_SLIP_IN = 0.34;
 /** how hard the controller closes the slip-angle error, 1/s */
 const DRIFT_SLIP_GAIN = 2.6;
+/**
+ * Ceiling on the yaw rate a drift may command, as `k / speed` — i.e. a minimum
+ * corner radius, since yaw rate times radius is speed. 26 puts it at 2.6 g,
+ * a shade above the ~2.4 g the non-drifting Ackermann assist allows (that
+ * margin is the crab), and it is the backstop that makes the slip controller
+ * unable to spin the kart no matter what the slip-angle error does. A
+ * proportional controller on a quantity whose own set-point moves with the
+ * kart's cornering load needs one; without it the fixed point can sit anywhere.
+ */
+const DRIFT_MAX_YAW = 26;
+/**
+ * The stick's authority over the *line*, in m/s^2 of extra cornering pull
+ * toward the inside at full inward lock (and of relief, pushing the kart wide,
+ * at full outward lock).
+ *
+ * Grip alone is not a precise enough lever: it acts through two sliding tyres
+ * on the falling side of their curve, so how much line it buys depends on the
+ * slip angle it is simultaneously changing. This is the direct term, and it is
+ * what makes the slide steerable rather than merely survivable. At 22 m/s,
+ * 6 m/s^2 is the difference between a 60 m radius and a 40 m one — roughly the
+ * width of this circuit's road, which is exactly the amount of adjustment a
+ * player needs to make a corner tighten under them. Scaled by surface grip, so
+ * a drift across grass does not get free cornering the tyres never earned.
+ */
+const DRIFT_TURN_ASSIST = 6.0;
+const DRIFT_TURN_RELIEF = 2.2;
 
 /**
  * ============================================================================
@@ -176,6 +270,8 @@ const _torque = new THREE.Vector3();
 const _planar = new THREE.Vector3();
 const _sep = new THREE.Vector3();
 const _euler = new THREE.Euler();
+const _lead = new THREE.Vector3();
+const _leadPos = new THREE.Vector3();
 
 /** Every live kart, so kart-vs-kart contacts resolve without a broadphase system. */
 const ACTIVE: Kart[] = [];
@@ -259,7 +355,16 @@ export class Kart implements IKart {
   private readonly wheelRestY = [0.36, 0.36, 0.36, 0.36];
 
   private mass = BASE_MASS;
-  private yawInertia = BASE_MASS * 0.51;
+  /**
+   * Yaw inertia, kg.m^2, as a coefficient on mass. A uniform box of this kart's
+   * footprint (1.6 m x 1.32 m) works out at m * 0.36; the old 0.51 was 1.4x
+   * that, i.e. the kart was being asked to rotate as though it were half again
+   * as long as it looks. Every tyre's yaw torque divides by this, so it shows up
+   * as lag on exactly the input the player is most sensitive to. 0.42 keeps a
+   * little above the uniform-box figure — the driver and engine mass really do
+   * sit at the ends — without paying for it in response.
+   */
+  private yawInertia = BASE_MASS * 0.42;
   private yaw = 0;
   private yawRate = 0;
   private steerInput = 0;
@@ -413,7 +518,7 @@ export class Kart implements IKart {
     this.buildLeanHull();
 
     this.mass = BASE_MASS * (stats.weightMul || 1);
-    this.yawInertia = this.mass * 0.51;
+    this.yawInertia = this.mass * 0.42;
     this.suspension.setMass(this.mass, GRAVITY);
     this.suspension.reset();
 
@@ -672,62 +777,53 @@ export class Kart implements IKart {
       wantDrift = false;
     }
 
-    // --- steering rack ------------------------------------------------------
-    // The input contract is `steer > 0 = the player wants to go RIGHT`, where
-    // right means screen-right: `forward x up`, the same convention types.ts
-    // declares for TrackSample.binormal.
-    //
-    // This chassis, though, is built on the opposite handedness. Heading is
-    // `forward = (sin yaw, 0, cos yaw)`, so a rising yaw swings forward toward
-    // +X — and with forward along +Z, `forward x up` is -X. Rising yaw is
-    // therefore a turn to the LEFT, and every internal quantity derived from it
-    // (steerAngle, yawRate, the tyre lateral axis, driftDir) inherits that.
-    //
-    // So the sign is inverted once, here at the boundary, and everything
-    // downstream stays in the chassis' own left-positive frame. Flipping the
-    // basis instead would be the tidier fix, but it would invert the lateral
-    // term of the tyre solve and every yaw consumer along with it.
-    const speed = Math.abs(this.forwardSpeed);
-    const speedRatio = clamp(speed / Math.max(6, this.topSpeed), 0, 1);
-    const rate = THREE.MathUtils.lerp(STEER_RATE_LOW, STEER_RATE_HIGH, speedRatio);
-    this.steerInput = approach(this.steerInput, -steer, rate * dt);
-
     // --- ground under the chassis centre ------------------------------------
     const probe = ctx.track.probe(this.position, this.t);
     if (Number.isFinite(probe.t)) this.t = probe.t;
     this.groundY = Number.isFinite(probe.y) ? probe.y : this.groundY;
     const centreSurface = probe.surface;
 
-    // --- drift / hop / trick state machine ----------------------------------
-    // Ground speed, not forward speed: deep in a slide the forward projection
-    // collapses, and a drift must not cancel itself just because it is working.
-    const groundSpeed = Math.hypot(this.velocity.x, this.velocity.z);
-    this.updateDriftState(ctx, dt, wantDrift, groundSpeed);
-
-    // --- suspension probe (once per frame; the plane is reused per substep) --
-    this.suspension.probeGround(ctx.track, this.position, this.quaternion, this.t);
+    // --- suspension probe ---------------------------------------------------
+    // Once per frame, but aimed at where the chassis will be HALFWAY through it
+    // rather than at where it starts. The ground plane each wheel gets is then
+    // centred on the frame instead of trailing it, and the systematic error
+    // vanishes to second order — which matters because that error scales with
+    // dt and is therefore one of the few genuinely frame-rate dependent things
+    // left in the model. At 30 fps and 28 m/s the old plane was most of a metre
+    // stale by the last substep. The lead is capped so that driving at a cliff
+    // edge cannot fit the plane to thin air.
+    _lead.copy(this.velocity).multiplyScalar(dt * 0.5);
+    const leadLen = _lead.length();
+    if (leadLen > 0.8) _lead.multiplyScalar(0.8 / leadLen);
+    _leadPos.copy(this.position).add(_lead);
+    this.suspension.probeGround(ctx.track, _leadPos, this.quaternion, this.t);
 
     // --- fixed timestep integration -----------------------------------------
+    // The steering rack and the drift state machine live INSIDE this loop, not
+    // outside it. They are both integrators over player input — the rack ramps,
+    // the mini-turbo clock counts, the hop window closes — and running them once
+    // per frame while the chassis runs at 120 Hz is precisely what made a 30 fps
+    // session and a 120 fps session take different corners. They cost no probes,
+    // so the only price is a few multiplies per substep.
     const n = Math.min(MAX_SUBSTEPS, Math.max(1, Math.ceil(dt / SUBSTEP)));
     const h = dt / n;
-    for (let i = 0; i < n; i++) this.substep(h, throttle, brake, stunned);
-
-    // --- contacts -----------------------------------------------------------
-    this.collideWalls(ctx);
-    this.collideKarts(ctx);
-
-    // --- airborne bookkeeping + landing -------------------------------------
-    const grounded = this.suspension.contacts > 0;
-    if (grounded) {
-      this.groundTime += dt;
-      if (this.airborne) this.onLanding(ctx);
-      else this.airTime = 0;
-    } else {
-      this.airTime += dt;
-      this.groundTime = 0;
-      // Debounced so a single wheel skipping over a kerb is not a jump.
-      if (this.airTime > 0.06) this.airborne = true;
+    // Contacts and the air/ground bookkeeping are inside the loop too. A wall
+    // resolved once per frame is a wall the kart is allowed to be 1.4 m inside
+    // of at 28 m/s on a 20 fps frame before anything pushes back, and the push
+    // it then gets is a step change in velocity — which is why the open-loop
+    // 30-vs-120 comparison used to agree to 0.75 m right up until the first
+    // barrier and then never again. Resolving per substep bounds the penetration
+    // by the substep, and makes the impulse land at the same point on the track
+    // at every frame rate.
+    for (let i = 0; i < n; i++) {
+      this.updateSteerInput(h, steer);
+      this.updateDriftState(ctx, h, wantDrift);
+      this.substep(h, throttle, brake, stunned);
+      this.collideWalls(ctx);
+      this.collideKarts(ctx, h);
+      this.updateAirborne(ctx, h);
     }
+    const grounded = this.suspension.contacts > 0;
 
     // --- surface / progress / respawn watchdogs ------------------------------
     // Two different questions, and round 1 answered both with one number.
@@ -762,6 +858,56 @@ export class Kart implements IKart {
   // ---------------------------------------------------------------------------
   // integration
   // ---------------------------------------------------------------------------
+
+  /**
+   * Advance the virtual steering rack toward the stick.
+   *
+   * The input contract is `steer > 0 = the player wants to go RIGHT`, where
+   * right means screen-right: `forward x up`, the same convention types.ts
+   * declares for TrackSample.binormal.
+   *
+   * This chassis, though, is built on the opposite handedness. Heading is
+   * `forward = (sin yaw, 0, cos yaw)`, so a rising yaw swings forward toward
+   * +X — and with forward along +Z, `forward x up` is -X. Rising yaw is
+   * therefore a turn to the LEFT, and every internal quantity derived from it
+   * (steerAngle, yawRate, the tyre lateral axis, driftDir) inherits that.
+   *
+   * So the sign is inverted once, here at the boundary, and everything
+   * downstream stays in the chassis' own left-positive frame. Flipping the
+   * basis instead would be the tidier fix, but it would invert the lateral
+   * term of the tyre solve and every yaw consumer along with it.
+   */
+  private updateSteerInput(h: number, steer: number) {
+    const want = -steer;
+    const cur = this.steerInput;
+    // Loading up = pushing the rack further from centre on the side it is
+    // already on. That is the only case the speed taper applies to; unwinding
+    // and crossing over run at the free rate, so releasing the stick or
+    // flicking the other way is immediate at any speed.
+    const loading = want * cur >= 0 && Math.abs(want) > Math.abs(cur);
+    const rate = loading
+      ? THREE.MathUtils.lerp(
+          STEER_RATE_LOW,
+          STEER_RATE_HIGH,
+          clamp(Math.abs(this.forwardSpeed) / Math.max(6, this.topSpeed), 0, 1),
+        )
+      : STEER_RATE_FREE;
+    this.steerInput = approach(cur, want, rate * h);
+  }
+
+  /** Air/ground edge detection and the landing event. Runs per substep. */
+  private updateAirborne(ctx: Ctx, h: number) {
+    if (this.suspension.contacts > 0) {
+      this.groundTime += h;
+      if (this.airborne) this.onLanding(ctx);
+      else this.airTime = 0;
+    } else {
+      this.airTime += h;
+      this.groundTime = 0;
+      // Debounced so a single wheel skipping over a kerb is not a jump.
+      if (this.airTime > 0.06) this.airborne = true;
+    }
+  }
 
   private substep(h: number, throttle: number, brake: number, stunned: boolean) {
     const sus = this.suspension;
@@ -835,13 +981,22 @@ export class Kart implements IKart {
       ? THREE.MathUtils.lerp(DRIFT_REAR_GRIP_OUT, DRIFT_REAR_GRIP_IN, (inward + 1) * 0.5)
       : 1;
 
-    // Front wheels always aim into the corner while drifting; the stick then
-    // modulates the angle rather than choosing it outright.
+    // Front wheels carry a standing bias into the corner while drifting, and
+    // the stick swings a full lock's worth around it. The old 0.55/0.50 split
+    // could not reach zero, let alone the far side: at full opposite lock the
+    // rack still sat at 0.05 INTO the drift, so the front tyres — crabbing at
+    // fourteen degrees of slip and gripping perfectly well — went on hauling the
+    // kart toward the apex no matter what the player did with the stick. That is
+    // what a counter-steer is FOR, and it was the last piece of the drift the
+    // player had no authority over. 0.45/0.95 keeps roughly the same neutral
+    // bias, still saturates inward, and reaches half a lock of genuine opposite
+    // lock at the other end.
+    //
     // Full lock at 30 m/s would demand a corner radius no tyre could hold, so
     // the rack physically winds off with speed the way a real kart's does.
     const steerFalloff = 0.32 + 0.68 / (1 + Math.abs(vf) * 0.075);
     const rackTarget = MAX_STEER * this.stats.handlingMul * steerFalloff *
-      (drifting ? clamp(this.driftDir * 0.55 + this.steerInput * 0.5, -1, 1) : this.steerInput);
+      (drifting ? clamp(this.driftDir * 0.45 + this.steerInput * 0.95, -1, 1) : this.steerInput);
     this.steerAngle += (rackTarget - this.steerAngle) * smooth(26, h);
 
     const cornerMass = this.mass * 0.3;
@@ -931,6 +1086,16 @@ export class Kart implements IKart {
     if (grounded && !stunned) {
       const gripBlend = clamp(sus.gripMul, 0.3, 1.2);
       if (drifting) {
+        // --- the stick's authority over the LINE ----------------------------
+        // See DRIFT_TURN_ASSIST. `driftDir * right` is the inside of the
+        // corner: driftDir is the sign of `steerInput`, which is left-positive
+        // in this chassis' frame, and so is `right` — so a right-hand drift
+        // (driftDir = -1) has its inside along `-right`, which is screen-right.
+        // Both signs are wrong together or right together, which is the only
+        // way to get this correct without a special case.
+        const assist = inward >= 0 ? DRIFT_TURN_ASSIST * inward : DRIFT_TURN_RELIEF * inward;
+        this.velocity.addScaledVector(this.right, this.driftDir * assist * gripBlend * h);
+
         // Slip-angle controller. The tyres still generate every force; this
         // only shapes how far the rear steps out.
         //
@@ -948,10 +1113,48 @@ export class Kart implements IKart {
         const beta = Math.atan2(latBefore, Math.max(2, Math.abs(fwdBefore)));
         const target = -this.driftDir *
           THREE.MathUtils.lerp(DRIFT_SLIP_OUT, DRIFT_SLIP_IN, (inward + 1) * 0.5);
-        // Yaw rate that would hold beta steady, biased to close the error.
-        const desired = this.aLatPure / v -
-          clamp(target - beta, -0.45, 0.45) * DRIFT_SLIP_GAIN;
+        // Yaw rate that would hold beta steady, biased to close the error, and
+        // then capped at a corner radius the kart could plausibly hold. The cap
+        // is not cosmetic: the first term is the kart's own cornering load
+        // divided by its speed, so the set-point rises with the very yaw rate it
+        // is setting. Left open it walks itself up — measured at 2.4 rad/s while
+        // the player held full opposite lock. See DRIFT_MAX_YAW.
+        const yawCap = (DRIFT_MAX_YAW * gripBlend) / v;
+        const slipYaw = clamp(
+          this.aLatPure / v - clamp(target - beta, -0.45, 0.45) * DRIFT_SLIP_GAIN,
+          -yawCap,
+          yawCap,
+        );
+
+        // --- handing the yaw back as the player counter-steers ---------------
+        // The slip controller regulates ONE thing: the angle between the nose
+        // and the direction of travel. It is perfectly happy to hold a small,
+        // tidy slip angle all the way round a fourteen metre radius, because its
+        // first term is the kart's own cornering load and a crabbed kart makes
+        // plenty of that. Traced on the cliff traverse — the narrowest section
+        // of the circuit, six metres of half-width — the player held full
+        // opposite lock for four tenths of a second and the kart went on turning
+        // in at 1.6 rad/s and put itself over the edge.
+        //
+        // So as the stick swings out of the drift, the command is blended toward
+        // what the steering rack alone would be asking for. The rack really is
+        // counter-steered at that point, so its Ackermann rate is a genuine
+        // unwind, and at full opposite lock the slide simply straightens out.
+        // Squared, so the first half of the stick's travel is still all drift
+        // and only the last of it is the escape hatch.
+        const escape = clamp(-inward, 0, 1);
+        const maxYaw = (24 * gripBlend) / Math.max(5, Math.abs(fwdBefore));
+        const rackYaw = clamp((fwdBefore / WHEELBASE) * Math.tan(this.steerAngle), -maxYaw, maxYaw);
+        const desired = THREE.MathUtils.lerp(slipYaw, rackYaw, escape * escape);
+
         this.yawRate += clamp(desired - this.yawRate, -2.5, 2.5) * 6 * h;
+        // The four tyres apply their own yaw torque, and in a slide that torque
+        // is the thing that would otherwise carry the kart past whatever the
+        // stick asked for — the assist above only nudges. Clamp the overshoot,
+        // but only in the direction of the drift: the tyres must stay free to
+        // pull the kart straight, which is the recovery the player wants.
+        const over = this.driftDir * (this.yawRate - desired);
+        if (over > 0.35) this.yawRate = desired + this.driftDir * 0.35;
         this.driftBeta = beta;
       } else {
         // Understeer killer: bleed a little of the chassis' lateral velocity.
@@ -963,7 +1166,11 @@ export class Kart implements IKart {
         // radius no amount of grip could produce and the kart pirouettes.
         const maxYaw = (24 * gripBlend) / Math.max(5, Math.abs(fwdBefore));
         const target = clamp((fwdBefore / WHEELBASE) * Math.tan(this.steerAngle), -maxYaw, maxYaw);
-        this.yawRate += clamp(target - this.yawRate, -3, 3) * 2.0 * gripBlend * h;
+        // Gain 3.4, not 2.0. This term is what carries the nose through the
+        // first tenth of a second of a turn, before the tyres have built a slip
+        // angle to work with; at 2.0 its time constant was half a second, which
+        // is longer than the whole corner entry the player is judging.
+        this.yawRate += clamp(target - this.yawRate, -3, 3) * 3.4 * gripBlend * h;
       }
     } else if (!grounded && !stunned) {
       this.yawRate += (this.steerInput * AIR_STEER - this.yawRate) * smooth(3.2, h);
@@ -1079,10 +1286,13 @@ export class Kart implements IKart {
   // drift, hop and tricks
   // ---------------------------------------------------------------------------
 
-  private updateDriftState(ctx: Ctx, dt: number, wantDrift: boolean, speed: number) {
+  private updateDriftState(ctx: Ctx, dt: number, wantDrift: boolean) {
     const pressed = wantDrift && !this.wantDriftPrev;
     this.wantDriftPrev = wantDrift;
     const grounded = this.suspension.contacts > 0;
+    // Ground speed, not forward speed: deep in a slide the forward projection
+    // collapses, and a drift must not cancel itself just because it is working.
+    const speed = Math.hypot(this.velocity.x, this.velocity.z);
 
     if (pressed) {
       if (grounded && this.stunTime <= 0 && speed > 4 && this.driftDir === 0) {
@@ -1115,13 +1325,24 @@ export class Kart implements IKart {
     }
 
     if (this.driftDir !== 0) {
-      const bail = !wantDrift || speed < 3.5 || this.stunTime > 0 || this.airTime > 0.55;
+      // 0.8 s of air, not 0.55: this circuit has a village climb, a beach
+      // descent and a bridge, and a kart that gets light over a crest halfway
+      // through a corner should not silently lose the mini-turbo it has already
+      // earned. The slide is still cancelled by an actual jump.
+      const bail = !wantDrift || speed < 3.5 || this.stunTime > 0 || this.airTime > 0.8;
       if (bail) {
         this.releaseDrift(ctx);
       } else if (this.suspension.contacts > 0) {
-        // Charge rewards actually holding an angle, not just holding a button.
-        const q = clamp((Math.abs(this.driftBeta) - 0.09) / 0.3, 0, 1);
-        this.driftTime += dt * (0.72 + 0.5 * q);
+        // Charge rewards actually holding an angle, not just holding a button —
+        // but the bonus is a bonus, not the whole clock. The old window wanted
+        // 0.39 rad of measured slip for full rate, which no kart that is staying
+        // on the road ever reaches now that the front wheels can counter-steer;
+        // a player driving the corner properly was charging at the floor rate
+        // for it. What the eye reads as a 30 degree drift is mostly the authored
+        // pose (see DRIFT_POSE_*), and the pose credits the physical slip against
+        // itself, so the physical number belongs down here where it lands.
+        const q = clamp((Math.abs(this.driftBeta) - 0.05) / 0.15, 0, 1);
+        this.driftTime += dt * (0.85 + 0.4 * q);
         const dt0 = this.driftTime;
         const tier = dt0 >= DRIFT_TIERS[2] ? 3 : dt0 >= DRIFT_TIERS[1] ? 2 : dt0 >= DRIFT_TIERS[0] ? 1 : 0;
         if (tier !== this.driftTier) {
@@ -1230,7 +1451,7 @@ export class Kart implements IKart {
    * other's current velocity. Both halves land in the same frame, so the result
    * is symmetric without needing a central broadphase pass.
    */
-  private collideKarts(ctx: Ctx) {
+  private collideKarts(ctx: Ctx, h: number) {
     const minDist = KART_RADIUS * 2;
     for (let i = 0; i < ACTIVE.length; i++) {
       const other = ACTIVE[i];
@@ -1265,7 +1486,14 @@ export class Kart implements IKart {
         // Resting overlap: push apart briskly. Too soft here and a kart shoving
         // a slower one takes seconds to squeeze past, which reads as the two
         // being welded together.
-        this.velocity.addScaledVector(_sep, Math.min(4, (minDist - d) * 9) * share);
+        //
+        // Written as an ACCELERATION (hence the `* 60 * h`), not as a velocity
+        // step. It used to be a flat velocity add applied once per frame, which
+        // meant a kart wedged against another was shoved exactly as hard on a
+        // 20 fps frame as on a 120 fps one despite the frame covering six times
+        // as much time — the separation rate was a function of the player's
+        // hardware. The scale is chosen so the behaviour at 60 fps is unchanged.
+        this.velocity.addScaledVector(_sep, Math.min(4, (minDist - d) * 9) * share * 60 * h);
       }
     }
   }

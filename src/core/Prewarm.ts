@@ -80,6 +80,10 @@ export interface PrewarmResult {
   materialsCaged: string[];
   /** which framebuffer(s) the compile ran against */
   surfaces: string[];
+  /** programs added by the forced shadow-depth pass (see `warmShadowDepth`) */
+  depthPrograms: number;
+  /** geometries whose vertex buffers were uploaded (see `warmGeometryUpload`) */
+  geometriesWarmed: number;
   ms: number;
 }
 
@@ -166,6 +170,204 @@ function scenePassSurface(): 'target' | 'canvas' | 'unknown' {
   return 'unknown';
 }
 
+/**
+ * Compile the SHADOW-DEPTH programs, which `compile()` does not touch.
+ *
+ * Every shadow caster is drawn a SECOND time, into the shadow map, through a
+ * different material — three's internal `MeshDepthMaterial`, or the object's
+ * `customDepthMaterial` — and that second material has its own program with its
+ * own cache key. `WebGLRenderer.compile()` only ever walks `object.material`, so
+ * not one of those depth programs exists when the pre-warm reports success.
+ *
+ * That stays hidden while every caster is inside the shadow camera on frame
+ * one, which is behind the boot curtain. What is left is whatever enters the
+ * shadow frustum later: measured here, `banner-cloth` compiled its depth
+ * program at **t=9.6s of racing**, a 20ms frame in the middle of a lap, and
+ * exactly the class of stall this module exists to remove.
+ *
+ * There is no API for "compile the depth variant", so the pass is provoked
+ * rather than requested. Three things are needed, and the third is the one that
+ * is easy to miss:
+ *
+ * 1. **Drive the shadow pass directly.** `WebGLShadowMap.render(lights, scene,
+ *    camera)` draws through `renderer.renderBufferDirect(shadowCamera, null, …)`
+ *    — the identical call the real pass makes, so the cache keys match. It must
+ *    run straight after `compileAsync`, which leaves `currentRenderState`
+ *    populated; called cold, `setProgram` dereferences a null render state.
+ *
+ *    Not a whole `renderer.render()`. A full frame also works, but its colour
+ *    pass draws the pre-warm cage — real materials on a degenerate triangle
+ *    with none of their textures bound — and that spat 35+ `GL_INVALID_OPERATION:
+ *    Mismatch between texture format and sampler type` warnings per boot.
+ *    Measured on this path: zero, same as before the change.
+ *
+ * 2. **Switch off frustum culling scene-wide** for the duration. The shadow
+ *    pass tests `!object.frustumCulled || frustum.intersectsObject(object)`, so
+ *    with culling off every caster in the world is drawn once, including the
+ *    half of the circuit the camera has not reached yet.
+ *
+ * 3. **Force the program to be re-derived per caster.** three mutates ONE
+ *    shared `_depthMaterial` as it walks the casters — `result.map =
+ *    material.map`, `result.alphaTest = …`, `result.side = …` — and never
+ *    touches `material.version`. `setProgram`'s change detection lists
+ *    instancing, skinning, morphs, fog, envMap, tone mapping and light state,
+ *    but *not* the material's textures, so every caster after the first is
+ *    drawn with whatever program the first one produced. The banner's map sits
+ *    on UV channel 1 (`vertexUv1s` → `#define USE_UV1`, a genuinely different
+ *    shader), so its variant was never built here — it was built mid-race, the
+ *    first time something else bumped the shared material's version while the
+ *    banner's map happened to be the one installed. Setting `needsUpdate` per
+ *    draw makes three ask the question once per caster instead.
+ *
+ *    That in turn means programs are ACQUIRED and RELEASED in a chain: three
+ *    releases a material's previous program when it acquires a new one, and a
+ *    release that takes `usedTimes` to zero deletes the program outright. Each
+ *    variant we warm would therefore be freed by the next one. So the depth
+ *    programs are pinned with one extra `usedTimes` on the way out — a
+ *    pre-warmed program that the next draw can garbage-collect is not
+ *    pre-warmed.
+ *
+ * 4. **Make every mesh a caster** for the duration. A mesh that does not cast
+ *    today may still own the only copy of a depth variant — and it costs one
+ *    depth draw per mesh into a shadow map that is invalidated on the way out.
+ *
+ * Shadow-casting is off entirely at `Quality.Low`, which is the tier a phone
+ * gets, so none of this runs there. The geometry upload that used to be folded
+ * into this pass therefore lives in `warmGeometryUpload`, which does not depend
+ * on shadows at all.
+ */
+function warmShadowDepth(ctx: Ctx): void {
+  const renderer = ctx.renderer;
+  const shadowMap = renderer.shadowMap as THREE.WebGLShadowMap & {
+    render?: (lights: THREE.Light[], scene: THREE.Object3D, camera: THREE.Camera) => void;
+  };
+  if (!shadowMap.enabled || typeof shadowMap.render !== 'function') return;
+
+  // The lights a real frame would hand it: `WebGLRenderer.projectObject` pushes
+  // a light into the shadows array when it casts one and passes the camera's
+  // layer test. Everything is visible at this point in the pre-warm, which is
+  // what we want — a caster only the second light sees still needs its program.
+  const lights: THREE.Light[] = [];
+  ctx.scene.traverse((o) => {
+    const l = o as THREE.Light;
+    if (l.isLight === true && l.castShadow === true && l.layers.test(ctx.camera.layers)) {
+      lights.push(l);
+    }
+  });
+  if (lights.length === 0) return;
+
+  const culled: THREE.Object3D[] = [];
+  const notCasting: THREE.Object3D[] = [];
+  ctx.scene.traverse((o) => {
+    if (o.frustumCulled) { culled.push(o); o.frustumCulled = false; }
+    // Every mesh casts for the duration, not just the ones that really do. See
+    // the note on vertex-buffer upload above: this is how a geometry that only
+    // ever appears in the colour pass still gets its VBOs created here.
+    if ((o as THREE.Mesh).isMesh === true && o.castShadow === false) {
+      notCasting.push(o);
+      o.castShadow = true;
+    }
+  });
+
+  type BufferDraw = (
+    camera: THREE.Camera, scene: THREE.Scene | null, geometry: THREE.BufferGeometry,
+    material: THREE.Material, object: THREE.Object3D, group: unknown,
+  ) => void;
+  const host = renderer as unknown as { renderBufferDirect: BufferDraw };
+  const passThrough = host.renderBufferDirect;
+  const prevAutoUpdate = shadowMap.autoUpdate;
+  const warmed = new Set<THREE.Material>();
+
+  host.renderBufferDirect = function (camera, scene, geometry, material, object, group) {
+    // See (3) above: without this, one program serves every caster.
+    if (material !== undefined && material !== null) {
+      material.needsUpdate = true;
+      warmed.add(material);
+    }
+    return passThrough.call(this, camera, scene, geometry, material, object, group);
+  };
+
+  try {
+    shadowMap.autoUpdate = true;
+    shadowMap.needsUpdate = true;
+    shadowMap.render(lights, ctx.scene, ctx.camera);
+  } finally {
+    host.renderBufferDirect = passThrough;
+    shadowMap.autoUpdate = prevAutoUpdate;
+    for (const o of culled) o.frustumCulled = true;
+    for (const o of notCasting) o.castShadow = false;
+    // Hold on to every variant just built. `releaseProgram` deletes at zero, and
+    // a shared depth material only ever points at its most recent one.
+    for (const p of renderer.info.programs ?? []) {
+      const prog = p as unknown as { usedTimes: number };
+      if (typeof prog.usedTimes === 'number') prog.usedTimes++;
+    }
+    warmed.clear();
+    // The maps now hold a pass drawn with culling off. Ask for them again so
+    // the first real frame shadows the view the player is actually given.
+    shadowMap.needsUpdate = true;
+  }
+}
+
+/**
+ * Upload every geometry's vertex buffers, by drawing the world once through a
+ * depth override.
+ *
+ * A `BufferGeometry` is a JS object until something renders it.
+ * `WebGLGeometries.get()` runs on the first draw — that is when the VBOs are
+ * created, and when `renderer.info.memory.geometries` increments. So a lap that
+ * reveals new parts of the circuit walks that counter up: measured on the
+ * mobile soak, **114 at t=0 and 182 at t=60s**. Nothing is built at runtime
+ * (the scene holds the same 182 geometries throughout); those are 68 first-draw
+ * buffer uploads landing on the frames where the player turns a corner, and
+ * they also trip the soak's growth gate. After this pass the counter is flat.
+ *
+ * Two details make it safe:
+ *
+ * - **`scene.overrideMaterial`**, so every object is drawn through one
+ *   `MeshDepthMaterial`. Drawing the scene through its own lit materials also
+ *   uploads the buffers, and that is what this tried first — it emitted 35+
+ *   `GL_INVALID_OPERATION: Mismatch between texture format and sampler type
+ *   (…/shadow)` warnings per boot, from lit materials sampling shadow maps in a
+ *   state the frame loop never puts them in. A depth material samples no shadow
+ *   map. Measured on this path: zero GL warnings, same as before any of this.
+ *   `WebGLObjects.update()` uploads EVERY attribute the geometry owns, not just
+ *   the ones the bound shader reads, so a depth draw is still a full upload.
+ *
+ * - **A 1x1 target**, so the vertices are transformed and essentially nothing
+ *   is rasterised. The shadow pass is held off for the duration; `warmShadowDepth`
+ *   has already done that work where it applies.
+ */
+function warmGeometryUpload(ctx: Ctx, target: THREE.WebGLRenderTarget, cage: THREE.Object3D): void {
+  const renderer = ctx.renderer;
+  const culled: THREE.Object3D[] = [];
+  ctx.scene.traverse((o) => {
+    if (o.frustumCulled) { culled.push(o); o.frustumCulled = false; }
+  });
+
+  const cageWasVisible = cage.visible;
+  const prevOverride = ctx.scene.overrideMaterial;
+  const prevShadowAuto = renderer.shadowMap.autoUpdate;
+  const prevShadowNeeds = renderer.shadowMap.needsUpdate;
+  const override = new THREE.MeshDepthMaterial();
+
+  try {
+    cage.visible = false;
+    ctx.scene.overrideMaterial = override;
+    renderer.shadowMap.autoUpdate = false;
+    renderer.shadowMap.needsUpdate = false;
+    renderer.setRenderTarget(target);
+    renderer.render(ctx.scene, ctx.camera);
+  } finally {
+    ctx.scene.overrideMaterial = prevOverride;
+    renderer.shadowMap.autoUpdate = prevShadowAuto;
+    renderer.shadowMap.needsUpdate = prevShadowNeeds;
+    cage.visible = cageWasVisible;
+    for (const o of culled) o.frustumCulled = true;
+    override.dispose();
+  }
+}
+
 // ---------------------------------------------------------------------------
 
 export async function prewarm(ctx: Ctx): Promise<PrewarmResult> {
@@ -226,6 +428,10 @@ export async function prewarm(ctx: Ctx): Promise<PrewarmResult> {
   const prevMip = renderer.getActiveMipmapLevel();
   let scratch: THREE.WebGLRenderTarget | null = null;
   const surfaces: string[] = [];
+  let programsBeforeDepth = 0;
+  let depthPrograms = 0;
+  let geometriesBefore = 0;
+  let geometriesWarmed = 0;
 
   try {
     const surface = scenePassSurface();
@@ -250,6 +456,16 @@ export async function prewarm(ctx: Ctx): Promise<PrewarmResult> {
       // compiles overlap instead of serialising — worth the async plumbing.
       await renderer.compileAsync(ctx.scene, ctx.camera);
     }
+    // Now the depth variants, which the loop above provably does not build.
+    programsBeforeDepth = renderer.info.programs?.length ?? 0;
+    geometriesBefore = renderer.info.memory.geometries;
+    warmShadowDepth(ctx);
+    depthPrograms = (renderer.info.programs?.length ?? 0) - programsBeforeDepth;
+
+    // And the vertex buffers, which nothing above uploads at every tier.
+    if (scratch === null) scratch = new THREE.WebGLRenderTarget(1, 1);
+    warmGeometryUpload(ctx, scratch, cage);
+    geometriesWarmed = renderer.info.memory.geometries - geometriesBefore;
   } catch (err) {
     // A failed pre-warm must never stop the game booting; the worst case is
     // simply the hitching we had before.
@@ -268,7 +484,8 @@ export async function prewarm(ctx: Ctx): Promise<PrewarmResult> {
   // The surface is the part worth seeing in a log: 'canvas' where the composer
   // is live means the pre-warm is compiling programs the game will never use.
   console.info(
-    `[prewarm] surface=${surfaces.join('+') || 'none'}` +
+    `[prewarm] surface=${surfaces.join('+') || 'none'} depth=+${depthPrograms} ` +
+    `geo=${geometriesBefore}+${geometriesWarmed}` +
     (materialsCaged.length ? ` hosted=[${materialsCaged.join(', ')}]` : ''),
   );
 
@@ -278,6 +495,8 @@ export async function prewarm(ctx: Ctx): Promise<PrewarmResult> {
     objectsRevealed: hidden.length,
     materialsCaged,
     surfaces,
+    depthPrograms,
+    geometriesWarmed,
     ms: Math.round(performance.now() - t0),
   };
 }

@@ -756,11 +756,45 @@ class Layer {
   readonly material: THREE.ShaderMaterial;
 
   private head = 0;
-  private lo = Infinity;
-  private hi = -Infinity;
   private wrapped = false;
   /** wall-clock time at which the newest particle expires */
   private liveUntil = -1;
+
+  /**
+   * SPAWNS ARE UPLOADED, NOT THE RING.
+   *
+   * `flush` used to mark the whole span from the lowest to the highest slot
+   * written this frame. That is exact while the writes stay in order and
+   * catastrophic on the frame the ring wraps: the span becomes [0, capacity)
+   * and three re-uploads the ENTIRE interleaved buffer — 435 KB for the
+   * additive layer, 307 KB for the alpha one. At a busy 250 spawns/frame the
+   * ring turns over every ~14 frames, so one frame in fourteen pushed three
+   * quarters of a megabyte across the bus while the other thirteen pushed
+   * twenty kilobytes. On a phone that is a visible, periodic hitch, and it is
+   * exactly the shape of stutter the player is reporting as a black flash.
+   *
+   * Tracking where this frame's writes STARTED instead lets the wrap upload as
+   * two tight ranges (tail of the ring plus head of it), so the cost of a frame
+   * is proportional to what it spawned and nothing else.
+   */
+  private frameStart = 0;
+  private frameWrote = 0;
+  /** something wrote outside the sequential window; fall back to a full upload */
+  private fullDirty = false;
+  /**
+   * HARD PER-FRAME SPAWN CEILING.
+   *
+   * Emission rates are additive across eight karts and half a dozen concurrent
+   * effects, so the worst case the art direction names — the whole field
+   * drifting at tier 3 with items going off — is not a bounded quantity today;
+   * it is however many particles the accumulators happen to ask for. This is
+   * the bound. Once it is spent the layer refuses further spawns for the frame,
+   * which guarantees the ring cannot turn over more than once per frame however
+   * heavy the scene gets, keeps the upload window small, and puts a ceiling on
+   * the CPU cost of a frame that does not depend on how the race is going.
+   */
+  private budget = 1 << 30;
+  private perFrame = 1 << 30;
 
   constructor(readonly capacity: number, atlas: THREE.DataTexture, additive: boolean, lit: boolean,
               tierCol: Float32Array) {
@@ -813,14 +847,39 @@ class Layer {
     this.mesh.frustumCulled = false;
     this.mesh.renderOrder = additive ? 12 : 10;
     this.mesh.matrixAutoUpdate = false;
+    // Named so a soak harness can read the live instance count straight off the
+    // scene graph without this file having to grow a stats API.
+    this.mesh.name = additive ? 'fx-particles-additive' : 'fx-particles-alpha';
   }
 
-  spawn(p: EmitParams, now: number, seed: number) {
+  /** Number of spawns this layer will still accept this frame. */
+  get room() { return this.budget; }
+  /** How many particles were written on the frame just flushed. */
+  spawned = 0;
+
+  set spawnsPerFrame(n: number) { this.perFrame = Math.max(1, n | 0); }
+
+  /**
+   * Spawns this layer REFUSED on the frame just flushed.
+   *
+   * A ceiling nobody can see being hit is a ceiling that quietly deletes half a
+   * drift shower and calls it a setting. This is what makes the trade visible:
+   * zero means every emitter got what it asked for and the cap is pure
+   * insurance, a number climbing toward the ceiling means emission is
+   * outrunning the budget and the thinning is real. Published on the mesh
+   * beside `spawned` so a soak harness can read both off the scene graph.
+   */
+  refused = 0;
+  private frameRefused = 0;
+
+  /** @returns false if the frame's spawn budget is spent. */
+  spawn(p: EmitParams, now: number, seed: number): boolean {
+    if (this.budget <= 0) { this.frameRefused++; return false; }
+    this.budget--;
     const i = this.head;
     this.head = this.head + 1;
     if (this.head >= this.capacity) { this.head = 0; this.wrapped = true; }
-    if (i < this.lo) this.lo = i;
-    if (i > this.hi) this.hi = i;
+    this.frameWrote++;
 
     const d = this.data;
     const o = i * STRIDE;
@@ -868,6 +927,7 @@ class Layer {
 
     const until = now + life;
     if (until > this.liveUntil) this.liveUntil = until;
+    return true;
   }
 
   /**
@@ -889,20 +949,48 @@ class Layer {
       const shortened = age + fade;
       if (shortened >= life) continue;
       d[o + 7] = shortened;
-      if (i < this.lo) this.lo = i;
-      if (i > this.hi) this.hi = i;
+      this.fullDirty = true;
     }
   }
 
+  /** Re-upload everything — after a WebGL context restore. */
+  invalidate() { this.fullDirty = true; }
+
   flush(now: number) {
-    if (this.hi >= this.lo) {
-      this.buffer.clearUpdateRanges();
-      this.buffer.addUpdateRange(this.lo * STRIDE, (this.hi - this.lo + 1) * STRIDE);
-      this.buffer.needsUpdate = true;
-      this.lo = Infinity; this.hi = -Infinity;
+    const cap = this.capacity;
+    const buf = this.buffer;
+    if (this.fullDirty || this.frameWrote >= cap) {
+      buf.clearUpdateRanges();
+      buf.addUpdateRange(0, cap * STRIDE);
+      buf.needsUpdate = true;
+    } else if (this.frameWrote > 0) {
+      buf.clearUpdateRanges();
+      const end = this.frameStart + this.frameWrote;
+      if (end <= cap) {
+        buf.addUpdateRange(this.frameStart * STRIDE, this.frameWrote * STRIDE);
+      } else {
+        // wrapped: tail of the ring, then the head of it. Two tight ranges
+        // instead of the whole buffer.
+        buf.addUpdateRange(this.frameStart * STRIDE, (cap - this.frameStart) * STRIDE);
+        buf.addUpdateRange(0, (end - cap) * STRIDE);
+      }
+      buf.needsUpdate = true;
     }
+    this.fullDirty = false;
+    this.spawned = this.frameWrote;
+    this.refused = this.frameRefused;
+    // Published on the mesh so a soak harness can read the spawn rate, the
+    // ceiling it is being measured against, and how much the ceiling actually
+    // cost, straight off the scene graph.
+    this.mesh.userData.spawned = this.frameWrote;
+    this.mesh.userData.refused = this.frameRefused;
+    this.mesh.userData.ceiling = this.perFrame;
+    this.frameStart = this.head;
+    this.frameWrote = 0;
+    this.frameRefused = 0;
+    this.budget = this.perFrame;
     // Skip the draw entirely once every particle has expired.
-    this.geo.instanceCount = now > this.liveUntil ? 0 : (this.wrapped ? this.capacity : this.head);
+    this.geo.instanceCount = now > this.liveUntil ? 0 : (this.wrapped ? cap : this.head);
   }
 
   dispose() {
@@ -942,13 +1030,50 @@ export class Particles {
   /** vec3[TIER_SLOTS], shared by both layers; written by `setChannelColor` */
   private readonly tierCol = new Float32Array(TIER_SLOTS * 3).fill(1);
 
-  constructor(additiveCapacity: number, alphaCapacity: number) {
-    this.atlas = buildAtlas(particleTiles(), 4, 2, 256);
+  /**
+   * `tileSize` is the resolution of ONE atlas tile. 256 gives a 1024x512 RGBA
+   * atlas — 2 MB before mips, 2.8 MB with them, held twice over (once in the
+   * JS heap as the mip chain, once on the GPU) for the life of the process.
+   * These sprites are soft by construction and are drawn at a few dozen pixels;
+   * 128 is visually indistinguishable in motion and costs a quarter as much in
+   * both memories, plus a quarter of the boot time to synthesise. Mobile takes
+   * 128, desktop keeps 256.
+   */
+  constructor(additiveCapacity: number, alphaCapacity: number, tileSize = 256) {
+    this.atlas = buildAtlas(particleTiles(), 4, 2, tileSize);
     this.additiveLayer = new Layer(additiveCapacity, this.atlas, true, false, this.tierCol);
     this.alphaLayer = new Layer(alphaCapacity, this.atlas, false, true, this.tierCol);
     this.layers = [this.alphaLayer, this.additiveLayer];
     this.group.add(this.alphaLayer.mesh, this.additiveLayer.mesh);
     this.group.matrixAutoUpdate = false;
+    // A frame may never spend more than a sixteenth of a ring, so at least
+    // ~0.27 s of history survives at 60 Hz whatever the field is doing.
+    //
+    // The direction of that trade is the point. When emission outruns the ring
+    // the choice is between DROPPING spawns and letting the ring turn over
+    // inside a particle's lifetime, and they do not degrade alike: dropping
+    // thins a shower evenly, while turnover chops its tail off and a spark that
+    // vanishes at a third of its life reads as a rendering fault rather than as
+    // a lower setting.
+    //
+    // Measured on an emulated iPhone at Quality.Medium with the whole field
+    // forced into a tier-3 drift and items firing continuously — the case art
+    // bible §6 names — the additive layer peaks at 79 spawns in a frame and
+    // averages 31, against a ceiling of 98. So this does not trim the shipped
+    // effect at all; it is the bound that stops a case nobody has thought of
+    // from turning into an unbounded frame.
+    this.additiveLayer.spawnsPerFrame = Math.max(24, additiveCapacity >> 4);
+    this.alphaLayer.spawnsPerFrame = Math.max(16, alphaCapacity >> 4);
+  }
+
+  /**
+   * Re-mark every GPU-resident buffer dirty. The interleaved rings and the
+   * atlas both keep their CPU copy, so a restored context only needs to be
+   * told to re-upload them.
+   */
+  invalidateGL() {
+    for (const l of this.layers) l.invalidate();
+    this.atlas.needsUpdate = true;
   }
 
   /** Reset the shared params to neutral defaults before configuring an emit. */
@@ -1011,14 +1136,39 @@ export class Particles {
    */
   emit(additive: boolean) {
     const p = this.p;
-    let n = p.count * this.density;
+    const n = p.count * this.density;
     // fractional remainder resolved stochastically — avoids density banding
     let count = Math.floor(n);
     if (Math.random() < n - count) count++;
     if (count <= 0) count = p.count > 0 ? 1 : 0;
     const layer = additive ? this.additiveLayer : this.alphaLayer;
     const now = this.time;
-    for (let i = 0; i < count; i++) layer.spawn(p, now, Math.random());
+    for (let i = 0; i < count; i++) if (!layer.spawn(p, now, Math.random())) break;
+  }
+
+  /**
+   * Emit `p.count` particles with NO density multiply.
+   *
+   * `emit` exists for one-shot readability cues — a tier promotion, an impact —
+   * where the count is the whole effect and a low-density machine should still
+   * get one of them, which is why it floors at one. That floor is exactly wrong
+   * for a *continuous* emitter driven by an accumulator that already spends the
+   * density on its rate: `slipstream` paid the multiplier twice (rate x density
+   * then count x density, i.e. 0.36 of the authored streaks at Medium), while
+   * every emitter that loops `count = 1` — the drift ground pool, the star
+   * husk, the spin-out stars, the boost-pad heat — paid it not at all, because
+   * one times any density still floors back to one.
+   *
+   * So the rule is now explicit rather than emergent: apply density to the RATE
+   * and use this, or leave the rate alone and use `emit`. Never both.
+   */
+  emitExact(additive: boolean) {
+    const p = this.p;
+    const count = p.count | 0;
+    if (count <= 0) return;
+    const layer = additive ? this.additiveLayer : this.alphaLayer;
+    const now = this.time;
+    for (let i = 0; i < count; i++) if (!layer.spawn(p, now, Math.random())) break;
   }
 
   private time = 0;
@@ -1031,6 +1181,16 @@ export class Particles {
 
   /** Global additive attenuation — see Effects for how the load is measured. */
   set additiveGain(v: number) { this.additiveLayer.material.uniforms.uGain.value = v; }
+
+  /**
+   * Particles written on the last flushed frame, and the ceiling they were
+   * written against. Published so a soak harness can prove the worst case
+   * plateaus instead of inferring it from upload bytes.
+   */
+  get spawnedLastFrame() { return this.additiveLayer.spawned + this.alphaLayer.spawned; }
+  get spawnCeiling() { return this.additiveLayer.room + this.additiveLayer.spawned; }
+  /** Spawns the per-frame ceiling turned away on the last flushed frame. */
+  get refusedLastFrame() { return this.additiveLayer.refused + this.alphaLayer.refused; }
 
   setLighting(sunDir: THREE.Vector3, sun: THREE.Color, sky: THREE.Color, bounce: THREE.Color) {
     const u = this.alphaLayer.material.uniforms;

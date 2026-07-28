@@ -141,7 +141,20 @@ export function solveTyre(
   cornerMass: number,
   dt: number,
 ): TyreResult {
-  if (!(load > 0) || !Number.isFinite(load) || !Number.isFinite(vLat) || !Number.isFinite(vLong)) {
+  // Every input is guarded, not just the three that used to be. This function
+  // is the only place in the model where a non-finite number becomes a FORCE,
+  // and a force becomes a velocity, and a velocity is permanent — `Kart.sanitize`
+  // can only notice afterwards and respawn, which is a visible failure rather
+  // than a survived one. `gripMul` in particular is a product of a surface
+  // lookup and a drift scaling, `dt` comes from the frame clock, and neither is
+  // this file's to trust. Written as a single conjunction of positive tests so
+  // that a NaN in any of them falls through to the safe branch.
+  if (
+    !(load > 0) ||
+    !Number.isFinite(vLat) || !Number.isFinite(vLong) ||
+    !Number.isFinite(gripMul) || !Number.isFinite(driveDemand) ||
+    !(cornerMass > 0) || !(dt > 0)
+  ) {
     out.long = 0;
     out.lat = 0;
     out.slipAngle = 0;

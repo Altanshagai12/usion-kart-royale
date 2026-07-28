@@ -104,6 +104,9 @@ const _quat = new THREE.Quaternion();
 const _col = new THREE.Color();
 const _col2 = new THREE.Color();
 const UP = new THREE.Vector3(0, 1, 0);
+const _frustum = new THREE.Frustum();
+const _viewProj = new THREE.Matrix4();
+const _bounds = new THREE.Sphere();
 
 const damp = (dt: number, rate: number) => 1 - Math.pow(rate, dt);
 
@@ -1098,6 +1101,23 @@ export class Effects implements System {
 
   private fx: KartFx[] = [];
   private gain = 1;
+  /** particle density asked for by the quality tier, before the governor */
+  private baseDensity = 1;
+  /**
+   * ADAPTIVE LOAD, 0.3..1. Multiplies both `particles.density` and every
+   * continuous emission rate in this file.
+   *
+   * A quality tier is a guess made at boot from a renderer string. A phone
+   * thermally throttling in lap two, or a pack fight arriving in the tunnel,
+   * is not something a boot-time guess can know about, and the particle layer
+   * is the right thing to give up first: it is the largest variable cost in the
+   * frame and the least missed, because a shower with two thirds of its grains
+   * still reads as a shower while a frame that arrives 40 ms late reads as a
+   * black flash. Falls fast (half a second to the floor) and recovers slowly
+   * (eight seconds back to full) so it cannot oscillate on a corner.
+   */
+  private loadScale = 1;
+  private smoothDt = 1 / 60;
   private blastLoad = 0;
   private shimmerAmount = 0;
   private shimmerTimer = 0;
@@ -1113,17 +1133,43 @@ export class Effects implements System {
   init(ctx: Ctx) {
     this.ctx = ctx;
     const q = ctx.settings.quality;
-    const dens = ctx.settings.particleDensity;
+    const mobile = q <= Quality.Medium;
+    // DENSITY IS A TIER, NOT A TRIM — but the tier is not bought here alone.
+    //
+    // The presets ask for 0.35 / 0.6 / 1.0 / 1.4. Raising the sub-1 end to the
+    // power 1.5 takes Medium to 0.46 and Low to 0.21 while leaving High and
+    // Ultra exactly where the art direction put them. That is deliberately not
+    // the whole of "far fewer on a phone": the rest — and most of it — comes
+    // from the distance curve in `lodOf`, which thins the SEVEN RIVALS hard and
+    // leaves the player's own kart at full rate. Cutting the field is nearly
+    // free because a rival at 40 m on a 390-pixel-tall screen is two dozen
+    // pixels; cutting the player's own drift shower by the same factor would be
+    // fixing mobile by making the game worse, which is the one thing the
+    // readability layer must not do.
+    const p = ctx.settings.particleDensity;
+    const dens = q >= Quality.High ? p : p * Math.sqrt(p);
+    this.baseDensity = dens;
+    this.emitScale = dens;
+    this.mobileLod = mobile;
 
-    const addCap = Math.round(THREE.MathUtils.clamp(3400 * dens, 900, 4200));
-    const alphaCap = Math.round(THREE.MathUtils.clamp(2400 * dens, 700, 3000));
-    this.particles = new Particles(addCap, alphaCap);
+    const addCap = Math.round(THREE.MathUtils.clamp(3400 * dens, 1200, 4200));
+    const alphaCap = Math.round(THREE.MathUtils.clamp(2400 * dens, 850, 3000));
+    // 128-pixel tiles on mobile: a quarter of the atlas memory, a quarter of the
+    // boot cost to synthesise it, and no visible difference on sprites that are
+    // soft by construction and never drawn much above 100 px.
+    this.particles = new Particles(addCap, alphaCap, mobile ? 128 : 256);
     this.particles.density = dens;
     this.particles.setLighting(ctx.sunDirection, this.sunColor, this.skyColor, this.bounceColor);
     this.particles.resize(ctx.width, ctx.height);
 
     this.trails = new Trails(16, true);
-    this.decals = new Decals(q <= Quality.Low ? 900 : 3200);
+    // Quality-scaled, and it matters more than it looks: every quad in this ring
+    // is a blended, texture-fetching fragment lying flat on the road, so the
+    // capacity is a direct multiplier on mobile fill rate in the worst case
+    // (the frame on which the live window straddles the ring's wrap).
+    this.decals = new Decals(
+      q <= Quality.Low ? 600 : q <= Quality.Medium ? 1200 : q <= Quality.High ? 2400 : 3200,
+      mobile ? 128 : 256);
     // 96 segments: the shockwave is now a 5%-thick annulus out at 7 m, and at
     // 64 segments a band that thin is visibly a chain of straight quads.
     this.rings = new Rings(28, 96);
@@ -1142,7 +1188,11 @@ export class Effects implements System {
     );
 
     if (q >= Quality.Medium) {
-      this.motes = new Motes(Math.round(THREE.MathUtils.clamp(760 * dens, 200, 1200)), 26, 24);
+      // Motes are pure additive overdraw spread across the near field, which is
+      // the one thing a mobile GPU is worst at. The floor drops to 90 so the
+      // squared Medium density actually reaches it — the haze in the light
+      // shafts survives, at a quarter of the fill.
+      this.motes = new Motes(Math.round(THREE.MathUtils.clamp(760 * dens, 90, 1200)), 26, 24);
       this.group.add(this.motes.mesh);
       this.shimmer = new Shimmer();
       this.group.add(this.shimmer.mesh);
@@ -1158,7 +1208,58 @@ export class Effects implements System {
     ctx.scene.add(this.group);
 
     this.unsubscribe = ctx.bus.on(this.onEvent);
+    this.hookContextLoss(ctx);
   }
+
+  /**
+   * WEBGL CONTEXT LOSS.
+   *
+   * A phone that is running out of memory does not always kill the tab: often
+   * enough it takes the GL context away first, and a page with no
+   * `webglcontextlost` handler answers that by rendering nothing at all — a
+   * black frame that never comes back. That is a plausible reading of "still
+   * black partial renders at times", and until this round there was not a
+   * single listener in the codebase.
+   *
+   * Owning the renderer's recovery is not this file's job (see Renderer.ts) but
+   * owning OUR OWN is. Both particle rings, the decal ring and the two
+   * procedural atlases keep their CPU copies for the life of the process, so a
+   * restored context needs nothing rebuilt — only telling that everything it
+   * holds is stale. Calling `preventDefault` on the loss event is what allows
+   * the browser to fire `webglcontextrestored` at all; without it the context
+   * is gone for good, which is the difference between a stutter and a dead tab.
+   */
+  private hookContextLoss(ctx: Ctx) {
+    const canvas = ctx.renderer?.domElement;
+    if (!canvas) return;
+    this.canvas = canvas;
+    canvas.addEventListener('webglcontextlost', this.onContextLost, false);
+    canvas.addEventListener('webglcontextrestored', this.onContextRestored, false);
+  }
+
+  private canvas: HTMLCanvasElement | null = null;
+
+  private onContextLost = (e: Event) => {
+    // Without this the browser never attempts a restore.
+    e.preventDefault();
+    this.contextLost = true;
+  };
+
+  private onContextRestored = () => {
+    this.contextLost = false;
+    this.particles?.invalidateGL();
+    this.decals?.invalidate();
+    // Whatever was in flight belonged to a context that no longer exists.
+    this.decals?.clear();
+    for (const f of this.fx) {
+      if (!f) continue;
+      if (f.trail >= 0) this.trails?.release(f.trail);
+      f.trail = -1;
+      f.skidding = false;
+    }
+  };
+
+  private contextLost = false;
 
   /**
    * Sea spray only makes sense where the road is actually above the water, so
@@ -1189,6 +1290,13 @@ export class Effects implements System {
   private onEvent = (e: GameEvent) => {
     const ctx = this.ctx;
     if (!ctx) return;
+    // Same rule as `update`: nothing emitted while the context is gone can ever
+    // reach a screen. `update` and `lateUpdate` already bail, which means
+    // `flush` is not running either — so without this the bus kept walking the
+    // ring write heads and inflating `frameWrote` for the whole outage, and the
+    // first frame back paid for every spawn made during it on top of the full
+    // re-upload the restore already owes.
+    if (this.contextLost) return;
     const now = ctx.time;
     // Events are raised during the gameplay update, which runs before ours;
     // re-stamp so a burst is born now rather than at last frame's flush.
@@ -1525,6 +1633,10 @@ export class Effects implements System {
   // -------------------------------------------------------------------------
 
   update(ctx: Ctx, dt: number) {
+    // Nothing this file produces can reach a screen while the context is gone,
+    // and emitting into a ring whose GPU mirror does not exist only guarantees
+    // that the restore frame has a full buffer's worth of upload to do.
+    if (this.contextLost) return;
     const race = ctx.race;
     const karts = race?.karts;
     const now = ctx.time;
@@ -1537,6 +1649,7 @@ export class Effects implements System {
       this.lastState = race.state;
     }
 
+    this.updateLoad(dt);
     this.updateGain(ctx, dt);
     // Smoke and dust must live in whatever light the sky system is actually
     // producing — including going flat and cool inside the tunnel — so track
@@ -1546,9 +1659,36 @@ export class Effects implements System {
     }
     this.particles.setLighting(ctx.sunDirection, this.sunColor, this.skyColor, this.bounceColor);
 
+    // Off-screen rivals are thinned on the mobile tiers; see `offScreenScale`.
+    // Built once per frame from the camera the chase rig posed last frame,
+    // which is a frame stale and irrelevant at the twelve metres of padding the
+    // test carries.
+    if (this.mobileLod) {
+      ctx.camera.updateMatrixWorld();
+      _viewProj.multiplyMatrices(ctx.camera.projectionMatrix, ctx.camera.matrixWorldInverse);
+      _frustum.setFromProjectionMatrix(_viewProj);
+    }
+
     this.lights.begin();
     if (karts) {
-      for (let i = 0; i < karts.length; i++) this.updateKart(ctx, karts[i], dt, now);
+      // THE PLAYER SPENDS THE FRAME'S PARTICLE BUDGET FIRST.
+      //
+      // Both particle layers enforce a hard per-frame spawn ceiling, and it is
+      // reached: measured on an emulated phone with the whole field pinned at
+      // drift tier 3 and items firing — the case art bible §6 names — the
+      // additive layer peaks at 75 spawns against a ceiling of 75 and averages
+      // 46. Once the ceiling is spent the layer refuses the rest of the frame,
+      // and it was being spent in `karts` order, which is grid order. So under
+      // exactly the load where readability matters most, whether the player's
+      // own drift shower survived depended on where they happened to be
+      // starting from. Emitting the player before the field costs one compare
+      // per kart and makes the capped case degrade in the only acceptable
+      // direction: the seven rivals thin out, the car you are driving does not.
+      const player = race?.player;
+      if (player) this.updateKart(ctx, player, dt, now);
+      for (let i = 0; i < karts.length; i++) {
+        if (karts[i] !== player) this.updateKart(ctx, karts[i], dt, now);
+      }
     }
     this.lights.end(dt);
 
@@ -1557,6 +1697,7 @@ export class Effects implements System {
   }
 
   lateUpdate(ctx: Ctx, dt: number) {
+    if (this.contextLost) return;
     const karts = ctx.race?.karts;
     const now = ctx.time;
 
@@ -1623,6 +1764,33 @@ export class Effects implements System {
    * about half the additive brightness, which is precisely the case the art
    * direction says must not white out.
    */
+  /**
+   * The frame-time governor. See `loadScale`.
+   *
+   * `dt` is already clamped to 1/20 upstream, which is exactly the behaviour a
+   * governor wants: it must chase a sustained deficit, not a single stall, and
+   * the clamp stops one hitch from slamming the whole particle layer shut.
+   */
+  private updateLoad(dt: number) {
+    if (dt <= 0) return;
+    this.smoothDt += (dt - this.smoothDt) * Math.min(1, dt * 2.5);
+    // 18.2 ms: comfortably inside a 60 Hz budget, so a machine holding frame
+    // never touches this. 14.7 ms: enough headroom that giving load back cannot
+    // immediately cost the frame it was given back for.
+    const HOT = 1 / 55, COOL = 1 / 68;
+    if (this.smoothDt > HOT) this.loadScale = Math.max(0.30, this.loadScale - dt * 1.4);
+    else if (this.smoothDt < COOL) this.loadScale = Math.min(1, this.loadScale + dt * 0.09);
+    this.emitScale = this.baseDensity * this.loadScale;
+    this.particles.density = this.emitScale;
+  }
+
+  /**
+   * The live density. Emitters that hand `emit()` a count let it apply this;
+   * emitters that loop over `count = 1` must apply it to their RATE and then
+   * call `emitExact`, because one times any density still rounds back to one.
+   */
+  private emitScale = 1;
+
   private updateGain(ctx: Ctx, dt: number) {
     let load = 0;
     const karts = ctx.race?.karts;
@@ -1793,13 +1961,49 @@ export class Effects implements System {
     }
   }
 
+  /** near/mid/far emission multiplier by distance; steeper on mobile tiers. */
+  private lodOf(dist: number): number {
+    if (this.mobileLod) return dist < 16 ? 1 : dist < 42 ? 0.30 : 0.09;
+    return dist < 30 ? 1 : dist < 70 ? 0.45 : 0.18;
+  }
+
+  private mobileLod = false;
+
+  /**
+   * Extra thinning for a kart that is not on screen. **Mobile tiers only** —
+   * `mobileLod` gates the frustum build as well as this call, so High and Ultra
+   * do not pay for the test and do not lose a grain.
+   *
+   * The measured worst case is fill-rate bound, not CPU bound (55% idle, 10% in
+   * the GL driver), and the layer that can produce unbounded blended fill is
+   * this one. A phone is 390 px tall with a 62-degree lens: on the harbour
+   * sweep most of a bunched field is behind or beside the camera, and every
+   * grain those karts emit is spawned, uploaded, integrated in the vertex
+   * shader and clipped, having spent a slot in a ring the karts you CAN see are
+   * competing for.
+   *
+   * A quarter rather than zero, and padded by twelve metres. Both matter: the
+   * emitters are stateful accumulators, so switching one off and on again makes
+   * a shower restart rather than fade, and a rival's smoke legitimately drifts
+   * into frame after the kart that made it has left it. Twelve metres is about
+   * a third of a second of travel at racing speed, which is more than the
+   * longest smoke life this file authors.
+   */
+  private offScreenScale(k: IKart): number {
+    _bounds.center.copy(k.position);
+    _bounds.radius = 12;
+    return _frustum.intersectsSphere(_bounds) ? 1 : 0.25;
+  }
+
   private updateKart(ctx: Ctx, k: IKart, dt: number, now: number) {
     const fx = this.state(k);
     const cam = ctx.camera.position;
     const dist = cam.distanceTo(k.position);
     // Everything below is readability for a kart you can see. Beyond 120 m the
-    // kart is a few pixels wide and its dust would be noise.
-    if (dist > 120) {
+    // kart is a few pixels wide and its dust would be noise. 80 m on the mobile
+    // tiers, where the same kart is a third of the pixels and `lodOf` has
+    // already taken it down to nine percent of its emission.
+    if (dist > (this.mobileLod ? 80 : 120)) {
       if (fx.trail >= 0) { this.trails.release(fx.trail); fx.trail = -1; }
       fx.skidding = false;
       return;
@@ -1816,7 +2020,16 @@ export class Effects implements System {
     const props = SURFACE_PROPS[fx.surface] ?? SURFACE_PROPS[Surface.Road];
     // Near effects get full rate; distant ones thin out so the far pack does
     // not quietly eat the particle budget.
-    const lod = dist < 30 ? 1 : dist < 70 ? 0.45 : 0.18;
+    //
+    // The mobile curve is far steeper, and this is where "far fewer particles
+    // on a phone" is actually bought without touching what the player sees of
+    // their OWN car. The chase camera sits ~7 m back, so the player is always
+    // in the near band at full rate; the seven rivals are typically 20-60 m out,
+    // where a kart on a 390-pixel-tall screen is a couple of dozen pixels and
+    // its shower is three. Thinning them 0.45 -> 0.16 removes most of the field's
+    // emission and none of the readability, which is a much better trade than
+    // taking a third of the grains off the drift the player is actually doing.
+    const lod = this.lodOf(dist) * (this.mobileLod && !k.isPlayer ? this.offScreenScale(k) : 1);
     fx.tierFlash = Math.max(0, fx.tierFlash - dt);
 
     // --- drift: sparks, smoke, skid marks ---------------------------------
@@ -1857,7 +2070,9 @@ export class Effects implements System {
       // nothing float in front of the world; this is the single change that
       // makes the tier read at a glance in a moving frame. Two cheap ground
       // quads carry it on every kart...
-      fx.poolAcc += dt * 26 * lod * airFade;
+      // Rate carries the density (see `emitScale`): `groundPool` loops two
+      // count-1 emits, and a count of one is immune to a density multiplier.
+      fx.poolAcc += dt * 26 * lod * airFade * this.emitScale;
       const np = Math.floor(fx.poolAcc);
       if (np > 0) {
         fx.poolAcc -= np;
@@ -2066,7 +2281,7 @@ export class Effects implements System {
       // clamps a single-particle emit up to one so the readability cue survives
       // a low setting, which is right for a drift spark and wrong for a
       // decorative rush line the player is meant to get fewer of.
-      fx.rushAcc += dt * (18 + 130 * ramp) * (boosting ? 1.8 : 1) * this.particles.density;
+      fx.rushAcc += dt * (18 + 130 * ramp) * (boosting ? 1.8 : 1) * this.emitScale;
       const n = Math.floor(fx.rushAcc);
       if (n > 0) { fx.rushAcc -= n; this.slipstream(k, n, ramp, boosting); }
     } else {
@@ -2088,7 +2303,7 @@ export class Effects implements System {
           1000 + k.id, (k.isPlayer ? 150 : 40) - dist * 0.05, _p, padCol,
           0.55 * (1 - dist / 50) * this.gain, 6.5);
       }
-      fx.padAcc += dt * 24 * lod;
+      fx.padAcc += dt * 24 * lod * this.emitScale;
       const np = Math.floor(fx.padAcc);
       if (np > 0) {
         fx.padAcc -= np;
@@ -2109,7 +2324,7 @@ export class Effects implements System {
         this.particles.vel(k.velocity.x * 0.5, 0, k.velocity.z * 0.5);
         this.particles.colorA(padCol, 0.34, 0.30);
         this.particles.colorB(padCol, 0.09, 0);
-        this.particles.emit(true);
+        this.particles.emitExact(true);
 
         p.mode = PMode.Billboard; p.tile = PTile.Core;
         p.life = 0.3; p.size0 = 0.055; p.size1 = 0.012; p.sizeJitter = 0.5;
@@ -2120,7 +2335,7 @@ export class Effects implements System {
         this.particles.vel(k.velocity.x * 0.3, 2.6, k.velocity.z * 0.3);
         this.particles.colorA(padCol, 1.8, 1);
         this.particles.colorB(padCol, 0.5, 0);
-        this.particles.emit(true);
+        this.particles.emitExact(true);
       }
     } else {
       fx.padAcc = 0;
@@ -2181,7 +2396,7 @@ export class Effects implements System {
     // orbit of sparks with no rigid boundary, a hue-cycling pool on the road,
     // and a coloured lamp that puts the cycle onto the kart's own bodywork.
     if (k.starTime > 0) {
-      fx.starAcc += dt * 58 * lod;
+      fx.starAcc += dt * 58 * lod * this.emitScale;
       const n = Math.floor(fx.starAcc);
       if (n > 0) { fx.starAcc -= n; this.starSparkle(k, fx, n, now); }
       _col.setHSL((now * 0.55 + k.id * 0.13) % 1, 0.85, 0.60);
@@ -2198,7 +2413,7 @@ export class Effects implements System {
     // --- spin-out stars ----------------------------------------------------
     if (k.stunTime > 0) {
       fx.stunPhase += dt * 5.4;
-      fx.sparkleAcc += dt * 26 * lod;
+      fx.sparkleAcc += dt * 26 * lod * this.emitScale;
       const n = Math.floor(fx.sparkleAcc);
       if (n > 0) { fx.sparkleAcc -= n; this.stunStars(k, fx, n); }
     } else {
@@ -2389,7 +2604,25 @@ export class Effects implements System {
     this.particles.vel(k.velocity.x * 0.9, 0.4, k.velocity.z * 0.9);
     this.particles.colorA(col, 1.45, 0.70);
     this.particles.colorB(col, 0.42, 0);
-    this.particles.emit(true);
+    // DENSITY, SPENT EXACTLY ONCE — and this lamp was the one emitter in the
+    // file spending it zero times.
+    //
+    // Every other layer here hands `emit` a count above one, so the density
+    // multiplier lands on the count. This one is deliberately a single sprite,
+    // and `emit` floors a single-particle spawn back up to one so a low setting
+    // still gets the readability cue. Correct for a one-shot; wrong for
+    // something emitted once per wheel per frame for the whole of every drift.
+    // The result was two additive particles per drifting kart per frame at ANY
+    // quality — sixteen a frame across the field, a fifth of the Low tier's
+    // entire 75-spawn ceiling, held at full rate while the shower they sit
+    // inside was thinned to 21%.
+    //
+    // A stochastic gate spends the density on the RATE instead, which is the
+    // rule Particles states. It keeps the cue: at Low the lamp lands on about a
+    // fifth of frames and lives 0.12 s, so there is still one on the road
+    // essentially all the time — it is simply no longer the most expensive
+    // thing in a tier-3 drift.
+    if (Math.random() < this.emitScale) this.particles.emitExact(true);
 
     // Ricochets: a handful of grains per emission that survive longer, drag
     // almost nothing and arc out clear of the kart. Real sparks are not a
@@ -2450,7 +2683,7 @@ export class Effects implements System {
     for (let s = 0; s < 2; s++) {
       const at = s === 0 ? this.skidLRef : this.skidRRef;
       this.particles.at(at.x, fx.groundY + 0.04, at.z);
-      this.particles.emit(true);
+      this.particles.emitExact(true);
     }
   }
 
@@ -2616,7 +2849,9 @@ export class Effects implements System {
       this.particles.at(_p.x, _p.y, _p.z);
       const rv = boosting ? 36 : 26;
       this.particles.vel(-_fwd.x * rv, -_fwd.y * rv, -_fwd.z * rv);
-      this.particles.emit(true);
+      // The rate above already spent the density; `emit` would spend it twice
+      // and Medium would get 0.13 of the authored streaks instead of 0.36.
+      this.particles.emitExact(true);
     }
   }
 
@@ -3222,7 +3457,7 @@ export class Effects implements System {
         k.position.y - 0.12 + rise * 1.05,
         k.position.z + Math.sin(a) * r);
       this.particles.vel(k.velocity.x * 0.6, k.velocity.y * 0.6 + 0.5, k.velocity.z * 0.6);
-      this.particles.emit(true);
+      this.particles.emitExact(true);
     }
 
     // The pool on the road. Ground-aligned, so it has area and no edge.
@@ -3234,7 +3469,7 @@ export class Effects implements System {
     this.particles.vel(k.velocity.x * 0.8, 0, k.velocity.z * 0.8);
     this.particles.colorA(_col2, 0.55, 0.45);
     this.particles.colorB(_col, 0.14, 0);
-    this.particles.emit(true);
+    this.particles.emitExact(true);
   }
 
   private stunStars(k: IKart, fx: KartFx, n: number) {
@@ -3256,7 +3491,7 @@ export class Effects implements System {
           k.position.x + Math.cos(a) * 0.72,
           k.position.y + 1.05 + Math.sin(a * 2) * 0.06,
           k.position.z + Math.sin(a) * 0.72);
-        this.particles.emit(true);
+        this.particles.emitExact(true);
       }
     }
   }
@@ -3526,6 +3761,11 @@ export class Effects implements System {
 
   dispose() {
     this.unsubscribe?.();
+    if (this.canvas) {
+      this.canvas.removeEventListener('webglcontextlost', this.onContextLost, false);
+      this.canvas.removeEventListener('webglcontextrestored', this.onContextRestored, false);
+      this.canvas = null;
+    }
     this.particles?.dispose();
     this.trails?.dispose();
     this.decals?.dispose();

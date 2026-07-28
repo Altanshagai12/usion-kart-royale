@@ -132,6 +132,26 @@ const _probeAt = new THREE.Vector3();
 const FOOTPRINT = [0, -0.92, 0.92];
 
 /**
+ * How close to a lateral surface transition a wheel has to be before the two
+ * tread samples are worth taking, in metres.
+ *
+ * The footprint exists for one reason: a kerb lip is a step in the surface
+ * profile a few centimetres wide, and a single hub sample walks through it.
+ * Everywhere else on this circuit the road cross-section is smooth over the
+ * 0.30 m of a tyre, so the three samples agree to within a rounding error and
+ * two of every three `ITrack.probe` calls buy nothing. The road is 18-26 m
+ * wide; a metre and a half of margin either side of the edge is generous cover
+ * for the transition while leaving the whole middle of the track — where eight
+ * karts spend nearly all of their time — on one probe per wheel.
+ *
+ * Off the road the samples are kept unconditionally: out there the height comes
+ * from a detail-noise field that really does vary across a tyre width, and a
+ * wheel bobbing on noise it should have ridden over is exactly what the
+ * footprint is for.
+ */
+const FOOTPRINT_EDGE_MARGIN = 1.5;
+
+/**
  * How badly a surface hurts, for choosing which one to *report*. Derived from
  * the speed multiplier so it can never disagree with the handling constants:
  * road is 0, a boost pad is negative, everything loose is positive.
@@ -309,8 +329,10 @@ export class Suspension {
       let bestSurface = Surface.Road;
       let valid = false;
       let haveFrame = false;
+      // Assume the cheap path until the hub sample says otherwise.
+      let samples = 1;
 
-      for (let s = 0; s < FOOTPRINT.length; s++) {
+      for (let s = 0; s < samples; s++) {
         _probeAt.copy(w.attachWorld);
         const off = FOOTPRINT[s];
         if (off !== 0) _probeAt.addScaledVector(_right, off * halfW);
@@ -324,6 +346,15 @@ export class Suspension {
           w.groundNormal.copy(probe.normal);
           if (w.groundNormal.lengthSq() < 1e-6) w.groundNormal.set(0, 1, 0);
           else w.groundNormal.normalize();
+          // `edgeRatio` is |lateral| / halfWidth, so halfWidth falls straight
+          // out of the pair and with it the distance to the road edge. Widen to
+          // the full footprint only where the profile can actually step: near
+          // the kerb, or anywhere off the road proper. See FOOTPRINT_EDGE_MARGIN.
+          const lat = Math.abs(probe.lateral);
+          const e = probe.edgeRatio;
+          const inside = e > 1e-3 ? lat * (1 / e - 1) : Infinity;
+          // Written as a negated ">" so a NaN edgeRatio takes the safe branch.
+          if (!(inside > FOOTPRINT_EDGE_MARGIN)) samples = FOOTPRINT.length;
         }
 
         const rumble = SURFACE_PROPS[probe.surface].rumble;
