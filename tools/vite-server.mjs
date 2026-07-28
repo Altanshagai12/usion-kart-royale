@@ -13,12 +13,32 @@
  *   2. tear it down on every exit path, including Ctrl-C and uncaught throws,
  *      not just the happy one.
  */
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { createConnection } from 'node:net';
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, realpathSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 
 const root = new URL('..', import.meta.url).pathname;
+
+/**
+ * Which directory is the process listening on `port` actually serving?
+ * Returns null when it cannot be determined (unsupported platform, no lsof,
+ * process owned by another user) — callers must treat null as "unknown", not
+ * as "fine".
+ */
+function ownerCwd(port) {
+  try {
+    const pid = execFileSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split('\n')[0];
+    if (!pid) return null;
+    const out = execFileSync('lsof', ['-p', pid, '-a', '-d', 'cwd', '-Fn'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const line = out.split('\n').find((l) => l.startsWith('n'));
+    return line ? { pid, cwd: line.slice(1) } : null;
+  } catch {
+    return null;
+  }
+}
 
 export function portOpen(port, host = '127.0.0.1') {
   return new Promise((res) => {
@@ -33,9 +53,35 @@ export function portOpen(port, host = '127.0.0.1') {
  * Returns a handle with `.stop()`. If something is already serving the port we
  * adopt it and `.stop()` is a no-op — never kill a server we did not start,
  * which is usually the developer's own `npm run dev`.
+ *
+ * ...but adoption is only safe if the squatter is serving THIS tree. With git
+ * worktrees it very often is not: an orphaned vite from a sibling worktree
+ * keeps the port bound, every harness hard-codes its port, and the harness then
+ * measures a DIFFERENT CHECKOUT'S code while reporting it as this one's. That
+ * is not a hypothetical — it silently corrupted several runs during the camera
+ * rebuild, and the numbers looked entirely plausible. Adoption is now verified
+ * against the owning process's cwd and refused when it disagrees.
  */
 export async function startVite(port, { timeoutMs = 36000 } = {}) {
-  if (await portOpen(port)) return { adopted: true, stop() {} };
+  if (await portOpen(port)) {
+    const owner = ownerCwd(port);
+    const mine = realpathSync(resolve(root));
+    if (owner && realpathSync(resolve(owner.cwd)) !== mine) {
+      throw new Error(
+        `refusing to adopt the server on port ${port}: it is serving a different tree.\n` +
+        `  owner pid   : ${owner.pid}\n` +
+        `  owner cwd   : ${owner.cwd}\n` +
+        `  this tree   : ${mine}\n` +
+        `Adopting it would measure that checkout's code and report it as this one's.\n` +
+        `Free the port (kill ${owner.pid}), or re-run this harness on another port.`,
+      );
+    }
+    if (!owner) {
+      console.warn(`[vite-server] adopting the existing server on port ${port}; ` +
+        `could not verify which tree it serves.`);
+    }
+    return { adopted: true, stop() {} };
+  }
 
   const bin = join(root, 'node_modules/.bin/vite');
   if (!existsSync(bin)) throw new Error(`vite binary not found at ${bin} — run npm install`);

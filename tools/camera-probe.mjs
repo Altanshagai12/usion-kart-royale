@@ -24,7 +24,17 @@
 import puppeteer from 'puppeteer';
 import { startVite } from './vite-server.mjs';
 
-const PORT = 5313;
+/**
+ * Port is overridable (`--port N`, or CAMERA_PROBE_PORT) because every harness
+ * here hard-codes one and `startVite` adopts whatever already holds it. When a
+ * sibling git worktree leaves an orphaned vite behind, the fixed port is how a
+ * probe ends up measuring someone else's camera. `startVite` now refuses to
+ * adopt a foreign tree outright; this flag is the escape hatch when the port is
+ * squatted and you cannot free it.
+ */
+const portArg = process.argv.indexOf('--port');
+const PORT = parseInt(
+  (portArg > -1 && process.argv[portArg + 1]) || process.env.CAMERA_PROBE_PORT || '5314', 10);
 
 const srv = await startVite(PORT);
 const browser = await puppeteer.launch({
@@ -69,13 +79,27 @@ async function trace(page, { steerScript, hz }) {
       const kYaw = yawOf(k.forward);
       const cYaw = yawOf(camDir());
       // Where is the kart on screen? -1 left edge, +1 right edge.
+      //
+      // `offCentre` below is WRONG and is kept only so historical numbers stay
+      // comparable. `Vector3.project` maps a WORLD POINT through
+      // matrixWorldInverse then projectionMatrix, so handing it a camera-
+      // relative vector projects the world point `kart - 2*camera`: a point
+      // reflected through the origin, ~110 m from the lens, whose NDC flips
+      // sign every time it crosses the camera plane. That is why the shipped
+      // metric returns 14, 306 and -10.7 on frames where the kart is plainly
+      // centred in shot. Use trueOffCentre.
       const toKart = k.position.clone().sub(ctx.camera.position);
       const proj = toKart.clone().project(ctx.camera);
+      const trueProj = k.position.clone().project(ctx.camera);
       out.push({
         t: +(i / hz).toFixed(3),
         lag: +(wrap(kYaw - cYaw) * 57.2958).toFixed(2),
         camRate: +(wrap(cYaw - prevCam) / dt * 57.2958).toFixed(1),
         offCentre: +proj.x.toFixed(3),
+        trueOffCentre: +trueProj.x.toFixed(3),
+        // Behind the lens: NDC x is meaningless there, and the kart is not on
+        // screen at all regardless of what it says.
+        behind: trueProj.z > 1 ? 1 : 0,
         camY: +ctx.camera.position.y.toFixed(2),
         dist: +ctx.camera.position.distanceTo(k.position).toFixed(2),
       });
@@ -106,6 +130,7 @@ for (const [name, script] of [['step', step], ['weave', weave]]) {
   const lags = t.map((s) => Math.abs(s.lag));
   const rates = t.map((s) => Math.abs(s.camRate));
   const off = t.map((s) => Math.abs(s.offCentre));
+  const trueOff = t.map((s) => Math.abs(s.trueOffCentre));
   // Time for the lag to fall back under 3 degrees after the input stops.
   const release = Math.floor(t.length * 120 / 210);
   let settle = -1;
@@ -121,6 +146,12 @@ for (const [name, script] of [['step', step], ['weave', weave]]) {
     meanOffCentre: +(off.reduce((a, b) => a + b, 0) / off.length).toFixed(3),
     settleSec: settle,
     framesPast35pct: +(off.filter((o) => o > 0.35).length / off.length * 100).toFixed(1),
+    // The same three statistics computed from a correct projection. These are
+    // the ones that mean anything; the three above are legacy.
+    TRUE_peakOffCentre: +Math.max(...trueOff).toFixed(3),
+    TRUE_meanOffCentre: +(trueOff.reduce((a, b) => a + b, 0) / trueOff.length).toFixed(3),
+    TRUE_framesPast35pct: +(trueOff.filter((o) => o > 0.35).length / trueOff.length * 100).toFixed(1),
+    TRUE_framesBehindLens: t.filter((s) => s.behind).length,
   };
 }
 
