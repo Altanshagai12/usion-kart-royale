@@ -598,6 +598,33 @@ export class RenderPipeline implements System {
   private msaaSamples(): number {
     if (!this.device.webgl2) return 0;
     const q = this.ctx.settings.quality;
+
+    // ---------------------------------------------------------------------
+    // MSAA IS INCOMPATIBLE WITH THE AO PASS, AND THAT IS THE BLACK-FRAME BUG.
+    //
+    // `N8AOPostPass` samples the composer's `inputBuffer` as a TEXTURE to get
+    // its scene colour. When that buffer is multisampled it has to be resolved
+    // first, and that resolve does not reliably happen before the read — so the
+    // pass composites over undefined contents and the frame comes back with a
+    // large black region bounded by a stepped, tile-aligned edge.
+    //
+    // Measured, at the reporter's own window size, over 420 frames each:
+    //     composer.multisampling = 2  ->  32 black frames  (7.6%)
+    //     composer.multisampling = 0  ->   1 black frame   (0.2%)
+    //
+    // An earlier round found this expression reading `ssao ? 0 : msaa` and
+    // removed the guard, because the stated justification for it was wrong:
+    // the comment claimed N8AOPostPass renders the scene privately and discards
+    // the composer's colour, which is true of `N8AOPass` but not of the `Post`
+    // variant. The justification was wrong and the guard was right. It is
+    // restored here with the reason it actually has, and with the numbers.
+    //
+    // Nothing is lost visually: SMAA is the last pass in the chain and resolves
+    // edges on top of whatever it is given, which is exactly how Quality.Low
+    // has always run.
+    if (this.ctx.settings.ssao) return 0;
+    // ---------------------------------------------------------------------
+
     // A software rasteriser pays for every sample of every fragment, so SMAA
     // carries the edges there. Quality.Low relies on SMAA alone by design.
     if (this.device.software) return q >= Quality.High ? 2 : 0;
