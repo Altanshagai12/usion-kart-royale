@@ -5,6 +5,7 @@ import { createSettings } from './core/Settings';
 import { Input } from './core/Input';
 import { Recorder } from './core/Recorder';
 import { prewarm } from './core/Prewarm';
+import { FrameWatch } from './core/FrameWatch';
 import { RenderPipeline } from './render/Renderer';
 import { DrawBudget } from './render/DrawBudget';
 import { Sky } from './render/Sky';
@@ -38,11 +39,33 @@ const parent = document.getElementById('app')!;
  *
  * Measuring the element we are about to fill has no such ambiguity, and on
  * desktop it returns exactly what `innerWidth`/`innerHeight` did.
+ *
+ * It does, however, introduce a failure the window never had: an ELEMENT can
+ * measure zero. A `display:none` ancestor, a collapsed pane, a tab in the
+ * background, or simply being read mid-layout all return 0, and the old
+ * `Math.max(1, ...)` dutifully turned that into a 1x1 canvas — resizing the
+ * drawing buffer AND every composer render target down to a single pixel.
+ * Observed live: `canvas 2x2, css 1x1`. Coming back from that costs at least
+ * one presented frame sourced from a one-pixel buffer, which is a black or
+ * part-black flash. A `ResizeObserver` on the element fires on every one of
+ * those transitions, so it happens often.
+ *
+ * So a degenerate measurement is not a size — it is the absence of one. Return
+ * null and let the caller keep what it had.
  */
-function viewportSize(): { w: number; h: number } {
-  const w = parent.clientWidth || innerWidth || 1;
-  const h = parent.clientHeight || innerHeight || 1;
-  return { w: Math.max(1, Math.round(w)), h: Math.max(1, Math.round(h)) };
+const MIN_SURFACE = 16;
+
+function viewportSize(): { w: number; h: number } | null {
+  let w = Math.round(parent.clientWidth || 0);
+  let h = Math.round(parent.clientHeight || 0);
+  // The element measuring zero does not mean the window has; fall back before
+  // giving up, which covers being read mid-layout.
+  if (w < MIN_SURFACE || h < MIN_SURFACE) {
+    w = Math.round(innerWidth || 0);
+    h = Math.round(innerHeight || 0);
+  }
+  if (w < MIN_SURFACE || h < MIN_SURFACE) return null;
+  return { w, h };
 }
 
 const pipeline = new RenderPipeline(parent);
@@ -58,6 +81,7 @@ const camera = new ChaseCamera();
 const hud = new HUD();
 const audio = new Audio();
 const drawBudget = new DrawBudget();
+const frameWatch = new FrameWatch();
 
 const view0 = viewportSize();
 
@@ -138,6 +162,7 @@ async function boot() {
     await new Promise((r) => requestAnimationFrame(r));
     await systems[i].init?.(ctx);
   }
+  frameWatch.init(ctx);
   installResizeListeners();
   installContextRecovery();
   resize(true);
@@ -247,13 +272,19 @@ function frame(now: number) {
   // few frames, which is where `__gameReady` and the boot curtain are decided.
   const maySkip = !frozen && ctx.frame > WATCHDOG_FROM_FRAME;
   let presented = false;
-  if (skipRender > 0 && maySkip) {
+  // Nothing usable can be presented onto a surface that is hidden or collapsed,
+  // and attempting it is how a one-pixel buffer reaches the compositor. The
+  // simulation keeps running; only the present is withheld.
+  if (!surfaceValid && maySkip) {
+    // no present this frame
+  } else if (skipRender > 0 && maySkip) {
     skipRender--;
   } else {
     presented = true;
     try {
       pipeline.render(ctx);
       renderFailures = 0;
+      frameWatch.afterPresent(ctx);
     } catch (err) {
       renderFailures++;
       console.error(`[frame] render threw (${renderFailures} in a row)`, err);
@@ -337,9 +368,26 @@ function installResizeListeners() {
  *   `resize()` and every layout that is only computed there — the HUD's safe
  *   area, the minimap box — would keep whatever it guessed at construction.
  */
+/**
+ * True while the display surface is unusable (hidden pane, background tab,
+ * mid-layout). The frame loop skips presenting rather than pushing a frame
+ * built from stale or degenerate buffers.
+ */
+let surfaceValid = true;
+
 function resize(force = false) {
-  const { w, h } = viewportSize();
-  if (!force && w === ctx.width && h === ctx.height) return;
+  const size = viewportSize();
+  if (size === null) {
+    // Hidden or collapsed. Deliberately do NOT resize: tearing the buffers down
+    // to 1x1 is what produced the black flash. Keep everything as it is and
+    // wait to be shown again.
+    surfaceValid = false;
+    return;
+  }
+  const { w, h } = size;
+  const wasInvalid = !surfaceValid;
+  surfaceValid = true;
+  if (!force && !wasInvalid && w === ctx.width && h === ctx.height) return;
   ctx.width = w;
   ctx.height = h;
   ctx.camera.aspect = w / h;
