@@ -6,6 +6,7 @@ import { Input } from './core/Input';
 import { Recorder } from './core/Recorder';
 import { prewarm } from './core/Prewarm';
 import { FrameWatch } from './core/FrameWatch';
+import { Diagnostics } from './core/Diagnostics';
 import { RenderPipeline } from './render/Renderer';
 import { DrawBudget } from './render/DrawBudget';
 import { Sky } from './render/Sky';
@@ -82,8 +83,12 @@ const hud = new HUD();
 const audio = new Audio();
 const drawBudget = new DrawBudget();
 const frameWatch = new FrameWatch();
+const diagnostics = new Diagnostics();
 
-const view0 = viewportSize();
+// At module scope the element may not be laid out yet, and viewportSize()
+// correctly refuses to invent a size. A real one arrives from `resize(true)`
+// during boot; this only has to be non-degenerate so the camera can be built.
+const view0 = viewportSize() ?? { w: Math.max(MIN_SURFACE, innerWidth || 1280), h: Math.max(MIN_SURFACE, innerHeight || 720) };
 
 const ctx: Ctx = {
   renderer: null as any,
@@ -163,6 +168,7 @@ async function boot() {
     await systems[i].init?.(ctx);
   }
   frameWatch.init(ctx);
+  diagnostics.init(ctx);
   installResizeListeners();
   installContextRecovery();
   resize(true);
@@ -237,6 +243,21 @@ let renderFailures = 0;
 /** Set between context loss and a completed restore; nothing runs meanwhile. */
 let suspended = false;
 
+/**
+ * Draw calls attributable to the SCENE, not the post chain.
+ *
+ * `renderer.info.render.calls` is reset by three at the top of every
+ * `render()`, and the composer's final fullscreen pass is the last one in the
+ * frame — so sampling after `composer.render()` reports the quad and nothing
+ * else. The pipeline records the scene-pass count for us; fall back to the raw
+ * counter when there is no composer.
+ */
+function sceneDrawCalls(): number {
+  const recorded = (pipeline as unknown as { lastSceneCalls?: number }).lastSceneCalls;
+  if (typeof recorded === 'number') return recorded;
+  return ctx.renderer?.info.render.calls ?? 0;
+}
+
 let last = performance.now();
 function frame(now: number) {
   requestAnimationFrame(frame);
@@ -285,6 +306,9 @@ function frame(now: number) {
       pipeline.render(ctx);
       renderFailures = 0;
       frameWatch.afterPresent(ctx);
+      // Scene draws only — the post chain's fullscreen quads always run, so
+      // counting everything would mask exactly the failure we are watching for.
+      diagnostics.afterPresent(ctx, sceneDrawCalls());
     } catch (err) {
       renderFailures++;
       console.error(`[frame] render threw (${renderFailures} in a row)`, err);

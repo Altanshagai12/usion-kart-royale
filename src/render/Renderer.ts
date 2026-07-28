@@ -53,6 +53,12 @@ function probeDevice(): DeviceProfile {
   return profile;
 }
 
+/**
+ * Fullscreen quads the post chain submits regardless of what the scene drew.
+ * Only used to keep the health signal honest, so a rough figure is fine.
+ */
+const POST_QUADS = 20;
+
 /** Packs the settings the pipeline actually reacts to into one comparable int. */
 function pipelineSignature(s: Settings): number {
   return (s.quality & 3) |
@@ -286,6 +292,17 @@ export class RenderPipeline implements System {
     this.applyResolution();
   }
 
+  /**
+   * Draw calls the SCENE pass submitted on the last frame.
+   *
+   * Sampled before the composer's fullscreen passes run, because three resets
+   * `info.render` at the top of every `render()` and the last pass in the frame
+   * is a single quad — read afterwards, an empty world and a healthy one both
+   * report about the same number. The diagnostics watchdog uses this to tell
+   * "the world is not being drawn" apart from "the world is fine".
+   */
+  lastSceneCalls = 0;
+
   render(ctx: Ctx) {
     // Nothing may draw between 'webglcontextlost' and the rebuild that follows
     // 'webglcontextrestored'. Every GL call in that window is a silent no-op,
@@ -304,7 +321,15 @@ export class RenderPipeline implements System {
 
     if (this.composer !== null) {
       this.fx.sync(ctx, ctx.dt);
+      this.renderer.info.autoReset = false;
+      this.renderer.info.reset();
       this.composer.render(ctx.dt);
+      // The scene pass is the first thing the composer runs, and every pass
+      // after it is one quad. Subtracting the fixed post-chain cost is less
+      // reliable across quality tiers than simply noting that a healthy frame
+      // is in the hundreds and a dead one is in single digits.
+      this.lastSceneCalls = Math.max(0, this.renderer.info.render.calls - POST_QUADS);
+      this.renderer.info.autoReset = true;
     } else {
       this.renderer.setRenderTarget(null);
       // Explicit, not left to `autoClear`: this path is reached both from a
@@ -316,6 +341,7 @@ export class RenderPipeline implements System {
       // is drawn but the HUD-side letterbox is not.
       this.renderer.clear(true, true, false);
       this.renderer.render(ctx.scene, ctx.camera);
+      this.lastSceneCalls = this.renderer.info.render.calls;
     }
 
     // ------------------------------------------------------------------------
