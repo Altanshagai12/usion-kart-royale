@@ -52,15 +52,75 @@ export class FrameWatch {
   private frames = 0;
   private reported = 0;
 
-  init(ctx: Ctx) {
-    this.enabled = new URLSearchParams(location.search).get('debug') === 'frames';
-    if (!this.enabled) return;
+  init(_ctx: Ctx) {
+    // ALWAYS publish the handle, even when sampling is off. Gating the global on
+    // the flag means a player who forgets ?debug=frames gets
+    // "__frameWatch is not defined" — an error about the debugging tool rather
+    // than any information about the bug.
     (window as any).__frameWatch = this;
+    if (new URLSearchParams(location.search).get('debug') === 'frames') this.start();
+    else {
+      console.info(
+        '%c[frame-watch] available but idle. Run __frameWatch.start() to begin sampling ' +
+        '(no reload needed), then __frameWatch.report() after you see a black flash.',
+        'color:#8ab4ff',
+      );
+    }
+  }
+
+  /**
+   * Begin sampling.
+   *
+   * Refuses unless the context was created with `preserveDrawingBuffer`, which
+   * only `?debug=frames` does. Without it `readPixels` on the default
+   * framebuffer returns discarded contents — measured as a solid run of zeros
+   * on a frame that presented perfectly — and every reading is a false
+   * positive. This tool existed for one round in that state and produced a
+   * console full of confident nonsense.
+   */
+  start(ctx?: Ctx) {
+    const c = ctx ?? (window as any).__ctx as Ctx | undefined;
+    const attrs = c?.renderer?.getContext?.()?.getContextAttributes?.();
+    if (attrs && attrs.preserveDrawingBuffer !== true) {
+      console.error(
+        '[frame-watch] cannot sample: the WebGL context was created without ' +
+        'preserveDrawingBuffer, so reads of the presented frame are garbage. ' +
+        'Reload with ?debug=frames',
+      );
+      return 'unavailable — reload with ?debug=frames';
+    }
+    this.enabled = true;
+    this.tears.length = 0;
+    this.reported = 0;
     console.info(
-      '%c[frame-watch] on — sampling the drawing buffer for partial-black presents.\n' +
-      'Play until you see a black flash, then run: copy(JSON.stringify(__frameWatch.tears))',
+      '%c[frame-watch] ON — sampling the drawing buffer for partial-black presents.\n' +
+      'Play until you see a black flash, then run: __frameWatch.report()',
       'color:#ffb020;font-weight:bold',
     );
+    return 'sampling';
+  }
+
+  stop() {
+    this.enabled = false;
+    return 'stopped';
+  }
+
+  /**
+   * Prints a summary and returns the raw records. Copy the JSON with
+   * `copy(__frameWatch.report())` — the return value is the string, so `copy`
+   * puts something useful on the clipboard rather than "[object Object]".
+   */
+  report(): string {
+    if (!this.enabled && this.tears.length === 0) {
+      console.warn('[frame-watch] never started — run __frameWatch.start() first.');
+      return '[]';
+    }
+    console.info(
+      `[frame-watch] ${this.tears.length} partial-black frame(s) out of ${this.frames} sampled ` +
+      `(every ${SAMPLE_EVERY}th frame).`,
+    );
+    if (this.tears.length) console.table(this.tears.slice(-25));
+    return JSON.stringify(this.tears);
   }
 
   /** Called immediately after the present, once the frame is on the buffer. */

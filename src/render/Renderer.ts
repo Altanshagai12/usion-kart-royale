@@ -124,7 +124,13 @@ export class RenderPipeline implements System {
       stencil: false,
       depth: true,
       alpha: false,
-      preserveDrawingBuffer: false,
+      // False in normal play: keeping the drawing buffer costs a copy every
+      // frame. But `?debug=frames` exists to read that buffer back, and with
+      // this false the read returns DISCARDED contents — measured as all zeros
+      // on a frame that presented perfectly — so the watchdog reports 100%
+      // black on a healthy frame. An instrument that lies is worse than none.
+      preserveDrawingBuffer:
+        new URLSearchParams(location.search).get('debug') === 'frames',
       failIfMajorPerformanceCaveat: false,
     });
 
