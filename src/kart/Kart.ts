@@ -209,7 +209,7 @@ const DRIFT_TIERS = [0.6, 1.45, 2.5];
  *  would be the wrong fix — it would pay for letting go, not for holding on.
  * ============================================================================
  */
-const DRIFT_CARRY_TIME = 0;
+const DRIFT_CARRY_TIME = 0.4;
 
 /** Tier banked by `t` seconds on the charge clock. */
 function tierFor(t: number) {

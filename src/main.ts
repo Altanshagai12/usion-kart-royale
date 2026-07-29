@@ -227,10 +227,30 @@ function dismissBootScreen() {
  */
 /** A single frame this long has already missed a dozen vsyncs. Let it drain. */
 const STALL_MS = 220;
-/** Sustained cost above this (~22 fps) buys nothing by presenting every frame. */
+/**
+ * Sustained cost above this (~22 fps) means the GPU cannot afford the frame at
+ * the current resolution. The answer is FEWER PIXELS, not fewer presents.
+ *
+ * This used to halve the present rate, and that was the wrong trade for a
+ * racing game. Presenting every other frame does not reduce the work per frame
+ * at all — it just shows half of it, so a 45ms frame becomes a 90ms *picture*
+ * while the simulation carries on underneath. The player reported exactly what
+ * that produces: "the frame rate or something seems slower... it doesn't feel
+ * as fast as the odometer". Present cadence is what the eye reads as motion.
+ * Dropping internal resolution instead makes the frame genuinely cheaper and
+ * keeps every frame on screen.
+ */
 const SLOW_MS = 45;
-/** Hysteresis, so the cadence does not chatter around the threshold. */
-const RECOVER_MS = 34;
+/** Hysteresis, so the scale does not chatter around the threshold. */
+const RECOVER_MS = 26;
+/** Resolution rungs. Each is ~30% fewer pixels than the one above. */
+const SCALE_RUNGS = [1, 0.85, 0.72, 0.6, 0.5];
+/**
+ * Frames between resolution changes. Every change reallocates the composer's
+ * buffers, so reacting instantly to a transient would cost more than the
+ * transient did.
+ */
+const SCALE_COOLDOWN = 90;
 /** The watchdog stays out of the way until the scene has settled. */
 const WATCHDOG_FROM_FRAME = 30;
 
@@ -238,8 +258,9 @@ const WATCHDOG_FROM_FRAME = 30;
 let renderCostEma = 16.7;
 /** Frames still to skip presenting. */
 let skipRender = 0;
-/** True while the loop is running at a 2:1 present cadence. */
-let halfRate = false;
+/** Index into SCALE_RUNGS; 0 is full resolution. */
+let scaleRung = 0;
+let scaleCooldown = 0;
 let stallCount = 0;
 let renderFailures = 0;
 /** Set between context loss and a completed restore; nothing runs meanwhile. */
@@ -340,13 +361,29 @@ function frame(now: number) {
         console.warn(`[frame] ${Math.round(cost)}ms frame; skipping the next present to drain`);
       }
       skipRender = 1;
-    } else if (!halfRate && renderCostEma > SLOW_MS) {
-      halfRate = true;
-      console.warn(`[frame] sustained ${Math.round(renderCostEma)}ms frames; halving the present rate`);
-    } else if (halfRate && renderCostEma < RECOVER_MS) {
-      halfRate = false;
+    } else if (ctx.frame <= WATCHDOG_FROM_FRAME) {
+      // Boot frames are enormous — shader pre-warm, first-use uploads, the
+      // PMREM bake — and they poison the average. Measured: the scaler dropped
+      // a rung at frame 9 off a 56ms EMA that was entirely startup cost, on a
+      // machine that then ran at 8ms. Hold the EMA at the target until the
+      // scene has actually settled.
+      renderCostEma = 16.7;
+    } else if (scaleCooldown > 0) {
+      scaleCooldown--;
+    } else if (renderCostEma > SLOW_MS && scaleRung < SCALE_RUNGS.length - 1) {
+      scaleRung++;
+      scaleCooldown = SCALE_COOLDOWN;
+      pipeline.setDynamicScale(SCALE_RUNGS[scaleRung]);
+      console.warn(
+        `[frame] sustained ${Math.round(renderCostEma)}ms frames; ` +
+        `render scale -> ${SCALE_RUNGS[scaleRung]} (every frame still presented)`,
+      );
+    } else if (renderCostEma < RECOVER_MS && scaleRung > 0) {
+      scaleRung--;
+      scaleCooldown = SCALE_COOLDOWN;
+      pipeline.setDynamicScale(SCALE_RUNGS[scaleRung]);
+      console.info(`[frame] recovered; render scale -> ${SCALE_RUNGS[scaleRung]}`);
     }
-    if (halfRate && skipRender === 0) skipRender = 1;
   }
 
   if (ctx.frame === 8) {
@@ -488,7 +525,9 @@ function installContextRecovery() {
     last = performance.now();
     renderCostEma = 16.7;
     skipRender = 0;
-    halfRate = false;
+    scaleRung = 0;
+    scaleCooldown = 0;
+    pipeline.setDynamicScale(1);
     renderFailures = 0;
     suspended = false;
   };
@@ -506,11 +545,12 @@ boot().catch((err) => {
 (window as any).__drawBudget = drawBudget;
 (window as any).__camRig = camera; // TEMP-PROBE
 // Watchdog state, for the perf and soak harnesses: how many frames overran, and
-// whether the loop is currently presenting at half rate.
+// what resolution rung the adaptive scaler has settled on.
 (window as any).__loopHealth = () => ({
   frame: ctx.frame,
   renderCostEma: +renderCostEma.toFixed(2),
-  halfRate,
+  renderScale: SCALE_RUNGS[scaleRung],
+  scaleRung,
   stalls: stallCount,
   renderFailures,
   suspended,

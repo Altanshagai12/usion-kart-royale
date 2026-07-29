@@ -583,10 +583,36 @@ export class RenderPipeline implements System {
    * `devicePixelRatio`: `maxPixelRatio` caps it, `renderScale` scales it, and a
    * software rasteriser is pinned to 1.
    */
+  /**
+   * Dynamic resolution, 0.5..1. Deliberately NOT part of `Settings`, because
+   * `pipelineSignature` covers `renderScale` and any change there tears down and
+   * rebuilds the entire effect chain. Adaptive scaling has to be able to move
+   * every second or two; rebuilding the chain that often would cost far more
+   * than it saves.
+   */
+  dynamicScale = 1;
+
+  /**
+   * Adjust internal render resolution without rebuilding the chain.
+   *
+   * This is the correct response to a GPU that cannot keep up, and it is what
+   * replaced halving the PRESENT rate. For a racing game a smooth 25 fps at 80%
+   * resolution beats a juddering 12 fps at full resolution every time: present
+   * cadence is what the eye reads as motion, and the sim was already running at
+   * full rate underneath, so halving the present only added judder and changed
+   * nothing about latency.
+   */
+  setDynamicScale(scale: number): void {
+    const next = THREE.MathUtils.clamp(scale, 0.5, 1);
+    if (Math.abs(next - this.dynamicScale) < 0.01) return;
+    this.dynamicScale = next;
+    this.applyResolution();
+  }
+
   private effectivePixelRatio(): number {
     const s = this.ctx.settings;
     const cap = this.device.software ? 1 : Math.max(0.5, s.maxPixelRatio);
-    const scale = THREE.MathUtils.clamp(s.renderScale, 0.25, 2);
+    const scale = THREE.MathUtils.clamp(s.renderScale, 0.25, 2) * this.dynamicScale;
     const dpr = THREE.MathUtils.clamp(globalThis.devicePixelRatio || 1, 0.5, 4);
     const ratio = Math.min(dpr, cap) * scale;
 
