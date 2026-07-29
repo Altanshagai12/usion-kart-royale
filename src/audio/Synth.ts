@@ -8,12 +8,21 @@
  *
  *  Signal flow:
  *
- *      music ─┐
- *      sfx  ──┼→ mix ─→ glue ─→ limiter ─→ trim ─→ safety clip ─→ master ─→ out
- *      engine ┘   ↑
- *                 │
+ *      music  ─→ musicDuck  ─┐
+ *      sfx  ─────────────────┼→ mix ─→ glue ─→ limiter ─→ trim ─→ safety ─→ master ─→ out
+ *      engine ─→ engineDuck ─┤   ↑
+ *      lead   ─→ presence ───┘   │
+ *                                │
  *      reverbIn ─→ HP ─→ convolver ─→ reverbReturn ─┤
  *      delayIn  ─→ ping-pong delay ─→ delayReturn  ─┘
+ *
+ *  The two duck gains exist so a boost can pull the engine and the music down
+ *  for 150 ms without fighting the levels the engine voices and the sequencer
+ *  are writing every frame — the duck owns one param, they own another.
+ *
+ *  `lead` is the mini-turbo charge's own path. It carries a presence bell at
+ *  2.4 kHz and it is never ducked, because the whole point of the tier tone is
+ *  that it stays legible on top of a full-throttle engine and a full band.
  *
  *  Nothing writes to `master` except the volume trim, so honouring
  *  Settings.masterVolume is a single param write.
@@ -58,6 +67,14 @@ export class Synth {
   readonly music: GainNode;
   readonly sfx: GainNode;
   readonly engine: GainNode;
+  /** the mini-turbo charge's own path — presence-lifted and never ducked */
+  readonly lead: GainNode;
+  /** event ducks — scheduled envelopes, written only by Audio.boost() */
+  readonly engineDuck: GainNode;
+  readonly musicDuck: GainNode;
+  /** continuous sidechain — smoothed per frame, written only by Audio.update() */
+  readonly engineSide: GainNode;
+  readonly musicSide: GainNode;
 
   /** send inputs — connect a source here through its own gain to feed an fx */
   readonly reverbIn: GainNode;
@@ -70,10 +87,18 @@ export class Synth {
   private voices = 0;
   private readonly voiceCap = 64;
 
-  constructor(volume: number) {
+  /**
+   * @param external an already-constructed context to build into. The game
+   *   never passes one. It exists so a harness can render this exact graph into
+   *   an OfflineAudioContext and measure it — every level, duck depth and tier
+   *   frequency quoted in the comments here and in Audio.ts came from such a
+   *   render, not from listening. An offline context implements every factory
+   *   used below.
+   */
+  constructor(volume: number, external?: BaseAudioContext) {
     const AC: typeof AudioContext =
       (globalThis as any).AudioContext || (globalThis as any).webkitAudioContext;
-    this.ctx = new AC({ latencyHint: 'interactive' });
+    this.ctx = (external ?? new AC({ latencyHint: 'interactive' })) as AudioContext;
     const ac = this.ctx;
 
     this.master = ac.createGain();
@@ -91,8 +116,14 @@ export class Synth {
     safety.oversample = '4x';
     safety.connect(this.master);
 
+    // `mix` came down 1.9 dB and this went up 1.0, so the compressors see 1.9 dB
+    // less and the output only loses 0.9. The old staging drove the race mix
+    // hard into the limiter, and a signal added on top of a pinned limiter does
+    // not get louder — it just pushes everything already there down, which is
+    // the opposite of what a tier tone needs to do. Measured at the new staging
+    // the full pile-up peaks at 0.86 with zero samples over full scale.
     const trim = ac.createGain();
-    trim.gain.value = 0.55;
+    trim.gain.value = 0.62;
     trim.connect(safety);
 
     const limiter = ac.createDynamicsCompressor();
@@ -107,29 +138,71 @@ export class Synth {
     // whole mix to one level: adding a tyre squeal on top of the engine moved
     // the output by 2 dB and ducked everything else by 3, which is exactly the
     // pumping that makes a racing mix feel dead. This only catches real peaks.
+    //
+    // Softened again this round. A bus compressor does not only squash things
+    // that get louder, it *fills in* things that get quieter: it releases into
+    // any hole a duck makes, which works directly against the boost duck and
+    // the charge sidechain. Measured, this setting is worth about 0.5 dB of duck
+    // depth on its own — the large offender was the reverb send (see Audio.ts),
+    // not this — but a racing mix wants the transients anyway.
     const glue = ac.createDynamicsCompressor();
-    glue.threshold.value = -8;
-    glue.knee.value = 10;
-    glue.ratio.value = 2.5;
-    glue.attack.value = 0.01;
-    glue.release.value = 0.25;
+    glue.threshold.value = -4;
+    glue.knee.value = 6;
+    glue.ratio.value = 1.8;
+    glue.attack.value = 0.012;
+    glue.release.value = 0.16;
     glue.connect(limiter);
 
     this.mix = ac.createGain();
-    this.mix.gain.value = 0.92;
+    this.mix.gain.value = 0.74;
     this.mix.connect(glue);
 
+    // Two gains in series per bus, not one. The event duck is a fully scheduled
+    // envelope that calls cancelScheduledValues, and the sidechain is rewritten
+    // every frame with setTargetAtTime — put them on the same AudioParam and
+    // each frame's write erases the boost duck that is mid-flight.
+    this.musicSide = ac.createGain();
+    this.musicSide.gain.value = 1;
+    this.musicSide.connect(this.mix);
+
+    this.musicDuck = ac.createGain();
+    this.musicDuck.gain.value = 1;
+    this.musicDuck.connect(this.musicSide);
+
     this.music = ac.createGain();
-    this.music.gain.value = 0.42;
-    this.music.connect(this.mix);
+    this.music.gain.value = 0.38;
+    this.music.connect(this.musicDuck);
 
     this.sfx = ac.createGain();
     this.sfx.gain.value = 0.9;
     this.sfx.connect(this.mix);
 
+    this.engineSide = ac.createGain();
+    this.engineSide.gain.value = 1;
+    this.engineSide.connect(this.mix);
+
+    this.engineDuck = ac.createGain();
+    this.engineDuck.gain.value = 1;
+    this.engineDuck.connect(this.engineSide);
+
     this.engine = ac.createGain();
     this.engine.gain.value = 0.62;
-    this.engine.connect(this.mix);
+    this.engine.connect(this.engineDuck);
+
+    // The charge tone's own path. The presence bell is not decoration: the
+    // engine's energy is almost all below 1.5 kHz and the music's lead sits at
+    // 700–1600, so a few dB at 2.4 k is where a tier tone can be heard without
+    // being loud. Measured against a full-throttle engine, this bought ~4 dB of
+    // separation for +1.5 dB of level.
+    const presence = ac.createBiquadFilter();
+    presence.type = 'peaking';
+    presence.frequency.value = 2400;
+    presence.Q.value = 0.7;
+    presence.gain.value = 6;
+    presence.connect(this.mix);
+    this.lead = ac.createGain();
+    this.lead.gain.value = 1;
+    this.lead.connect(presence);
 
     // --- reverb -----------------------------------------------------------
     const conv = ac.createConvolver();
@@ -445,6 +518,35 @@ export class Synth {
   /** Linear glide toward a value — the workhorse for continuous voices. */
   glide(p: AudioParam, v: number, tau = 0.04, t = this.ctx.currentTime) {
     p.setTargetAtTime(v, t, tau);
+  }
+
+  /**
+   * A duck-and-return envelope, fully scheduled up front so it cannot be
+   * disturbed by whatever the per-frame code writes to *other* params.
+   *
+   *   1 → `depth` in `fall` → hold → `over` (overshoot) → 1
+   *
+   * The overshoot is the important part. A duck that returns to unity sounds
+   * like a mistake being corrected; a duck that comes back *past* unity and
+   * settles reads as the thing that was ducked surging back under load, which
+   * is exactly what an engine does when a boost lets go.
+   */
+  duck(
+    p: AudioParam,
+    t0: number,
+    depth: number,
+    hold: number,
+    over: number,
+    recover: number,
+    fall = 0.018,
+  ) {
+    const d = Math.max(depth, EPS);
+    p.cancelScheduledValues(t0);
+    p.setValueAtTime(Math.max(p.value, EPS), t0);
+    p.exponentialRampToValueAtTime(d, t0 + fall);
+    p.setValueAtTime(d, t0 + fall + hold);
+    p.exponentialRampToValueAtTime(Math.max(over, EPS), t0 + fall + hold + recover * 0.45);
+    p.exponentialRampToValueAtTime(1, t0 + fall + hold + recover);
   }
 
   // -------------------------------------------------------------------------

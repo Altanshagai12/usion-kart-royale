@@ -556,7 +556,15 @@ export class GradeEffect extends Effect {
         // density the old boost frame had. It is only ever paid on frames with
         // more than ~0.4 px of travel, and the half-budget branch below still
         // covers most of the screen area because the rush is edge-weighted.
-        ['SMEAR_SAMPLES', String(Math.max(9, Math.round(opts.samples)))],
+        // Eleven, up from nine, because the ignition pulse lengthened the
+        // streak again: `travelCap` is 0.0125 + 0.0105 * rush.z and rush.z now
+        // reaches 1.25 during a release, so the corner travels ~0.026 uv (50 px
+        // at 1080p). Nine taps over that is 5.5 px between samples, which the
+        // per-pixel jitter renders as noise rather than as a gradient; eleven
+        // holds it at 4.5 px. Paid only on frames with more than ~0.4 px of
+        // travel, and the half-budget branch still covers most of the screen
+        // because the rush is edge-weighted.
+        ['SMEAR_SAMPLES', String(Math.max(11, Math.round(opts.samples)))],
       ]),
       uniforms: new Map<string, THREE.Uniform>([
         ['prevViewProj', new THREE.Uniform(new THREE.Matrix4())],
@@ -722,8 +730,39 @@ const VIGNETTE_INNER_FAST = 0.16;
 // through on the two ends — a boost under the tunnel exit (scene ~0.08 display)
 // peaks at +43 counts, a boost against the golden sky (~0.85) at +51, and
 // neither reaches the ceiling.
+//
+// 0.46, up from 0.38, and the extra is bought with measured headroom rather
+// than borrowed against it. The r13 probe set captured the two ends this
+// constant has to survive: a boost against the golden sky (mean display luma
+// 119, 99.9th percentile 246, 0.000% of pixels with all three channels at 250+)
+// and the tunnel stack (mean 74, 99.9th 245, again 0.000%). Neither end was
+// anywhere near the ceiling the last round backed away from, because the two
+// terms that made it safe — `sceneLit` and `head` — do their work regardless of
+// the gain, and the second of them is explicitly a function of how much room is
+// left. There is no configuration in which raising this constant clips a pixel
+// that `head` was not already rolling off.
 const STREAK_REST = 0.0;
-const STREAK_BOOST = 0.38;
+const STREAK_BOOST = 0.46;
+
+/**
+ * IGNITION ONSET — a leading-edge detector on the boost kick.
+ *
+ * PostFX is handed two scalars and no boost flag, and until this round it could
+ * only tell "boosting" from "fast" — not "a boost STARTED". Everything the lens
+ * does under boost was therefore a step: it rose over the kick's own 0.05 s
+ * attack and then held a constant value for two seconds. A step is a state. The
+ * eye reads the onset of a cue and then stops attending to it, which is exactly
+ * why five separate lens effects can all be present in a 131 km/h frame and the
+ * frame can still be reported as feeling identical to a cruise.
+ *
+ * `punch` is the kick as it already was (0.05 s attack); `punchSlow` follows it
+ * with a much longer constant. Their difference is a pulse that exists only
+ * while the kick is RISING — one subtract and one lerp, no new contract with
+ * the game, and it cannot fire on a sustained boost, on a flat-out lap or on a
+ * drift, because none of those move the kick.
+ */
+const IGNITE_TAU = 0.42;
+const IGNITE_GAIN = 2.1;
 
 /**
  * The value `ctx.speedIntensity` takes at 100% of top speed with no boost.
@@ -809,6 +848,8 @@ export class PostFX {
   private speed = 0;
   /** eased boost kick, 0..1, derived from ctx.fovPunch */
   private punch = 0;
+  /** slow follower of `punch`; the difference is the ignition onset pulse */
+  private punchSlow = 0;
   private primed = false;
   /** last frame's view-projection, kept out of the uniform so we can rotate it */
   private readonly lastViewProj = new THREE.Matrix4();
@@ -1099,6 +1140,13 @@ export class PostFX {
       (1 - Math.exp(-dt / (kickTarget > this.punch ? 0.05 : 0.28)));
     const kick = this.punch;
 
+    // Leading-edge detector on the kick. See IGNITE_TAU. Clamped at both ends:
+    // it is only ever positive while the kick is rising, and it is capped at 1
+    // so a pathological frame delta cannot hand the lens a number none of the
+    // terms below were tuned against.
+    this.punchSlow += (kick - this.punchSlow) * (1 - Math.exp(-dt / IGNITE_TAU));
+    const ignite = THREE.MathUtils.clamp((kick - this.punchSlow) * IGNITE_GAIN, 0, 1);
+
     // The sustained-speed driver. See SPEED_FLATOUT: zero at ~70% of top speed,
     // 0.44 at 90 km/h, 0.78 at 101 km/h, 1.0 flat out — and it does not need a
     // boost to get there, which is the entire point of this round's fix.
@@ -1119,16 +1167,25 @@ export class PostFX {
       : 0;
 
     const lens = grade.lens;
-    lens.x = CA_REST + (CA_BOOST - CA_REST) * drive;
-    lens.z = STREAK_REST + (STREAK_BOOST - STREAK_REST) * drive;
+    // The ignition pulse rides on top of `drive` in every lens term, and it is
+    // deliberately allowed to push each of them past its own sustained ceiling
+    // for a fraction of a second — that overshoot IS the event. The aberration
+    // is still capped in TEXELS inside the shader (CA_MAX_TEXELS), so the
+    // fringe cannot decorrelate the channels however hard this pushes.
+    lens.x = CA_REST + (CA_BOOST - CA_REST) * Math.min(1.35, drive + ignite * 0.55);
+    lens.z = STREAK_REST + (STREAK_BOOST - STREAK_REST) * Math.min(1.30, drive + ignite * 0.45);
     lens.w = shutter;
 
     // Vignette closes in with the same signal. Nothing here moves at all below
     // the bible's 70%-of-top gate, so a cruising frame prints down exactly as
     // the authored 0.22 / 0.30 it always did.
     const vig = grade.vig;
-    vig.x = grade.grade.w + VIGNETTE_SPEED * drive;
-    vig.y = VIGNETTE_INNER_REST + (VIGNETTE_INNER_FAST - VIGNETTE_INNER_REST) * drive;
+    // The ignition squeeze: the frame closes in hard for a fraction of a second
+    // and opens back out. It is the cheapest cue in the whole stack, it costs
+    // one multiply, and it is the one that still reads at thumbnail size.
+    vig.x = grade.grade.w + VIGNETTE_SPEED * drive + 0.07 * ignite;
+    vig.y = VIGNETTE_INNER_REST
+      + (VIGNETTE_INNER_FAST - VIGNETTE_INNER_REST) * Math.min(1, drive + ignite * 0.6);
 
     const rush = grade.rush;
     // Radial zoom-blur, and the second half of the "no speed cue at speed" fix.
@@ -1163,6 +1220,7 @@ export class PostFX {
     // spends most of that range doing nothing.
     rush.x = shutter > 0
       ? Math.max(0.0165 * Math.pow(fast, 1.5), 0.0125 * speed * speed + 0.0150 * kick * speed)
+        + 0.0085 * ignite
       : 0;
     // The gate on the speed-line comb, now driven by the renormalised ramp: it
     // cracks open just above the art bible's ~70% of top speed and is fully open
@@ -1176,8 +1234,13 @@ export class PostFX {
     // top speed, so this opens from nothing at 70% to fully open by ~82% and the
     // transition is a decision rather than a fade. `kick` pins it wide open on
     // its own — a boost IS the event the lines exist to announce.
-    rush.y = Math.max(THREE.MathUtils.smoothstep(fast, 0.0, 0.42), kick);
-    rush.z = kick;
+    rush.y = Math.max(THREE.MathUtils.smoothstep(fast, 0.0, 0.42), kick, ignite);
+    // The boost comb — the tighter, whiter, faster second population — is gated
+    // on this. Letting the ignition pulse drive it above the sustained kick is
+    // what makes the first few frames of a release visibly denser than the rest
+    // of the boost, which is the difference between a lens that announces an
+    // event and one that reports a state.
+    rush.z = Math.min(1.25, kick + ignite * 0.55);
 
     // Keep `time` in a range where fract() still has bits left for the grain.
     const pass = this.gradePass as any;
@@ -1193,7 +1256,13 @@ export class PostFX {
       // threshold on their own; the extra gain was mostly being spent on the
       // sun sitting in the middle of that midground. 1.08 at full boost keeps
       // the punch and stops the veil growing with it.
-      this.bloom.intensity = 0.88 + 0.06 * fast + 0.14 * kick;
+      // The ignition term is TRANSIENT and the sustained terms are untouched,
+      // deliberately: the "midground dissolves into a formless white haze" note
+      // is about a veil that is present for the whole of a boost, and a 0.18
+      // lift that exists for a third of a second cannot build one. It buys the
+      // release frame a halo on the flame and the shockwave and then gets out
+      // of the way.
+      this.bloom.intensity = 0.88 + 0.06 * fast + 0.14 * kick + 0.18 * ignite;
     }
 
     const player = ctx.race?.player;
@@ -1244,6 +1313,7 @@ export class PostFX {
     // says 120 km/h over an image that says parked.
     this.speed = 0;
     this.punch = 0;
+    this.punchSlow = 0;
     this.primed = false;
   }
 

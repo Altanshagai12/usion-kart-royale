@@ -47,6 +47,7 @@
  * ============================================================================
  */
 import * as THREE from 'three';
+import { feel } from '../core/Feel';
 import { BASE_TOP_SPEED, RaceState, type Ctx, type IKart, type System, type TrackSample } from '../types';
 
 // ===========================================================================
@@ -1089,13 +1090,13 @@ export class ChaseCamera implements System {
       _dir.applyQuaternion(_q);
     }
 
-    let dist = ARM_DIST + ARM_DIST_SPEED * sp
+    let dist = ARM_DIST + feel.armDistSpeed * sp
       + surge * BOOST_SURGE_DIST
       - boost * BOOST_DIST
       - this.brakeAmt * BRAKE_DIST
       + this.driftAmt * DRIFT_DIST
       - this.lookAmt * 1.4;
-    let height = ARM_HEIGHT + ARM_HEIGHT_SPEED * sp
+    let height = ARM_HEIGHT + feel.armHeightSpeed * sp
       + surge * BOOST_SURGE_HEIGHT
       - boost * BOOST_HEIGHT
       - this.brakeAmt * BRAKE_HEIGHT
@@ -1570,7 +1571,7 @@ export class ChaseCamera implements System {
     } else {
       target = clamp(
         FOV_BASE
-        + sp * FOV_SPEED
+        + sp * feel.fovSpeed
         + ctx.fovPunch * FOV_BOOST
         + this.lookAmt * 3.0
         + Math.abs(this.corner) * FOV_CORNER

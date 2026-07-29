@@ -125,7 +125,58 @@ import { TUNNEL_T0, TUNNEL_T1 } from '../world/TrackLayout';
  * wrap) and Effects (particle lighting). All three clamp, and all three now sit
  * ON their clamp — see the report; they want re-scaling against 8.0.
  */
-const SUN_INTENSITY = 8.0;
+const SUN_INTENSITY = 13.5;
+/*
+ * ROUND 3, and the number above is the whole of this round's headline.
+ *
+ * Round 2's note (kept below in full) got the diagnosis right and stopped one
+ * lever short of the target. Measured on the running build, linear irradiance
+ * on a flat upward-facing surface, decomposed per term:
+ *
+ *                       round 2        round 3
+ *   key                 1.445          2.438
+ *   cool fill           0.151          0.119     (re-aimed, not scaled)
+ *   SH probe            0.055          0.031
+ *   diffuse IBL         0.106          0.043
+ *   irradiance floor    0.076          0.056
+ *   ------------------------------------------
+ *   lit total           1.752          2.647
+ *   shadowed total      0.388          0.249
+ *   ratio               4.51:1         10.6:1
+ *   STOPS               2.17           3.41
+ *
+ * Two things are worth saying about the shape of that.
+ *
+ * FIRST, both halves moved, and they had to. Halving the shadow alone gets to
+ * 3.2 stops with the frame a stop darker than it already was; doubling the key
+ * alone gets to 3.0 with the shadow still carrying a quarter of a stop of blue
+ * wash that nothing occludes. The complaint is a RATIO, so the fix is a ratio.
+ *
+ * SECOND, there was room. The round-2 build clipped 0.000% of every frame to
+ * white — the histogram never touched the top — which is the "no highlight
+ * anchor" note stated numerically, and it means raising the key by 5.5 stops'
+ * worth of nothing... by 0.75 of a stop costs no highlight that was there. It
+ * spends headroom that was sitting unused. Exposure is Renderer.ts's (1.05,
+ * ACES) and is deliberately NOT touched: the sky calibration solves against
+ * whatever it finds, so the bible's #3f74c4 / #ffd0a0 land wherever it is set,
+ * and moving it would have re-graded every frame instead of re-lighting it.
+ *
+ * WHAT THIS IS NOT: physical. At a 14° sun a physically correct horizontal
+ * surface sees roughly 150 W/m² of direct against 90 of diffuse sky, i.e. about
+ * 0.7 of a stop — which is precisely why every round of this project has
+ * reported a flat road and why no amount of correctness was going to fix it.
+ * The 3-4 stops asked for here is what a golden-hour photograph looks like on a
+ * surface facing the light, applied to one that is not. It is a deliberate
+ * stylisation and the rest of the rig is built to pay for it: the key is the
+ * only term with a cosine, so everything else has to be small enough that a
+ * quarter of the key still wins.
+ *
+ * DOWNSTREAM, RE-CHECKED: `ctx.sun.intensity` is read by Water (glitter,
+ * `min(i, 6)`), Scenery (foliage wrap, `clamp(i * 0.14, 0.2, 1.1)`) and Effects
+ * (particle lighting, `min(1.2, i * 0.26)`). All three were already saturated on
+ * their clamps at 8.0, so all three are bit-identical at 13.5. The rim term in
+ * `krSunRim` scales linearly with the key and IS affected — see RIM_STRENGTH.
+ */
 /**
  * `scene.environmentIntensity`, i.e. the multiplier on every material's
  * authored envMapIntensity. This is 1.0 and must stay 1.0: at 0.40 the kart's
@@ -152,8 +203,17 @@ const ENV_INTENSITY = 1.0;
  * to anything. It, not the fill, is what made a lit tarmac patch measure R:B
  * 1.04 (neutral) under a #ffd9a8 key. Trimmed to 0.115 the lit road measures
  * 1.61 while the shadowed road stays at 0.39.
+ *
+ * ROUND 3: 0.115 -> 0.060, and this is a smaller cut than it looks. The
+ * environment's lower hemisphere was as bright as its sky (see `groundColor` in
+ * Atmosphere.ts), so a large share of what this term delivered to an UP-facing
+ * normal was reflected ground arriving as pure DC — a number with no direction
+ * in it at all. With the ground darkened, the same coefficient would already
+ * have cost ~15%; the rest of the cut buys shadow separation. What survives,
+ * 0.043 on flat road, is now genuinely the blue upper sky and now genuinely
+ * varies with the normal, which is the only thing a diffuse IBL is for.
  */
-const DIFFUSE_ENV_INTENSITY = 0.115;
+const DIFFUSE_ENV_INTENSITY = 0.060;
 /**
  * Roughness rolloff on the SPECULAR half of the IBL — see `envDiffuseChunk`.
  * Full strength below ROUGH_ENV_START so nothing §4 asks to mirror the sky is
@@ -198,16 +258,34 @@ const DIFFUSE_ENV_INTENSITY = 0.115;
  *
  * After: tarmac 2.68:1 (1.42 stops), lit (57,51,62) against shadowed
  * (18,25,47) — a shadow you can see from across the room.
+ *
+ * ROUND 3 takes the far end from 0.14 to 0.09. The argument has not changed and
+ * the arithmetic has: this is still the one term on a road pixel that a shadow
+ * map cannot touch, so as the DIFFUSE ratio goes from 4.5:1 to 10.6:1 it becomes
+ * a larger and larger share of what is left in shadow, and a fixed unshadowed
+ * pedestal is exactly what caps a measured pixel ratio below the measured
+ * irradiance ratio. 0.09 is still five times what the polish line at roughness
+ * 0.55 keeps (0.46 of full strength), so the worn racing groove goes on reading
+ * brighter and smoother than the tarmac either side of it, and every material
+ * §4 names is below ROUGH_ENV_START and untouched.
  */
 const ROUGH_ENV_START = 0.35;
 const ROUGH_ENV_END = 0.70;
-const ROUGH_ENV_SCALE = 0.14;
+const ROUGH_ENV_SCALE = 0.09;
 /** SH ambient on top of the env map — energy compensation for the bounces
  *  single-scattering IBL cannot see, and the only ambient that reaches
  *  materials which ignore environment maps. Deliberately small — and smaller
  *  still than it was (0.08), for the same reason as DIFFUSE_ENV_INTENSITY: it
- *  is omnidirectional, so every unit of it is a unit of shadow lift. */
-const PROBE_INTENSITY = 0.06;
+ *  is omnidirectional, so every unit of it is a unit of shadow lift.
+ *
+ *  ROUND 3: 0.06 -> 0.034, on the same argument taken to the same place as
+ *  DIFFUSE_ENV_INTENSITY. This is the most purely omnidirectional term in the
+ *  file — it reaches every normal in the game whatever it faces and whatever is
+ *  between it and the sky — so per unit it does more damage to key/fill
+ *  separation than anything else here, and per unit it is the least missed:
+ *  what it is compensating for is multiple scattering, and multiple scattering
+ *  at golden hour is weak. */
+const PROBE_INTENSITY = 0.034;
 /**
  * How far the ambient probe's chromaticity is pulled toward the bible's
  * #a8c8ff. Up from 0.5: the probe is the omnidirectional part of the fill and
@@ -262,6 +340,17 @@ const BOUNCE_INTENSITY = 0.13;
  *
  * i.e. the term is removed from where it was erasing the shadow and kept where
  * it was sculpting.
+ *
+ * ROUND 3 LEAVES THIS NUMBER ALONE AND TIPS THE LIGHT AGAIN (2.6 -> 3.4 of
+ * horizontal weight, 21.6° -> 16.9°; see SKY_FILL_DIRECTION). That is
+ * deliberate. This is the largest single term left on a shadowed road — 39% of
+ * that budget before this round and still 48% after it — but it is also the
+ * ONLY term putting §2's blue on a shaded flank, and the two facts point in
+ * opposite directions the moment you reach for the intensity. Tipping resolves
+ * them: -21% on the carriageway, +3% on an anti-solar wall, one number.
+ *
+ * Flat road, shadowed, this light alone: 0.151 -> 0.119. Anti-solar wall:
+ * 0.382 -> 0.392.
  */
 const SKY_FILL_INTENSITY = 0.72;
 /**
@@ -355,8 +444,17 @@ const LATERAL_BOUNCE_SLOPE = -0.14;
  * frame — which is where §2's teal is meant to live — came out grey. At 0.25
  * the term is small enough to carry real hue, and the measured lit:shadowed hue
  * split on tarmac goes from 4.10x to 4.28x for free.
+ *
+ * ROUND 3: 0.25 -> 0.185, and it is now the SECOND largest term on a shadowed
+ * road (0.056 against the fill's 0.119) rather than the fourth. That promotion
+ * is why it cannot follow the others down any further: with the probe and the
+ * diffuse IBL both roughly halved, this is what is left holding a cavity off
+ * pure black, and §3/§9.6 are not negotiable. On tarmac a fragment that no
+ * directional term reaches still lands at sRGB (4, 7, 9) — a teal near-black
+ * with hue in it. Verified in frame: the darkest 0.05% of a chase frame sits at
+ * sRGB 9, and the near-black fraction is unchanged from round 2.
  */
-const FLOOR_IRRADIANCE = 0.25;
+const FLOOR_IRRADIANCE = 0.185;
 const FLOOR_COLOR = 0x6f9cb4;
 /**
  * The same floor inside an interior volume, warm sodium instead of teal. The
@@ -384,8 +482,14 @@ const INTERIOR_FLOOR_COLOR = 0xc07a3c;
  * has just halved (0.69 -> 0.40 on flat road), so 0.22 would now be more than
  * half the shadow at the half-shadow line — a warm LINE, which is a different
  * artefact. 0.16 keeps the same visible warmth against the new floor.
+ *
+ * ROUND 3: 0.16 -> 0.105, for the third time for the same reason. The shadow
+ * budget this sits on has gone 0.69 -> 0.40 -> 0.25 across three rounds, so an
+ * absolute number that was a lick of warmth at the first is a stripe at the
+ * third. 0.105 holds it at roughly 40% of the shadow at the half-shadow line,
+ * which is where it has always visually been.
  */
-const TERMINATOR_IRRADIANCE = 0.16;
+const TERMINATOR_IRRADIANCE = 0.105;
 
 // --- aerial perspective ------------------------------------------------------
 // Replaces FogExp2. The old single exp2 term at density 0.0019 reached 44% at
@@ -714,8 +818,17 @@ interface InteriorVolume {
  * direct specular. A silhouette edge fully side-on to a 4.2 key picks up ~1.2
  * scene-linear, which lands just under display white through the shoulder — a
  * bright edge with colour still in it, not a white outline.
+ *
+ * ROUND 3: 0.34 -> 0.21, because this term multiplies `directLight.color`,
+ * which three has already premultiplied by the light's intensity — so raising
+ * the key from 8.0 to 13.5 scaled the rim by 1.69 on its own. Left alone it
+ * would have put 2.9 scene-linear on a grazing silhouette, which is not a rim
+ * with colour in it, it is a white outline. 0.21 lands the same edge at 1.8,
+ * i.e. a little hotter than round 2 in absolute terms and considerably hotter
+ * relative to a shadow that has halved — which is exactly the direction the
+ * "no rim" note was pointing.
  */
-const RIM_STRENGTH = 0.34;
+const RIM_STRENGTH = 0.21;
 /** How tightly the rim hugs the silhouette. 3.0 confines it to roughly the last
  *  20° of grazing angle; lower and it becomes a wash over the whole side. */
 const RIM_POWER = 3.0;

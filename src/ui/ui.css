@@ -407,14 +407,246 @@
   opacity: 0;
 }
 
-/* Edge tint only. The precise charge read lives on the speedometer's inner
-   arc; this is peripheral-vision confirmation. */
+/* Edge tint, and it now carries exactly one fact: the tier you have BANKED —
+   what you keep if you let go this instant. What you are earning is the rails
+   below. Two facts, two surfaces, never the same fact twice. */
 .kr-drift {
   background: radial-gradient(ellipse 72% 64% at 50% 54%,
               transparent 64%, var(--tier) 116%);
   mix-blend-mode: screen;
   opacity: 0;
   transition: background 0.22s var(--e-out);
+}
+
+/* ==========================================================================
+   THE LOOP — drift charge rails, the tier-up wash, the release callout
+   ==========================================================================
+   ROUND 11. Measured on the shipped build, kart posed at tier 2 / charge 0.72:
+   the only mark on screen saying so was a 3 px stroke on the inner radius of a
+   157 px dial in the bottom-right corner, in an orange within ~20 degrees of
+   hue of the speed fill it sat against. At 1:1 it is invisible — the frame has
+   to be magnified five times before you can find it. Meanwhile the player's
+   eyes are on the apex, which is roughly the centre of the frame, roughly
+   1300 px away from that stroke.
+
+   Peripheral vision resolves MOTION and COLOUR and does not resolve shape or
+   text, so the answer is not a bigger widget. It is a moving band of colour at
+   the edge of the frame, which is the one place peripheral vision is actually
+   pointed.
+
+   COST. Each rail is ONE element with two background layers, moved by ONE
+   translateY off `--fill`. No layout, no paint, no filter, and no per-frame
+   allocation: the HUD writes three cached custom properties a frame and the
+   compositor does the rest. `--fill` is deliberately NOT eased — a tier
+   boundary is a step, and the reset to zero is what the player feels as
+   "banked, start again". Only the layer's opacity is eased. */
+
+.kr-charge {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  --fill: 0;
+  /* `--cc` is the tier you have BANKED, which is also the colour of the sparks
+     coming off the rear wheels, so the screen and the world never disagree.
+     `--cn` is the tier you are EARNING, and it appears only as a bright band
+     immediately under the rail's leading cap — a preview of the reward, right
+     where the eye is already tracking the motion. That pairing is the entire
+     "hold or release?" decision, answered without a number. */
+  --cc: #a8b6cc;
+  --cn: var(--boost-blue);
+  will-change: opacity;
+}
+.kr-charge-e {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  /* Wide enough to be caught by peripheral vision at 1280 (38 px) and not so
+     wide at 2560 (90 px) that it eats the frame. */
+  width: clamp(30px, 5.4vmin, 90px);
+  overflow: hidden;
+}
+.kr-charge-e.l { left: 0; transform-origin: 0% 50%;
+  -webkit-mask-image: linear-gradient(to right, #000 0%, rgba(0, 0, 0, 0.5) 38%, transparent 100%);
+          mask-image: linear-gradient(to right, #000 0%, rgba(0, 0, 0, 0.5) 38%, transparent 100%); }
+.kr-charge-e.r { right: 0; transform-origin: 100% 50%;
+  -webkit-mask-image: linear-gradient(to left, #000 0%, rgba(0, 0, 0, 0.5) 38%, transparent 100%);
+          mask-image: linear-gradient(to left, #000 0%, rgba(0, 0, 0, 0.5) 38%, transparent 100%); }
+
+/* The rail itself. Two layers on ONE element so both move together: a warm
+   scrim (the same #170e0a-family ink as every plate) under a tier ramp with a
+   3 px near-white cap at the leading edge. The cap is what survives a
+   blown-out golden-hour sky — a saturated colour alone would not, and a
+   cream-on-dark edge always does.
+
+   The cap, the `--cn` preview band and the handover to `--cc` are all in PX,
+   not in percentages, and that is load-bearing rather than a style choice.
+   This element is the full height of the rail and is moved by `translateY`, so
+   the only part of the gradient on screen is its top `--fill` of that height —
+   which means a stop written as a percentage is a percentage of the FULL rail,
+   not of the visible bar. The previous version put `--cn` at 4 px but `--cc` at
+   9%, i.e. ~97 px down a 1080 px rail, so below 0.09 of charge the only colour
+   on screen was the tier the player had NOT yet earned, and the banked tier —
+   the one matching the sparks off the rear wheels — never appeared at all. The
+   rail was reporting the wrong tier for the first tenth of every charge, and
+   for the whole of any charge that never got past 9%.
+   In px the preview band is a fixed 22 px under the cap at every resolution and
+   every fill, so `--cc` owns the body from ~30 px of bar upward and the pairing
+   the comment above describes is the pairing that actually draws. */
+.kr-charge-e > i {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 100%;
+  transform: translateY(calc((1 - var(--fill)) * 100%));
+  will-change: transform;
+  background:
+    linear-gradient(to bottom,
+      rgba(255, 250, 240, 0.96) 0px, rgba(255, 250, 240, 0.96) 3px,
+      var(--cn) 4px,
+      var(--cn) 18px,
+      color-mix(in srgb, var(--cn) 82%, transparent) 22px,
+      var(--cc) 30px,
+      color-mix(in srgb, var(--cc) 70%, transparent) 24%,
+      color-mix(in srgb, var(--cc) 44%, transparent) 54%,
+      color-mix(in srgb, var(--cc) 30%, transparent) 100%),
+    /* The scrim holds a FLOOR rather than fading out. Measured against §3's
+       sky-warm `#ffd0a0` with the world hidden, an orange tier-2 body over an
+       orange sunset with the scrim tailing to 0.12 alpha simply vanished below
+       the halfway mark — the rail had a bright cap and no body. Nothing in the
+       rail is allowed to depend on the sky being dark. */
+    linear-gradient(to bottom,
+      rgba(24, 13, 5, 0.74) 0%, rgba(24, 13, 5, 0.56) 40%, rgba(24, 13, 5, 0.40) 100%);
+}
+
+/* Boost: the rail is draining rather than climbing, which is slow motion, and
+   slow motion is exactly what peripheral vision is worst at. A short pulse
+   puts the movement back so "you are still boosting" is legible without a
+   glance. Opacity only — the transform belongs to `--fill`. */
+.kr-charge.boosting .kr-charge-e > i { animation: kr-railBoost 0.42s var(--e-soft) infinite; }
+@keyframes kr-railBoost {
+  0%, 100% { opacity: 0.76; }
+  50%      { opacity: 1; }
+}
+
+/* Tier 3: the rail is full and there is nothing left to earn, so it breathes
+   instead of climbing. Opacity only — the transform belongs to `--fill`. */
+.kr-charge.maxed .kr-charge-e > i { animation: kr-railMax 0.66s var(--e-soft) infinite; }
+@keyframes kr-railMax {
+  0%, 100% { opacity: 0.72; }
+  50%      { opacity: 1; }
+}
+
+/* The tier-up flare: the rail slams wide and hot for a fifth of a second. */
+/* `none` fill, not `both`: the class is never removed, and a `both` fill would
+   leave a standing `filter: brightness(1)` on two full-height elements for the
+   rest of the race — a permanent extra compositing pass for no pixels. */
+.kr-charge.pop .kr-charge-e { animation: kr-railPop 0.44s var(--e-out); }
+@keyframes kr-railPop {
+  0%   { transform: scaleX(2.4); filter: brightness(2.6); }
+  100% { transform: scaleX(1); filter: brightness(1); }
+}
+
+/* --- the tier-up wash -----------------------------------------------------
+   A colour wash that rushes INWARD from the frame edge and is transparent
+   through the middle third: the one frame the player most needs to see the
+   apex is the one frame nothing is painted over it. The inward scale is the
+   punch — it is the whole reason this reads as a hit rather than as a tint. */
+.kr-tierpop {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  --tc: var(--boost-blue);
+  /* The transparent core is deliberately huge. Measured on the first cut, an
+     `ellipse 66% 58%` with the ramp starting at 38% put tier colour over the
+     entire frame including the apex — the exact thing this must not do. The
+     ramp now starts past half the radius of an ellipse wider than the frame,
+     so the middle ~55% of the width and ~50% of the height stay clean and the
+     wash is a rush of colour INTO the frame from outside it. */
+  background:
+    radial-gradient(ellipse 82% 74% at 50% 52%,
+      transparent 54%,
+      color-mix(in srgb, var(--tc) 30%, transparent) 82%,
+      color-mix(in srgb, var(--tc) 82%, transparent) 100%),
+    radial-gradient(ellipse 132% 120% at 50% 52%,
+      transparent 72%, rgba(255, 248, 236, 0.24) 100%);
+  /* No `will-change` on purpose: this is a full-screen layer and at 2560x1440
+     a standing promotion is ~14 MB of compositor memory for something that is
+     live for 0.42 s. The animation promotes it for exactly as long as it runs. */
+}
+.kr-tierpop.run { animation: kr-tierPop 0.42s var(--e-out) both; }
+/* Tier 3 is the one the player is chasing; it gets a longer, harder hit. */
+.kr-tierpop.t3.run { animation: kr-tierPop3 0.58s var(--e-out) both; }
+@keyframes kr-tierPop {
+  0%   { opacity: 0;    transform: scale(1.14); }
+  11%  { opacity: 0.88; transform: scale(1); }
+  100% { opacity: 0;    transform: scale(0.985); }
+}
+@keyframes kr-tierPop3 {
+  0%   { opacity: 0;    transform: scale(1.20); }
+  9%   { opacity: 1;    transform: scale(1); }
+  46%  { opacity: 0.34; transform: scale(0.995); }
+  100% { opacity: 0;    transform: scale(0.98); }
+}
+
+/* --- the release callout --------------------------------------------------
+   Bottom-right, sitting on the speedometer's top edge, because the payoff and
+   the instrument showing the payoff should be one cluster. It is a CHILD of
+   .kr-speed, so the touch reflow that moves the speedometer moves this too and
+   there is no second override to keep in sync.
+
+   Fully transient: nothing is added to the resting frame. */
+.kr-callout {
+  position: absolute;
+  right: 0;
+  bottom: 100%;
+  margin-bottom: calc(var(--gutter) * 0.7);
+  display: flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: 0.45em;
+  white-space: nowrap;
+  opacity: 0;
+  transform-origin: 100% 100%;
+  --tc: var(--boost-blue);
+  /* Measured at 1280x720 the first cut came out 89x16 px, which is a footnote,
+     not a payoff. This is the only element in the HUD whose job is to make
+     someone want to run the corner again. */
+  font-size: calc(var(--t2) * 1.2);
+}
+.kr-callout-l {
+  font-family: var(--fd);
+  font-weight: 900;
+  font-size: 1em;
+  letter-spacing: 0.16em;
+  text-indent: 0.16em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--tc) 34%, #fff6e6);
+  /* the ring first, so it survives the sky, then the tier colour as a glow */
+  text-shadow: var(--ring-s),
+               0 0 0.7vmin color-mix(in srgb, var(--tc) 85%, transparent),
+               0 0 1.8vmin color-mix(in srgb, var(--tc) 55%, transparent);
+}
+.kr-callout.t3 .kr-callout-l { font-size: 1.42em; letter-spacing: 0.2em; text-indent: 0.2em; }
+/* The chain is the reason to rerun the track. It only exists from two up. */
+.kr-callout-x {
+  font-family: var(--fd);
+  font-weight: 900;
+  font-size: 1.34em;
+  color: var(--paper);
+  text-shadow: var(--ring);
+  opacity: 0;
+}
+.kr-callout.chain .kr-callout-x { opacity: 1; }
+.kr-callout.run { animation: kr-callout 1.15s var(--e-out) both; }
+@keyframes kr-callout {
+  0%   { opacity: 0; transform: translateY(0.9vmin) scale(0.8); }
+  10%  { opacity: 1; transform: translateY(0) scale(1.12); }
+  21%  { opacity: 1; transform: translateY(0) scale(1); }
+  70%  { opacity: 1; transform: translateY(0) scale(1); }
+  100% { opacity: 0; transform: translateY(-0.7vmin) scale(0.97); }
 }
 
 .kr-flash {
@@ -888,14 +1120,37 @@
   width: calc(var(--rail) * 1.04);
   transform-origin: 100% 100%;
   --accent: var(--kerb-red);
+  /* The dial's resting scale, as a token. TouchControls.ts sets the widget to
+     scale(.82) to clear the thumb cluster; the tier pop below animates
+     `transform`, and an animation beats an inline or author rule, so on touch
+     the whole speedometer used to jump to full size for the half second of
+     every mini-turbo and snap back. The keyframes now multiply this token
+     instead of assuming 1, and the touch rule below sets it. */
+  --speed-s: 1;
 }
-.kr-speed-face { --clip: var(--clip-tl); position: absolute; inset: 0; }
+/* Higher specificity than TouchControls' own `html[data-touch] .kr-speed`,
+   which is injected after this sheet — it must set the token, not just the
+   transform, or the pop reintroduces the jump. The VALUE is deliberately the
+   same .82 that rule uses; if that number ever changes, change it here too. */
+html[data-touch] .kr .kr-speed { --speed-s: 0.82; transform: scale(var(--speed-s)); }
+
+.kr-speed-face { --clip: var(--clip-tl); position: absolute; inset: 0; transform-origin: 100% 100%; }
 .kr-speed-face canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
 .kr-speed.tier { animation: kr-dialPop 0.52s var(--e-spring) both; }
 @keyframes kr-dialPop {
-  0%   { transform: scale(1); }
-  26%  { transform: scale(1.09); }
-  100% { transform: scale(1); }
+  0%   { transform: scale(var(--speed-s)); }
+  26%  { transform: scale(calc(var(--speed-s) * 1.09)); }
+  100% { transform: scale(var(--speed-s)); }
+}
+/* THE RELEASE SURGE. On the face, not on .kr-speed — .kr-speed already owns
+   the tier pop and the touch scale, and two animations on one transform is how
+   a widget teleports. A hard kick plus a gold bloom on the plate: the boost is
+   the payoff and the instrument showing the speed it bought should say so. */
+.kr-speed-face.surge { animation: kr-dialSurge 0.62s var(--e-spring); }
+@keyframes kr-dialSurge {
+  0%   { transform: scale(1.16); filter: var(--plate-shadow) drop-shadow(0 0 2.2vmin rgba(255, 194, 74, 0.95)); }
+  34%  { transform: scale(0.985); }
+  100% { transform: scale(1); filter: var(--plate-shadow) drop-shadow(0 0 0 rgba(255, 194, 74, 0)); }
 }
 /* The readout sits in the dial's open bottom wedge, outside the needle sweep.
    The digit box is a fixed three-character tabular cell and the digits are

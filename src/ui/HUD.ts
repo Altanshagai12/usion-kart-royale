@@ -87,6 +87,40 @@ function dialMax(kmh: number) {
 
 const ROULETTE_TIME = 1.15;
 
+// --- the drift -> mini-turbo -> boost loop ---------------------------------
+// ROUND 11. Measured on the shipped build at 1920x1080, with the kart posed at
+// `driftTier = 2, driftCharge = 0.72`: the ONLY thing on screen that said so
+// was a 3 px stroke on the inner radius of a 157 px dial in the bottom-right
+// corner, painted in an orange within about 20 degrees of hue of the speed
+// fill it sits directly against. At 1:1 it is invisible; you have to magnify
+// the frame five times to find it. The player's eyes are on the corner, so a
+// widget in the corner of the screen is not a channel at all.
+//
+// The loop now reports itself on TWO channels that carry the same number:
+//
+//   PERIPHERAL  screen-edge rails, left and right, rising as the charge fills
+//               toward the NEXT tier and then draining as the boost is spent.
+//               Peripheral vision resolves motion and colour, not shape, so
+//               the rails are exactly that: a moving band of tier colour.
+//   PRECISE     the dial's inner arc, same number, kept because the player
+//               who wants to read it should be able to.
+//
+// One channel, two meanings, in the order the loop runs: the rail rises while
+// you earn and falls while you are paid. That IS the loop, drawn.
+
+/** Boost gold. Deliberately NOT a tier colour — banked is not the same as earning. */
+const BOOST_COL = '#ffc24a';
+
+/** What the release is called. Index is the tier that was banked. */
+const TIER_LABEL = ['', 'Mini-Turbo', 'Super Turbo', 'Perfect!'];
+
+/**
+ * Seconds a chain survives without a new mini-turbo. Long enough to bridge the
+ * start straight and the bridge; short enough that a chain means "this run",
+ * not "this race".
+ */
+const CHAIN_WINDOW = 9;
+
 /**
  * Below this, the interval to the kart you are racing is not a number the
  * player can act on — it is the readout flickering around zero. Round 1 shipped
@@ -119,6 +153,24 @@ export class HUD implements System {
   private boostEl!: HTMLDivElement;
   private driftEl!: HTMLDivElement;
   private flash!: HTMLDivElement;
+
+  // the loop: screen-edge charge rails, the tier-up wash, the release callout
+  private charge!: HTMLDivElement;
+  private tierPop!: HTMLDivElement;
+  private callout!: HTMLDivElement;
+  private calloutLabel!: HTMLSpanElement;
+  private calloutChain!: HTMLSpanElement;
+  /** consecutive mini-turbos, reset by CHAIN_WINDOW seconds of nothing or a hit */
+  private chain = 0;
+  private chainT = 0;
+  /** the duration the live boost started with, so the rail can drain honestly */
+  private boostSpan = 0;
+  /** eased rail visibility; the fill itself is never eased — a tier is a step */
+  private railOn = 0;
+  /** last frame's drift tier while the slide was live, for edge detection */
+  private lastTier = 0;
+  private lastDir = 0;
+  private prevRaceTime = 0;
 
   // lap
   private lapWrap!: HTMLDivElement;
@@ -173,6 +225,7 @@ export class HUD implements System {
 
   // speedometer
   private speedWrap!: HTMLDivElement;
+  private speedFace!: HTMLDivElement;
   private speedCanvas!: HTMLCanvasElement;
   private speedG!: CanvasRenderingContext2D;
   private speedNum!: Pair;
@@ -219,6 +272,21 @@ export class HUD implements System {
     this.vig = el('div', 'kr-vig', this.root);
     this.boostEl = el('div', 'kr-boost', this.root);
     this.driftEl = el('div', 'kr-drift', this.root);
+
+    // THE RAILS. Two screen-edge bands, outside the forward sightline and
+    // outside every plate, that rise with the charge and drain with the boost.
+    // Each is ONE element carrying two background layers — a warm-dark scrim
+    // under a tier-coloured ramp with a bright cap at its leading edge — moved
+    // by a single translateY off `--fill`, so a frame costs one composited
+    // transform and no layout, no paint and no allocation.
+    this.charge = el('div', 'kr-charge', this.root);
+    el('i', undefined, el('div', 'kr-charge-e l', this.charge));
+    el('i', undefined, el('div', 'kr-charge-e r', this.charge));
+
+    // The tier-up wash. Edge-weighted and transparent through the middle
+    // third, so the one frame the player most needs to see the corner is the
+    // one frame nothing is painted over it.
+    this.tierPop = el('div', 'kr-tierpop', this.root);
 
     this.hud = el('div', 'kr-hud', this.root);
     this.buildLap();
@@ -382,6 +450,7 @@ export class HUD implements System {
   private buildSpeedo() {
     this.speedWrap = el('div', 'kr-speed', this.hud);
     const face = el('div', 'kr-speed-face', this.speedWrap);
+    this.speedFace = face;
     this.speedCanvas = el('canvas', undefined, face);
     this.speedG = this.speedCanvas.getContext('2d')!;
     // Below the dial's open bottom wedge, outside the needle's reach, with a
@@ -389,6 +458,15 @@ export class HUD implements System {
     const read = el('div', 'kr-speed-read', this.speedWrap);
     this.speedNum = this.cased(read, 'kr-speed-n', '').parts[0];
     el('span', 'kr-speed-u', read, 'km/h');
+
+    // THE RELEASE CALLOUT — a child of the speedometer, not of .kr-hud, on
+    // purpose. It has to name the thing that just happened right next to the
+    // instrument that is showing the payoff, and being a child means the touch
+    // layout's `html[data-touch] .kr-speed` reflow carries it for free rather
+    // than needing a second override that can drift out of sync with the first.
+    this.callout = el('div', 'kr-callout', this.speedWrap);
+    this.calloutLabel = el('span', 'kr-callout-l', this.callout, 'Mini-Turbo');
+    this.calloutChain = el('span', 'kr-callout-x', this.callout, '');
   }
 
   private buildCountdown() {
@@ -444,6 +522,10 @@ export class HUD implements System {
       case 'hit':
         if (e.kart === player) {
           this.toast(ITEM_NAMES[e.kind] || 'Hit', '!', ITEM_TINT[e.kind] || '#ff7a6a');
+          // Getting hit ends the run. A chain that survives a red shell is not
+          // a chain the player would brag about.
+          this.chain = 0;
+          this.chainT = 0;
         }
         break;
       case 'finish':
@@ -737,26 +819,88 @@ export class HUD implements System {
     // --- item --------------------------------------------------------------
     this.updateItem(ctx, dt);
 
+    // --- the loop: drift -> mini-turbo -> boost ----------------------------
+    // Every transition below is derived from STATE, not from the bus, and that
+    // is deliberate. `boost` is also raised by trick landings, boost pads and
+    // the rocket start, so an event-driven callout would announce "PERFECT!"
+    // for driving over a boost pad. The two edges that mean a mini-turbo are
+    //   tier went up while the slide was live      -> the tier-up punch
+    //   the slide ended holding a tier, with boost -> the release payoff
+    // and both are visible here. Kart.update runs in the update pass and this
+    // runs in lateUpdate of the SAME frame, so the punch, the VFX burst and the
+    // audio hit all land on one frame — which is the whole requirement.
+    const drifting = player.driftDir !== 0;
+    const tier = drifting ? clamp(player.driftTier | 0, 0, 3) : 0;
+    const charge = drifting ? clamp(player.driftCharge, 0, 1) : 0;
+    const boostTime = Math.max(0, player.boostTime);
+    const boosting = boostTime > 0;
+
+    // A race reset must not carry a chain across the start line.
+    if (race.raceTime < this.prevRaceTime - 0.01) { this.chain = 0; this.chainT = 0; }
+    this.prevRaceTime = race.raceTime;
+    if (this.chainT > 0) {
+      this.chainT -= dt;
+      if (this.chainT <= 0) this.chain = 0;
+    }
+
+    this.tierFlash = Math.max(0, this.tierFlash - dt * 2.6);
+    if (drifting && tier > this.lastTier) this.onTierUp(tier);
+    if (!drifting && this.lastDir !== 0 && this.lastTier >= 1 && boostTime > 0.05) {
+      this.onRelease(this.lastTier);
+    }
+    this.lastTier = tier;
+    this.lastDir = player.driftDir;
+
+    // The boost's own starting length, taken from whatever set it, so the rail
+    // drains honestly for a mini-turbo, a mushroom and a boost pad alike.
+    if (boostTime > this.boostSpan) this.boostSpan = boostTime;
+    else if (!boosting) this.boostSpan = 0;
+    const boostFrac = this.boostSpan > 0.01 ? clamp(boostTime / this.boostSpan, 0, 1) : 0;
+
     // --- speedometer -------------------------------------------------------
     const kmh = Math.abs(player.forwardSpeed) * 3.6;
     const frac = clamp(kmh / this.speedMax, 0, 1);
     this.needle.target = frac;
     this.needle.step(dt);
-    const boosting = player.boostTime > 0;
     setPair(this.speedNum, String(Math.round(kmh)));
     this.speedWrap.classList.toggle('red', frac > REDLINE);
     this.speedWrap.classList.toggle('boosting', boosting);
+    this.drawDial(frac, charge, tier, boosting, boostFrac);
 
-    // drift charge, and a decaying flash when a tier locks in
-    const tier = player.driftTier | 0;
-    const charge = player.driftDir !== 0 ? clamp(player.driftCharge, 0, 1) : 0;
-    this.tierFlash = Math.max(0, this.tierFlash - dt * 2.6);
-    if (tier > this.lastTier) {
-      this.tierFlash = 1;
-      retrigger(this.speedWrap, 'tier');
+    // --- the screen-edge rails ---------------------------------------------
+    // HEIGHT is the charge toward the next tier. BODY COLOUR is the tier you
+    // have banked — the same colour as the sparks coming off the rear wheels,
+    // so the screen and the world never state different things. CAP COLOUR is
+    // the tier you are earning. That is the whole "hold or release?" decision
+    // in two colours and a height, with nothing to read.
+    //
+    // On release the same rail snaps to full in boost gold and drains: the
+    // payout drawn as the thing you just earned being spent.
+    let fill = 0;
+    let body = TIER_COLORS[0];
+    let cap = BOOST_COL;
+    let wantRail = 0;
+    if (drifting) {
+      fill = tier >= 3 ? 1 : charge;
+      body = TIER_COLORS[tier];
+      cap = TIER_COLORS[Math.min(3, tier + 1)];
+      wantRail = 0.46 + 0.34 * fill + 0.06 * tier;
+    } else if (boosting) {
+      fill = boostFrac;
+      body = BOOST_COL;
+      wantRail = 0.34 + 0.60 * boostFrac;
     }
-    this.lastTier = player.driftDir !== 0 ? tier : 0;
-    this.drawDial(frac, charge, tier, boosting, ctx.time);
+    // The rails live outside `.kr-hud`, so the blocking-screen fade does not
+    // reach them. Pausing mid-slide must not leave two lit bands down the
+    // sides of the pause menu.
+    if (blocked) wantRail = 0;
+    this.railOn = damp(this.railOn, wantRail, wantRail > this.railOn ? 22 : 8, dt);
+    setNum(this.charge, '--fill', fill, 0.004);
+    setStyle(this.charge, '--cc', body);
+    setStyle(this.charge, '--cn', cap);
+    setNum(this.charge, 'opacity', this.railOn, 0.01);
+    this.charge.classList.toggle('maxed', drifting && tier >= 3);
+    this.charge.classList.toggle('boosting', !drifting && boosting);
 
     // --- minimap -----------------------------------------------------------
     if (!blocked) this.minimap.update(ctx);
@@ -764,15 +908,53 @@ export class HUD implements System {
     // --- atmospherics ------------------------------------------------------
     const si = clamp(ctx.speedIntensity, 0, 1.4);
     setNum(this.vig, 'opacity', clamp((si - 0.42) / 0.75, 0, 1) * 0.9, 0.01);
-    setNum(this.boostEl, 'opacity', clamp(player.boostTime * 2.2, 0, 1) * 0.85, 0.01);
+    setNum(this.boostEl, 'opacity', clamp(boostTime * 2.2, 0, 1) * 0.85, 0.01);
 
-    const wantGlow = player.driftDir !== 0 ? 0.09 + charge * 0.15 + this.tierFlash * 0.30 : 0;
+    // The centre-screen tint stays the BANKED tier — what you would keep if
+    // you let go this instant — against the rails' next-tier colour. Two
+    // facts, two places, never the same fact twice.
+    const wantGlow = drifting ? 0.10 + charge * 0.12 + this.tierFlash * 0.34 : 0;
     this.driftGlow = damp(this.driftGlow, wantGlow, 9, dt);
     setNum(this.driftEl, 'opacity', this.driftGlow, 0.01);
-    setStyle(this.driftEl, '--tier', TIER_COLORS[clamp(tier, 0, 3)]);
+    setStyle(this.driftEl, '--tier', TIER_COLORS[tier]);
   }
 
-  private lastTier = 0;
+  /**
+   * A tier locked in. One event, three surfaces: a full-screen edge wash in
+   * the new tier's colour that rushes inward (the punch), a flare on the rails,
+   * and the dial's pop — all started on the same frame the VFX burst and the
+   * spark audio fire, so they read as one hit rather than three.
+   */
+  private onTierUp(tier: number) {
+    this.tierFlash = 1;
+    setStyle(this.tierPop, '--tc', TIER_COLORS[tier]);
+    this.tierPop.classList.toggle('t3', tier >= 3);
+    retrigger(this.tierPop, 'run');
+    retrigger(this.charge, 'pop');
+    retrigger(this.speedWrap, 'tier');
+  }
+
+  /**
+   * The slide ended holding a tier: the payoff. The callout names it, the
+   * chain counter says whether this one was part of a run, and the dial gets
+   * its surge. Everything here is transient — nothing new is left on screen.
+   */
+  private onRelease(tier: number) {
+    this.chain = this.chainT > 0 ? this.chain + 1 : 1;
+    this.chainT = CHAIN_WINDOW;
+
+    const col = TIER_COLORS[clamp(tier, 1, 3)];
+    setStyle(this.callout, '--tc', col);
+    setText(this.calloutLabel, TIER_LABEL[tier]);
+    setText(this.calloutChain, this.chain >= 2 ? '×' + this.chain : '');
+    this.callout.classList.toggle('chain', this.chain >= 2);
+    this.callout.classList.toggle('t3', tier >= 3);
+    retrigger(this.callout, 'run');
+    // The surge rides the dial FACE, not `.kr-speed`: `.kr-speed` already owns
+    // the tier pop and, on touch, a standing `scale(.82)`, and two animations
+    // fighting over one transform is how a widget ends up teleporting.
+    retrigger(this.speedFace, 'surge');
+  }
 
   /** m : ss . hh, one field per fixed-width slot. */
   private writeClock(seconds: number) {
@@ -867,7 +1049,7 @@ export class HUD implements System {
 
   // --------------------------------------------------------------- dial draw
 
-  private drawDial(frac: number, charge: number, tier: number, boosting: boolean, _time: number) {
+  private drawDial(frac: number, charge: number, tier: number, boosting: boolean, boostFrac: number) {
     const g = this.speedG;
     const W = this.dialW;
     const H = this.dialH;
@@ -1002,30 +1184,94 @@ export class HUD implements System {
       }
     }
 
-    // --- mini-turbo charge: ONE concentric inner arc in the tier colour ----
-    // §6 wants an unmistakable read on the drift charge; it does not want a
-    // second instrument. Same centre, same sweep, same idiom as the speed arc,
-    // half the weight, inside it — so it reads as part of the same dial.
-    const driftOn = charge > 0.001 || this.tierFlash > 0.001;
-    if (driftOn) {
-      const cr = r - chanW * 1.0;
-      const col = TIER_COLORS[clamp(tier, 0, 3)];
+    // --- the loop arc: ONE concentric inner arc, two states -----------------
+    // ROUND 11. This arc was 3 px of orange laid immediately inside an orange
+    // value fill, at a radius the needle sweeps over — which is why a posed
+    // tier-2 drift produced a frame with no visible drift indication in it at
+    // all. Three things changed and none of them added a second instrument:
+    //
+    //   WEIGHT   0.34 -> 0.62 of the channel, and pulled a further half-channel
+    //            inboard so there is dark between it and the speed fill.
+    //   MEANING  the BANKED tier is a full-sweep band at low value and the
+    //            charge toward the NEXT tier is the bright fill over it, in the
+    //            next tier's colour — the same pairing the screen-edge rails
+    //            carry, so the precise channel and the peripheral one agree.
+    //   REUSE    with the slide over, the same arc drains with the boost in
+    //            boost gold. The loop has one arc, and it means whichever half
+    //            of the loop you are in.
+    const railFill = boosting && charge <= 0.001 ? boostFrac : charge;
+    const loopOn = charge > 0.001 || this.tierFlash > 0.001 || (boosting && boostFrac > 0.001);
+    if (loopOn) {
+      const cr = r - chanW * 1.28;
+      const lw = chanW * 0.62;
+      const drift = charge > 0.001 || this.tierFlash > 0.001;
+      // Same encoding as the rails, so the precise channel and the peripheral
+      // one can never say different things: body = banked, cap = next.
+      const col = drift ? TIER_COLORS[tier] : BOOST_COL;
+      const nextCol = drift ? TIER_COLORS[Math.min(3, tier + 1)] : BOOST_COL;
       g.lineCap = 'butt';
       g.beginPath();
       g.arc(cx, cy, cr, A0, A1);
-      g.lineWidth = chanW * 0.34;
-      g.strokeStyle = 'rgba(18, 10, 4, 0.58)';
+      g.lineWidth = lw;
+      g.strokeStyle = 'rgba(18, 10, 4, 0.66)';
       g.stroke();
-      const ca = A0 + sweep * clamp(Math.max(charge, this.tierFlash * 0.2), 0.02, 1);
+
+      // banked: what you keep if you let go now, across the whole sweep
+      if (drift && tier >= 1) {
+        g.save();
+        g.globalAlpha = 0.34;
+        g.beginPath();
+        g.arc(cx, cy, cr, A0, A1);
+        g.lineWidth = lw * 0.82;
+        g.strokeStyle = col;
+        g.stroke();
+        g.restore();
+      }
+
+      // earning (or spending)
+      const ca = A0 + sweep * clamp(Math.max(railFill, this.tierFlash * 0.25), 0.02, 1);
       g.save();
-      g.shadowColor = col;
-      g.shadowBlur = W * (0.015 + this.tierFlash * 0.05);
+      g.shadowColor = nextCol;
+      g.shadowBlur = W * (0.03 + this.tierFlash * 0.075);
       g.beginPath();
       g.arc(cx, cy, cr, A0, ca);
-      g.lineWidth = chanW * 0.34;
+      g.lineWidth = lw * 0.82;
       g.strokeStyle = col;
       g.stroke();
+      // The leading edge, in the colour of the tier being earned, capped with
+      // cream — the eye finds a moving end-stop far faster than it measures the
+      // length of a bar, and cream on dark is the one thing a blown-out sky
+      // cannot wash away.
+      g.beginPath();
+      g.arc(cx, cy, cr, Math.max(A0, ca - 0.16), ca);
+      g.lineWidth = lw * 0.82;
+      g.strokeStyle = nextCol;
+      g.stroke();
+      g.beginPath();
+      g.arc(cx, cy, cr, Math.max(A0, ca - 0.05), ca);
+      g.lineWidth = lw * 0.82;
+      g.strokeStyle = '#fff6e6';
+      g.stroke();
       g.restore();
+    }
+
+    // --- the boost surge halo ----------------------------------------------
+    // §6: boost must be unmistakable. An additive ring outside the channel,
+    // pulsing with what is left of the boost, so the payoff is visible on the
+    // instrument that is showing the speed it bought.
+    if (boosting) {
+      g.save();
+      g.globalAlpha = 0.25 + 0.5 * boostFrac;
+      g.shadowColor = 'rgba(255, 194, 74, 0.95)';
+      g.shadowBlur = W * 0.07;
+      g.beginPath();
+      g.arc(cx, cy, r + chanW * 0.62, A0, A0 + sweep * boostFrac);
+      g.lineWidth = Math.max(1.5, chanW * 0.16);
+      g.lineCap = 'round';
+      g.strokeStyle = BOOST_COL;
+      g.stroke();
+      g.restore();
+      g.lineCap = 'butt';
     }
 
     // --- needle: a pointer with a counterweight, pivoting IN the dial -------

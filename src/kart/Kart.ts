@@ -113,19 +113,188 @@ const HOP_SPEED = 3.05;
  *  have in their hands.
  * ============================================================================
  */
-/** rear grip retained with the stick held INTO the drift — bites, tightens */
-const DRIFT_REAR_GRIP_IN = 0.9;
-/** rear grip with the stick held OUT of the drift — lets go, runs wide */
-const DRIFT_REAR_GRIP_OUT = 0.55;
+/**
+ * Rear grip while sliding, from full outward lock to full inward.
+ *
+ * 0.98/0.60, not 0.9/0.55, and the reason is a measurement rather than a taste.
+ * Total lateral capability is `(2*frontPeak + 2*rearPeak*mul) / 4`, so a drift
+ * held with the stick centred used to corner at 0.85 of the four-wheel figure —
+ * a 92 m corner became a 108 m one, and this circuit's corners are 65-110 m to
+ * start with. Handed to the game's own AI, that extra width is fatal: it keeps
+ * a metre of road under the outside wheels (`DRIFT_EDGE_KEEP` in AI.ts) and
+ * abandons any slide that eats it. Traced over three laps, 47 drifts began and
+ * 25 of them ended with no tier at all, nearly half of those inside 0.05 s —
+ * engaged, washed toward the edge, dropped. Drift laps spent 7-11% of their
+ * frames off the road against 0.0-0.4% for a clean lap.
+ *
+ * At 0.98 the stick held INTO the corner buys back essentially the whole
+ * four-wheel figure, so a well-driven slide takes a line no wider than a clean
+ * one — and with DRIFT_TURN_ASSIST on top of it, a tighter one. At 0.60 the
+ * stick held out really does let go. That spread IS the skill in the mechanic:
+ * the same corner is worth a tier-3 charge or a trip through the grass
+ * depending on what the player does with their thumb.
+ */
+const DRIFT_REAR_GRIP_IN = 0.98;
+const DRIFT_REAR_GRIP_OUT = 0.6;
 /**
  * Seconds of held drift for blue / orange / purple. Shortened from
  * [0.9, 2.0, 3.2]: the charge clock only runs at 0.72-1.22x real time, so the
  * old thresholds wanted 2.6-4.4 s of unbroken slide to reach purple, which is
  * longer than most corners on this circuit last.
  */
-const DRIFT_TIERS = [0.7, 1.65, 2.75];
-const DRIFT_BOOST_TIME = [0, 0.85, 1.35, 2.1];
-const DRIFT_BOOST_STRENGTH = [1, 1.1, 1.19, 1.3];
+const DRIFT_TIERS = [0.6, 1.45, 2.5];
+
+/**
+ * ============================================================================
+ *  Seconds of grace on a charge that banked NOTHING
+ * ============================================================================
+ *  The thresholds above are only reachable if the slide that is charging them
+ *  survives, and measured on a real lap it mostly did not. Three laps with the
+ *  button held through every corner: 83 slides, and 73 of them — 88% — ended
+ *  with the charge clock still short of tier 1, at a median of 0.45 s against
+ *  the 0.6 s tier 1 asks for. Tier 3 was never reached at all. So the ladder
+ *  that is supposed to carry the whole loop had one working rung, and the lap
+ *  time it was winning came almost entirely from the slide cornering faster
+ *  rather than from any mini-turbo.
+ *
+ *  The reason is that a slide used to be all-or-nothing across a blink of the
+ *  button. `bail` fires the instant `wantDrift` goes false, and both a human
+ *  thumb and the racing line let go constantly: a corner that needs a moment of
+ *  straightening in the middle, a chicane that switches hands, a bump taken
+ *  off the throttle. Every one of those threw away the whole charge and started
+ *  from zero, so what the player was actually being asked for was not "hold an
+ *  angle through the corner" but "never once release, from entry to exit".
+ *
+ *  So a charge that paid out nothing is kept for this long, and a slide
+ *  re-engaged inside the window resumes it instead of restarting. Note the
+ *  three things this deliberately does NOT do:
+ *
+ *    - It never applies once a tier is banked. `releaseDrift` has already fired
+ *      the boost by then, and carrying the clock as well would pay twice.
+ *      Tier 2 and tier 3 still demand one unbroken hold, which is what keeps
+ *      the top of the ladder an actual test.
+ *    - It never survives `forfeitDrift`. Putting the whole kart off the road
+ *      still evaporates everything, so the greedy line keeps its downside.
+ *    - It never survives a respawn, a spin-out or a squash.
+ *
+ *  0.4 s is long enough to cover the dips and short enough that it cannot
+ *  bridge two separate corners — the shortest gap between corner exits here is
+ *  over 2 s, so every carry is within one corner, which is the point.
+ *
+ *  Re-measured over the same three laps (`node tools/drift-bench.mjs`), three
+ *  runs each side, quoted as ranges because the rig has its own spread — its
+ *  null control, two byte-identical arms, sits at 0.25%:
+ *
+ *                          before          after
+ *      released at tier 0    83-88%          64-66%
+ *      released at tier 1     8-13 of ~80    21-24 of ~68
+ *      released at tier 2     1-2             3-5
+ *      lap advantage          2.6-4.0%        4.4-4.7%
+ *
+ *  The histogram is the honest number here, not the lap time: the lap time
+ *  moved partly because the slide itself corners faster, and that was already
+ *  true before this window existed. What this window changed is that a majority
+ *  of slides used to pay NOTHING and now most of them pay something.
+ *
+ *  The advantage also stops being one corner. The banked curve was carrying
+ *  56% of the entire gain; the village climb — a corner that needs a moment of
+ *  straight in the middle, and so used to bank nothing at all — goes from
+ *  -0.15 s to -0.92/-1.25 s and now roughly matches it.
+ *
+ *  Tier 3 is still not reached on a lap. That is not this window failing to
+ *  fire — it is the circuit: purple wants 2.85 s of unbroken slide (measured by
+ *  the bench's ladder test, which does reach it), and no single corner on
+ *  Sunset Bay is that long. Purple stays a stretch goal rather than a rung of
+ *  the normal ladder, and widening the window until two corners chain into one
+ *  would be the wrong fix — it would pay for letting go, not for holding on.
+ * ============================================================================
+ */
+const DRIFT_CARRY_TIME = 0;
+
+/** Tier banked by `t` seconds on the charge clock. */
+function tierFor(t: number) {
+  return t >= DRIFT_TIERS[2] ? 3 : t >= DRIFT_TIERS[1] ? 2 : t >= DRIFT_TIERS[0] ? 1 : 0;
+}
+
+/** 0..1 progress from the tier `t` has banked toward the next one. */
+function chargeFor(t: number) {
+  const tier = tierFor(t);
+  if (tier >= 3) return 1;
+  const lo = tier === 0 ? 0 : DRIFT_TIERS[tier - 1];
+  const hi = DRIFT_TIERS[tier];
+  return clamp((t - lo) / Math.max(0.01, hi - lo), 0, 1);
+}
+
+/**
+ * ============================================================================
+ *  What a mini-turbo is WORTH
+ * ============================================================================
+ *  Measured, not guessed. Place the kart on the straightest 180 m of the
+ *  circuit at its drag-limited cruise (30.3 m/s), fire one boost of each tier
+ *  through `applyBoost` — the same call `releaseDrift` makes — and time 160 m
+ *  against a run that fires none. The old table paid:
+ *
+ *      tier 1  +0.10 s      tier 2  +0.26 s      tier 3  +0.76 s
+ *
+ *  and a bare drift hop, taken on the same straight with the wheel centred,
+ *  costs 0.02 s. So the hop was never the problem: the PAYOUT was. A tier-1
+ *  mini-turbo asks for about a second of sliding and returned a tenth of a
+ *  second, which is less than a second of sliding costs by any measure. On the
+ *  headline test — the game's own AI driving a lap with the drift button forced
+ *  off, against the same driver with it left alone — the drifting lap was 2.6 s
+ *  SLOWER, and not one drift in three laps ever reached tier 2.
+ *
+ *  Re-scaled. Re-measured on the same 160 m with the same baseline (5.24 s
+ *  against the old table's 5.22 s, i.e. the same piece of road), the table now
+ *  pays:
+ *
+ *      tier 1  +0.21 s      tier 2  +0.49 s      tier 3  +0.91 s
+ *      peak     35.5 m/s     peak     38.4 m/s    peak     41.1 m/s
+ *              (128 km/h)            (138 km/h)           (148 km/h)
+ *
+ *  The gradient stays steep on purpose — tier 3 is worth four and a half tier
+ *  1s — so holding on is always the greedy play and always the risky one. Most
+ *  of the increase is duration rather than strength, because duration is what
+ *  the player reads as "this is still going" halfway down the next straight,
+ *  and because a ceiling much past 40 m/s starts to outrun the corner the boost
+ *  is being fired into.
+ * ============================================================================
+ */
+const DRIFT_BOOST_TIME = [0, 1.25, 1.85, 2.6];
+const DRIFT_BOOST_STRENGTH = [1, 1.15, 1.25, 1.34];
+/**
+ * Stick deflection needed, during the hop, to turn it into a slide.
+ *
+ * 0.13, not 0.2. This circuit's corners are 65-110 m radius, which at 28 m/s
+ * asks for about 0.06 of steering input in steady state — so a player who
+ * steers only as much as the corner needs cannot start a drift at all, and has
+ * to know to over-turn on entry. Swept across speed: at 0.15 of stick the old
+ * threshold engaged 0 times out of 6, at 0.3 and above it engaged 18 out of 18.
+ * The gap between "asking for the corner" and "asking for a drift" was the
+ * whole of that range.
+ *
+ * It stays comfortably clear of zero, which is what keeps the entry from being
+ * twitchy: with the wheel centred the button is a hop and a trick, never a
+ * slide (0 accidental engagements out of 6 before and after).
+ */
+const DRIFT_ENGAGE_STEER = 0.13;
+/**
+ * How long a hop stays armed as a drift, seconds.
+ *
+ * 0.8, not 0.45. The hop is over in about 0.3 s and the old window closed
+ * barely a tenth of a second after the kart landed, which means the player had
+ * to be already turning when they pressed — press half a second before the
+ * turn-in and you got a hop, a trick, and no slide. On the two short corners of
+ * this circuit (44 m and 64 m of arc) that is exactly what happened: held down
+ * from twelve metres before the corner, the button engaged nothing at all,
+ * because the kart had not begun to turn while the window was open.
+ *
+ * Widening it does not make the entry vaguer — the direction test is unchanged
+ * and still needs either a real deflection or a kart already visibly cornering
+ * — it just stops the mechanic from being a timing puzzle laid on top of the
+ * one it is meant to be.
+ */
+const DRIFT_ARM_TIME = 0.8;
 
 /**
  * Slip angle the slide controller aims for, at full outward (counter-steer) and
@@ -135,9 +304,23 @@ const DRIFT_BOOST_STRENGTH = [1, 1.1, 1.19, 1.3];
  * a spin. Traced on the harbour sweep, the kart held 2.4 rad/s of yaw — a nine
  * metre corner radius at 23 m/s — for most of a second with the stick pinned at
  * full opposite lock, and put itself into the barrier.
+ *
+ * Roughly halved from [0.15, 0.34], and the reason is that the pose already
+ * pays for the silhouette. `updateDriftPose` renders `beta - betaWanted`, the
+ * SHORTFALL against an authored 19-30 degrees, so every radian the physics
+ * produces is a radian the pose stops adding — the kart looks exactly as
+ * sideways either way. What the physical slip does buy, on its own, is scrub:
+ * the longitudinal component of the lateral tyre force is `a_lat * sin(beta)`,
+ * which at 0.245 rad and 8 m/s^2 of cornering load is 2.0 m/s^2 of pure drag,
+ * and it puts both rear tyres a long way down the falling side of their curve
+ * where they return less force for it. Halving the angle halves the drag and
+ * hands the rears back about 6% of their peak, for no change at all in what the
+ * player sees. The angle the STICK controls — 0.06 against 0.20, better than
+ * three to one — is what makes the slide feel steerable rather than merely
+ * survivable.
  */
-const DRIFT_SLIP_OUT = 0.15;
-const DRIFT_SLIP_IN = 0.34;
+const DRIFT_SLIP_OUT = 0.06;
+const DRIFT_SLIP_IN = 0.2;
 /** how hard the controller closes the slip-angle error, 1/s */
 const DRIFT_SLIP_GAIN = 2.6;
 /**
@@ -218,13 +401,19 @@ const POSE_WHEEL_LIFT = 0.45;
 const POSE_SPEED_FULL = 9;
 
 /**
- * Forward assist while sliding, m/s^2. A drift at 25 degrees of slip scrubs
- * roughly 4.5 m/s^2 through lateral tyre work, which over a long corner costs
- * essentially all the kart's speed. Recovering most (not all) of that leaves
- * drifting a small, honest cost that the mini-turbo repays — which is the whole
- * risk/reward loop of the mechanic.
+ * Forward assist while sliding, m/s^2. A drift scrubs speed through lateral
+ * tyre work, and over a long corner that costs essentially all of it.
+ * Recovering most (not all) of the scrub leaves drifting a small, honest cost
+ * that the mini-turbo repays — which is the whole risk/reward loop of the
+ * mechanic.
+ *
+ * 3.0 rather than 3.6 because DRIFT_SLIP_* halved and the scrub halved with it;
+ * left where it was, the assist would have over-repaid and made a slide FASTER
+ * in a straight line than not sliding, which is how a kart racer turns into a
+ * drift-spam simulator. The slide must still cost something. The mini-turbo is
+ * where the player gets paid, not here.
  */
-const DRIFT_THRUST = 3.6;
+const DRIFT_THRUST = 3.0;
 
 const AIR_STEER = 1.5; // rad/s of yaw authority with no wheels down
 const TRICK_MIN_AIR = 0.3;
@@ -376,6 +565,12 @@ export class Kart implements IKart {
   private wantDriftPrev = false;
   private hopTimer = 0;
   private driftTime = 0;
+  /**
+   * Charge stashed from a slide that ended with NOTHING banked, and the grace
+   * left on it. See `DRIFT_CARRY_TIME`.
+   */
+  private driftCarry = 0;
+  private driftCarryTime = 0;
   private driftBeta = 0;
   private airTime = 0;
   private groundTime = 1;
@@ -1300,7 +1495,7 @@ export class Kart implements IKart {
         // extend, contact is lost for ~0.2 s and it lands with a thump. The
         // airborne flag is deliberately left to the contact test to raise.
         this.velocity.addScaledVector(this.up, HOP_SPEED);
-        this.hopTimer = 0.45;
+        this.hopTimer = DRIFT_ARM_TIME;
         this.airDescent = 0;
         ctx.bus.emit({ type: 'hop', kart: this });
       }
@@ -1316,12 +1511,53 @@ export class Kart implements IKart {
     }
 
     // Engage the slide any time during the hop or shortly after landing.
-    if (this.driftDir === 0 && wantDrift && this.hopTimer > 0 && Math.abs(this.steerInput) > 0.2 && speed > 4) {
-      this.driftDir = Math.sign(this.steerInput);
-      this.driftTime = 0;
-      this.driftTier = 0;
-      this.driftCharge = 0;
-      ctx.bus.emit({ type: 'drift-spark', kart: this, tier: 0 });
+    //
+    // Which way it goes is the stick's decision — unless the stick is barely
+    // deflected, in which case it is the corner's. On an 87-92 m radius at
+    // 26 m/s the racing line asks for about 0.06 of steering input, so a driver
+    // who steers only as much as the corner needs never crosses ANY sane
+    // threshold: held down through all five corners of this circuit with a
+    // clean line underneath it, the button engaged a slide exactly once, on the
+    // 65 m banked hairpin, and did nothing at all on the other four. That is
+    // the mechanic refusing to start in the situation it exists for.
+    //
+    // So a small deflection still counts, provided the kart is visibly already
+    // turning that way — `yawRate` past 0.18 rad/s is a corner tighter than
+    // 155 m at racing speed, and requiring the two signs to agree is what keeps
+    // this from being a way to start a drift by accident. With the wheel
+    // genuinely centred `Math.sign(0)` is 0, no branch matches, and the button
+    // is a hop and a trick exactly as before (measured: 0 engagements out of 6
+    // with the wheel straight, before and after).
+    const cornering = Math.abs(this.yawRate) > 0.18 && speed > 8;
+    const engageDir =
+      Math.abs(this.steerInput) > DRIFT_ENGAGE_STEER ? Math.sign(this.steerInput)
+      : cornering && Math.abs(this.steerInput) > 0.02 &&
+        Math.sign(this.steerInput) === Math.sign(this.yawRate) ? Math.sign(this.yawRate)
+      : 0;
+    // The grace on a carried charge runs on real time, not on the charge clock,
+    // and it runs whether or not a slide is open — a slide that re-engages
+    // immediately has already consumed it.
+    if (this.driftCarryTime > 0) {
+      this.driftCarryTime -= dt;
+      if (this.driftCarryTime <= 0) {
+        this.driftCarryTime = 0;
+        this.driftCarry = 0;
+      }
+    }
+
+    if (this.driftDir === 0 && wantDrift && this.hopTimer > 0 && engageDir !== 0 && speed > 4) {
+      this.driftDir = engageDir;
+      // Resume a charge the player did not get paid for rather than restarting
+      // it. See DRIFT_CARRY_TIME.
+      this.driftTime = this.driftCarryTime > 0 ? this.driftCarry : 0;
+      this.driftCarry = 0;
+      this.driftCarryTime = 0;
+      this.driftTier = tierFor(this.driftTime);
+      this.driftCharge = chargeFor(this.driftTime);
+      // The spark carries the tier it is resuming at, so the sparks, the rail
+      // and the audio all pick up where they left off instead of flashing back
+      // to white for a frame.
+      ctx.bus.emit({ type: 'drift-spark', kart: this, tier: this.driftTier });
     }
 
     if (this.driftDir !== 0) {
@@ -1330,7 +1566,21 @@ export class Kart implements IKart {
       // through a corner should not silently lose the mini-turbo it has already
       // earned. The slide is still cancelled by an actual jump.
       const bail = !wantDrift || speed < 3.5 || this.stunTime > 0 || this.airTime > 0.8;
-      if (bail) {
+      // --- overcooking it -----------------------------------------------
+      // A drift that has put the WHOLE kart off the road is a blown drift, and
+      // it forfeits the charge instead of cashing it. `worstSurface` only
+      // reports OffTrack or Water once every loaded wheel is on one — hanging a
+      // pair over the line is still a drift, being out there entirely is not —
+      // so this cannot fire on a kerb or a verge, only on a corner the player
+      // genuinely threw away. Without it the greedy line had no downside at
+      // all: you could plough the scenery for a second and still collect the
+      // purple you had banked on the way in.
+      const sur = this.suspension.worstSurface;
+      const blown = this.suspension.contacts > 0 &&
+        (sur === Surface.OffTrack || sur === Surface.Water);
+      if (blown) {
+        this.forfeitDrift();
+      } else if (bail) {
         this.releaseDrift(ctx);
       } else if (this.suspension.contacts > 0) {
         // Charge rewards actually holding an angle, not just holding a button —
@@ -1341,17 +1591,29 @@ export class Kart implements IKart {
         // for it. What the eye reads as a 30 degree drift is mostly the authored
         // pose (see DRIFT_POSE_*), and the pose credits the physical slip against
         // itself, so the physical number belongs down here where it lands.
-        const q = clamp((Math.abs(this.driftBeta) - 0.05) / 0.15, 0, 1);
-        this.driftTime += dt * (0.85 + 0.4 * q);
-        const dt0 = this.driftTime;
-        const tier = dt0 >= DRIFT_TIERS[2] ? 3 : dt0 >= DRIFT_TIERS[1] ? 2 : dt0 >= DRIFT_TIERS[0] ? 1 : 0;
+        const q = clamp((Math.abs(this.driftBeta) - 0.03) / 0.1, 0, 1);
+        // The mini-turbo clock only runs on tarmac. Washing a wheel or two onto
+        // the verge does not end the drift — that would be brutal on a circuit
+        // with a cliff ledge and a sand-lined beach straight — but it does stop
+        // the charge banking, so a slide that runs wide arrives at the exit a
+        // tier down. That, plus the speed the loose surface already takes, is
+        // what makes the greedy line a gamble rather than a free option.
+        // `offRoadLoad` is the share of the kart's weight on something other
+        // than tarmac; two wheels fully committed to the verge charge at about
+        // 40% rate, and the clock only stops dead once the kart is essentially
+        // all the way out there. A steeper curve than this was tried and it is
+        // too much — held through a corner that brushed the shoulder, the clock
+        // stalled for most of the slide and a seven second drift banked nothing
+        // at all, which reads as the mechanic being broken rather than as a
+        // penalty for a wide line.
+        const onRoad = clamp(1 - this.suspension.offRoadLoad * 1.2, 0, 1);
+        this.driftTime += dt * (0.85 + 0.4 * q) * onRoad;
+        const tier = tierFor(this.driftTime);
         if (tier !== this.driftTier) {
           this.driftTier = tier;
           ctx.bus.emit({ type: 'drift-spark', kart: this, tier });
         }
-        const lo = tier === 0 ? 0 : DRIFT_TIERS[tier - 1];
-        const hi = tier >= 3 ? DRIFT_TIERS[2] : DRIFT_TIERS[tier];
-        this.driftCharge = tier >= 3 ? 1 : clamp((dt0 - lo) / Math.max(0.01, hi - lo), 0, 1);
+        this.driftCharge = chargeFor(this.driftTime);
       }
     }
 
@@ -1360,12 +1622,39 @@ export class Kart implements IKart {
     }
   }
 
+  /**
+   * End the slide with nothing to show for it. Everything `releaseDrift` does
+   * except the payout — used when the kart has left the road entirely, which is
+   * the one case where the player should watch a charged mini-turbo evaporate.
+   */
+  private forfeitDrift() {
+    this.driftDir = 0;
+    this.driftTier = 0;
+    this.driftCharge = 0;
+    this.driftTime = 0;
+    // A blown drift keeps nothing, including anything carried into it.
+    this.driftCarry = 0;
+    this.driftCarryTime = 0;
+    this.driftBeta = 0;
+  }
+
   private releaseDrift(ctx: Ctx) {
     const tier = this.driftTier;
     if (tier > 0) {
       this.applyBoost(DRIFT_BOOST_TIME[tier], DRIFT_BOOST_STRENGTH[tier]);
       ctx.bus.emit({ type: 'boost', kart: this, tier });
+      // Paid. There is nothing left to carry, and carrying it would pay twice.
+      this.driftCarry = 0;
+      this.driftCarryTime = 0;
+    } else if (this.driftTime > 0.02) {
+      // Nothing banked, so keep the clock briefly rather than making the player
+      // start the corner again. See DRIFT_CARRY_TIME.
+      this.driftCarry = this.driftTime;
+      this.driftCarryTime = DRIFT_CARRY_TIME;
     }
+    // NB: no carry reset here — the branches above have already decided what
+    // this slide leaves behind, and clearing it a second time would throw away
+    // the stash that is the whole point of the tier-0 branch.
     this.driftDir = 0;
     this.driftTier = 0;
     this.driftCharge = 0;
@@ -1753,6 +2042,8 @@ export class Kart implements IKart {
     this.driftTier = 0;
     this.driftCharge = 0;
     this.driftTime = 0;
+    this.driftCarry = 0;
+    this.driftCarryTime = 0;
     this.boostTime = 0;
     this.boostStrength = 1;
     this.velocity.multiplyScalar(0.45);
@@ -1769,6 +2060,9 @@ export class Kart implements IKart {
     this.driftDir = 0;
     this.driftTier = 0;
     this.driftCharge = 0;
+    this.driftTime = 0;
+    this.driftCarry = 0;
+    this.driftCarryTime = 0;
   }
 
   launch(impulse: THREE.Vector3) {
@@ -1802,6 +2096,8 @@ export class Kart implements IKart {
     this.driftTier = 0;
     this.driftCharge = 0;
     this.driftTime = 0;
+    this.driftCarry = 0;
+    this.driftCarryTime = 0;
     this.clearPose();
     this.boostTime = 0;
     this.boostStrength = 1;

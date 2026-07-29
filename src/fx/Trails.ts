@@ -156,7 +156,18 @@ export class Trails {
     this.material = new THREE.ShaderMaterial({
       uniforms: {
         uGain: { value: 1 },
-        uNearFade: { value: new THREE.Vector2(1.5, 4.5) },
+        // 1.1 -> 3.2 m, in from 1.5 -> 4.5.
+        //
+        // The 4.5 m outer edge was sized against a boost ribbon that ran five
+        // metres behind the kart and swept the lens. That ribbon is gone: it is
+        // capped at 3.4 m of world length now and its head is welded to the
+        // exhaust stacks, so the FAR end of it sits about 4-6 m from a chase
+        // camera that itself surges in to ~4.5 m under boost — which is to say
+        // the entire ribbon lived inside the old fade window and the payoff's
+        // heat spine was being multiplied by roughly a third for the whole of
+        // every boost. The near edge is what protects the lens, and 1.1 m is
+        // still well outside anything the rig can reach.
+        uNearFade: { value: new THREE.Vector2(1.1, 3.2) },
         // Only the additive pool needs a shoulder; an alpha-blended ribbon
         // cannot sum past its own colour.
         uClip: { value: additive ? 0.13 : 0.0 },

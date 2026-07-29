@@ -112,18 +112,26 @@ export const SKY_FILL_COLOR = 0xa8c8ff;
  * reason: the cascade was resolving correctly and the fill was refilling the
  * result.
  *
- * At a horizontal weight of 2.6 the fill arrives at 21.6°:
+ * Round 3 takes the same lever one notch further, 2.6 -> 3.4, for the same
+ * reason and with the same asymmetric payoff. Measured, cosine on the two
+ * surfaces that matter:
  *
- *                            35° / 1.45   21.6° / 2.6
- *   cos on flat road         0.580        0.369     (-36%, shadow comes back)
- *   cos on anti-solar wall   0.815        0.933     (+14%, sculpting improves)
+ *                            35° / 1.45   21.6° / 2.6   16.9° / 3.4
+ *   cos on flat road         0.580        0.369         0.290   (-21% again)
+ *   cos on anti-solar wall   0.815        0.933         0.957   (+3% again)
  *
- * so this is not a trade at all — it is strictly better placement of the same
- * light. It stays above the horizon, and well above the key's 14°, so §2's
- * "cool sky fill from above" still describes it.
+ * The fill is the largest single term left on a SHADOWED road (it was 39% of
+ * that budget at 2.6) and it is also the only thing putting §2's blue on a
+ * shaded flank, so every unit of it wants to be on the flank and not on the
+ * carriageway. Tipping is how you get both; scaling is how you get neither.
+ *
+ * 16.9° is still above the key's 14.2° and still unambiguously "from above", so
+ * §2's clause holds. It does not go lower than this: below the key the fill
+ * starts lighting UNDERSIDES the sun cannot reach, which is the ground bounce's
+ * job and is warm, not blue.
  */
 export const SKY_FILL_DIRECTION = new THREE.Vector3(
-  -SUN_DIRECTION.x * 2.6, 1.0, -SUN_DIRECTION.z * 2.6,
+  -SUN_DIRECTION.x * 3.4, 1.0, -SUN_DIRECTION.z * 3.4,
 ).normalize();
 /** Target displayed sky colours after tone mapping. */
 export const SKY_ZENITH_TARGET = 0x3f74c4;
@@ -653,10 +661,39 @@ export class AtmosphereModel {
     // Below the horizon: warm sea and sand haze. Only the env map and the last
     // couple of degrees of the dome ever see this, but a black lower hemisphere
     // would strip every PBR material of its bounce.
+    //
+    // THIS IS THE SECOND REASON PBR IN THIS GAME READ FLAT, and unlike the
+    // direct rig it is invisible in any still of the sky itself.
+    //
+    // An environment map only sculpts if its luminance actually varies with
+    // direction: a metal reflects the sphere, so a sphere that is the same
+    // brightness everywhere reflects as a flat swatch no matter how good the
+    // material is, and the same map convolved to irradiance gives every normal
+    // the same fill. Measured over 2048 uniform directions on the round-2 sky:
+    //
+    //   mean radiance above +0.2 elevation   0.311
+    //   mean radiance below -0.05 elevation  0.314      <- 1.01 : 1
+    //
+    // i.e. the lower hemisphere was AS BRIGHT AS THE SKY. Chrome had no horizon
+    // line to catch, clearcoat had no dark half to roll its Fresnel against, and
+    // the diffuse IBL arrived as pure DC with no vertical gradient at all — an
+    // upward-facing normal and a downward-facing one got the same skylight.
+    // Every "no rim, no readable key direction on the karts" note lands here.
+    //
+    // The old coefficients say why: 0.30 of a superwhite horizon is already a
+    // bright plate, and the additive offsets on top of it were (0.014, 0.080,
+    // 0.097) — i.e. weighted toward BLUE, which is the one thing golden-hour
+    // ground is not. That was a second sky pasted under the world.
+    //
+    // Now: 0.15 of the horizon (a plausible albedo for water, sand and rock
+    // taken together) plus a small WARM pedestal, so the lower hemisphere reads
+    // as sunlit ground seen through haze. Upper:lower goes to about 1.9:1, which
+    // is a horizon line a mirror can find, a vertical gradient the SH can carry,
+    // and a genuine warm-below / cool-above axis in the irradiance itself.
     this.groundColor.set(
-      this.horizonColor.x * 0.30 + 0.014,
-      this.horizonColor.y * 0.30 + 0.080,
-      this.horizonColor.z * 0.30 + 0.097,
+      this.horizonColor.x * 0.15 + 0.030,
+      this.horizonColor.y * 0.15 + 0.018,
+      this.horizonColor.z * 0.15 + 0.012,
     );
 
     // Sun disc: transmittance along its own path, normalised then driven hot.
@@ -1269,12 +1306,42 @@ void main() {
 
   vec3 col = atmosphere(dir, gamma);
 
-  // sun disc with limb darkening, plus two halo lobes
+  // THE DISC. Art bible §2 and §9.2 — the clearest possible statement of where
+  // the key is, and the frame's only guaranteed highlight anchor.
+  //
+  // Two things changed in round 3, both about the EDGE rather than the core.
+  //
+  //  · Real limb darkening instead of a shaped falloff. The solar disc obeys
+  //    I(mu)/I(0) ~ 1 - u(1 - mu) with mu the cosine off the disc normal and
+  //    u ~ 0.6 in visible light, so the rim of the sun is genuinely a third the
+  //    brightness of its centre. pow(1 - r*r, 0.35) -- what this was -- only
+  //    reached 0.70 at r = 0.8 and was then mixed 45% back toward flat, so the
+  //    disc was to within a few percent a uniform white sticker — which is
+  //    exactly what it read as against the glare it sits in.
+  //
+  //  · Limb SOFTENING, i.e. the edge is not on the disc. Seen through 30-odd
+  //    air masses at 14° elevation the limb is smeared by atmospheric seeing and
+  //    aerosol forward scatter over a couple of tenths of a degree, and it bleeds
+  //    slightly PAST the geometric radius. The old edge ramp ran 0.80 -> 1.00 of
+  //    the radius and terminated exactly at it, i.e. a hard geometric boundary
+  //    with a wide interior ramp — backwards on both counts. This runs
+  //    0.93 -> 1.09: a tight core with a soft skirt that hands over to the
+  //    aureole below instead of stopping dead against the sky.
   float ang = acos(clamp(gamma, -1.0, 1.0));
-  float r = clamp(ang / uSunRadius, 0.0, 1.0);
-  float limb = pow(max(1.0 - r * r, 0.0), 0.35);
-  float disc = 1.0 - smoothstep(0.80, 1.0, r);
-  col += uSunDisc * disc * mix(0.45, 1.0, limb);
+  float rr = ang / uSunRadius;
+  float mu = sqrt(max(1.0 - min(rr, 1.0) * min(rr, 1.0), 0.0));
+  float limb = 0.34 + 0.66 * mu;
+  float disc = 1.0 - smoothstep(0.93, 1.09, rr);
+  col += uSunDisc * disc * limb;
+  // THE AUREOLE, i.e. the atmospheric halo proper: the tight, near-white collar
+  // of aerosol forward scatter that welds the disc to the sky. Without it the
+  // disc has a hard outer boundary against a sky two orders of magnitude dimmer
+  // and reads as a decal pasted on the dome — which, with the glare lobes below
+  // starting three degrees out, is what it was. Falls to 15% within 2° and to a
+  // thousandth by 5°, so it is a halo and not a wash; at the 90° calibration
+  // probe it is exp(-86), i.e. exactly zero, and the bible's #ffd0a0 horizon is
+  // untouched.
+  col += uSunDisc * 0.11 * exp(-ang * 55.0);
   // THE AUREOLE. Art bible §2 asks for "a warm bloom around the sun disc", and
   // §6 keys the whole readability layer off being able to tell where the light
   // is coming from. The two lobes here used to peak at 0.42 and 0.025 linear

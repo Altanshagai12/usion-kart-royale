@@ -7,6 +7,7 @@ import { Recorder } from './core/Recorder';
 import { prewarm } from './core/Prewarm';
 import { FrameWatch } from './core/FrameWatch';
 import { Diagnostics } from './core/Diagnostics';
+import { installFeel } from './core/Feel';
 import { RenderPipeline } from './render/Renderer';
 import { DrawBudget } from './render/DrawBudget';
 import { Sky } from './render/Sky';
@@ -169,6 +170,7 @@ async function boot() {
   }
   frameWatch.init(ctx);
   diagnostics.init(ctx);
+  installFeel();
   installResizeListeners();
   installContextRecovery();
   resize(true);
