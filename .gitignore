@@ -4,3 +4,7 @@ shots/
 
 # camera-panel worktrees, removed when the winner lands
 .claude/worktrees/
+
+.DS_Store
+*.local
+.vercel
