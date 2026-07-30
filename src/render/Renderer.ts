@@ -16,10 +16,12 @@ import * as THREE from 'three';
 import { EffectComposer } from 'postprocessing';
 import { Quality, type Ctx, type Settings, type System } from '../types';
 import { PostFX } from './PostFX';
+import { glCapabilities, forcedFailure, type GLCapabilities } from '../core/Settings';
+import { logPipeline, recordShaderError, type FrameSample } from '../core/Diagnostics';
 
 interface DeviceProfile {
   webgl2: boolean;
-  /** RGBA16F is colour-renderable — required for an HDR composer buffer */
+  /** RGBA16F was BUILT as a colour attachment and reported complete */
   halfFloat: boolean;
   /** SwiftShader / llvmpipe / ANGLE-on-CPU, i.e. a headless capture or CI */
   software: boolean;
@@ -27,37 +29,84 @@ interface DeviceProfile {
 }
 
 /**
- * Probes capabilities on a throwaway context so the real renderer can be
- * constructed with the right attributes first time. Discovering afterwards
- * that we need a different context means replacing the canvas, and by then
- * every other system has already captured `ctx.renderer`.
+ * The device profile, taken from the one shared capability probe.
+ *
+ * This used to open a second throwaway context of its own and decide
+ * `halfFloat` from the extension string. Both were wrong: browsers cap live
+ * contexts (we were spending two before the game started), and the extension
+ * string is a promise about a FORMAT, not about an ATTACHMENT — a driver can
+ * advertise it and still refuse the framebuffer, at which point every draw into
+ * the composer's buffer is discarded and the canvas is uniformly black. That
+ * exact condition, forced on real hardware, produced 222 draw calls into a
+ * canvas that was never painted. `glCapabilities()` builds the attachment and
+ * asks; see the long note there.
  */
 function probeDevice(): DeviceProfile {
-  const profile: DeviceProfile = { webgl2: false, halfFloat: false, software: false, name: '' };
-  try {
-    const canvas = document.createElement('canvas');
-    const gl = canvas.getContext('webgl2', { failIfMajorPerformanceCaveat: false });
-    if (gl === null) return profile;
-    profile.webgl2 = true;
-    profile.halfFloat =
-      gl.getExtension('EXT_color_buffer_half_float') !== null ||
-      gl.getExtension('EXT_color_buffer_float') !== null;
-    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
-    profile.name = dbg !== null ? String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)) : '';
-    profile.software =
-      /SwiftShader|llvmpipe|Software|Microsoft Basic|Mesa OffScreen|ANGLE \(Software/i.test(profile.name);
-    gl.getExtension('WEBGL_lose_context')?.loseContext();
-  } catch {
-    /* A blocked or exhausted context just means we take the safe path. */
-  }
-  return profile;
+  const caps = glCapabilities();
+  return {
+    webgl2: caps.webgl2,
+    halfFloat: caps.halfFloatRenderable,
+    software: caps.software,
+    name: caps.renderer,
+  };
 }
+
+// ---------------------------------------------------------------------------
+//  THE FALLBACK LADDER
+// ---------------------------------------------------------------------------
+/**
+ * Every rung is a real, playable frame except the last, and each one removes
+ * the thing the rung above it depends on. A driver that cannot do the top rung
+ * gets the next one down, not a black screen.
+ *
+ *   Hdr     composer with a half-float HDR buffer — the shipping look
+ *   Ldr     composer with an 8-bit buffer: the grade clips earlier, everything
+ *           else is intact. This is what a GPU with no renderable float
+ *           attachment gets, and it is chosen at BOOT from the probe rather
+ *           than discovered by going black first.
+ *   Direct  no composer at all: `renderer.render()` straight to the canvas.
+ *           No grade, no bloom, no AO, no SMAA — three's own ACES tone map
+ *           carries the exposure. A worse-looking game, and a game.
+ *   Safe    Direct, plus every material in the scene replaced with a simple lit
+ *           one and shadows off. This is the rung for a driver that rejects the
+ *           PBR shader family: the geometry is all still there, it just stops
+ *           being invisible.
+ *   Flat    Direct, plus the simplest shader three has that still shows form.
+ *           No lights, no textures, no environment — if this draws nothing,
+ *           nothing will.
+ *   Dead    the banner. Reached only after every rung above it drew nothing.
+ */
+const enum Rung { Hdr = 0, Ldr = 1, Direct = 2, Safe = 3, Flat = 4, Dead = 5 }
+
+const RUNG_NAMES = ['hdr-composer', 'ldr-composer', 'direct', 'safe-materials', 'flat-materials', 'dead'];
 
 /**
  * Fullscreen quads the post chain submits regardless of what the scene drew.
  * Only used to keep the health signal honest, so a rough figure is fine.
  */
 const POST_QUADS = 20;
+
+/**
+ * Recovers which material a failing program belonged to.
+ *
+ * `debug.onShaderError` is handed the GL objects and nothing else, but three
+ * stamps `#define SHADER_NAME <name>` into every prefix it generates, so the
+ * source itself carries the identity. Every world material in this game is a
+ * MeshStandard/PhysicalMaterial under a descriptive name ('tarmac-vc',
+ * 'kerb-vc', 'bridge-stone-2s'), which is precisely what a report needs to say.
+ */
+function shaderNameOf(gl: WebGLRenderingContext, shader: WebGLShader): string {
+  try {
+    const src = gl.getShaderSource(shader) || '';
+    const m = src.match(/#define SHADER_NAME (\S+)/);
+    const type = /RE_Direct_Physical|PhysicalMaterial material;/.test(src)
+      ? 'MeshStandardMaterial' : '';
+    if (m === null) return type;
+    return type === '' ? m[1] : `${m[1]} (${type})`;
+  } catch {
+    return '';
+  }
+}
 
 /** Packs the settings the pipeline actually reacts to into one comparable int. */
 function pipelineSignature(s: Settings): number {
@@ -103,6 +152,12 @@ export class RenderPipeline implements System {
   private ctx!: Ctx;
   private device: DeviceProfile = { webgl2: false, halfFloat: false, software: false, name: '' };
   private usePost = false;
+  /** Current position on the fallback ladder. Only ever moves downward. */
+  private rung: Rung = Rung.Hdr;
+  /** The material every object is drawn with at Rung.Safe / Rung.Flat. */
+  private overrideMat: THREE.Material | null = null;
+  /** Scratch for `sampleFrame`, allocated at most once per width. */
+  private samplePixels: Uint8Array | null = null;
   private width = 1;
   private height = 1;
   private signature = -1;
@@ -121,6 +176,46 @@ export class RenderPipeline implements System {
     this.device = probeDevice();
     this.usePost = this.device.webgl2;
 
+    // THE FIRST RUNG IS CHOSEN FROM THE PROBE, NOT DISCOVERED BY GOING BLACK.
+    // A GPU that cannot complete an RGBA16F attachment starts on the 8-bit
+    // composer; one that cannot complete an RGBA8 attachment either has no
+    // off-screen rendering at all and starts on the direct path.
+    const caps = glCapabilities();
+    if (!caps.webgl2) {
+      // three r185 creates WebGL2 contexts and nothing else, so there is no
+      // renderer to build and no frame to degrade to. Say so in a way a player
+      // can act on, and make it survive main.ts's boot-failure handler — which
+      // replaces the whole of <body> — by hanging it off <html> instead.
+      this.showFatal(
+        'This browser cannot start WebGL 2',
+        'The game needs WebGL 2, and this browser or graphics driver is not providing it. ' +
+        'Updating the graphics driver, or enabling hardware acceleration in the browser settings, usually fixes it.',
+      );
+      logPipeline('fatal', 'no WebGL2 context — nothing can be rendered');
+      throw new Error('WebGL 2 is unavailable, so the renderer cannot be created.');
+    }
+    if (!caps.halfFloatRenderable) this.rung = Rung.Ldr;
+    if (!caps.byteRenderable) this.rung = Rung.Direct;
+    if (this.rung !== Rung.Hdr) {
+      logPipeline('start', `pipeline starts on ${RUNG_NAMES[this.rung]} (boot probe)`);
+    }
+
+    let renderer: THREE.WebGLRenderer;
+    try {
+      renderer = this.createRenderer(ctx);
+    } catch (err) {
+      this.showFatal(
+        'Graphics could not start',
+        'The browser refused to create a WebGL context for this page. Updating the graphics driver, ' +
+        'or enabling hardware acceleration in the browser settings, usually fixes it.',
+      );
+      logPipeline('fatal', 'WebGLRenderer could not be constructed: ' + String(err));
+      throw err;
+    }
+    this.finishInit(ctx, renderer);
+  }
+
+  private createRenderer(ctx: Ctx): THREE.WebGLRenderer {
     const renderer = new THREE.WebGLRenderer({
       // With the composer running, MSAA lives on the composer's render target
       // and the default framebuffer only ever receives one fullscreen triangle.
@@ -189,6 +284,10 @@ export class RenderPipeline implements System {
       console.error('[render] context creation error:', e.statusMessage);
     }) as EventListener, false);
 
+    return renderer;
+  }
+
+  private finishInit(ctx: Ctx, renderer: THREE.WebGLRenderer) {
     this.renderer = renderer;
     try { this.gl = renderer.getContext(); } catch { this.gl = null; }
     ctx.renderer = renderer;
@@ -197,49 +296,100 @@ export class RenderPipeline implements System {
     // is deliberately not on Ctx) to A/B a single pass.
     (globalThis as unknown as { __render?: RenderPipeline }).__render = this;
 
+    // A LINK FAILURE IS THE LEADING THEORY AND THIS IS WHERE IT SURFACES.
+    //
+    // three logs a shader error and then carries on using the program, so a
+    // material family the driver rejects does not throw, does not stop the
+    // frame, and does not reduce the draw-call count — it just stops appearing.
+    // Installing this hook suppresses three's own console.error, so it has to
+    // both record and re-emit, and the info log it hands over is the exact text
+    // the bug report we never received would have contained.
+    renderer.debug.onShaderError = (gl, program, vs, fs) => {
+      const type = shaderNameOf(gl, vs) || shaderNameOf(gl, fs) || 'unknown';
+      const text =
+        `program link failed for "${type}"\n` +
+        `  program: ${gl.getProgramInfoLog(program) || '(no log)'}\n` +
+        `  vertex : ${gl.getShaderInfoLog(vs) || '(ok)'}\n` +
+        `  frag   : ${gl.getShaderInfoLog(fs) || '(ok)'}`;
+      recordShaderError(text, type);
+      console.error('[render] ' + text);
+    };
+
     this.width = Math.max(1, ctx.width);
     this.height = Math.max(1, ctx.height);
     this.signature = pipelineSignature(ctx.settings);
     this.applyResolution();
+
+    // DOES A REPRESENTATIVE MATERIAL ACTUALLY DRAW? Asked before the world is
+    // built, so the answer is available before any of it can go missing.
+    const trial = this.trialDraw();
+    if (!trial.ok) {
+      logPipeline('trial', 'a representative PBR material drew nothing: ' + trial.detail);
+      if (this.rung < Rung.Safe) this.rung = Rung.Safe;
+    }
+
     this.rebuild();
   }
 
   /**
    * Tears the effect chain down and reassembles it against the current
-   * settings. Safe to call at any time — quality may change mid-race.
+   * settings and the current rung. Safe to call at any time — quality may
+   * change mid-race, and so may the rung.
+   *
+   * Each attempt that fails moves one rung DOWN and is retried, so a device
+   * that cannot build the composer ends this call on the direct path with a
+   * frame in hand rather than with an exception and a black canvas. The loop
+   * is bounded by the number of rungs; it cannot spin.
    */
   rebuild(): void {
     if (this.contextLost) return;
+    for (let attempt = 0; attempt <= Rung.Dead; attempt++) {
+      if (this.tryBuild()) return;
+    }
+  }
+
+  /** One attempt at the current rung. False means "moved down, try again". */
+  private tryBuild(): boolean {
+    this.applyMaterialOverride();
+    // Shadow maps are the other thing a rejected shader family takes with it,
+    // and at the safe rungs there are no PBR materials left to receive them.
+    this.renderer.shadowMap.enabled = this.ctx.settings.shadows && this.rung < Rung.Safe;
+    this.usePost = this.rung <= Rung.Ldr;
+
     if (!this.usePost) {
       this.fx.dispose();
+      if (this.composer !== null) {
+        try { this.composer.removeAllPasses(); this.composer.dispose(); } catch { /* going away */ }
+        this.composer = null;
+      }
       // Nothing owns the default framebuffer's clear any more. See render().
       this.renderer.autoClear = true;
-      return;
+      this.invalidateResolutionCache();
+      this.applyResolution();
+      return true;
     }
 
     if (this.composer === null) {
       try {
+        if (forcedFailure('composer')) throw new Error('forced by ?glfail=composer');
         this.composer = new EffectComposer(this.renderer, {
           depthBuffer: true,
           stencilBuffer: false,
           multisampling: 0,
           // Half float is what makes a high bloom threshold and our own tone
           // map meaningful; without it the scene clips to white before there
-          // is anything left to grade.
-          frameBufferType: this.device.halfFloat ? THREE.HalfFloatType : THREE.UnsignedByteType,
+          // is anything left to grade. `Rung.Ldr` is that trade taken
+          // deliberately, on a device that proved it cannot do the other one.
+          frameBufferType: this.rung === Rung.Hdr ? THREE.HalfFloatType : THREE.UnsignedByteType,
         });
         // A brand-new composer starts at multisampling 0 and at whatever size
         // its constructor picked, so the `applyResolution` guard has no history
         // to compare against and must not skip the first push.
         this.invalidateResolutionCache();
       } catch (err) {
-        console.warn('[render] composer unavailable, falling back to direct render', err);
-        this.composer = null;
-        this.usePost = false;
-        this.renderer.autoClear = true;
-        this.invalidateResolutionCache();
-        this.applyResolution();
-        return;
+        this.dropComposer();
+        this.fall(`composer could not be constructed: ${String(err)}`);
+        return false;
       }
     } else {
       this.fx.dispose();
@@ -266,30 +416,90 @@ export class RenderPipeline implements System {
     this.setMultisampling(this.msaaSamples());
 
     try {
-      this.fx.build(this.ctx, this.composer, { software: this.device.software });
+      this.fx.build(this.ctx, this.composer, {
+        software: this.device.software,
+        // The chain has to know it is writing into 8 bits: with an LDR buffer
+        // the scene is clamped at 1.0 before bloom ever sees it, so a threshold
+        // authored against scene-linear HDR selects nothing at all.
+        ldr: this.rung >= Rung.Ldr,
+      });
     } catch (err) {
-      console.warn('[render] effect chain failed to build, falling back', err);
-      this.fx.dispose();
-      try {
-        this.composer.removeAllPasses();
-        this.composer.dispose();
-      } catch { /* the composer is being abandoned either way */ }
-      this.composer = null;
-      this.usePost = false;
-      // §6 of the brief: degrade, do not die. The direct path below is a real
-      // frame — no grade, no bloom, but a legible game — and it needs the
-      // renderer's own clear back, because the EffectComposer constructor
-      // turned `autoClear` off on its way in and nothing else would ever turn
-      // it on again. Without this the default framebuffer is never cleared and
-      // whatever the previous frame left in the pixels the scene does not cover
-      // stays on screen: a genuine partial-render, permanently.
-      this.renderer.autoClear = true;
-      this.invalidateResolutionCache();
-      this.applyResolution();
-      return;
+      this.dropComposer();
+      // §6 of the brief: degrade, do not die. The direct path is a real frame —
+      // no grade, no bloom, but a legible game.
+      this.fall(`effect chain failed to build: ${String(err)}`);
+      return false;
     }
 
     this.applyResolution();
+
+    // THE TARGETS THE COMPOSER ACTUALLY GOT, NOT THE ONES IT ASKED FOR.
+    //
+    // `new WebGLRenderTarget(...)` never fails: three defers the allocation to
+    // the first bind, and a driver that refuses the format then leaves an
+    // INCOMPLETE framebuffer behind, into which every draw is silently
+    // discarded. That is a uniformly black canvas with a full draw-call count —
+    // reproduced on real hardware by refusing RGBA16F attachments, 222 draws
+    // into a canvas that was never painted. Binding it and asking is the whole
+    // difference between shipping that and catching it.
+    const status = this.targetStatus(this.composer.inputBuffer);
+    if (!status.ok) {
+      this.dropComposer();
+      this.fall(`the composer's ${this.rung === Rung.Hdr ? 'half-float' : '8-bit'} buffer is not ` +
+        `renderable at ${this.appliedW}x${this.appliedH} (framebuffer status 0x${status.status.toString(16)})`);
+      return false;
+    }
+    return true;
+  }
+
+  /** Releases the effect chain and the composer, tolerating a dead context. */
+  private dropComposer(): void {
+    this.fx.dispose();
+    try {
+      this.composer?.removeAllPasses();
+      this.composer?.dispose();
+    } catch { /* the composer is being abandoned either way */ }
+    this.composer = null;
+    this.usePost = false;
+    // The EffectComposer constructor turns `autoClear` off on its way in and
+    // nothing else would ever turn it back on. Without this the default
+    // framebuffer is never cleared and whatever the previous frame left in the
+    // pixels the scene does not cover stays on screen: a permanent
+    // partial-render.
+    this.renderer.autoClear = true;
+    this.invalidateResolutionCache();
+  }
+
+  /** Steps one rung down from inside a build attempt, and says why. */
+  private fall(reason: string): void {
+    const from = RUNG_NAMES[this.rung];
+    this.rung = Math.min(this.rung + 1, Rung.Dead) as Rung;
+    logPipeline('degrade', `${from} -> ${RUNG_NAMES[this.rung]}: ${reason}`);
+  }
+
+  /**
+   * Is this render target's framebuffer complete and error-free?
+   *
+   * `setRenderTarget` is what makes three allocate and bind it, so this is also
+   * the moment the allocation either happens or does not.
+   */
+  private targetStatus(rt: THREE.WebGLRenderTarget): { ok: boolean; status: number } {
+    const gl = this.gl as WebGL2RenderingContext | null;
+    if (gl === null) return { ok: true, status: 0 };
+    const prev = this.renderer.getRenderTarget();
+    let status = 0;
+    let err = 0;
+    try {
+      while (gl.getError() !== gl.NO_ERROR) { /* drain anything we inherited */ }
+      this.renderer.setRenderTarget(rt);
+      status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+      err = gl.getError();
+    } catch {
+      return { ok: false, status: 0 };
+    } finally {
+      this.renderer.setRenderTarget(prev);
+    }
+    return { ok: status === gl.FRAMEBUFFER_COMPLETE && err === gl.NO_ERROR, status };
   }
 
   /**
@@ -314,7 +524,9 @@ export class RenderPipeline implements System {
     const sig = pipelineSignature(ctx.settings);
     if (sig !== this.signature) {
       this.signature = sig;
-      this.renderer.shadowMap.enabled = ctx.settings.shadows;
+      // `tryBuild` owns the shadow flag now, because at the safe rungs it is
+      // not simply the setting — a driver that rejected the lit material family
+      // is in no position to be handed a shadow pass either.
       this.rebuild();
       this.applyResolution();
     }
@@ -408,6 +620,12 @@ export class RenderPipeline implements System {
       this.composer.dispose();
       this.composer = null;
     }
+    if (this.overrideMat !== null) {
+      if (this.ctx?.scene?.overrideMaterial === this.overrideMat) this.ctx.scene.overrideMaterial = null;
+      this.overrideMat.dispose();
+      this.overrideMat = null;
+    }
+    this.samplePixels = null;
     this.notice?.remove();
     this.notice = null;
     this.renderer?.dispose();
@@ -424,18 +642,256 @@ export class RenderPipeline implements System {
    * is a black rectangle.
    */
   disablePostProcessing(reason: string): void {
-    if (!this.usePost && this.composer === null) return;
-    console.warn(`[render] disabling post-processing: ${reason}`);
-    this.fx.dispose();
+    if (this.rung >= Rung.Direct) return;
+    logPipeline('degrade', `${RUNG_NAMES[this.rung]} -> ${RUNG_NAMES[Rung.Direct]}: ${reason}`);
+    this.rung = Rung.Direct;
+    this.dropComposer();
+    this.rebuild();
+  }
+
+  // -------------------------------------------------------------------------
+  //  The fallback ladder, driven from Diagnostics
+  // -------------------------------------------------------------------------
+
+  /**
+   * Step one rung down and rebuild. Returns false when there is nothing left
+   * below — which is the only condition under which the banner is allowed.
+   *
+   * Called by the watchdogs in Diagnostics, which is deliberate: the pipeline
+   * knows how to degrade and the diagnostics know when to. Neither of them
+   * should be deciding both.
+   */
+  degrade(reason: string): boolean {
+    if (this.rung >= Rung.Flat) {
+      logPipeline('degrade', `already on ${RUNG_NAMES[this.rung]}; nothing simpler to try (${reason})`);
+      return false;
+    }
+    this.fall(reason);
+    this.rebuild();
+    return true;
+  }
+
+  /**
+   * Jump straight to the simple-material rung.
+   *
+   * Used when the cause is KNOWN to be a material family the driver rejected.
+   * Walking down through the composer rungs first would waste several seconds
+   * of the player's time on changes that cannot possibly help: the shader is
+   * broken wherever it is composited to.
+   */
+  degradeToSafeMaterials(reason: string): boolean {
+    // Already there. Say so and change nothing: the remedy for this cause has
+    // been applied, and the image detector is the thing entitled to decide
+    // whether it worked. Escalating here as well is how a driver that rejects
+    // ONE shader family ended up on flat normal-shading when the untextured lit
+    // variant one rung up was drawing the world perfectly well.
+    if (this.rung >= Rung.Safe) {
+      logPipeline('degrade', `already on ${RUNG_NAMES[this.rung]}, which covers this (${reason})`);
+      return true;
+    }
+    logPipeline('degrade', `${RUNG_NAMES[this.rung]} -> ${RUNG_NAMES[Rung.Safe]}: ${reason}`);
+    this.rung = Rung.Safe;
+    this.rebuild();
+    return true;
+  }
+
+  rungName(): string { return RUNG_NAMES[this.rung]; }
+
+  capabilities(): GLCapabilities { return glCapabilities(); }
+
+  /**
+   * Read two strips of the finished frame back and score them.
+   *
+   * THE ONLY HONEST ORACLE IN THE FILE. Draw calls, framebuffer status and
+   * shader logs are all proxies; this is the picture. It works without
+   * `preserveDrawingBuffer` because it runs inside the same task that drew the
+   * frame — the drawing buffer is only discarded when the compositor takes the
+   * surface, which cannot happen until this task yields.
+   *
+   * `readPixels` is a synchronous pipeline stall, so this is called a handful
+   * of times in the life of the page and never in a steady state; see
+   * FIRST_LOOK in Diagnostics. The strips are 4 rows each at 45% and 75% of
+   * frame height, which crosses sky, horizon, trackside and road — a band that
+   * is featureless in every one of the failure modes and never featureless in a
+   * working frame.
+   */
+  sampleFrame(): FrameSample | null {
+    const gl = this.gl as WebGL2RenderingContext | null;
+    if (gl === null || this.contextLost) return null;
+    const w = gl.drawingBufferWidth | 0;
+    const h = gl.drawingBufferHeight | 0;
+    if (w < 8 || h < 8) return null;
+
+    const rows = 4;
+    const need = w * rows * 4;
+    if (this.samplePixels === null || this.samplePixels.length < need) {
+      this.samplePixels = new Uint8Array(need);
+    }
+    const buf = this.samplePixels;
+
+    let n = 0;
+    let sum = 0;
+    let sum2 = 0;
+    let lit = 0;
+    const prev = this.renderer.getRenderTarget();
     try {
-      this.composer?.removeAllPasses();
-      this.composer?.dispose();
-    } catch { /* going away regardless */ }
-    this.composer = null;
-    this.usePost = false;
-    this.renderer.autoClear = true;
-    this.invalidateResolutionCache();
-    this.applyResolution();
+      // The default framebuffer is what the player sees; anything still bound
+      // from the last pass is not.
+      this.renderer.setRenderTarget(null);
+      while (gl.getError() !== gl.NO_ERROR) { /* drain */ }
+      for (const frac of [0.45, 0.75]) {
+        const y = Math.min(h - rows, Math.max(0, Math.round(h * frac)));
+        gl.readPixels(0, y, w, rows, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+        if (gl.getError() !== gl.NO_ERROR) return { lit: 0, mean: 0, sd: 0, ok: false };
+        for (let i = 0; i < need; i += 4) {
+          const luma = 0.2126 * buf[i] + 0.7152 * buf[i + 1] + 0.0722 * buf[i + 2];
+          n++;
+          sum += luma;
+          sum2 += luma * luma;
+          if (luma > 12) lit++;
+        }
+      }
+    } catch {
+      return { lit: 0, mean: 0, sd: 0, ok: false };
+    } finally {
+      this.renderer.setRenderTarget(prev);
+    }
+    if (n === 0) return { lit: 0, mean: 0, sd: 0, ok: false };
+    const mean = sum / n;
+    return { lit: lit / n, mean, sd: Math.sqrt(Math.max(0, sum2 / n - mean * mean)), ok: true };
+  }
+
+  /**
+   * Draws a representative material into a small off-screen target and reads
+   * the result back. Runs once, at boot, before any of the world exists.
+   *
+   * A clearcoated MeshPhysicalMaterial under a directional light is the game's
+   * headline material (art bible §4) and shares its entire shader family with
+   * the road, the kerbs, the buildings and the karts. If this comes back the
+   * colour of the clear, that family does not draw on this GPU — which is the
+   * leading theory for the empty-world reports, and the whole point of asking
+   * before the player has anything to lose.
+   */
+  private trialDraw(): { ok: boolean; detail: string } {
+    if (forcedFailure('trial')) return { ok: false, detail: 'forced by ?glfail=trial' };
+    const size = 8;
+    let rt: THREE.WebGLRenderTarget | null = null;
+    const scene = new THREE.Scene();
+    const geo = new THREE.PlaneGeometry(4, 4);
+    const mat = new THREE.MeshPhysicalMaterial({
+      color: 0xe0453f, metalness: 0, roughness: 0.28, clearcoat: 1, clearcoatRoughness: 0.06,
+    });
+    const prevTarget = this.renderer.getRenderTarget();
+    const prevClear = new THREE.Color();
+    this.renderer.getClearColor(prevClear);
+    const prevAlpha = this.renderer.getClearAlpha();
+    try {
+      // 8-bit on purpose: this probe asks about the MATERIAL, and pairing it
+      // with a float target would confuse a shader failure with a format one.
+      rt = new THREE.WebGLRenderTarget(size, size, { type: THREE.UnsignedByteType, depthBuffer: true });
+      const cam = new THREE.PerspectiveCamera(50, 1, 0.1, 20);
+      cam.position.set(0, 0, 2.4);
+      const key = new THREE.DirectionalLight(0xffd9a8, 4.2);
+      key.position.set(0.5, 0.9, 1.4);
+      scene.add(key, new THREE.AmbientLight(0xa8c8ff, 0.8), new THREE.Mesh(geo, mat));
+
+      this.renderer.setRenderTarget(rt);
+      this.renderer.setClearColor(0x000000, 1);
+      this.renderer.clear(true, true, false);
+      this.renderer.render(scene, cam);
+
+      const px = new Uint8Array(size * size * 4);
+      this.renderer.readRenderTargetPixels(rt, 0, 0, size, size, px);
+      let brightest = 0;
+      for (let i = 0; i < px.length; i += 4) {
+        brightest = Math.max(brightest, px[i], px[i + 1], px[i + 2]);
+      }
+      // The quad fills the frame and is lit from the front, so a working driver
+      // returns something in the hundreds. Anything under 8 counts is the clear
+      // colour with rounding on top.
+      return brightest >= 8
+        ? { ok: true, detail: '' }
+        : { ok: false, detail: `brightest channel was ${brightest}/255 on a fully-lit quad` };
+    } catch (err) {
+      return { ok: false, detail: String(err) };
+    } finally {
+      this.renderer.setRenderTarget(prevTarget);
+      this.renderer.setClearColor(prevClear, prevAlpha);
+      scene.clear();
+      geo.dispose();
+      mat.dispose();
+      rt?.dispose();
+    }
+  }
+
+  /**
+   * Installs, updates or removes the whole-scene material override.
+   *
+   * `Scene.overrideMaterial` is a blunt instrument and that is exactly what is
+   * wanted here: at this point the driver has told us it will not draw the
+   * materials the world is made of, and the choice is between one simple
+   * material for everything and nothing at all. The geometry, the layout, the
+   * karts and the track are all still there — they stop being invisible.
+   */
+  private applyMaterialOverride(): void {
+    const scene = this.ctx?.scene;
+    if (scene === undefined || scene === null) return;
+    const want: 'safe' | 'flat' | null =
+      this.rung >= Rung.Flat ? 'flat' : this.rung >= Rung.Safe ? 'safe' : null;
+    const have = this.overrideMat === null ? null
+      : (this.overrideMat as THREE.Material).userData.kartFallback as 'safe' | 'flat';
+    if (want === have) return;
+
+    if (this.overrideMat !== null) {
+      if (scene.overrideMaterial === this.overrideMat) scene.overrideMaterial = null;
+      this.overrideMat.dispose();
+      this.overrideMat = null;
+    }
+    if (want === null) return;
+
+    // 'safe' keeps the lights and the fog, so the frame still reads as
+    // golden-hour Sunset Bay with its textures missing. 'flat' has no lights,
+    // no textures and no environment at all — the simplest shader three has
+    // that still shows the shape of a thing.
+    const mat: THREE.Material = want === 'safe'
+      ? new THREE.MeshLambertMaterial({ color: 0xb9b2a6, fog: true })
+      : new THREE.MeshNormalMaterial();
+    mat.userData.kartFallback = want;
+    this.overrideMat = mat;
+    scene.overrideMaterial = mat;
+    logPipeline('materials', `every material replaced with the ${want} variant`);
+  }
+
+  /**
+   * A full-page explanation for the failures that leave nothing to render at
+   * all, attached to <html> rather than <body>.
+   *
+   * That is not a stylistic choice. When the pipeline cannot be constructed,
+   * `init` throws, and main.ts's boot handler replaces the entire contents of
+   * <body> with a stack trace — which would take a panel inside it with it. A
+   * node parented to the document element survives, so the player gets a
+   * sentence they can act on instead of a red monospace dump.
+   */
+  private showFatal(title: string, detail: string): void {
+    if (document.getElementById('gl-fatal') !== null) return;
+    const el = document.createElement('div');
+    el.id = 'gl-fatal';
+    el.setAttribute('role', 'alert');
+    el.style.cssText = [
+      'position:fixed', 'inset:0', 'z-index:9999', 'display:flex',
+      'flex-direction:column', 'align-items:center', 'justify-content:center',
+      'gap:.6em', 'padding:8vmin', 'text-align:center',
+      'font-family:system-ui,-apple-system,sans-serif', 'color:#f6efe4',
+      'background:radial-gradient(120% 100% at 50% 30%,#1d2436 0%,#0b0f18 70%)',
+    ].join(';');
+    const h = document.createElement('div');
+    h.style.cssText = 'font-weight:800;font-size:clamp(18px,3.2vmin,26px);letter-spacing:.02em';
+    h.textContent = title;
+    const p = document.createElement('div');
+    p.style.cssText = 'max-width:34em;opacity:.8;font-size:clamp(13px,2vmin,16px);line-height:1.6';
+    p.textContent = detail;
+    el.append(h, p);
+    document.documentElement.appendChild(el);
   }
 
   /**
@@ -496,7 +952,12 @@ export class RenderPipeline implements System {
     // the device is live and every texture, geometry and program will re-upload
     // the next time it is used. What is left to us is everything that wraps a
     // GL resource of our own.
-    this.usePost = this.device.webgl2;
+    //
+    // The RUNG is deliberately not reset. Whatever the driver refused before
+    // the context went away, it will refuse again, and climbing back up to a
+    // pipeline this device has already failed would spend the recovery on a
+    // second black screen.
+    this.usePost = this.device.webgl2 && this.rung <= Rung.Ldr;
     this.composer = null;
     this.invalidateResolutionCache();
     this.signature = pipelineSignature(this.ctx.settings);

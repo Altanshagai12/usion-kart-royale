@@ -1484,7 +1484,14 @@ export class Effects implements System {
         // Carries the kart's velocity, otherwise a 0.4 s flash on a kart doing
         // 25 m/s is stranded eight metres back down the road by the time it
         // fades.
-        p.fadeIn = 0.05; p.drag = 0.6; p.count = 1; p.camBias = 0.08;
+        // ROUND 14. `fadeIn` was 0.05 s — three frames at 60 Hz to reach full
+        // value. The HUD punch was separately measured arriving two to five
+        // frames after the same trigger, and a promotion whose three channels
+        // peak on three different frames is the "mush rather than an event"
+        // failure however loud each channel is on its own. Every cue on this
+        // event now peaks on the frame it is raised; a single frame of fade is
+        // still enough to keep a 3.4 m ground disc from popping in hard.
+        p.fadeIn = 0.016; p.drag = 0.6; p.count = 1; p.camBias = 0.08;
         this.particles.at(_q.x, _q.y, _q.z);
         this.particles.vel(e.kart.velocity.x, 0, e.kart.velocity.z);
         this.particles.colorA(col, 1.05 + 0.42 * tier, 0.78);
@@ -1513,7 +1520,8 @@ export class Effects implements System {
         p.mode = PMode.Billboard; p.tile = PTile.Glow;
         p.life = 0.26 + 0.05 * tier; p.lifeJitter = 0.2;
         p.size0 = 0.45 + 0.30 * tier; p.size1 = 1.7 + 0.95 * tier; p.sizeJitter = 0.2;
-        p.drag = 4.5; p.gravity = 1.2; p.count = 1; p.fadeIn = 0.04;
+        // Same-frame attack as the pool and the sparks above. See there.
+        p.drag = 4.5; p.gravity = 1.2; p.count = 1; p.fadeIn = 0.012;
         // Two metres of camera-facing disc 42 cm off the deck: it needs a real
         // soft fade and a real bias, or the road slices it in half.
         this.particles.ground(fx.groundY, fx.groundN, 0.55, 0.45);
@@ -1676,15 +1684,18 @@ export class Effects implements System {
     // shipped arcade racer, and it costs one instanced draw the pool already
     // pays for.
     _q.copy(k.position); _q.y = fx.groundY + 0.30;
-    this.rings.spawn(_q, fx.groundN, 0.9, 8.6 + 1.1 * bt, 0.34, 0.055,
-      col, 1.7 + 0.28 * bt, now, k.velocity, 1.6);
+    this.rings.spawn(_q, fx.groundN, 0.9, 7.5 + 2.2 * bt, 0.34, 0.055,
+      col, 1.55 + 0.45 * bt, now, k.velocity, 1.6);
     _q.y = fx.groundY + 0.52;
     this.rings.spawn(_q, fx.groundN, 0.5, 4.8, 0.24, 0.075, C_HOT, 1.25, now, k.velocity, 1.6);
     // The overtaking front: 14 m in a fifth of a second, 3.5% thick, on the
     // tier colour, held high enough to sweep the lens rather than the tarmac.
+    // This is the ring the player's eye ends up INSIDE, so it is the one that
+    // most has to differ between a blue and a purple cash-out: 15.5 m against
+    // 11.5 m, and half again the intensity.
     _q.y = fx.groundY + 1.05;
-    this.rings.spawn(_q, fx.groundN, 2.2, 14.5, 0.20, 0.035,
-      col, 1.15 + 0.22 * bt, now, k.velocity, 1.2);
+    this.rings.spawn(_q, fx.groundN, 2.2, 9.5 + 2.0 * bt, 0.20, 0.035,
+      col, 0.95 + 0.42 * bt, now, k.velocity, 1.2);
 
     // Ignition bloom at the stacks: a short violent scatter of hot gas that
     // seeds the ribbon before it has grown to length.
@@ -1698,7 +1709,17 @@ export class Effects implements System {
       // 5 at 1.9x, down from 7 at 2.6x. This lands on the same pixels as the
       // plume, the ribbon, the root kiss and the boost lamp, all within the
       // 0.3 s the ignition overshoot is also multiplying everything else.
-      p.fadeIn = 0.04; p.count = 7;
+      //
+      // ROUND 14 — THE RELEASE HAS TO ESCALATE, BECAUSE THE PROMOTION DOES.
+      // Counted off the authored constants, a tier-3 PROMOTION spawns nine
+      // times the sparks of a tier-1 promotion, throws a ring twice the radius
+      // and shakes the camera five times as hard. The RELEASE — the thing the
+      // whole ladder exists to buy — scaled by 1.1 per tier on a couple of
+      // radii and by nothing at all on every particle count: a purple mini
+      // turbo cashed out about 25% louder than a blue one. That is the wrong
+      // way round. The counts below now grow with the tier so that cashing a
+      // tier 3 is visibly the biggest thing that happens in a lap.
+      p.fadeIn = 0.04; p.count = 5 + 3 * bt;
       this.particles.ground(fx.groundY, fx.groundN, 0.5, 0.2);
       this.particles.at(_p.x, _p.y, _p.z);
       // Carries most of the kart's velocity so the burst stays with the car
@@ -1719,7 +1740,7 @@ export class Effects implements System {
       p.life = 0.26; p.lifeJitter = 0.5;
       p.size0 = 0.10; p.size1 = 0.014; p.sizeJitter = 0.55;
       p.gravity = -7; p.drag = 1.2; p.velJitter = 3.4; p.posJitter = 0.06;
-      p.count = 9;
+      p.count = 5 + 5 * bt;
       this.particles.ground(fx.groundY, fx.groundN, 0, 0.14);
       this.particles.vel(
         k.velocity.x * 0.70 - _fwd.x * 9.0 + _side.x * (s === 0 ? -2.4 : 2.4),
@@ -1737,7 +1758,10 @@ export class Effects implements System {
     const g = this.particles.reset();
     g.tile = PTile.Glow; g.mode = PMode.Ground;
     g.life = 0.28; g.size0 = 1.4; g.size1 = 3.6 + 0.5 * bt; g.sizeJitter = 0.1;
-    g.drag = 0.7; g.count = 1; g.camBias = 0.08; g.fadeIn = 0.05;
+    // Same-frame attack: the ignition is one event and every channel of it has
+    // to be at value on the frame the boost is applied. See the drift-spark
+    // case for the measurement.
+    g.drag = 0.7; g.count = 1; g.camBias = 0.08; g.fadeIn = 0.018;
     this.particles.at(k.position.x, fx.groundY + 0.05, k.position.z);
     this.particles.vel(k.velocity.x, 0, k.velocity.z);
     this.particles.colorA(col, 0.9 + 0.16 * bt, 0.6);
@@ -1758,13 +1782,26 @@ export class Effects implements System {
     // frame. This is a spike on top of the plateau, decaying over ~0.35 s, and
     // it is what makes the first three frames of a boost different from the
     // twentieth. See `updateSignals`.
-    if (k.isPlayer) this.igniteImpulse = Math.max(this.igniteImpulse, 0.55 + 0.15 * bt);
+    // 0.70 / 0.95 / 1.20 rather than 0.70 / 0.85 / 1.00. This is the term that
+    // owns the FOV punch and the radial smear, i.e. the half of the payoff that
+    // is felt rather than seen, and it is the cheapest place to make a purple
+    // release outrank a blue one. `speedIntensity` is clamped downstream; the
+    // FOV punch is not, and 1.20 buys about 4.1 degrees against 2.4.
+    if (k.isPlayer) this.igniteImpulse = Math.max(this.igniteImpulse, 0.45 + 0.25 * bt);
     // 6 puffs at 1.15, down from 8 at 1.4. Mini-turbo ignition is corner exit —
     // the moment the chase camera is closest to the rear axle and pointing
     // along it — and sixteen 2.1 m puffs arriving at once two metres from the
     // lens is the other half of "the boost effect deletes the subject".
+    // NOT escalated by tier, deliberately. Everything else on this event is
+    // behind or beside the kart; this is the one layer that lands between the
+    // chase lens and the subject, and the note above records that it was cut
+    // from 8 at 1.4x to 6 at 1.15x precisely because it was deleting the car it
+    // was supposed to be celebrating. A louder tier 3 must not buy that back.
     this.tyreSmokePuff(k, fx, 6, 1.15);
-    if (k.isPlayer) this.ctx.shake(0.20 + 0.07 * bt, 0.24);
+    // 0.20 + 0.07 was a 1.35x spread across the whole ladder. The promotion's
+    // own shake spreads 5x across the same three tiers, so the release used to
+    // feel SMALLER than the promotion that preceded it by a second.
+    if (k.isPlayer) this.ctx.shake(0.16 + 0.13 * bt, 0.24);
     this.blastLoad = Math.max(this.blastLoad, 0.5);
   }
 

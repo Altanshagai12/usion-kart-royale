@@ -169,6 +169,8 @@ export class HUD implements System {
   private railOn = 0;
   /** last frame's drift tier while the slide was live, for edge detection */
   private lastTier = 0;
+  /** the tier class currently on the rail element, so it is written on change */
+  private railTier = -1;
   private lastDir = 0;
   private prevRaceTime = 0;
 
@@ -868,11 +870,31 @@ export class HUD implements System {
     this.drawDial(frac, charge, tier, boosting, boostFrac);
 
     // --- the screen-edge rails ---------------------------------------------
-    // HEIGHT is the charge toward the next tier. BODY COLOUR is the tier you
-    // have banked — the same colour as the sparks coming off the rear wheels,
-    // so the screen and the world never state different things. CAP COLOUR is
-    // the tier you are earning. That is the whole "hold or release?" decision
-    // in two colours and a height, with nothing to read.
+    // HEIGHT is the position on the WHOLE LADDER, `(tier + charge) / 3`. BODY
+    // COLOUR is the tier you have banked — the same colour as the sparks coming
+    // off the rear wheels, so the screen and the world never state different
+    // things. CAP COLOUR is the tier you are earning, and two fixed marks at a
+    // third and two thirds of the rail say which rung the cap has climbed past.
+    //
+    // ROUND 14 — WHY HEIGHT IS THE LADDER AND NOT THE CHARGE.
+    //
+    // `chargeFor()` in Kart.ts is progress WITHIN the current tier, so it resets
+    // to zero every time a tier is banked. Feeding it straight to the rail meant
+    // the rail collapsed to nothing at the exact instant the player earned
+    // something. Probed on the shipped stylesheet at 1280x720, 1920x1080 and
+    // 2560x1440, over dark, over §3's sky-warm and over a blown-out white, the
+    // frame `driftTier` went to 1 or 2 measured `lit = 0 px` in all nine
+    // combinations, and the first tenth of the following rung was still mostly
+    // the NEXT tier's colour (banked fraction 0.25 at 720p). The whole point of
+    // the rail is to answer "what am I holding?" and it answered "nothing"
+    // precisely when the answer changed.
+    //
+    // As a ladder position the number is continuous across a promotion — the
+    // top of rung one and the bottom of rung two are both 0.333 — so a slide
+    // produces one monotone climb from zero to full, the banked tier owns the
+    // body of a bar that is never shorter than a third of the screen, and the
+    // promotion reads as a colour change plus a mark being passed rather than
+    // as the indicator disappearing.
     //
     // On release the same rail snaps to full in boost gold and drains: the
     // payout drawn as the thing you just earned being spent.
@@ -881,10 +903,13 @@ export class HUD implements System {
     let cap = BOOST_COL;
     let wantRail = 0;
     if (drifting) {
-      fill = tier >= 3 ? 1 : charge;
+      fill = (tier + (tier >= 3 ? 0 : charge)) / 3;
       body = TIER_COLORS[tier];
       cap = TIER_COLORS[Math.min(3, tier + 1)];
-      wantRail = 0.46 + 0.34 * fill + 0.06 * tier;
+      // Opacity is now mostly a function of the TIER rather than of the fill:
+      // what is banked outranks progress toward the next thing, and the rail's
+      // brightness is the cheapest way to say so.
+      wantRail = 0.44 + 0.16 * fill + 0.13 * tier;
     } else if (boosting) {
       fill = boostFrac;
       body = BOOST_COL;
@@ -899,8 +924,18 @@ export class HUD implements System {
     setStyle(this.charge, '--cc', body);
     setStyle(this.charge, '--cn', cap);
     setNum(this.charge, 'opacity', this.railOn, 0.01);
-    this.charge.classList.toggle('maxed', drifting && tier >= 3);
+    this.charge.classList.toggle('drifting', drifting);
     this.charge.classList.toggle('boosting', !drifting && boosting);
+    // The tier class drives the pulse RATE, the third channel carrying the same
+    // number as the height and the hue. Cached on an int compare rather than
+    // three `toggle` calls a frame — a class write that changes nothing still
+    // dirties style on this element and every one of its descendants.
+    const railTier = drifting ? tier : 0;
+    if (railTier !== this.railTier) {
+      this.charge.classList.remove('t1', 't2', 't3');
+      if (railTier >= 1) this.charge.classList.add('t' + railTier);
+      this.railTier = railTier;
+    }
 
     // --- minimap -----------------------------------------------------------
     if (!blocked) this.minimap.update(ctx);
@@ -954,6 +989,29 @@ export class HUD implements System {
     // the tier pop and, on touch, a standing `scale(.82)`, and two animations
     // fighting over one transform is how a widget ends up teleporting.
     retrigger(this.speedFace, 'surge');
+
+    // THE NEEDLE ACTUALLY SURGES.
+    //
+    // Everything else about the release is a decoration laid over the
+    // instrument; this is the instrument itself reacting. The needle is a real
+    // second-order spring, so an impulse on its VELOCITY throws it past the
+    // speed the kart is currently doing and lets the kart catch up to it over
+    // the next third of a second — which is, physically, what a mini-turbo is.
+    // Scaled by tier: about 12% of full scale for a blue release and 20% for a
+    // purple one, so the hardest thing in the game visibly moves the biggest
+    // number on the HUD.
+    this.needle.vel += 1.5 + 0.5 * clamp(tier, 1, 3);
+
+    // A tier-3 release gets the full-screen wash as well, in boost GOLD rather
+    // than in a tier colour — the tier colours mean "earning", gold means
+    // "paid". This is the only place in the HUD gold goes full screen, and that
+    // is the point: the rarest thing a player can do should be the one cue they
+    // have not seen anywhere else.
+    if (tier >= 3) {
+      setStyle(this.tierPop, '--tc', BOOST_COL);
+      this.tierPop.classList.add('t3');
+      retrigger(this.tierPop, 'run');
+    }
   }
 
   /** m : ss . hh, one field per fixed-width slot. */

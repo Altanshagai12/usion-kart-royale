@@ -829,6 +829,19 @@ const SUBJECT_FADE = 3.40;
 export interface PostFXOptions {
   /** true when we detected a software rasteriser (headless capture / CI) */
   software: boolean;
+  /**
+   * True when the composer's buffer is 8-bit rather than half-float, because
+   * this GPU could not complete an RGBA16F attachment.
+   *
+   * It changes exactly one thing, and it has to. Every threshold in this file
+   * is authored against SCENE-LINEAR HDR — the bloom gate sits at 1.55, i.e.
+   * above sunlit diffuse white, on the assumption that there are values above 1
+   * to select. An 8-bit buffer clamps at 1.0 before the bloom pass ever runs,
+   * so a threshold of 1.55 selects the empty set and the tier loses its bloom
+   * entirely and silently. Below, the gate moves into the range the buffer can
+   * actually represent.
+   */
+  ldr?: boolean;
 }
 
 /**
@@ -1025,7 +1038,13 @@ export class PostFX {
         // ADD, not SCREEN: the buffer is scene-linear HDR, and screen blending
         // values above 1 actually *darkens* them. Bloom is light being added.
         blendFunction: BlendFunction.ADD,
-        luminanceThreshold: 1.55,
+        // 0.78 on an 8-bit buffer, and that number is not a taste call. The
+        // buffer clamps at 1.0, so a gate of 1.55 selects nothing whatsoever
+        // and the fallback tier ships with the bloom silently missing — the
+        // exact class of invisible degradation this round exists to remove.
+        // 0.78 keeps the same population it was aiming at (just above sunlit
+        // diffuse white) inside the range the buffer can represent.
+        luminanceThreshold: opts.ldr === true ? 0.78 : 1.55,
         luminanceSmoothing: 0.32,
         mipmapBlur: true,
         // Slightly hotter to pay back the pixels the higher threshold removed:

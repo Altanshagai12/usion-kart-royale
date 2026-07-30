@@ -446,6 +446,20 @@
   inset: 0;
   pointer-events: none;
   opacity: 0;
+  /* ROUND 14. `--fill` IS NO LONGER THE CHARGE. It is the cumulative position
+     on the whole three-rung ladder, `(tier + charge) / 3`, written by HUD.ts.
+     The reason is measured, not stylistic. `chargeFor()` in Kart.ts resets the
+     within-tier charge to zero at every tier boundary, so with `--fill = charge`
+     the rail's height went to ZERO on the exact frame a tier was banked:
+     probed at 1280x720, 1920x1080 and 2560x1440, over dark, over §3's sky-warm
+     and over a blown-out white, `tier 1 charge 0` and `tier 2 charge 0` all
+     measured `lit = 0 px`. The one moment the player most needs to know what
+     they are holding was the one moment the rail was blank, and it stayed
+     nearly blank for the first tenth of the next rung.
+     As a ladder position the fill is CONTINUOUS across a promotion — 1.0 of
+     rung one and 0.0 of rung two are both 0.333 — so the rail only ever climbs
+     during a slide, and the banked tier owns the whole body of a bar that is at
+     least a third of the screen from the instant tier 1 lands. */
   --fill: 0;
   /* `--cc` is the tier you have BANKED, which is also the colour of the sparks
      coming off the rear wheels, so the screen and the world never disagree.
@@ -455,6 +469,12 @@
      "hold or release?" decision, answered without a number. */
   --cc: #a8b6cc;
   --cn: var(--boost-blue);
+  /* Pulse period and depth. Peripheral vision resolves temporal frequency about
+     as well as it resolves hue, and better than it resolves either when the sky
+     behind is blowing out — so the tier is ALSO encoded as how fast the rail
+     breathes. Set per tier below. */
+  --pulse: 1.1s;
+  --pulse-lo: 0.84;
   will-change: opacity;
 }
 .kr-charge-e {
@@ -466,6 +486,38 @@
   width: clamp(30px, 5.4vmin, 90px);
   overflow: hidden;
 }
+
+/* THE TWO RUNG MARKS. Fixed to the frame, not to the bar, at exactly a third
+   and two thirds of the rail — the two tier boundaries. They turn a height into
+   a COUNT: how many marks the cap has climbed past IS the tier you have banked,
+   readable without resolving hue, which is what makes this survive both a
+   blown-out sky and a red-green deficiency. Cream between two ink edges, the
+   same recipe every numeral in the HUD uses to survive over a bright sky.
+   Painted on `::after`, so they sit OVER the moving bar, and they cost nothing:
+   one extra background box per rail, never animated, never laid out. */
+.kr-charge-e::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transition: opacity 0.14s linear;
+  background:
+    linear-gradient(to top,
+      transparent calc(33.333% - 3px),
+      rgba(30, 16, 7, 0.88) calc(33.333% - 3px), rgba(30, 16, 7, 0.88) calc(33.333% - 1px),
+      rgba(255, 246, 230, 0.96) calc(33.333% - 1px), rgba(255, 246, 230, 0.96) calc(33.333% + 1px),
+      rgba(30, 16, 7, 0.88) calc(33.333% + 1px), rgba(30, 16, 7, 0.88) calc(33.333% + 3px),
+      transparent calc(33.333% + 3px)),
+    linear-gradient(to top,
+      transparent calc(66.666% - 3px),
+      rgba(30, 16, 7, 0.88) calc(66.666% - 3px), rgba(30, 16, 7, 0.88) calc(66.666% - 1px),
+      rgba(255, 246, 230, 0.96) calc(66.666% - 1px), rgba(255, 246, 230, 0.96) calc(66.666% + 1px),
+      rgba(30, 16, 7, 0.88) calc(66.666% + 1px), rgba(30, 16, 7, 0.88) calc(66.666% + 3px),
+      transparent calc(66.666% + 3px));
+}
+/* Only while a slide is live. During a boost the rail means "time left", which
+   has no rungs, and a scale over it would be a lie. */
+.kr-charge.drifting .kr-charge-e::after { opacity: 1; }
 .kr-charge-e.l { left: 0; transform-origin: 0% 50%;
   -webkit-mask-image: linear-gradient(to right, #000 0%, rgba(0, 0, 0, 0.5) 38%, transparent 100%);
           mask-image: linear-gradient(to right, #000 0%, rgba(0, 0, 0, 0.5) 38%, transparent 100%); }
@@ -491,8 +543,16 @@
    rail was reporting the wrong tier for the first tenth of every charge, and
    for the whole of any charge that never got past 9%.
    In px the preview band is a fixed 22 px under the cap at every resolution and
-   every fill, so `--cc` owns the body from ~30 px of bar upward and the pairing
-   the comment above describes is the pairing that actually draws. */
+   every fill, so `--cc` owns the body from ~34 px of bar upward.
+
+   ROUND 14 measured what that fix left behind. The px handover is correct and
+   stays, but it was only ever half the problem: with `--fill` set from the
+   WITHIN-TIER charge, the bar was 36 px tall at 1280x720 the moment after tier 1
+   banked (of which 23 px was still the next tier's colour, banked fraction 0.25)
+   and 0 px tall on the frame the tier actually landed. `--fill` is now the
+   cumulative ladder position (see `.kr-charge`), so the shortest bar the player
+   can ever see with a tier banked is a third of the screen and `--cc` owns
+   essentially all of it. Same gradient, honest input. */
 .kr-charge-e > i {
   position: absolute;
   left: 0;
@@ -503,38 +563,50 @@
   will-change: transform;
   background:
     linear-gradient(to bottom,
-      rgba(255, 250, 240, 0.96) 0px, rgba(255, 250, 240, 0.96) 3px,
-      var(--cn) 4px,
-      var(--cn) 18px,
-      color-mix(in srgb, var(--cn) 82%, transparent) 22px,
-      var(--cc) 30px,
-      color-mix(in srgb, var(--cc) 70%, transparent) 24%,
-      color-mix(in srgb, var(--cc) 44%, transparent) 54%,
-      color-mix(in srgb, var(--cc) 30%, transparent) 100%),
+      rgba(255, 250, 240, 0.98) 0px, rgba(255, 250, 240, 0.98) 4px,
+      var(--cn) 5px,
+      var(--cn) 20px,
+      color-mix(in srgb, var(--cn) 55%, var(--cc)) 26px,
+      var(--cc) 34px,
+      /* ROUND 14. Was 70/44/30. Probed over §3's sky-warm `#ffd0a0` and over a
+         blown-out `#fffdf4`, the old tail dropped under the saturation the eye
+         needs to call a hue at all for the bottom two thirds of a long bar —
+         293 of 432 lit pixels came back unclassifiable at 1280x720. The tail
+         now floors at 0.58, which is still transparent enough to see the road
+         through and no longer a colour that only exists on a dark sky. */
+      color-mix(in srgb, var(--cc) 90%, transparent) 22%,
+      color-mix(in srgb, var(--cc) 74%, transparent) 56%,
+      color-mix(in srgb, var(--cc) 58%, transparent) 100%),
     /* The scrim holds a FLOOR rather than fading out. Measured against §3's
        sky-warm `#ffd0a0` with the world hidden, an orange tier-2 body over an
        orange sunset with the scrim tailing to 0.12 alpha simply vanished below
        the halfway mark — the rail had a bright cap and no body. Nothing in the
        rail is allowed to depend on the sky being dark. */
     linear-gradient(to bottom,
-      rgba(24, 13, 5, 0.74) 0%, rgba(24, 13, 5, 0.56) 40%, rgba(24, 13, 5, 0.40) 100%);
+      rgba(24, 13, 5, 0.80) 0%, rgba(24, 13, 5, 0.64) 40%, rgba(24, 13, 5, 0.50) 100%);
 }
 
-/* Boost: the rail is draining rather than climbing, which is slow motion, and
-   slow motion is exactly what peripheral vision is worst at. A short pulse
-   puts the movement back so "you are still boosting" is legible without a
-   glance. Opacity only — the transform belongs to `--fill`. */
-.kr-charge.boosting .kr-charge-e > i { animation: kr-railBoost 0.42s var(--e-soft) infinite; }
-@keyframes kr-railBoost {
-  0%, 100% { opacity: 0.76; }
-  50%      { opacity: 1; }
+/* THE PULSE — the third channel, and the one that costs nothing.
+   One keyframe, driven by two custom properties, so the rail breathes FASTER
+   AND DEEPER the more you are holding: tier 1 a slow 1.1 s swell, tier 3 a hard
+   0.40 s throb. Peripheral vision is far better at temporal frequency than at
+   hue, so the tier survives even when the sun is directly in frame and every
+   saturated colour on screen is being washed toward the same cream.
+   Boost reuses the fastest rate: during a boost the bar is DRAINING, which is
+   slow motion, and slow motion is what peripheral vision is worst at.
+   Opacity only — the transform belongs to `--fill`. */
+.kr-charge.t1 { --pulse: 1.10s; --pulse-lo: 0.84; }
+.kr-charge.t2 { --pulse: 0.70s; --pulse-lo: 0.74; }
+.kr-charge.t3 { --pulse: 0.40s; --pulse-lo: 0.60; }
+.kr-charge.boosting { --pulse: 0.40s; --pulse-lo: 0.70; }
+.kr-charge.t1 .kr-charge-e > i,
+.kr-charge.t2 .kr-charge-e > i,
+.kr-charge.t3 .kr-charge-e > i,
+.kr-charge.boosting .kr-charge-e > i {
+  animation: kr-railPulse var(--pulse) var(--e-soft) infinite;
 }
-
-/* Tier 3: the rail is full and there is nothing left to earn, so it breathes
-   instead of climbing. Opacity only — the transform belongs to `--fill`. */
-.kr-charge.maxed .kr-charge-e > i { animation: kr-railMax 0.66s var(--e-soft) infinite; }
-@keyframes kr-railMax {
-  0%, 100% { opacity: 0.72; }
+@keyframes kr-railPulse {
+  0%, 100% { opacity: var(--pulse-lo); }
   50%      { opacity: 1; }
 }
 
@@ -576,17 +648,27 @@
      a standing promotion is ~14 MB of compositor memory for something that is
      live for 0.42 s. The animation promotes it for exactly as long as it runs. */
 }
+/* ATTACK ON FRAME ZERO. Measured on the shipped build by sampling computed
+   style every animation frame from the frame `retrigger()` adds the class:
+   this wash peaked 33 ms after the trigger (2 frames) and its tier-3 variant
+   50 ms (3 frames), while the spark burst and the audio flourish — which are a
+   particle spawn and an oscillator ramp, both raised from `Kart.update` — are
+   at full value on the trigger frame itself. Three cues peaking on three
+   different frames is exactly the "mush rather than an event" failure. Every
+   keyframe list below now starts AT its peak opacity and decays; the rush
+   inward is carried by the scale alone, which is where it was always doing the
+   work. Nothing about the look changes; the hit just lands with the sparks. */
 .kr-tierpop.run { animation: kr-tierPop 0.42s var(--e-out) both; }
 /* Tier 3 is the one the player is chasing; it gets a longer, harder hit. */
 .kr-tierpop.t3.run { animation: kr-tierPop3 0.58s var(--e-out) both; }
 @keyframes kr-tierPop {
-  0%   { opacity: 0;    transform: scale(1.14); }
-  11%  { opacity: 0.88; transform: scale(1); }
+  0%   { opacity: 0.90; transform: scale(1.16); }
+  26%  { opacity: 0.72; transform: scale(1); }
   100% { opacity: 0;    transform: scale(0.985); }
 }
 @keyframes kr-tierPop3 {
-  0%   { opacity: 0;    transform: scale(1.20); }
-  9%   { opacity: 1;    transform: scale(1); }
+  0%   { opacity: 1;    transform: scale(1.24); }
+  20%  { opacity: 0.80; transform: scale(1); }
   46%  { opacity: 0.34; transform: scale(0.995); }
   100% { opacity: 0;    transform: scale(0.98); }
 }
@@ -640,11 +722,16 @@
   opacity: 0;
 }
 .kr-callout.chain .kr-callout-x { opacity: 1; }
+/* The payoff has to be ON the frame the boost ignites, not seven frames after
+   it. Measured on the shipped build this reached full opacity at 117 ms — the
+   ring, the plume, the FOV punch and the audio had all been and gone by then,
+   and the word arrived as a separate, later, smaller event. It now starts lit
+   and oversized on frame zero and settles. */
 .kr-callout.run { animation: kr-callout 1.15s var(--e-out) both; }
 @keyframes kr-callout {
-  0%   { opacity: 0; transform: translateY(0.9vmin) scale(0.8); }
-  10%  { opacity: 1; transform: translateY(0) scale(1.12); }
-  21%  { opacity: 1; transform: translateY(0) scale(1); }
+  0%   { opacity: 1; transform: translateY(0) scale(1.34); }
+  9%   { opacity: 1; transform: translateY(0) scale(1.06); }
+  16%  { opacity: 1; transform: translateY(0) scale(1); }
   70%  { opacity: 1; transform: translateY(0) scale(1); }
   100% { opacity: 0; transform: translateY(-0.7vmin) scale(0.97); }
 }
@@ -1136,10 +1223,13 @@ html[data-touch] .kr .kr-speed { --speed-s: 0.82; transform: scale(var(--speed-s
 
 .kr-speed-face { --clip: var(--clip-tl); position: absolute; inset: 0; transform-origin: 100% 100%; }
 .kr-speed-face canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+/* Peaked at 83 ms — five frames after the tier landed. A punch that arrives
+   five frames late is a second event. It now starts at full scale on the
+   trigger frame and springs back, which is also simply what a struck object
+   does. */
 .kr-speed.tier { animation: kr-dialPop 0.52s var(--e-spring) both; }
 @keyframes kr-dialPop {
-  0%   { transform: scale(var(--speed-s)); }
-  26%  { transform: scale(calc(var(--speed-s) * 1.09)); }
+  0%   { transform: scale(calc(var(--speed-s) * 1.10)); }
   100% { transform: scale(var(--speed-s)); }
 }
 /* THE RELEASE SURGE. On the face, not on .kr-speed — .kr-speed already owns

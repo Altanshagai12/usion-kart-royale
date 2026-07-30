@@ -177,9 +177,23 @@ const DRIFT_TIERS = [0.6, 1.45, 2.5];
  *      still evaporates everything, so the greedy line keeps its downside.
  *    - It never survives a respawn, a spin-out or a squash.
  *
- *  0.4 s is long enough to cover the dips and short enough that it cannot
- *  bridge two separate corners — the shortest gap between corner exits here is
- *  over 2 s, so every carry is within one corner, which is the point.
+ *  0.8 s, not 0.4, and the number comes from measuring the gaps rather than
+ *  guessing at them. Instrumented over three laps with the button driven off a
+ *  real steering trace, a slide ends and the button comes back down after a
+ *  median of 0.28 s, and the distribution is:
+ *
+ *      < 0.15 s : 26      < 0.5 s :  5      < 1.5 s :  0
+ *      < 0.30 s : 10      < 0.8 s : 23      >= 1.5 s : 8   (n = 72)
+ *
+ *  The eight long ones are the genuine corner exits; everything below 0.8 s is
+ *  a dip inside a corner. At 0.4 s the window covered a little over half of
+ *  them and the other half started the corner again from zero.
+ *
+ *  It still cannot bridge two corners. Sunset Bay's corner regions, taken as
+ *  the runs of centreline curvature above 0.005 1/m, are separated by 82 m,
+ *  166 m and 349 m of straight — 3.3 s, 6 s and 13 s at racing speed. The one
+ *  6 m gap in the list is the middle of the village-climb esses, which is one
+ *  corner complex and is exactly what the window exists to hold together.
  *
  *  Re-measured over the same three laps (`node tools/drift-bench.mjs`), three
  *  runs each side, quoted as ranges because the rig has its own spread — its
@@ -209,7 +223,130 @@ const DRIFT_TIERS = [0.6, 1.45, 2.5];
  *  would be the wrong fix — it would pay for letting go, not for holding on.
  * ============================================================================
  */
-const DRIFT_CARRY_TIME = 0.4;
+const DRIFT_CARRY_TIME = 0.8;
+
+/**
+ * ============================================================================
+ *  A release that would pay NOTHING is not a release yet
+ * ============================================================================
+ *  `DRIFT_CARRY_TIME` above preserves the CLOCK across a dip. It does not
+ *  preserve the SLIDE: `driftDir` still drops to zero, so getting the charge
+ *  back costs a fresh hop, a fresh steering threshold and a fresh spark, and
+ *  the chassis spends the gap gripping rather than sliding. Measured, that is
+ *  most of why the window under-delivered — of 45 slides that ended with
+ *  nothing banked, only 17 managed to resume at all, even though 36 of the gaps
+ *  were inside the old window.
+ *
+ *  So the button is debounced at the one point where debouncing is free. While
+ *  the charge clock is still short of tier 1 there is, by definition, nothing
+ *  to pay out, so letting go and pressing again inside this window is
+ *  indistinguishable from never having let go — the slide simply continues.
+ *
+ *  Three things this deliberately does NOT do:
+ *
+ *    - It never delays a payout. The instant `driftTier` is 1 or more, letting
+ *      go fires the mini-turbo on that frame, with no grace at all. The whole
+ *      value of the release is that it is immediate, and a debounce on the one
+ *      input the player is timing would be a far worse bug than the one being
+ *      fixed.
+ *    - It never overrides an explicit escape. Swinging the stick past 0.6 of a
+ *      lock AWAY from the drift is the player asking to straighten out, and it
+ *      ends the slide on the frame it arrives.
+ *    - It never overrides the other bail conditions. Stalling, a spin-out, a
+ *      long flight or putting the whole kart off the road all still end the
+ *      slide immediately, and `forfeitDrift` still takes everything with it.
+ *
+ *  0.3 s: long enough to cover the sub-0.3 s dips that are half the measured
+ *  distribution, short enough that a kart whose driver has genuinely let go
+ *  and centred the stick is gripping again within a third of a second.
+ * ============================================================================
+ */
+const DRIFT_RELEASE_GRACE = 0.3;
+
+/**
+ * ============================================================================
+ *  "Am I in a corner?" — and why it cannot be answered from the kart
+ * ============================================================================
+ *  Two of the rules below need to know whether the kart is going round
+ *  something or down a straight, and the obvious tests all fail, because a
+ *  drift SUSTAINS ITS OWN YAW. The slip controller's set-point is a slip angle,
+ *  not a path: with the stick centred it commands whatever yaw rate builds
+ *  0.13 rad of slip, the rear tyres then bend the path to match, and the result
+ *  is a stable circle that satisfies every internal test for "still cornering"
+ *  in the middle of the longest straight on the circuit. Measured with a yaw
+ *  test in place, a button that chattered every couple of tenths held ONE slide
+ *  for 35 s through the tunnel.
+ *
+ *  Steering input is no better: a deep drift is held on opposite lock, so
+ *  "stick pointing into the corner" ends exactly the slides that are working.
+ *
+ *  So the answer comes from the road. The centreline's own curvature is
+ *  sampled once per track into a 512-bin table — 3.1 m per bin — max-filtered
+ *  over +-4 bins so that turn-in and track-out both read as part of the corner.
+ *  Building it costs 512 `sample` calls at boot and the per-frame cost is one
+ *  array index; nothing here allocates after the table exists. It is shared by
+ *  every kart, keyed on the track object, so a rebuilt circuit rebuilds it.
+ *
+ *  Sunset Bay's corners peak at 0.0055 (the shallow cliff kink) through 0.0156
+ *  (the banked 180); its straights sit under 0.001. The window below therefore
+ *  separates them with a wide margin at both ends.
+ * ============================================================================
+ */
+const CORNER_BINS = 512;
+/** below this, 400 m radius, nothing is a corner */
+const CORNER_CURV_MIN = 0.0025;
+/** at this, 220 m radius, it is a corner by any measure */
+const CORNER_CURV_FULL = 0.0045;
+/** how long a held slide survives once it has left the corner, seconds */
+const DRIFT_STRAIGHT_BAIL = 1.0;
+
+let cornerTable: Float32Array | null = null;
+let cornerTableFor: ITrack | null = null;
+
+function buildCornerTable(track: ITrack) {
+  const n = CORNER_BINS;
+  const tan = new Float64Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const s = track.sample(i / n);
+    tan[i * 3] = s.tangent.x;
+    tan[i * 3 + 1] = s.tangent.y;
+    tan[i * 3 + 2] = s.tangent.z;
+  }
+  const ds = Math.max(1e-3, track.length / n);
+  const raw = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const j = ((i + 1) % n) * 3;
+    const i3 = i * 3;
+    // |a x b| is sin(angle) between two unit tangents, which for the angles a
+    // road turns through in three metres is the angle. acos(a.b) would be the
+    // same number computed where acos is at its least accurate.
+    const cx = tan[i3 + 1] * tan[j + 2] - tan[i3 + 2] * tan[j + 1];
+    const cy = tan[i3 + 2] * tan[j] - tan[i3] * tan[j + 2];
+    const cz = tan[i3] * tan[j + 1] - tan[i3 + 1] * tan[j];
+    raw[i] = Math.sqrt(cx * cx + cy * cy + cz * cz) / ds;
+  }
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    let m = 0;
+    for (let k = -4; k <= 4; k++) {
+      const v = raw[(i + k + n) % n];
+      if (v > m) m = v;
+    }
+    out[i] = m;
+  }
+  cornerTable = out;
+  cornerTableFor = track;
+}
+
+/** 0 on a straight, 1 in a corner, ramped across the window between. */
+function cornerFactor(track: ITrack, t: number): number {
+  if (cornerTableFor !== track || !cornerTable) buildCornerTable(track);
+  const tbl = cornerTable!;
+  const n = tbl.length;
+  let i = Math.floor((t - Math.floor(t)) * n);
+  if (i < 0) i = 0; else if (i >= n) i = n - 1;
+  return clamp((tbl[i] - CORNER_CURV_MIN) / (CORNER_CURV_FULL - CORNER_CURV_MIN), 0, 1);
+}
 
 /** Tier banked by `t` seconds on the charge clock. */
 function tierFor(t: number) {
@@ -571,6 +708,13 @@ export class Kart implements IKart {
    */
   private driftCarry = 0;
   private driftCarryTime = 0;
+  /**
+   * Seconds left before a button that has come up actually ends the slide.
+   * Only ever non-zero while nothing is banked. See `DRIFT_RELEASE_GRACE`.
+   */
+  private driftGrace = 0;
+  /** seconds this slide has spent outside every corner. See `DRIFT_STRAIGHT_BAIL`. */
+  private driftStraight = 0;
   private driftBeta = 0;
   private airTime = 0;
   private groundTime = 1;
@@ -1552,6 +1696,8 @@ export class Kart implements IKart {
       this.driftTime = this.driftCarryTime > 0 ? this.driftCarry : 0;
       this.driftCarry = 0;
       this.driftCarryTime = 0;
+      this.driftGrace = DRIFT_RELEASE_GRACE;
+      this.driftStraight = 0;
       this.driftTier = tierFor(this.driftTime);
       this.driftCharge = chargeFor(this.driftTime);
       // The spark carries the tier it is resuming at, so the sparks, the rail
@@ -1561,11 +1707,43 @@ export class Kart implements IKart {
     }
 
     if (this.driftDir !== 0) {
+      // --- the button, debounced while there is nothing to pay -------------
+      // See DRIFT_RELEASE_GRACE. The grace re-arms on every frame the button
+      // is held, so it is a window on the GAP rather than on the slide, and it
+      // collapses to nothing the moment a tier is banked or the player asks to
+      // straighten out.
+      const escaping = this.steerInput * this.driftDir < -0.6;
+      // ...and only inside a corner. See the corner table above for why this
+      // cannot be asked of the kart itself; measured with a yaw test instead,
+      // a button that chattered every couple of tenths held ONE slide for 35 s
+      // through the tunnel and spent 84% of the lap sideways.
+      const corner = cornerFactor(ctx.track, this.t);
+      let letGo = !wantDrift;
+      if (!letGo) {
+        this.driftGrace = DRIFT_RELEASE_GRACE;
+      } else if (this.driftTier === 0 && !escaping && corner > 0.5 && this.driftGrace > 0) {
+        this.driftGrace -= dt;
+        letGo = this.driftGrace <= 0;
+      } else {
+        this.driftGrace = 0;
+      }
+      // --- a drift is a cornering technique --------------------------------
+      // Holding the button down a straight used to slide for ever, and with the
+      // charge clock running it was a way to reach purple without going near a
+      // corner: the ladder became a test of patience on the longest straight
+      // rather than of commitment through the fastest curve. So a slide that
+      // has been out of every corner for a second ends itself — and, because
+      // that goes through `releaseDrift`, it PAYS. Leaving the corner with the
+      // button still down fires the mini-turbo you earned in it, which is where
+      // a player wants it anyway.
+      if (corner > 0.5) this.driftStraight = 0;
+      else this.driftStraight += dt;
       // 0.8 s of air, not 0.55: this circuit has a village climb, a beach
       // descent and a bridge, and a kart that gets light over a crest halfway
       // through a corner should not silently lose the mini-turbo it has already
       // earned. The slide is still cancelled by an actual jump.
-      const bail = !wantDrift || speed < 3.5 || this.stunTime > 0 || this.airTime > 0.8;
+      const bail = letGo || speed < 3.5 || this.stunTime > 0 || this.airTime > 0.8 ||
+        this.driftStraight > DRIFT_STRAIGHT_BAIL;
       // --- overcooking it -----------------------------------------------
       // A drift that has put the WHOLE kart off the road is a blown drift, and
       // it forfeits the charge instead of cashing it. `worstSurface` only
@@ -1591,7 +1769,15 @@ export class Kart implements IKart {
         // for it. What the eye reads as a 30 degree drift is mostly the authored
         // pose (see DRIFT_POSE_*), and the pose credits the physical slip against
         // itself, so the physical number belongs down here where it lands.
-        const q = clamp((Math.abs(this.driftBeta) - 0.03) / 0.1, 0, 1);
+        //
+        // Re-centred on the angle this chassis actually produces. Traced over
+        // three laps the mean |beta| while sliding is 0.044 rad and a long held
+        // slide averages 0.089; against a 0.03-0.13 window that is q = 0.14,
+        // so the clock ran at 0.906x real time for every competent drift on the
+        // circuit and the "bonus" was a flat 10% tax with a bonus painted on it.
+        // 0.02-0.08 puts an ordinary slide at 1.01x and a deep one at 1.25x,
+        // which is what the comment above always claimed it did.
+        const q = clamp((Math.abs(this.driftBeta) - 0.02) / 0.06, 0, 1);
         // The mini-turbo clock only runs on tarmac. Washing a wheel or two onto
         // the verge does not end the drift — that would be brutal on a circuit
         // with a cliff ledge and a sand-lined beach straight — but it does stop
@@ -1607,7 +1793,11 @@ export class Kart implements IKart {
         // at all, which reads as the mechanic being broken rather than as a
         // penalty for a wide line.
         const onRoad = clamp(1 - this.suspension.offRoadLoad * 1.2, 0, 1);
-        this.driftTime += dt * (0.85 + 0.4 * q) * onRoad;
+        // ...and only in a corner, for the same reason the slide itself ends on
+        // a straight. `corner` ramps rather than switching, so the clock fades
+        // out over the last dozen metres of a corner exit instead of stopping
+        // dead under the player.
+        this.driftTime += dt * (0.85 + 0.4 * q) * onRoad * corner;
         const tier = tierFor(this.driftTime);
         if (tier !== this.driftTier) {
           this.driftTier = tier;
