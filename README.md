@@ -9,6 +9,16 @@ note is generated in code at load time.
 Built by Claude Opus 5 from a single prompt, then improved over nine orchestrated
 multi-agent rounds.
 
+The prompting technique is the **[Gauntlet Loop](https://somethingbig.ai/gauntlet-loop)**,
+named and developed by [Matt Shumer](https://x.com/mattshumer_): give a lead agent a goal and a
+concrete example of what great looks like, let it decompose the work into pieces that can be
+improved independently, and give each piece a *separate* critic that compares the output against
+the bar and sends it back until it clears. The separation of builder and critic is the whole
+idea — a builder grading its own homework is not a measurement.
+
+The interesting wrinkle in this project was what happened when the bar could not be used as
+stated. See below.
+
 ## The prompt
 
 Verbatim, typo and all:
@@ -29,13 +39,34 @@ Verbatim, typo and all:
 > blind and say which one looks better. Do this in ThreeJS. `/loop` until it's
 > utterly perfect. Fan out sub-agents and ultracode.
 
-One instruction could not be honoured as written: comparing side by side against
-the actual Mario Kart would have meant scraping copyrighted frames, and a model
-declaring itself the winner is not a measurement anyway. It was replaced with an
-explicit written rubric with hard calibration bands — *"almost nothing deserves
-88+ on an early round; if you are inclined to give 85, look harder"* — which is
-the change that made the loop produce specific, actionable findings instead of
-vibes. That rubric is section 9 of `ART_DIRECTION.md`.
+### The bar problem
+
+A Gauntlet Loop needs a concrete, inspectable bar. This prompt named one — *compare it side by
+side, blind, against the actual Mario Kart* — and that bar could not be used: it would have meant
+scraping copyrighted frames, and a model declaring itself the winner of its own comparison is not
+a measurement.
+
+So the bar was rewritten as an explicit rubric with hard calibration bands, in
+`ART_DIRECTION.md` section 9:
+
+> ```
+> 0-40   reads as a programmer-art prototype
+> 40-60  a competent hobby project; obviously not commercial
+> 60-75  a good indie game; still clearly not first-party
+> 75-88  near-professional, but a trained eye spots the tells immediately
+> 88-95  genuinely shipped-AAA quality
+> ```
+> *"Almost nothing deserves 88+ on an early round. If you are inclined to give 85, look harder —
+> you are probably missing something."*
+
+That substitution is the single change that made the loop work. A critic told to compare against
+a reference it cannot see produces vibes; a critic given calibrated bands and told that generous
+scoring produces a worse game produces specific, routable findings — which subsystem, which
+frame, which fix.
+
+The second thing that mattered: **the critics judge rendered screenshots from a real headless
+build, not source code.** That is what makes them an oracle rather than a second opinion. It is
+also where the loop's blind spot lives — see the last item under *Things that went wrong*.
 
 ---
 
