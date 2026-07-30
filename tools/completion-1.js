@@ -7,11 +7,13 @@ export const meta = {
   ],
 }
 
-/**
- * Set ROOT to your checkout. Workflow scripts run in a sandbox without
- * filesystem access, so the path cannot be derived — it has to be stated.
- */
-const ROOT = process.env.KART_ROOT || '/ABSOLUTE/PATH/TO/kart-game'
+// CHANGE THIS to your checkout before running.
+//
+// Not read from the environment: workflow scripts execute in a sandbox with no
+// `process` and no filesystem, so `process.env` throws on the first line and the
+// run dies before a single agent starts. Asking for a literal is the honest
+// interface here.
+const ROOT = '/Users/ryan/dev/personal/kart-game'
 
 const BASE = `Three.js kart racing game at ${ROOT}. Read ${ROOT}/ART_DIRECTION.md and ${ROOT}/src/types.ts first.
 Current frames are in ${ROOT}/shots/r7/ — Read the relevant PNGs before AND after your change.

@@ -4,7 +4,13 @@ A Mario Kart-style racer in the browser. **No art assets.** No Blender, no Unity
 no textures, no models, no fonts, no audio files — every mesh, texture, sound and
 note is generated in code at load time.
 
-**Play:** [racing.ryancampbell.com](https://racing.ryancampbell.com)
+**Play:** [racing.ryancampbell.com](https://racing.ryancampbell.com) ·
+**Write-up:** [ryancampbell.com/kart-royale](https://www.ryancampbell.com/kart-royale)
+
+![Kart Royale — a tier-2 drift through the village section](docs/hero-drift.png)
+
+*Every pixel above is generated at runtime. The kerb stripes, the crowd, the tyre
+tread, the sparks, the sky — there is not a single image file in this repository.*
 
 Built by Claude Opus 5 from a single prompt, then improved over nine orchestrated
 multi-agent rounds.
