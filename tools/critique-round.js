@@ -9,7 +9,11 @@ export const meta = {
   ],
 }
 
-const ROOT = '/Users/ryan/dev/personal/kart-game'
+/**
+ * Set ROOT to your checkout. Workflow scripts run in a sandbox without
+ * filesystem access, so the path cannot be derived — it has to be stated.
+ */
+const ROOT = process.env.KART_ROOT || '/ABSOLUTE/PATH/TO/kart-game'
 // `args` can arrive as a JSON string rather than a parsed object depending on
 // how the run was launched. Reading `.round` off a string yields undefined, so
 // every round silently defaulted to 1 — captures all landed in shots/r1 and,

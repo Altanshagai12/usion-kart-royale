@@ -8,7 +8,11 @@ export const meta = {
   ],
 }
 
-const ROOT = '/Users/ryan/dev/personal/kart-game'
+/**
+ * Set ROOT to your checkout. Workflow scripts run in a sandbox without
+ * filesystem access, so the path cannot be derived — it has to be stated.
+ */
+const ROOT = process.env.KART_ROOT || '/ABSOLUTE/PATH/TO/kart-game'
 
 const MEASURED = `## MEASURED BASELINE — this is what is wrong, in numbers
 
