@@ -6,9 +6,36 @@ note is generated in code at load time.
 
 **Play:** [racing.ryancampbell.com](https://racing.ryancampbell.com)
 
-Built by Claude Opus 5 from a single prompt (which contained a typo — "kat racing
-game"), then improved over nine orchestrated multi-agent rounds. The prompt, the
-process, the numbers and the mistakes are all written up below.
+Built by Claude Opus 5 from a single prompt, then improved over nine orchestrated
+multi-agent rounds.
+
+## The prompt
+
+Verbatim, typo and all:
+
+> I want you to build a **kat racing game** at the level of the most recent Mario
+> Kart games. It should be utterly perfect, visually beautiful, with every single
+> thing done at AAA quality—from textures to physics to anything you could think
+> of.
+>
+> Fan out sub-agents and have sub-agents tackle each one individually so that the
+> game is utterly perfect. You should `/loop` on each item and have a separate
+> sub-agent check it visually to ensure it looks triple A. That separate sub-agent
+> should be a really harsh critic, and if it doesn't look triple A, it should keep
+> going.
+>
+> Don't stop until each sub-agent is utterly wowed with the quality when compared
+> with the actual Mario Kart game. It should literally compare them side by side
+> blind and say which one looks better. Do this in ThreeJS. `/loop` until it's
+> utterly perfect. Fan out sub-agents and ultracode.
+
+One instruction could not be honoured as written: comparing side by side against
+the actual Mario Kart would have meant scraping copyrighted frames, and a model
+declaring itself the winner is not a measurement anyway. It was replaced with an
+explicit written rubric with hard calibration bands — *"almost nothing deserves
+88+ on an early round; if you are inclined to give 85, look harder"* — which is
+the change that made the loop produce specific, actionable findings instead of
+vibes. That rubric is section 9 of `ART_DIRECTION.md`.
 
 ---
 
