@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  MAX_PLAYERS, RECONNECT_GRACE_MS, SNAPSHOT_MAX_BYTES,
+  MAX_ITEM_ENTITIES, MAX_PLAYERS, RECONNECT_GRACE_MS, SNAPSHOT_MAX_BYTES,
 } from '../shared/constants.js';
 import { Room } from '../server/Room.js';
+import { ITEM_KIND } from '../server/item-runtime.js';
 
 class Socket {
   readyState = 1;
@@ -61,9 +62,50 @@ test('stale input is ignored and reconnect replaces the old transport', () => {
   room.destroy();
 });
 
+test('item actions are exactly-once and ignore client-authored item kinds', () => {
+  const room = new Room('item-room', { onDestroy() {} });
+  const conn = connection('one', room);
+  room.join(conn);
+  room.phase = 'playing';
+  const player = room.players[0];
+  player.itemKind = ITEM_KIND.TRIPLE_MUSHROOM;
+  player.itemCount = 3;
+  player.itemArm = 0;
+
+  const action = {
+    action_type: 'use_item',
+    action_data: {
+      item_seq: 1,
+      item_revision: player.itemRevision,
+      expected_kind: player.itemKind,
+      kind: ITEM_KIND.BOLT,
+      hit_slot: 99,
+    },
+  };
+  room.input(conn, action);
+  room.input(conn, action);
+  assert.equal(player.ackItemSeq, 1);
+  assert.equal(player.itemKind, ITEM_KIND.TRIPLE_MUSHROOM);
+  assert.equal(player.itemCount, 2);
+  assert.ok(player.boostTime > 0);
+  room.input(conn, {
+    action_type: 'use_item',
+    action_data: { item_seq: Number.POSITIVE_INFINITY },
+  });
+  assert.equal(player.ackItemSeq, 1);
+  room.destroy();
+});
+
 test('maximum roster snapshot stays inside the JSON transport budget', () => {
   const room = new Room('size-room', { onDestroy() {} });
   for (let i = 0; i < MAX_PLAYERS; i++) room.join(connection(`player-${i}`, room));
+  for (const box of room.items.boxes) box.cooldown = 2.5;
+  room.items.entities = Array.from({ length: MAX_ITEM_ENTITIES }, (_, id) => ({
+    id, kind: ITEM_KIND.GREEN_SHELL, distance: id * 10, lateral: id % 8,
+  }));
+  room.items.events = Array.from({ length: 32 }, (_, id) => ({
+    id: id + 1, type: 'hit', slot: id % MAX_PLAYERS, kind: ITEM_KIND.GREEN_SHELL,
+  }));
   const { json } = room.snapshot({ keyframe: true });
   assert.ok(Buffer.byteLength(json) < SNAPSHOT_MAX_BYTES);
   room.destroy();

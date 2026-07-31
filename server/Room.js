@@ -5,10 +5,14 @@ import {
   SIM_DT_MS, SNAPSHOT_MAX_BYTES,
 } from './config.js';
 import {
-  createPlayer, neutralInput, sanitizeInput, stepRace,
+  createPlayer, neutralInput, stepRace,
 } from '../shared/race-sim.js';
 import { serializeSnapshot } from './snapshot.js';
 import { finishRoom } from './result.js';
+import {
+  createItemRuntime, stepItemRuntime,
+} from './item-runtime.js';
+import { handlePlayerInput } from './input.js';
 
 const SWEEP_MS = 5000;
 
@@ -28,6 +32,7 @@ export class Room {
     this.roundStartedAt = 0;
     this.firstFinishAt = 0;
     this.loneSince = 0;
+    this.items = createItemRuntime();
     this.startTimer = null;
     this.tickTimer = null;
     this.lastTickAt = 0;
@@ -146,26 +151,7 @@ export class Room {
   }
 
   input(conn, envelope) {
-    const type = envelope.action_type;
-    const data = envelope.action_data || envelope;
-    if (type === 'hello') {
-      const name = String(data.name || '')
-        .replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 24);
-      const player = this.players.find((p) => p.userId === conn.userId);
-      if (name && player) {
-        player.name = name;
-        conn.name = name;
-        this.broadcast('player_joined', { roster: this.roster(), slot: player.slot });
-      }
-      return;
-    }
-    if (type !== 'drive' || !['countdown', 'playing'].includes(this.phase)) return;
-    const player = this.players.find((p) => p.userId === conn.userId);
-    if (!player || player.finished) return;
-    const next = sanitizeInput(data);
-    if (next.iseq <= player.ackIseq) return;
-    player.ackIseq = next.iseq;
-    player.input = next;
+    handlePlayerInput(this, conn, envelope);
   }
 
   armStart() {
@@ -213,6 +199,7 @@ export class Room {
     } else {
       const before = new Set(this.players.filter((p) => p.finished).map((p) => p.slot));
       this.players = stepRace(this.players, dtMs / 1000);
+      stepItemRuntime(this.items, this.players, dtMs / 1000);
       for (const player of this.players) {
         if (player.finished && !before.has(player.slot)) {
           player.finishMs = Date.now() - this.roundStartedAt;

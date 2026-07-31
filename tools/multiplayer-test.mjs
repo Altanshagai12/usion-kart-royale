@@ -107,10 +107,64 @@ try {
       ),
       roadPlaneClearance: kart.position.y - ground.y,
       speed: kart.forwardSpeed,
+      itemsVisible: ctx.items.group.visible,
+      itemBoxes: ctx.items.boxMesh?.count ?? 0,
+      itemSnapshot: window.__multiplayer.latest?.items,
     };
   });
   await pages[1].keyboard.up('ArrowRight');
-  await delay(1600);
+  await delay(6000);
+  await waitFor(async () => pages[0].evaluate(() => (
+    window.__multiplayer.latest?.players?.some((row) => row.item_kind > 0)
+  )), 20_000);
+  const itemReplicas = await Promise.all(pages.map((page) => page.evaluate(() => ({
+    ownSlot: window.__multiplayer.ownSlot,
+    unavailable: window.__multiplayer.latest.items.box_down.map(([id]) => id).sort((a, b) => a - b),
+    players: window.__multiplayer.latest.players.map((row) => ({
+      slot: row.slot,
+      kind: row.item_kind,
+      count: row.item_count,
+      ack: row.ack_item_seq,
+    })),
+    visibleBoxes: window.__ctx.items.boxMesh.count,
+    events: window.__multiplayer.latest.items.events,
+  }))));
+  assert.deepEqual(itemReplicas[0].unavailable, itemReplicas[1].unavailable);
+  assert.ok(itemReplicas.every((replica) => replica.visibleBoxes > 0));
+  assert.ok(itemReplicas[0].events.some((event) => event.type === 'pickup'));
+  const holderPage = itemReplicas.findIndex((replica) => (
+    replica.players.some((row) => row.slot === replica.ownSlot && row.kind > 0)
+  ));
+  assert.ok(holderPage >= 0, 'at least one local player should receive an authoritative item');
+  const heldBefore = itemReplicas[holderPage].players
+    .find((row) => row.slot === itemReplicas[holderPage].ownSlot);
+  await delay(1100);
+  await pages[holderPage].evaluate(() => window.__multiplayer.setConnection('reconnecting'));
+  await pages[holderPage].keyboard.press('Enter');
+  await delay(100);
+  const queuedAcrossReconnect = await pages[holderPage].evaluate(() => (
+    !!window.__multiplayer.pendingItem
+    && window.__multiplayer.connection === 'reconnecting'
+  ));
+  assert.equal(queuedAcrossReconnect, true, 'item press must remain pending during reconnect');
+  await pages[holderPage].evaluate(() => window.__multiplayer.setConnection('connected'));
+  await waitFor(async () => pages[holderPage].evaluate(() => {
+    const own = window.__multiplayer.ownSlot;
+    return window.__multiplayer.latest.players
+      .some((row) => row.slot === own && row.ack_item_seq > 0);
+  }), 5000);
+  const heldAfter = await pages[holderPage].evaluate(() => {
+    const own = window.__multiplayer.ownSlot;
+    return window.__multiplayer.latest.players.find((row) => row.slot === own);
+  });
+  const useFeedback = await pages[holderPage].evaluate(() => (
+    window.__multiplayer.latest.items.events.some((event) => event.type === 'use')
+  ));
+  assert.equal(useFeedback, true, 'authoritative use feedback must be replicated');
+  assert.ok(
+    heldAfter.item_kind !== heldBefore.kind || heldAfter.item_count < heldBefore.count,
+    'server must consume the held item after an acknowledged use',
+  );
   await pages[0].keyboard.up('ArrowUp');
   await pages[1].keyboard.up('ArrowUp');
   await delay(500);
@@ -133,7 +187,9 @@ try {
     ownSlot: window.__multiplayer.ownSlot,
     prediction: window.__multiplayer.predictor?.view?.(),
   }))));
-  console.log(JSON.stringify({ viewOne, viewTwo, diagnostics, handlingProbe }, null, 2));
+  console.log(JSON.stringify({
+    viewOne, viewTwo, diagnostics, handlingProbe, itemReplicas, heldAfter,
+  }, null, 2));
   assert.ok(
     Math.abs(handlingProbe.authoritativeHeading) > 0.08,
     'steering probe should create a measurable heading',
@@ -156,6 +212,9 @@ try {
   );
   assert.ok(trackPhaseError < 1e-6, `direct track phase drifted by ${trackPhaseError}`);
   assert.ok(handlingProbe.speed > 4, 'steering probe should be accelerating through the turn');
+  assert.equal(handlingProbe.itemsVisible, true, 'direct multiplayer must not hide item presentation');
+  assert.ok(handlingProbe.itemBoxes > 0, 'direct multiplayer must render item boxes');
+  assert.ok(Array.isArray(handlingProbe.itemSnapshot?.box_down));
   for (const view of [viewOne, viewTwo]) {
     assert.equal(view.length, 2);
     assert.ok(view.every((kart) => kart.visible));
@@ -190,6 +249,7 @@ try {
     adverseNetworkMs: 120,
     handlingProbe,
     views: [viewOne, viewTwo],
+    items: { replicas: itemReplicas, heldAfter },
     reconnect: reconnectState,
   }, null, 2));
 } catch (error) {

@@ -764,10 +764,10 @@
 .kr-hud {
   position: absolute;
   isolation: isolate;
-  top: calc(var(--safe) + env(safe-area-inset-top, 0px));
-  right: calc(var(--safe-x) + env(safe-area-inset-right, 0px));
-  bottom: calc(var(--safe) + env(safe-area-inset-bottom, 0px));
-  left: calc(var(--safe-x) + env(safe-area-inset-left, 0px));
+  top: calc(var(--safe) + var(--kr-safe-top, 0px));
+  right: calc(var(--safe-x) + var(--kr-safe-right, 0px));
+  bottom: calc(var(--safe) + var(--kr-safe-bottom, 0px));
+  left: calc(var(--safe-x) + var(--kr-safe-left, 0px));
   transition: opacity 0.55s var(--e-out), transform 0.6s var(--e-out), filter 0.42s var(--e-soft);
 }
 .kr.is-blocked .kr-hud {
@@ -1531,10 +1531,10 @@ html[data-touch] .kr .kr-speed { --speed-s: 0.82; transform: scale(var(--speed-s
 .kr-screen > .kr-screen-in {
   position: relative;
   width: min(150vmin, 94vw);
-  padding: calc(var(--safe) + env(safe-area-inset-top, 0px))
-           calc(var(--safe-x) + env(safe-area-inset-right, 0px))
-           calc(var(--safe) + env(safe-area-inset-bottom, 0px))
-           calc(var(--safe-x) + env(safe-area-inset-left, 0px));
+  padding: calc(var(--safe) + var(--kr-safe-top, 0px))
+           calc(var(--safe-x) + var(--kr-safe-right, 0px))
+           calc(var(--safe) + var(--kr-safe-bottom, 0px))
+           calc(var(--safe-x) + var(--kr-safe-left, 0px));
   display: flex;
   flex-direction: column;
   align-items: center;

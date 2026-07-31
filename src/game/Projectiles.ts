@@ -326,7 +326,7 @@ interface MatSet {
 }
 
 /** Painted shell: banded albedo, a spotted height field, spatially varying roughness. */
-function shellArt(base: string, rim: string, spot: string, glow: number, S = 256): MatSet {
+export function shellArt(base: string, rim: string, spot: string, glow: number, S = 256): MatSet {
   const alb = pad(S);
   const rgh = pad(S);
   const g = alb.g;
@@ -430,7 +430,7 @@ function shellArt(base: string, rim: string, spot: string, glow: number, S = 256
   return { geo: lathe(SHELL_PROFILE, 30), mat };
 }
 
-function bananaArt(S = 128): MatSet {
+export function bananaArt(S = 128): MatSet {
   const alb = pad(S);
   const g = alb.g;
   // v runs along the sweep: brown stem, yellow body, brown nub
@@ -487,7 +487,7 @@ function bananaArt(S = 128): MatSet {
   return { geo: crescent(2.3, 0.46, 0.145, 22, 12), mat };
 }
 
-function bombArt(S = 128): MatSet {
+export function bombArt(S = 128): MatSet {
   const alb = pad(S);
   const g = alb.g;
   const grd = g.createLinearGradient(0, 0, 0, S);

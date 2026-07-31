@@ -26,7 +26,7 @@ export class ConnectionOverlay {
       .kr-network {
         position: fixed;
         z-index: 45;
-        top: calc(env(safe-area-inset-top, 0px) + 1.8vmin);
+        top: calc(var(--kr-safe-top, 0px) + 1.8vmin);
         left: 50%;
         transform: translateX(-50%);
         max-width: min(84vw, 520px);
@@ -51,9 +51,6 @@ export class ConnectionOverlay {
         color: #fff;
         background: rgba(157,31,50,.94);
         border-color: rgba(255,170,183,.9);
-      }
-      @media (orientation: portrait) {
-        .kr-network { top: auto; bottom: 8vmin; }
       }
     `;
     document.head.appendChild(style);

@@ -5,3 +5,5 @@
 - Keep one documented public steering sign at every boundary. When the renderer uses the opposite yaw handedness, convert heading, yaw rate, rack, and drift direction together and pin the mapping with a regression test.
 - Normalize authoritative distance with the authoritative track length, not a renderer's resampled spline length, or pose phase drifts every lap.
 - Prediction must pause while disconnected and reset its timing accumulator on every connection transition; neutral input is still an input, and a stale clock creates a catch-up burst after reconnect.
+- A portrait-locked host cannot satisfy a “rotate your device” gate. When the game requires landscape, rotate the game surface into a logical landscape viewport and transform touch coordinates with it.
+- Never silently remove a core gameplay system to make multiplayer authoritative. If items are not yet server-owned, keep their presentation explicit and add the missing authority instead of hiding the entire item layer.

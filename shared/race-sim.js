@@ -79,7 +79,11 @@ export function createPlayer({ slot, userId, name }) {
     speed: 0, heading: 0, yawRate: 0,
     rack: 0, rackVelocity: 0,
     input: neutralInput(), ackIseq: 0,
+    ackItemSeq: 0,
     drifting: false, driftDir: 0, driftCharge: 0,
+    itemKind: 0, itemCount: 0, itemArm: 0,
+    itemRevision: 0,
+    boostTime: 0, stunTime: 0, starTime: 0, shrinkTime: 0,
     lap: 0, place: slot + 1, finished: false, finishMs: null,
   };
 }
@@ -107,13 +111,21 @@ export function stepPlayer(player, rawInput, dt) {
   for (let i = 0; i < steps; i++) p = stepPlayerSubstep(p, input, h);
   for (const key of [
     'distance', 'lateral', 'speed', 'heading', 'yawRate', 'rack',
-    'rackVelocity', 'driftCharge',
+    'rackVelocity', 'driftCharge', 'itemArm', 'boostTime', 'stunTime',
+    'starTime', 'shrinkTime',
   ]) p[key] = q(p[key]);
   return p;
 }
 
 function stepPlayerSubstep(player, input, dt) {
   const p = { ...player };
+  const stunned = p.stunTime > 0;
+  if (stunned) input = neutralInput();
+  p.itemArm = Math.max(0, (p.itemArm || 0) - dt);
+  p.boostTime = Math.max(0, (p.boostTime || 0) - dt);
+  p.stunTime = Math.max(0, (p.stunTime || 0) - dt);
+  p.starTime = Math.max(0, (p.starTime || 0) - dt);
+  p.shrinkTime = Math.max(0, (p.shrinkTime || 0) - dt);
   const speedMix = clamp(Math.abs(p.speed) / MAX_SPEED, 0, 1);
   const maxRackRate = STEER_RATE_LOW + (STEER_RATE_HIGH - STEER_RATE_LOW) * speedMix;
   const desiredRackVelocity = clamp(
@@ -124,9 +136,12 @@ function stepPlayerSubstep(player, input, dt) {
   p.rackVelocity = moveToward(p.rackVelocity, desiredRackVelocity, STEER_ACCEL * dt);
   p.rack = clamp(p.rack + p.rackVelocity * dt, -1, 1);
 
-  const longitudinal = input.accel * ACCEL - input.brake * BRAKE
+  const effectAccel = p.boostTime > 0 ? 5.5 : p.starTime > 0 ? 2.2 : 0;
+  const longitudinal = input.accel * ACCEL + effectAccel - input.brake * BRAKE
     - COAST_DRAG - AERO_DRAG * p.speed * p.speed;
-  p.speed = clamp(p.speed + longitudinal * dt, 0, MAX_SPEED);
+  const effectMax = MAX_SPEED + (p.boostTime > 0 ? 5 : 0) + (p.starTime > 0 ? 2 : 0);
+  const shrinkMul = p.shrinkTime > 0 ? 0.78 : 1;
+  p.speed = clamp(p.speed + longitudinal * dt, 0, effectMax * shrinkMul);
 
   const wantsDrift = input.drift
     && p.speed >= DRIFT_MIN_SPEED

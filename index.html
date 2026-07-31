@@ -23,6 +23,31 @@
         position: fixed; inset: 0;
       }
       body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; -webkit-font-smoothing: antialiased; }
+      body {
+        --kr-safe-top: env(safe-area-inset-top, 0px);
+        --kr-safe-right: env(safe-area-inset-right, 0px);
+        --kr-safe-bottom: env(safe-area-inset-bottom, 0px);
+        --kr-safe-left: env(safe-area-inset-left, 0px);
+      }
+      /*
+       * Usion's mobile WebView is portrait-locked. Give the game a real logical
+       * landscape surface inside that portrait frame instead of asking for an
+       * orientation change the host cannot perform. Rotating body also carries
+       * every dynamically-mounted HUD/control/overlay with the canvas.
+       */
+      @media (orientation: portrait) {
+        body {
+          inset: auto;
+          top: 50%; left: 50%;
+          width: 100vh; height: 100vw;
+          transform: translate(-50%, -50%) rotate(90deg);
+          transform-origin: center;
+          --kr-safe-top: env(safe-area-inset-right, 0px);
+          --kr-safe-right: env(safe-area-inset-bottom, 0px);
+          --kr-safe-bottom: env(safe-area-inset-left, 0px);
+          --kr-safe-left: env(safe-area-inset-top, 0px);
+        }
+      }
       #app { position: fixed; inset: 0; }
       canvas { display: block; width: 100%; height: 100%; touch-action: none; }
       #ui { position: fixed; inset: 0; pointer-events: none; z-index: 10; }

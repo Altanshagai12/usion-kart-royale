@@ -13,6 +13,7 @@ export const KEYFRAME_EVERY_NET_TICKS = 20;
 export const INPUT_HZ = 30;
 export const INPUT_RATE_LIMIT_PER_S = 60;
 export const SNAPSHOT_MAX_BYTES = 7500;
+export const MAX_ITEM_ENTITIES = 24;
 
 export const COUNTDOWN_MS = 3400;
 export const AUTO_START_MS = 5000;

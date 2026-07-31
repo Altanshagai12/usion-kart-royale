@@ -1,6 +1,7 @@
 import {
   PROTOCOL_VERSION, SNAPSHOT_MAX_BYTES,
 } from './config.js';
+import { itemSnapshot } from './item-runtime.js';
 
 export function serializeSnapshot(room, { keyframe = false, advance = false } = {}) {
   if (advance) room.snapSeq += 1;
@@ -16,6 +17,7 @@ export function serializeSnapshot(room, { keyframe = false, advance = false } = 
     countdown_ms: room.phase === 'countdown' ? Math.max(0, room.countdownMs) : 0,
     roster: room.roster(),
     ack,
+    items: itemSnapshot(room.items),
     players: room.players.map((player) => ({
       slot: player.slot,
       user_id: player.userId,
@@ -31,6 +33,15 @@ export function serializeSnapshot(room, { keyframe = false, advance = false } = 
       drifting: player.drifting,
       drift_dir: player.driftDir,
       drift_charge: player.driftCharge,
+      item_kind: player.itemKind,
+      item_count: player.itemCount,
+      item_arm: player.itemArm,
+      item_revision: player.itemRevision,
+      ack_item_seq: player.ackItemSeq,
+      boost_time: player.boostTime,
+      stun_time: player.stunTime,
+      star_time: player.starTime,
+      shrink_time: player.shrinkTime,
       lap: player.lap,
       place: player.place,
       finished: player.finished,

@@ -19,8 +19,18 @@ import * as THREE from 'three';
 import { ItemKind, RaceState, type Ctx, type IItems, type IKart } from '../types';
 import type { RacingLine } from './AI';
 import {
-  BlobShadows, Projectiles, mushroomArt, pad, padTexture, radialSprite, roundedBox,
+  BlobShadows, Projectiles, bananaArt, bombArt, mushroomArt, pad, padTexture,
+  radialSprite, roundedBox, shellArt,
 } from './Projectiles';
+import type { DirectItemEntity, DirectSnapshot } from '../net/protocol';
+import {
+  ITEM_BOX_HEIGHT as BOX_HEIGHT,
+  ITEM_BOX_PICKUP_RADIUS as BOX_PICKUP_R,
+  ITEM_BOX_RESPAWN as BOX_RESPAWN,
+  createItemBoxLayout,
+} from '../../shared/item-layout.js';
+import { TRACK_LENGTH as DIRECT_TRACK_LENGTH } from '../../shared/constants.js';
+import { MAX_ITEM_ENTITIES } from '../../shared/constants.js';
 
 // --- tuning ------------------------------------------------------------------
 const BOX_SIZE = 1.55;
@@ -32,8 +42,6 @@ const BOX_SIZE = 1.55;
  * gets anything at all when eight karts cross a row nose to tail — at 4.5 s
  * everyone behind the leading two or three found an empty road.
  */
-const BOX_RESPAWN = 2.5;
-const BOX_PICKUP_R = 1.9;
 /**
  * Clearance from the tarmac to the *centre* of the box, metres, measured along
  * the local ground normal.
@@ -44,7 +52,6 @@ const BOX_PICKUP_R = 1.9;
  * still visibly floating, still above the kart's nose — while halving the gap
  * the contact shadow has to bridge.
  */
-const BOX_HEIGHT = 1.05;
 /** seconds the roulette spins before the item can be spent (matches the HUD) */
 const ARM_TIME = 1.05;
 
@@ -55,7 +62,6 @@ const BOLT_TIME = 6.5;
 const BOLT_STUN = 0.65;
 
 /** rows of boxes around the lap, avoiding the boost strips */
-const BOX_ROWS = [0.052, 0.148, 0.246, 0.336, 0.428, 0.505, 0.646, 0.712, 0.802, 0.906];
 
 /**
  * A row of boxes is a *wall*, not a decoration: it must span the road, and
@@ -70,11 +76,7 @@ const BOX_ROWS = [0.052, 0.148, 0.246, 0.336, 0.428, 0.505, 0.646, 0.712, 0.802,
  * the actual width at each row: spread edge to edge inside the kerb margin, and
  * enough of them that the gap never exceeds the capture diameter.
  */
-const BOX_ROW_MARGIN = 1.8;
 /** target metres between boxes in a row; must stay under 2 × BOX_PICKUP_R */
-const BOX_LANE_GAP = 3.1;
-const BOX_LANES_MIN = 3;
-const BOX_LANES_MAX = 8;
 
 // --- distribution ------------------------------------------------------------
 // Columns are leader / midfield / last. Everything between is a lerp, so an
@@ -499,6 +501,9 @@ function markMaterial(ctx: Ctx): THREE.MeshStandardMaterial {
 export class Items implements IItems {
   readonly group = new THREE.Group();
   private directMultiplayer = false;
+  private directEntities: DirectItemEntity[] = [];
+  private directEventsReady = false;
+  private lastDirectEventId = 0;
 
   private slots = new Map<number, Slot>();
   private heldViews = new Map<number, { kind: ItemKind; count: number }>();
@@ -514,6 +519,7 @@ export class Items implements IItems {
   private boxShadows!: BlobShadows;
   private boxGlow!: BlobShadows;
   private orbitMesh!: THREE.InstancedMesh;
+  private directEntityMeshes = new Map<ItemKind, THREE.InstancedMesh>();
   private boxMat!: THREE.MeshPhysicalMaterial;
   private markMat!: THREE.MeshStandardMaterial;
   private coreMat!: THREE.MeshBasicMaterial;
@@ -529,6 +535,7 @@ export class Items implements IItems {
     this.proj.init(ctx);
     this.buildBoxes(ctx);
     this.buildOrbit();
+    this.buildDirectEntities();
 
     ctx.scene.add(this.group);
     for (const k of this.karts) this.slots.set(k.id, this.freshSlot());
@@ -569,32 +576,67 @@ export class Items implements IItems {
   }
 
   /**
-   * The direct server currently owns a pure racing ruleset. Hide and suspend
-   * browser-authoritative pickups/projectiles so two clients can never invent
-   * different hits while the server remains the only competitive authority.
+   * Direct mode keeps presentation live while the server owns pickup, use and
+   * hit decisions. This browser only animates replicated state.
    */
   setDirectMultiplayer(enabled: boolean) {
     if (enabled === this.directMultiplayer) return;
     this.directMultiplayer = enabled;
-    this.group.visible = !enabled;
-    if (enabled) this.reset();
+    this.group.visible = true;
+    if (enabled) {
+      this.reset();
+      this.directEventsReady = false;
+      this.lastDirectEventId = 0;
+    }
+  }
+
+  applyDirectSnapshot(snapshot: DirectSnapshot) {
+    if (!this.directMultiplayer) this.setDirectMultiplayer(true);
+    const down = new Map(snapshot.items.box_down);
+    for (let i = 0; i < this.boxes.length; i++) {
+      const cooldown = Math.max(0, Number(down.get(i)) || 0);
+      this.boxes[i].down = cooldown;
+      if (cooldown > 0) this.boxes[i].scale = 0;
+    }
+    this.directEntities = snapshot.items.entities;
+    for (const row of snapshot.players) {
+      const kart = this.karts[row.slot];
+      if (!kart) continue;
+      const slot = this.slot(kart);
+      slot.kind = clamp(Math.trunc(row.item_kind), ItemKind.None, ItemKind.Bomb) as ItemKind;
+      slot.count = Math.max(0, Math.trunc(row.item_count));
+      slot.arm = Math.max(0, row.item_arm);
+      slot.carried = -1;
+    }
+    const maxEventId = snapshot.items.events.reduce(
+      (max, event) => Math.max(max, event.id),
+      this.lastDirectEventId,
+    );
+    if (!this.directEventsReady) {
+      this.directEventsReady = true;
+      this.lastDirectEventId = maxEventId;
+      return;
+    }
+    for (const event of snapshot.items.events) {
+      if (event.id <= this.lastDirectEventId) continue;
+      const kart = this.karts[event.slot];
+      if (!kart) continue;
+      const kind = event.kind as ItemKind;
+      if (event.type === 'pickup') this.ctx.bus.emit({ type: 'item-pickup', kart });
+      else if (event.type === 'use') this.ctx.bus.emit({ type: 'item-use', kart, kind });
+      else this.ctx.bus.emit({ type: 'hit', kart, kind });
+    }
+    this.lastDirectEventId = maxEventId;
   }
 
   // -------------------------------------------------------------------- build
 
   private buildBoxes(ctx: Ctx) {
     const track = ctx.track;
-    for (const t of BOX_ROWS) {
+    for (const layout of createItemBoxLayout()) {
+      const t = layout.distance / DIRECT_TRACK_LENGTH;
       const s = track.sample(t);
-      // Half the span the row has to cover, kerb margin removed.
-      const reach = Math.max(2.4, s.halfWidth - BOX_ROW_MARGIN);
-      const lanes = clamp(
-        Math.round((reach * 2) / BOX_LANE_GAP) + 1,
-        BOX_LANES_MIN,
-        BOX_LANES_MAX,
-      );
-      for (let j = 0; j < lanes; j++) {
-        const lat = ((j / (lanes - 1)) * 2 - 1) * reach;
+      const lat = layout.lateral;
         // Lay the row out on the centreline frame first — that is what makes it
         // a wall across the tangent rather than a line down the road.
         const p = new THREE.Vector3()
@@ -624,7 +666,6 @@ export class Items implements IItems {
           down: 0,
           scale: 1,
         });
-      }
     }
 
     const aniso = Math.min(8, ctx.renderer.capabilities.getMaxAnisotropy());
@@ -734,6 +775,25 @@ export class Items implements IItems {
     this.orbitMesh.count = 0;
     this.orbitMesh.name = 'item-orbit';
     this.group.add(this.orbitMesh);
+  }
+
+  private buildDirectEntities() {
+    const art = new Map<ItemKind, ReturnType<typeof bananaArt>>([
+      [ItemKind.GreenShell, shellArt('#3fbf52', '#f2ece0', '#2b8f3d', 0.10)],
+      [ItemKind.RedShell, shellArt('#e8433f', '#f2ece0', '#a92a2c', 0.16)],
+      [ItemKind.Banana, bananaArt()],
+      [ItemKind.Bomb, bombArt()],
+    ]);
+    for (const [kind, visual] of art) {
+      const mesh = new THREE.InstancedMesh(visual.geo, visual.mat, MAX_ITEM_ENTITIES);
+      mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      mesh.count = 0;
+      mesh.frustumCulled = false;
+      mesh.castShadow = true;
+      mesh.name = `direct-item-${kind}`;
+      this.directEntityMeshes.set(kind, mesh);
+      this.group.add(mesh);
+    }
   }
 
   // --------------------------------------------------------------- IItems API
@@ -928,7 +988,6 @@ export class Items implements IItems {
 
   update(ctx: Ctx, dt: number) {
     this.ctx = ctx;
-    if (this.directMultiplayer) return;
     const karts = ctx.race?.karts ?? this.karts;
     this.karts = karts;
     const now = ctx.time;
@@ -948,6 +1007,13 @@ export class Items implements IItems {
       om.envMap = this.env;
       om.needsUpdate = true;
       this.proj.setEnv(this.env);
+    }
+
+    if (this.directMultiplayer) {
+      this.updateBoxes(dt, [], now);
+      this.updateOrbit(karts, now);
+      this.updateDirectEntities(ctx, now);
+      return;
     }
 
     // The pause menu stops `Race`, and `Race` is the only thing that knows the
@@ -1155,6 +1221,36 @@ export class Items implements IItems {
     this.orbitMesh.instanceMatrix.needsUpdate = true;
   }
 
+  private updateDirectEntities(ctx: Ctx, now: number) {
+    const counts = new Map<ItemKind, number>();
+    for (const entity of this.directEntities) {
+      const kind = entity.kind as ItemKind;
+      const mesh = this.directEntityMeshes.get(kind);
+      if (!mesh) continue;
+      const index = counts.get(kind) ?? 0;
+      if (index >= MAX_ITEM_ENTITIES) continue;
+      const t = ((entity.distance / DIRECT_TRACK_LENGTH) % 1 + 1) % 1;
+      const sample = ctx.track.sample(t);
+      _v2.copy(sample.pos).addScaledVector(sample.binormal, entity.lateral);
+      const ground = ctx.track.probe(_v2, t);
+      _v2.y = ground.y + (entity.kind === ItemKind.Banana ? 0.42 : 0.68);
+      _q.setFromAxisAngle(
+        ground.normal,
+        now * (entity.kind === ItemKind.Banana ? 0.6 : 3.4),
+      );
+      const scale = entity.kind === ItemKind.Bomb ? 1.25
+        : entity.kind === ItemKind.Banana ? 0.8 : 1;
+      _s.setScalar(scale);
+      _m.compose(_v2, _q, _s);
+      mesh.setMatrixAt(index, _m);
+      counts.set(kind, index + 1);
+    }
+    for (const [kind, mesh] of this.directEntityMeshes) {
+      mesh.count = counts.get(kind) ?? 0;
+      mesh.instanceMatrix.needsUpdate = true;
+    }
+  }
+
   dispose() {
     this.proj.dispose();
     this.boxMesh.geometry.dispose();
@@ -1162,6 +1258,10 @@ export class Items implements IItems {
     this.coreMesh.geometry.dispose();
     this.orbitMesh.geometry.dispose();
     (this.orbitMesh.material as THREE.Material).dispose();
+    for (const mesh of this.directEntityMeshes.values()) {
+      mesh.geometry.dispose();
+      (mesh.material as THREE.Material).dispose();
+    }
     this.boxMat.map?.dispose();
     this.boxMat.roughnessMap?.dispose();
     this.boxMat.iridescenceThicknessMap?.dispose();

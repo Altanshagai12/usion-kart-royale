@@ -253,8 +253,9 @@ export class TouchControls {
     this.dirty = false;
     for (const b of this.buttons) {
       const r = b.el.getBoundingClientRect();
-      b.cx = r.left + r.width / 2;
-      b.cy = r.top + r.height / 2;
+      const c = clientToSurface(r.left + r.width / 2, r.top + r.height / 2);
+      b.cx = c.x;
+      b.cy = c.y;
       // Generously padded: thumbs are imprecise and a miss on the drift button
       // at corner entry is felt immediately.
       const rad = r.width / 2 + 16;
@@ -283,7 +284,8 @@ export class TouchControls {
     const t = e.target as HTMLElement;
     if (t?.closest?.('.tc-chip, .tc-pause')) return; // handled by their own listeners
 
-    const btn = this.hitButton(e.clientX, e.clientY);
+    const point = clientToSurface(e.clientX, e.clientY);
+    const btn = this.hitButton(point.x, point.y);
     if (btn) {
       e.preventDefault();
       this.claim(btn, e.pointerId);
@@ -291,11 +293,12 @@ export class TouchControls {
     }
 
     // Left half and no thumb already steering: spawn the stick here.
-    if (this.stickPointer < 0 && e.clientX < innerWidth * 0.5) {
+    const surface = surfaceSize();
+    if (this.stickPointer < 0 && point.x < surface.w * 0.5) {
       e.preventDefault();
       this.stickPointer = e.pointerId;
-      this.originX = e.clientX;
-      this.originY = e.clientY;
+      this.originX = point.x;
+      this.originY = point.y;
       this.state.steering = true;
       this.state.steer = 0;
       this.stickWrap.classList.add('live');
@@ -311,7 +314,8 @@ export class TouchControls {
     if (e.pointerId !== this.stickPointer) {
       // A thumb that missed the button it was aiming at can still slide on.
       if (this.free.has(e.pointerId)) {
-        const b = this.hitButton(e.clientX, e.clientY);
+        const point = clientToSurface(e.clientX, e.clientY);
+        const b = this.hitButton(point.x, point.y);
         if (b) {
           e.preventDefault();
           this.free.delete(e.pointerId);
@@ -321,14 +325,15 @@ export class TouchControls {
       return;
     }
     e.preventDefault();
-    let dx = e.clientX - this.originX;
-    const dy = e.clientY - this.originY;
+    const point = clientToSurface(e.clientX, e.clientY);
+    let dx = point.x - this.originX;
+    const dy = point.y - this.originY;
     const r = this.radius;
 
     // Let the base trail the thumb once it leaves the ring, so the stick never
     // saturates and a pull back toward centre responds immediately.
-    if (dx > r) { this.originX = e.clientX - r; dx = r; }
-    else if (dx < -r) { this.originX = e.clientX + r; dx = -r; }
+    if (dx > r) { this.originX = point.x - r; dx = r; }
+    else if (dx < -r) { this.originX = point.x + r; dx = -r; }
 
     this.placeStick(dx, Math.max(-r, Math.min(r, dy)));
 
@@ -415,7 +420,6 @@ const MARKUP = `
   <div class="tc-btn tc-drift" data-btn="drift"><span>DRIFT</span></div>
 </div>
 
-<div class="tc-rotate"><div><b>Rotate your device</b><br/>Kart Royale plays in landscape.</div></div>
 `;
 
 const CSS = `
@@ -454,8 +458,8 @@ const CSS = `
    kind of collision that reads as unfinished. */
 .tc-top {
   position: absolute; display: flex; gap: 1.4vmin;
-  top: calc(env(safe-area-inset-top, 0px) + 1.6vmin);
-  left: calc(env(safe-area-inset-left, 0px) + 17vmin);
+  top: calc(var(--kr-safe-top, 0px) + 1.6vmin);
+  left: calc(var(--kr-safe-left, 0px) + 17vmin);
 }
 .tc-chip {
   pointer-events: auto; min-width: 11vmin; padding: 1.1vmin 1.8vmin;
@@ -473,8 +477,8 @@ const CSS = `
 
 .tc-cluster {
   position: absolute;
-  right: calc(env(safe-area-inset-right, 0px) + 3vmin);
-  bottom: calc(env(safe-area-inset-bottom, 0px) + 3vmin);
+  right: calc(var(--kr-safe-right, 0px) + 3vmin);
+  bottom: calc(var(--kr-safe-bottom, 0px) + 3vmin);
   width: 46vmin; height: 40vmin;
 }
 .tc-btn {
@@ -528,22 +532,11 @@ html[data-touch] .kr-speed {
 /* The AUTO / PAUSE chips start at 17vmin, which is inside the lap plate on a
    short landscape phone. Push them clear; the minimap sits at frame centre and
    is nowhere near them. */
-html[data-touch] .tc-top { left: calc(env(safe-area-inset-left, 0px) + 26vmin); }
+html[data-touch] .tc-top { left: calc(var(--kr-safe-left, 0px) + 26vmin); }
 /* The item box deliberately stays in its desktop bottom-left home. Moving it up
    the left edge to dodge the thumb put it straight through the position
    indicator, and it is a read-only display the floating stick can safely
    overlap for the moment a thumb is actually down there. */
 
-/* Portrait is unplayable at this HUD density; say so rather than shipping a
-   squashed frame the player has to guess at. */
-.tc-rotate { display: none; }
-@media (orientation: portrait) {
-  .tc-rotate {
-    display: grid; place-items: center; position: absolute; inset: 0;
-    background: rgba(5,8,16,.92); color: #f0f4fa; pointer-events: auto;
-    text-align: center; font-size: 4.2vmin; line-height: 1.55; padding: 8vmin;
-  }
-  .tc-rotate b { font-size: 5.4vmin; letter-spacing: .04em; }
-  .tc-stick-zone, .tc-cluster, .tc-top { display: none; }
-}
 `;
+import { clientToSurface, surfaceSize } from './Viewport';

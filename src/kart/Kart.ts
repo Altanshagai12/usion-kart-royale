@@ -1656,8 +1656,9 @@ export class Kart implements IKart {
     this.driftTier = row.drift_charge >= 1.9 ? 3
       : row.drift_charge >= 1.15 ? 2
       : row.drift_charge >= 0.55 ? 1 : 0;
-    this.boostTime = 0;
-    this.stunTime = 0;
+    this.boostTime = Math.max(0, row.boost_time);
+    this.stunTime = Math.max(0, row.stun_time);
+    this.starTime = Math.max(0, row.star_time);
     this.airborne = false;
     this.groundY = position.y;
     this.tyreSlip = row.drifting ? Math.min(1, 0.45 + row.drift_charge * 0.2) : 0;
@@ -1678,7 +1679,10 @@ export class Kart implements IKart {
       wheel.spinRate = row.speed / DEFAULT_SUSPENSION.wheelRadius;
     }
     this.object.visible = true;
-    this.object.scale.setScalar(1);
+    const shrink = row.shrink_time > 0
+      ? 0.52 + 0.48 * Math.pow(1 - Math.min(1, row.shrink_time / 6.5), 2.2)
+      : 1;
+    this.object.scale.setScalar(shrink);
     this.updateVisuals(Math.max(1 / 240, Math.min(dt, 1 / 20)));
   }
 

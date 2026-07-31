@@ -1,0 +1,87 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { MAX_ITEM_ENTITIES } from '../shared/constants.js';
+import { normalizeSnapshot } from '../src/net/protocol.ts';
+
+function legacySnapshot() {
+  return {
+    v: 1,
+    s: 1,
+    server_ts: Date.now(),
+    elapsed_ms: 0,
+    phase: 'playing',
+    countdown_ms: 0,
+    roster: [{ slot: 0, user_id: 'one', name: 'one' }],
+    ack: { 0: 0 },
+    players: [{
+      slot: 0,
+      user_id: 'one',
+      name: 'one',
+      connected: true,
+      distance: 0,
+      lateral: 0,
+      speed: 0,
+      heading: 0,
+      yaw_rate: 0,
+      rack: 0,
+      rack_velocity: 0,
+      drifting: false,
+      drift_dir: 0,
+      drift_charge: 0,
+      lap: 1,
+      place: 1,
+      finished: false,
+      finish_ms: null,
+    }],
+  };
+}
+
+test('legacy v1 snapshots normalize to an empty authoritative item state', () => {
+  const normalized = normalizeSnapshot(legacySnapshot());
+  assert.ok(normalized);
+  assert.deepEqual(normalized.items, { box_down: [], entities: [], events: [] });
+  assert.equal(normalized.players[0].item_kind, 0);
+  assert.equal(normalized.players[0].item_revision, 0);
+});
+
+test('snapshot parser rejects malformed, non-finite, oversized, and unknown data', () => {
+  const malformedBox = {
+    ...legacySnapshot(),
+    items: { box_down: [['bad']], entities: [], events: [] },
+  };
+  assert.equal(normalizeSnapshot(malformedBox), null);
+
+  const nanPlayer = legacySnapshot();
+  nanPlayer.players[0].distance = Number.NaN;
+  assert.equal(normalizeSnapshot(nanPlayer), null);
+
+  const oversized = {
+    ...legacySnapshot(),
+    items: {
+      box_down: [],
+      events: [],
+      entities: Array.from({ length: MAX_ITEM_ENTITIES + 1 }, (_, id) => ({
+        id, kind: 3, distance: id, lateral: 0,
+      })),
+    },
+  };
+  assert.equal(normalizeSnapshot(oversized), null);
+  assert.equal(normalizeSnapshot({ ...legacySnapshot(), v: 2 }), null);
+});
+
+test('snapshot parser bounds every authoritative item-effect duration', () => {
+  const effectFields = ['boost_time', 'stun_time', 'star_time', 'shrink_time'];
+  const invalidValues = ['bad', Number.NaN, -0.01, 60.01, Number.POSITIVE_INFINITY];
+
+  for (const field of effectFields) {
+    for (const value of invalidValues) {
+      const snapshot = legacySnapshot();
+      snapshot.players[0][field] = value;
+      assert.equal(
+        normalizeSnapshot(snapshot),
+        null,
+        `${field} should reject ${String(value)}`,
+      );
+    }
+  }
+});

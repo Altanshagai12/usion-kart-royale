@@ -11,7 +11,7 @@ import {
 import type {
   DirectJoined, DirectPlayerRow, DirectRosterRow, DirectSnapshot, DrivePayload,
 } from './protocol';
-import { isSnapshot } from './protocol';
+import { normalizeSnapshot } from './protocol';
 
 type ConnectionState = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'error';
 
@@ -36,6 +36,15 @@ export class DirectMultiplayer implements System {
   private lastSnapshotSequence = -1;
   private lastResyncAt = 0;
   private sendAccumulator = 0;
+  private itemSequence = 0;
+  private pendingItem: {
+    item_seq: number;
+    item_revision: number;
+    expected_kind: number;
+    backwards: boolean;
+    client_sent_at: number;
+    sentAt: number;
+  } | null = null;
   private connectingRoom: string | null = null;
   private localMode = false;
   private language = 'en';
@@ -125,6 +134,14 @@ export class DirectMultiplayer implements System {
       && this.ownSlot !== null
     ) {
       this.predictor?.advance(performance.now(), drive);
+    }
+    if (input.itemPressed && !this.pendingItem) {
+      const own = this.latest.players.find((row) => row.slot === this.ownSlot);
+      if (own?.item_kind) this.queueItemUse(own, input.brake > 0.5 || input.lookBack);
+    }
+    if (this.pendingItem && this.connection === 'connected'
+        && performance.now() - this.pendingItem.sentAt >= 250) {
+      this.sendPendingItem();
     }
     this.sendAccumulator += dt;
     const sendEvery = 1 / INPUT_HZ;
@@ -227,8 +244,8 @@ export class DirectMultiplayer implements System {
   }
 
   private handleSnapshot(value: unknown, fromJoin = false) {
-    if (!isSnapshot(value)) return;
-    const snapshot = value;
+    const snapshot = normalizeSnapshot(value);
+    if (!snapshot) return;
     const fresh = snapshot.s > this.lastSnapshotSequence;
     if (!fresh && !(snapshot.k && snapshot.s === this.lastSnapshotSequence)) return;
     if (fresh && this.lastSnapshotSequence >= 0 && snapshot.s > this.lastSnapshotSequence + 1) {
@@ -236,11 +253,18 @@ export class DirectMultiplayer implements System {
     }
     if (fresh) this.lastSnapshotSequence = snapshot.s;
     this.latest = snapshot;
+    const directItems = this.ctx?.items as Items | undefined;
+    directItems?.setDirectMultiplayer(true);
+    directItems?.applyDirectSnapshot(snapshot);
     this.phase = snapshot.phase;
     this.setRoster(snapshot.roster);
     if (this.ownSlot !== null) {
       const own = snapshot.players.find((row) => row.slot === this.ownSlot);
       if (own) {
+        this.itemSequence = Math.max(this.itemSequence, own.ack_item_seq || 0);
+        if (this.pendingItem && own.ack_item_seq >= this.pendingItem.item_seq) {
+          this.pendingItem = null;
+        }
         const ack = snapshot.ack?.[String(this.ownSlot)] ?? snapshot.ack?.[this.ownSlot] ?? -1;
         if (fromJoin) this.predictor?.reset(own);
         else this.predictor?.reconcile(own, ack);
@@ -271,6 +295,26 @@ export class DirectMultiplayer implements System {
   private sendDrive(payload: DrivePayload) {
     if (this.localSocket) this.localSocket.send('drive', payload);
     else this.usion?.game?.realtime('drive', payload);
+  }
+
+  private queueItemUse(row: DirectPlayerRow, backwards: boolean) {
+    this.pendingItem = {
+      item_seq: ++this.itemSequence,
+      item_revision: row.item_revision,
+      expected_kind: row.item_kind,
+      backwards,
+      client_sent_at: Date.now(),
+      sentAt: 0,
+    };
+    this.sendPendingItem();
+  }
+
+  private sendPendingItem() {
+    if (!this.pendingItem || this.connection !== 'connected') return;
+    this.pendingItem.sentAt = performance.now();
+    const { sentAt: _, ...payload } = this.pendingItem;
+    if (this.localSocket) this.localSocket.send('use_item', payload);
+    else this.usion?.game?.realtime('use_item', payload);
   }
 
   private sendHello() {

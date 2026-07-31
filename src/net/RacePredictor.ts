@@ -87,6 +87,11 @@ export class RacePredictor {
       rack_velocity: row.rackVelocity ?? row.rack_velocity,
       drift_dir: row.driftDir ?? row.drift_dir,
       drift_charge: row.driftCharge ?? row.drift_charge,
+      boost_time: row.boostTime ?? row.boost_time,
+      stun_time: row.stunTime ?? row.stun_time,
+      star_time: row.starTime ?? row.star_time,
+      shrink_time: row.shrinkTime ?? row.shrink_time,
+      item_arm: row.itemArm ?? row.item_arm,
     } as DirectPlayerRow;
   }
 
@@ -110,6 +115,11 @@ export class RacePredictor {
       rackVelocity: row.rack_velocity,
       driftDir: row.drift_dir,
       driftCharge: row.drift_charge,
+      boostTime: row.boost_time,
+      stunTime: row.stun_time,
+      starTime: row.star_time,
+      shrinkTime: row.shrink_time,
+      itemArm: row.item_arm,
       input: {
         steer: 0, accel: 0, brake: 0, drift: false, iseq: 0,
       },

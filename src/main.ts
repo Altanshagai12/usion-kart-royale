@@ -8,6 +8,7 @@ import { prewarm } from './core/Prewarm';
 import { FrameWatch } from './core/FrameWatch';
 import { Diagnostics } from './core/Diagnostics';
 import { installFeel } from './core/Feel';
+import { surfaceSize } from './core/Viewport';
 import { RenderPipeline } from './render/Renderer';
 import { DrawBudget } from './render/DrawBudget';
 import { Sky } from './render/Sky';
@@ -64,8 +65,9 @@ function viewportSize(): { w: number; h: number } | null {
   // The element measuring zero does not mean the window has; fall back before
   // giving up, which covers being read mid-layout.
   if (w < MIN_SURFACE || h < MIN_SURFACE) {
-    w = Math.round(innerWidth || 0);
-    h = Math.round(innerHeight || 0);
+    const fallback = surfaceSize(innerWidth || 0, innerHeight || 0);
+    w = Math.round(fallback.w);
+    h = Math.round(fallback.h);
   }
   if (w < MIN_SURFACE || h < MIN_SURFACE) return null;
   return { w, h };
@@ -91,7 +93,11 @@ const diagnostics = new Diagnostics();
 // At module scope the element may not be laid out yet, and viewportSize()
 // correctly refuses to invent a size. A real one arrives from `resize(true)`
 // during boot; this only has to be non-degenerate so the camera can be built.
-const view0 = viewportSize() ?? { w: Math.max(MIN_SURFACE, innerWidth || 1280), h: Math.max(MIN_SURFACE, innerHeight || 720) };
+const fallbackView = surfaceSize(innerWidth || 1280, innerHeight || 720);
+const view0 = viewportSize() ?? {
+  w: Math.max(MIN_SURFACE, fallbackView.w),
+  h: Math.max(MIN_SURFACE, fallbackView.h),
+};
 
 const ctx: Ctx = {
   renderer: null as any,
