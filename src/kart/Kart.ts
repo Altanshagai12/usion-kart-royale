@@ -689,6 +689,8 @@ export class Kart implements IKart {
   private yawRate = 0;
   private steerInput = 0;
   private steerVelocity = 0;
+  /** Direct replicas bypass the suspension solver; initialize their stance once. */
+  private directPoseActive = false;
   private steerAngle = 0;
   private boostStrength = 1;
   private topSpeed = BASE_TOP_SPEED;
@@ -1031,6 +1033,7 @@ export class Kart implements IKart {
   // ---------------------------------------------------------------------------
 
   placeAt(pos: THREE.Vector3, yaw: number, t: number) {
+    this.directPoseActive = false;
     this.position.copy(pos);
     this.yaw = yaw;
     this.yawRate = 0;
@@ -1626,10 +1629,17 @@ export class Kart implements IKart {
     trackT: number,
     dt: number,
   ) {
+    if (!this.directPoseActive) {
+      this.suspension.reset();
+      this.directPoseActive = true;
+    }
     this.position.copy(position);
     this.up.copy(up).normalize();
-    this.yaw = trackYaw + row.heading;
-    this.yawRate = row.yaw_rate;
+    // Server track space is right-positive. The authored chassis yaw is
+    // left-positive, so heading and every signed derivative cross the boundary
+    // together. Rack and drift already follow the same conversion below.
+    this.yaw = trackYaw - row.heading;
+    this.yawRate = -row.yaw_rate;
     this.steerInput = -row.rack;
     this.steerVelocity = -row.rack_velocity;
     this.steerAngle = this.steerInput * MAX_STEER;
@@ -1649,8 +1659,24 @@ export class Kart implements IKart {
     this.boostTime = 0;
     this.stunTime = 0;
     this.airborne = false;
+    this.groundY = position.y;
     this.tyreSlip = row.drifting ? Math.min(1, 0.45 + row.drift_charge * 0.2) : 0;
-    this.lateralAccel = row.yaw_rate * row.speed;
+    const lateralAccel = -row.yaw_rate * row.speed;
+    this.aLat = this.aLatPure = this.lateralAccel = lateralAccel;
+
+    // Direct snapshots own planar motion, but the existing model still owns
+    // wheel placement and animation. Keep that visual state deterministic
+    // instead of leaking the half-solved solo grid suspension into the replica.
+    const sus = this.suspension;
+    sus.groundNormal.copy(this.up);
+    sus.contacts = 4;
+    sus.roll = sus.rollVel = sus.pitch = sus.pitchVel = 0;
+    for (const wheel of sus.wheels) {
+      wheel.compression = DEFAULT_SUSPENSION.restCompression;
+      wheel.compressionVel = 0;
+      wheel.contact = true;
+      wheel.spinRate = row.speed / DEFAULT_SUSPENSION.wheelRadius;
+    }
     this.object.visible = true;
     this.object.scale.setScalar(1);
     this.updateVisuals(Math.max(1 / 240, Math.min(dt, 1 / 20)));

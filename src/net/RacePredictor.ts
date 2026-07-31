@@ -94,6 +94,11 @@ export class RacePredictor {
     return this.core?.lastSeq || 0;
   }
 
+  resetClock() {
+    this.lastAdvanceAt = 0;
+    this.accumulator = 0;
+  }
+
   lastCorrection() {
     return this.correction;
   }

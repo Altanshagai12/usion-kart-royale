@@ -118,7 +118,12 @@ export class DirectMultiplayer implements System {
       brake: this.connection === 'connected' && this.phase === 'playing' ? input.brake : 0,
       drift: this.connection === 'connected' && this.phase === 'playing' && input.drift,
     };
-    if (this.phase === 'playing' && !this.spectator && this.ownSlot !== null) {
+    if (
+      this.connection === 'connected'
+      && this.phase === 'playing'
+      && !this.spectator
+      && this.ownSlot !== null
+    ) {
       this.predictor?.advance(performance.now(), drive);
     }
     this.sendAccumulator += dt;
@@ -286,6 +291,7 @@ export class DirectMultiplayer implements System {
   }
 
   private setConnection(state: ConnectionState) {
+    if (state !== this.connection) this.predictor?.resetClock();
     this.connection = state;
     if (state === 'connecting') {
       this.overlay.show(this.copy('Connecting racers…', 'Тоглогчдыг холбож байна…'));

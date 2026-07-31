@@ -37,6 +37,7 @@ import { Kart } from '../kart/Kart';
 import { AIField, type DriveCmd } from './AI';
 import { Items } from './Items';
 import type { DirectPlayerRow, DirectRosterRow, DirectSnapshot } from '../net/protocol';
+import { TRACK_LENGTH as DIRECT_TRACK_LENGTH } from '../../shared/constants.js';
 
 const ROSTER: KartStats[] = [
   { name: 'Vela',   color: new THREE.Color(0xff3b5c), accelMul: 1.00, topSpeedMul: 1.00, weightMul: 1.0,  handlingMul: 1.00 },
@@ -839,13 +840,22 @@ export class Race implements IRace {
       const kart = this.karts[member.slot];
       if (!row || !kart) continue;
       kart.stats.name = member.name;
-      const t = ((row.distance / track.length) % 1 + 1) % 1;
+      // Authoritative curvature, lap timing and distance all use the shared
+      // 1600 m schedule. The rendered spline resamples to ~1606.19 m, so using
+      // its physical length here drifts the visual start line by 6.2 m per lap.
+      const t = ((row.distance / DIRECT_TRACK_LENGTH) % 1 + 1) % 1;
       const sample = track.sample(t);
       _drop.copy(sample.pos)
-        .addScaledVector(sample.binormal, row.lateral)
-        .addScaledVector(sample.normal, GRID_LIFT);
+        .addScaledVector(sample.binormal, row.lateral);
+      // Unlike the solo grid, a direct replica does not integrate gravity.
+      // Its chassis origin is authored on the contact plane, so reusing the
+      // 0.7 m solo drop height leaves every kart permanently airborne. Probe
+      // the final lateral point as well: the road crown, apron and kerb are not
+      // part of the centre sample's ideal banked plane.
+      const ground = track.probe(_drop, t);
+      _drop.y = ground.y;
       const yaw = Math.atan2(sample.tangent.x, sample.tangent.z);
-      kart.applyDirectPose(row, _drop, sample.normal, yaw, t, dt);
+      kart.applyDirectPose(row, _drop, ground.normal, yaw, t, dt);
       if (row.finished) this.finishedCount += 1;
     }
 

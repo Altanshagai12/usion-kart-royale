@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  STEER_ACCEL, STEER_RATE_LOW,
+  KART_RADIUS, MAX_LATERAL_ACCEL, STEER_ACCEL, STEER_RATE_LOW,
 } from '../shared/constants.js';
 import {
-  createPlayer, stepPlayer,
+  createPlayer, halfWidthAt, stepPlayer,
 } from '../shared/race-sim.js';
 
 function run(hz, segments, speed = 20) {
@@ -47,4 +47,46 @@ test('small analog input stays proportional instead of snapping to full lock', (
   const full = run(60, [[0.6, 1]]).state;
   assert.ok(gentle.rack > 0.15 && gentle.rack < 0.35);
   assert.ok(full.rack > gentle.rack * 2);
+});
+
+test('full steering at race speed stays grip-limited and controllable', () => {
+  let state = {
+    ...createPlayer({ slot: 0, userId: 'p1', name: 'P1' }),
+    lateral: 0,
+    speed: 20,
+  };
+  let peakLateralAccel = 0;
+  for (let i = 0; i < 60; i++) {
+    state = stepPlayer(state, { steer: 1, accel: 0 }, 1 / 60);
+    peakLateralAccel = Math.max(
+      peakLateralAccel,
+      Math.abs(state.yawRate * state.speed),
+    );
+  }
+  assert.ok(
+    peakLateralAccel <= MAX_LATERAL_ACCEL + 0.2,
+    `lateral acceleration escaped grip limit: ${peakLateralAccel}`,
+  );
+  assert.ok(Math.abs(state.lateral) < 4, `full lock crossed ${state.lateral}m in one second`);
+  assert.ok(state.speed > 14, 'a one-second turn must not slam the kart into the edge');
+});
+
+test('releasing steering settles the travel heading without an edge snap', () => {
+  let state = {
+    ...createPlayer({ slot: 0, userId: 'p1', name: 'P1' }),
+    lateral: 0,
+  };
+  for (let i = 0; i < 54; i++) {
+    state = stepPlayer(state, { steer: 1, accel: 1 }, 1 / 60);
+  }
+  for (let i = 0; i < 96; i++) {
+    state = stepPlayer(state, { steer: 0, accel: 1 }, 1 / 60);
+  }
+  assert.ok(Math.abs(state.heading) < 0.12, `released heading stayed at ${state.heading}`);
+  const safeEdge = halfWidthAt(state.distance) - KART_RADIUS - 0.4;
+  assert.ok(
+    Math.abs(state.lateral) < safeEdge,
+    `released kart reached the road edge at ${state.lateral}`,
+  );
+  assert.ok(state.speed > 16, 'steering release should preserve forward momentum');
 });

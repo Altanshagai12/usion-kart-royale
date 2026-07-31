@@ -5,7 +5,8 @@ import {
   KART_RADIUS, MAX_SPEED, MAX_STEER_RAD, OFFROAD_SPEED_MUL,
   STATE_PRECISION, STEER_ACCEL, STEER_RATE_HIGH, STEER_RATE_LOW,
   STEER_RESPONSE, TOTAL_LAPS, TRACK_LEGS, TRACK_LENGTH, TRACK_WIDTH,
-  WHEELBASE, YAW_RESPONSE, MAX_YAW_ACCEL, HEADING_DAMP,
+  WHEELBASE, YAW_RESPONSE, YAW_RETURN_RESPONSE, MAX_YAW_ACCEL,
+  MAX_LATERAL_ACCEL, HEADING_DAMP,
 } from './constants.js';
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
@@ -149,9 +150,20 @@ function stepPlayerSubstep(player, input, dt) {
   }
 
   const yawMul = p.drifting ? DRIFT_YAW_MUL : 1;
-  const targetYawRate = (p.speed / WHEELBASE) * Math.tan(p.rack * MAX_STEER_RAD) * yawMul;
+  const bicycleYawRate = (
+    (p.speed / WHEELBASE) * Math.tan(p.rack * MAX_STEER_RAD) * yawMul
+  );
+  // A bicycle model without tyre saturation asks for more than 4 rad/s at race
+  // speed and full lock. That is not a turn: it is an instantaneous spin into
+  // the road edge. Bound yaw by the lateral acceleration the tyres can produce,
+  // while retaining the bicycle response at low speed and small steering input.
+  const gripYawRate = MAX_LATERAL_ACCEL / Math.max(1, Math.abs(p.speed));
+  const targetYawRate = clamp(bicycleYawRate, -gripYawRate, gripYawRate);
+  const yawResponse = Math.abs(input.steer) < 0.03
+    ? YAW_RETURN_RESPONSE
+    : YAW_RESPONSE;
   p.yawRate += clamp(
-    (targetYawRate - p.yawRate) * YAW_RESPONSE,
+    (targetYawRate - p.yawRate) * yawResponse,
     -MAX_YAW_ACCEL,
     MAX_YAW_ACCEL,
   ) * dt;

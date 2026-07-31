@@ -35,8 +35,13 @@ export const STEER_ACCEL = 26;
 export const STEER_RATE_LOW = 5.8;
 export const STEER_RATE_HIGH = 3.2;
 export const YAW_RESPONSE = 5.5;
+/** Faster self-aligning response when the rack target returns to centre. */
+export const YAW_RETURN_RESPONSE = 10;
 export const MAX_YAW_ACCEL = 7;
-export const HEADING_DAMP = 0.18;
+/** Tyre-grip envelope for the server-authoritative planar simulation, m/s^2. */
+export const MAX_LATERAL_ACCEL = 15;
+/** Exponential tyre self-alignment once the player releases the steering. */
+export const HEADING_DAMP = 2;
 
 export const DRIFT_MIN_SPEED = 9;
 export const DRIFT_MIN_STEER = 0.18;
