@@ -11,6 +11,7 @@ import {
 import { buildKart } from './KartModel';
 import { DEFAULT_SUSPENSION, Suspension } from './Suspension';
 import { FRONT_TYRE, REAR_TYRE, makeTyreResult, solveTyre, type TyreResult } from './Tyre';
+import type { DirectPlayerRow } from '../net/protocol';
 
 /**
  * ============================================================================
@@ -57,23 +58,16 @@ const WHEELBASE = DEFAULT_SUSPENSION.halfBase * 2;
 /** peak steering angle at a standstill, radians */
 const MAX_STEER = 0.55;
 /**
- * How fast the virtual steering rack follows the stick, in units of input per
- * second. Loading the rack up is deliberately speed-scaled — full lock arriving
- * instantly at 28 m/s is twitch, not response — but UNLOADING it is not.
- *
- * That asymmetry is the whole of "the kart changes direction the instant I ask".
- * A symmetric 4.2/s rack has to travel the full 2.0 units of input to get from
- * hard left to hard right, which is 480 ms of the player holding a stick against
- * a kart that is still turning the other way; measured, the yaw rate took 367 ms
- * to reach 90% of its new value and essentially all of that was the rack. Making
- * only the unwind and the cross-over fast leaves the anti-twitch behaviour
- * exactly where it was — you still cannot slam into a corner — while a
- * direction change costs about a tenth of a second.
+ * The rack is a single acceleration-limited steering authority. Speed reduces
+ * its maximum travel rate, while the acceleration cap removes the instant
+ * direction changes that made keyboard and full-stick input feel abrupt.
  */
-const STEER_RATE_LOW = 10.5;
-const STEER_RATE_HIGH = 5.6;
-/** rate used when the rack is unwinding toward centre or crossing over */
-const STEER_RATE_FREE = 15;
+const STEER_RATE_LOW = 5.8;
+const STEER_RATE_HIGH = 3.2;
+/** acceleration limit keeps turn-in and counter-steer continuous, not jerky */
+const STEER_ACCEL = 26;
+/** position error -> desired rack velocity */
+const STEER_RESPONSE = 8;
 
 const MAX_DRIVE = 3000; // newtons at full throttle, before stat multipliers
 const BRAKE_FORCE = 4200;
@@ -694,6 +688,7 @@ export class Kart implements IKart {
   private yaw = 0;
   private yawRate = 0;
   private steerInput = 0;
+  private steerVelocity = 0;
   private steerAngle = 0;
   private boostStrength = 1;
   private topSpeed = BASE_TOP_SPEED;
@@ -1045,6 +1040,7 @@ export class Kart implements IKart {
     this.lastGoodT = t;
     this.forwardSpeed = 0;
     this.steerInput = 0;
+    this.steerVelocity = 0;
     this.steerAngle = 0;
     this.aLat = this.aLong = this.aLatPure = 0;
     this.driftDir = 0;
@@ -1219,19 +1215,24 @@ export class Kart implements IKart {
   private updateSteerInput(h: number, steer: number) {
     const want = -steer;
     const cur = this.steerInput;
-    // Loading up = pushing the rack further from centre on the side it is
-    // already on. That is the only case the speed taper applies to; unwinding
-    // and crossing over run at the free rate, so releasing the stick or
-    // flicking the other way is immediate at any speed.
-    const loading = want * cur >= 0 && Math.abs(want) > Math.abs(cur);
-    const rate = loading
-      ? THREE.MathUtils.lerp(
-          STEER_RATE_LOW,
-          STEER_RATE_HIGH,
-          clamp(Math.abs(this.forwardSpeed) / Math.max(6, this.topSpeed), 0, 1),
-        )
-      : STEER_RATE_FREE;
-    this.steerInput = approach(cur, want, rate * h);
+    const maxRate = THREE.MathUtils.lerp(
+      STEER_RATE_LOW,
+      STEER_RATE_HIGH,
+      clamp(Math.abs(this.forwardSpeed) / Math.max(6, this.topSpeed), 0, 1),
+    );
+    // The old rack changed velocity instantaneously, especially on a
+    // counter-flick. That discontinuity was the abrupt turn the player felt:
+    // the stick target was valid, but the rack had infinite acceleration.
+    // Chase a bounded desired velocity, then acceleration-limit the chase.
+    // This remains the one steering authority — Input still reports the
+    // device's normalized target without adding a second lag layer.
+    const desiredVelocity = clamp((want - cur) * STEER_RESPONSE, -maxRate, maxRate);
+    this.steerVelocity = approach(this.steerVelocity, desiredVelocity, STEER_ACCEL * h);
+    this.steerInput = clamp(cur + this.steerVelocity * h, -1, 1);
+    if ((this.steerInput === -1 && this.steerVelocity < 0)
+        || (this.steerInput === 1 && this.steerVelocity > 0)) {
+      this.steerVelocity = 0;
+    }
   }
 
   /** Air/ground edge detection and the landing event. Runs per substep. */
@@ -1596,7 +1597,10 @@ export class Kart implements IKart {
     // is non-finite for the rest of the race and nothing downstream can tell.
     if (!(this.up.lengthSq() > 1e-6) || !(this.up.y > 0.15)) this.up.set(0, 1, 0);
     this.up.normalize();
+    this.rebuildBasis();
+  }
 
+  private rebuildBasis() {
     _fwdFlat.set(Math.sin(this.yaw), 0, Math.cos(this.yaw));
     _basisR.crossVectors(this.up, _fwdFlat);
     if (_basisR.lengthSq() < 1e-8) _basisR.set(1, 0, 0);
@@ -1606,6 +1610,50 @@ export class Kart implements IKart {
     this.forward.copy(_basisF);
     _mat.makeBasis(_basisR, this.up, _basisF);
     this.quaternion.setFromRotationMatrix(_mat);
+  }
+
+  /**
+   * Pose this model from the direct server's authoritative track-space state.
+   * Multiplayer never runs a second competing browser physics simulation for
+   * remote karts; the shared predictor/server state is transformed onto the
+   * already-authored Three.js track here.
+   */
+  applyDirectPose(
+    row: DirectPlayerRow,
+    position: THREE.Vector3,
+    up: THREE.Vector3,
+    trackYaw: number,
+    trackT: number,
+    dt: number,
+  ) {
+    this.position.copy(position);
+    this.up.copy(up).normalize();
+    this.yaw = trackYaw + row.heading;
+    this.yawRate = row.yaw_rate;
+    this.steerInput = -row.rack;
+    this.steerVelocity = -row.rack_velocity;
+    this.steerAngle = this.steerInput * MAX_STEER;
+    this.rebuildBasis();
+    this.velocity.copy(this.forward).multiplyScalar(row.speed);
+    this.forwardSpeed = row.speed;
+    this.t = trackT;
+    this.lap = row.lap;
+    this.place = row.place;
+    this.finished = row.finished;
+    this.raceDistance = row.distance;
+    this.driftDir = row.drifting ? -row.drift_dir : 0;
+    this.driftCharge = row.drift_charge;
+    this.driftTier = row.drift_charge >= 1.9 ? 3
+      : row.drift_charge >= 1.15 ? 2
+      : row.drift_charge >= 0.55 ? 1 : 0;
+    this.boostTime = 0;
+    this.stunTime = 0;
+    this.airborne = false;
+    this.tyreSlip = row.drifting ? Math.min(1, 0.45 + row.drift_charge * 0.2) : 0;
+    this.lateralAccel = row.yaw_rate * row.speed;
+    this.object.visible = true;
+    this.object.scale.setScalar(1);
+    this.updateVisuals(Math.max(1 / 240, Math.min(dt, 1 / 20)));
   }
 
   /** Last line of defence: a single NaN would take the whole scene with it. */
@@ -2281,6 +2329,7 @@ export class Kart implements IKart {
     this.forwardSpeed = 0;
     this.aLat = this.aLong = this.aLatPure = 0;
     this.steerInput = 0;
+    this.steerVelocity = 0;
     this.steerAngle = 0;
     this.driftDir = 0;
     this.driftTier = 0;

@@ -1,0 +1,9 @@
+.git
+dist
+node_modules
+tasks
+test
+tools
+docs
+*.log
+.env*

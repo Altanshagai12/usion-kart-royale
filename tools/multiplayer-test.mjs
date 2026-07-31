@@ -1,0 +1,157 @@
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { createServer } from 'node:net';
+import puppeteer from 'puppeteer';
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function freePort() {
+  const server = createServer();
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+}
+
+async function waitFor(check, timeoutMs = 15_000) {
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    const value = await check();
+    if (value) return value;
+    await delay(50);
+  }
+  throw new Error(`Timed out after ${timeoutMs}ms`);
+}
+
+const port = await freePort();
+const server = spawn(process.execPath, ['server/dev.js'], {
+  cwd: process.cwd(),
+  env: { ...process.env, PORT: String(port) },
+  stdio: ['ignore', 'pipe', 'pipe'],
+});
+let serverLog = '';
+server.stdout.on('data', (bytes) => { serverLog += String(bytes); });
+server.stderr.on('data', (bytes) => { serverLog += String(bytes); });
+
+let browser;
+try {
+  await waitFor(async () => {
+    try {
+      return (await fetch(`http://127.0.0.1:${port}/health`)).ok;
+    } catch {
+      return false;
+    }
+  });
+
+  browser = await puppeteer.launch({
+    headless: 'shell',
+    args: [
+      '--no-sandbox',
+      '--enable-unsafe-swiftshader',
+      '--use-gl=angle',
+      '--window-size=800,600',
+    ],
+  });
+  const pages = await Promise.all(['one', 'two'].map(async (player) => {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 800, height: 600 });
+    await page.setRequestInterception(true);
+    page.on('request', (request) => {
+      if (request.url().startsWith('https://usions.com/')) request.abort();
+      else request.continue();
+    });
+    await page.goto(
+      `http://127.0.0.1:${port}/?multiplayer=1&room=browser-room&player=${player}&quality=low`,
+      { waitUntil: 'domcontentloaded' },
+    );
+    return page;
+  }));
+  await Promise.all(pages.map((page) => page.waitForFunction(
+    'window.__gameReady === true && window.__ctx?.race?.directMultiplayer === true',
+    { timeout: 90_000 },
+  )));
+  await Promise.all(pages.map((page) => page.waitForFunction(
+    'window.__ctx.race.state === 2',
+    { timeout: 20_000 },
+  )));
+
+  const cdp = await pages[1].createCDPSession();
+  await cdp.send('Network.enable');
+  await cdp.send('Network.emulateNetworkConditions', {
+    offline: false,
+    latency: 120,
+    downloadThroughput: 128 * 1024,
+    uploadThroughput: 64 * 1024,
+    connectionType: 'cellular3g',
+  });
+
+  await pages[0].keyboard.down('ArrowUp');
+  await pages[1].keyboard.down('ArrowUp');
+  await pages[1].keyboard.down('ArrowLeft');
+  await delay(2500);
+  await pages[0].keyboard.up('ArrowUp');
+  await pages[1].keyboard.up('ArrowLeft');
+  await pages[1].keyboard.up('ArrowUp');
+  await delay(500);
+
+  const readKarts = (page) => page.evaluate(() => window.__ctx.race.karts
+    .slice(0, 2)
+    .map((kart) => ({
+      visible: kart.object.visible,
+      x: kart.position.x,
+      y: kart.position.y,
+      z: kart.position.z,
+      speed: kart.forwardSpeed,
+    })));
+  const [viewOne, viewTwo] = await Promise.all(pages.map(readKarts));
+  const diagnostics = await Promise.all(pages.map((page) => page.evaluate(() => ({
+    input: window.__ctx.input.state,
+    connection: window.__multiplayer.connection,
+    phase: window.__multiplayer.phase,
+    latest: window.__multiplayer.latest?.players,
+    ownSlot: window.__multiplayer.ownSlot,
+    prediction: window.__multiplayer.predictor?.view?.(),
+  }))));
+  console.log(JSON.stringify({ viewOne, viewTwo, diagnostics }, null, 2));
+  for (const view of [viewOne, viewTwo]) {
+    assert.equal(view.length, 2);
+    assert.ok(view.every((kart) => kart.visible));
+  }
+  assert.ok(
+    diagnostics[0].latest.some((row) => row.distance > -5),
+    'authoritative karts should advance from the starting grid',
+  );
+  for (let slot = 0; slot < 2; slot++) {
+    const a = viewOne[slot];
+    const b = viewTwo[slot];
+    const delta = Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+    assert.ok(delta < 12, `slot ${slot} diverged by ${delta.toFixed(2)}m`);
+  }
+
+  await pages[0].evaluate(() => window.__multiplayer.localSocket.socket.close());
+  await waitFor(() => pages[0].evaluate(
+    () => document.querySelector('.kr-network')?.textContent?.includes('Reconnecting'),
+  ));
+  await waitFor(() => pages[0].evaluate(
+    () => window.__multiplayer.connection === 'connected',
+  ), 20_000);
+  const reconnectState = await pages[0].evaluate(() => ({
+    active: window.__multiplayer.active,
+    joined: window.__multiplayer.joined,
+    state: window.__multiplayer.connection,
+  }));
+  assert.deepEqual(reconnectState, { active: true, joined: true, state: 'connected' });
+
+  console.log(JSON.stringify({
+    ok: true,
+    adverseNetworkMs: 120,
+    views: [viewOne, viewTwo],
+    reconnect: reconnectState,
+  }, null, 2));
+} catch (error) {
+  console.error(serverLog);
+  throw error;
+} finally {
+  await browser?.close();
+  server.kill();
+}

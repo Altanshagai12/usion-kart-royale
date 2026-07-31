@@ -36,6 +36,7 @@ import {
 import { Kart } from '../kart/Kart';
 import { AIField, type DriveCmd } from './AI';
 import { Items } from './Items';
+import type { DirectPlayerRow, DirectRosterRow, DirectSnapshot } from '../net/protocol';
 
 const ROSTER: KartStats[] = [
   { name: 'Vela',   color: new THREE.Color(0xff3b5c), accelMul: 1.00, topSpeedMul: 1.00, weightMul: 1.0,  handlingMul: 1.00 },
@@ -159,6 +160,14 @@ export class Race implements IRace {
   bestLap = Infinity;
   /** true while the player is pointing the wrong way at speed */
   wrongWay = false;
+  private directReplica = false;
+  private directSlot = 0;
+  private directCount = 0;
+  private directSpectator = false;
+
+  get directMultiplayer() {
+    return this.directReplica;
+  }
 
   /**
    * Debug / capture hook: hand the player's kart to the AI. The screenshot
@@ -356,6 +365,10 @@ export class Race implements IRace {
 
   update(ctx: Ctx, dt: number) {
     this.ctx = ctx;
+    if (this.directReplica) {
+      this.updateCamera(ctx, dt);
+      return;
+    }
     const input = ctx.input.state;
 
     // --- pause --------------------------------------------------------------
@@ -783,6 +796,60 @@ export class Race implements IRace {
     // punch in fast, ease out slowly — the asymmetry is what sells the kick
     const rate = fov > ctx.fovPunch ? 11 : 4.5;
     ctx.fovPunch += (fov - ctx.fovPunch) * Math.min(1, dt * rate);
+  }
+
+  configureDirectReplica(slot: number, slots: number[], spectator = false) {
+    this.directReplica = true;
+    this.directSlot = clamp(slot, 0, Math.max(0, this.karts.length - 1));
+    const activeSlots = new Set(slots.filter((value) => (
+      Number.isInteger(value) && value >= 0 && value < Math.min(4, this.karts.length)
+    )));
+    this.directCount = activeSlots.size;
+    this.directSpectator = spectator;
+    this.player = this.karts[this.directSlot] || this.karts[0];
+    this.standings.length = 0;
+    for (let i = 0; i < this.karts.length; i++) {
+      this.karts[i].object.visible = activeSlots.has(i);
+      if (activeSlots.has(i)) this.standings.push(this.karts[i]);
+    }
+  }
+
+  applyDirectViews(
+    phase: DirectSnapshot['phase'],
+    countdownMs: number,
+    roster: DirectRosterRow[],
+    views: Map<number, DirectPlayerRow>,
+    dt: number,
+    elapsedMs = 0,
+  ) {
+    if (!this.directReplica || !this.ctx) return;
+    this._state = phase === 'countdown' ? RaceState.Countdown
+      : phase === 'playing' ? RaceState.Racing
+      : phase === 'finished' ? RaceState.Results
+      : RaceState.Menu;
+    this.countdown = phase === 'countdown'
+      ? clamp(Math.ceil(countdownMs / 1000), 0, 3)
+      : 0;
+    this.raceTime = Math.max(0, elapsedMs / 1000);
+    this.finishedCount = 0;
+
+    const track = this.ctx.track;
+    for (const member of roster) {
+      const row = views.get(member.slot);
+      const kart = this.karts[member.slot];
+      if (!row || !kart) continue;
+      kart.stats.name = member.name;
+      const t = ((row.distance / track.length) % 1 + 1) % 1;
+      const sample = track.sample(t);
+      _drop.copy(sample.pos)
+        .addScaledVector(sample.binormal, row.lateral)
+        .addScaledVector(sample.normal, GRID_LIFT);
+      const yaw = Math.atan2(sample.tangent.x, sample.tangent.z);
+      kart.applyDirectPose(row, _drop, sample.normal, yaw, t, dt);
+      if (row.finished) this.finishedCount += 1;
+    }
+
+    this.standings.sort((a, b) => a.place - b.place);
   }
 
   dispose() {

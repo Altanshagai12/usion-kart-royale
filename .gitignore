@@ -8,3 +8,4 @@ shots/
 .DS_Store
 *.local
 .vercel
+.env*

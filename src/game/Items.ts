@@ -498,6 +498,7 @@ function markMaterial(ctx: Ctx): THREE.MeshStandardMaterial {
 
 export class Items implements IItems {
   readonly group = new THREE.Group();
+  private directMultiplayer = false;
 
   private slots = new Map<number, Slot>();
   private heldViews = new Map<number, { kind: ItemKind; count: number }>();
@@ -565,6 +566,18 @@ export class Items implements IItems {
       b.scale = 1;
     }
     this.proj.clear();
+  }
+
+  /**
+   * The direct server currently owns a pure racing ruleset. Hide and suspend
+   * browser-authoritative pickups/projectiles so two clients can never invent
+   * different hits while the server remains the only competitive authority.
+   */
+  setDirectMultiplayer(enabled: boolean) {
+    if (enabled === this.directMultiplayer) return;
+    this.directMultiplayer = enabled;
+    this.group.visible = !enabled;
+    if (enabled) this.reset();
   }
 
   // -------------------------------------------------------------------- build
@@ -915,6 +928,7 @@ export class Items implements IItems {
 
   update(ctx: Ctx, dt: number) {
     this.ctx = ctx;
+    if (this.directMultiplayer) return;
     const karts = ctx.race?.karts ?? this.karts;
     this.karts = karts;
     const now = ctx.time;

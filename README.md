@@ -1,5 +1,10 @@
 # Kart Royale
 
+This fork adds smooth, acceleration-limited steering and server-authoritative
+2–4 player racing for the Usion platform. It remains a standalone repository:
+no game source, assets, or deployment configuration is stored in
+`usionthemobile`.
+
 A Mario Kart-style racer in the browser. **No art assets.** No Blender, no Unity,
 no textures, no models, no fonts, no audio files — every mesh, texture, sound and
 note is generated in code at load time.
@@ -83,6 +88,26 @@ npm install
 npm run dev      # http://localhost:5173
 npm run build    # tsc --noEmit && vite build
 ```
+
+For a local two-player direct-server test, run `npm run build` and
+`npm run dev:server`, then open:
+
+- `http://localhost:3017/?multiplayer=1&room=test&player=one`
+- `http://localhost:3017/?multiplayer=1&room=test&player=two`
+
+Production uses the included Dockerfile as a single Railway service for both
+the static game and `/ws`. Required environment variables are `SERVICE_ID`,
+`SIGNING_SECRET`, `API_URL`, and optionally `JWKS_URL`/`SIGNING_KEY_ID`.
+`NODE_ENV=production` rejects unsigned tokens, placeholder secrets, and
+non-HTTPS Usion endpoints.
+
+Register the healthy HTTPS deployment with `USION_API_TOKEN` and `GAME_URL`
+via `npm run register:usion`. Registration starts unpublished, mints the
+one-time result-signing secret, and writes the matching production variables
+to ignored `.env.railway.generated`. Import those variables into Railway,
+redeploy, then set `USION_SERVICE_ID` and run `npm run publish:usion`.
+Railway is deliberately pinned to one Singapore replica because rooms live
+in-process.
 
 Useful URL flags:
 

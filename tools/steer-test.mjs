@@ -7,20 +7,13 @@
  * is `forward x up`. That is also the convention types.ts declares for
  * TrackSample.binormal, so it is the one the whole codebase is supposed to use.
  */
-import { spawn } from 'node:child_process';
-import { createConnection } from 'node:net';
+import assert from 'node:assert/strict';
+import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
 import { startVite } from './vite-server.mjs';
 
-const root = new URL('..', import.meta.url).pathname;
+const root = fileURLToPath(new URL('..', import.meta.url));
 const PORT = 5178;
-
-const portOpen = (port) => new Promise((res) => {
-  const s = createConnection({ port, host: '127.0.0.1' });
-  s.on('connect', () => { s.destroy(); res(true); });
-  s.on('error', () => res(false));
-  setTimeout(() => { s.destroy(); res(false); }, 800);
-});
 
 const server = await startVite(PORT);
 
@@ -66,9 +59,45 @@ const result = await page.evaluate(async () => {
       wheelVisualYaw: +(k.wheels?.[0]?.rotation?.y ?? 0).toFixed(3),
     };
   }
-  return runs;
+  k.steerInput = 0;
+  k.steerVelocity = 0;
+  const response = [];
+  for (const [frames, steer] of [[30, 1], [42, -1], [36, 0]]) {
+    for (let i = 0; i < frames; i++) {
+      k.updateSteerInput(1 / 60, steer);
+      response.push({ rack: k.steerInput, velocity: k.steerVelocity });
+    }
+  }
+  let maxRackStep = 0;
+  let maxVelocityStep = 0;
+  for (let i = 1; i < response.length; i++) {
+    maxRackStep = Math.max(maxRackStep, Math.abs(response[i].rack - response[i - 1].rack));
+    maxVelocityStep = Math.max(
+      maxVelocityStep,
+      Math.abs(response[i].velocity - response[i - 1].velocity),
+    );
+  }
+  return {
+    runs,
+    response: {
+      initialRack: response[0].rack,
+      turnInRack: response[29].rack,
+      counterRack: response[71].rack,
+      releasedRack: response.at(-1).rack,
+      maxRackStep,
+      maxVelocityStep,
+    },
+  };
 });
 
 console.log(JSON.stringify(result, null, 2));
+assert.ok(result.runs['steerRight_+1'].lateralAlongScreenRight > 2, 'positive steer must move right');
+assert.ok(result.runs['steerLeft_-1'].lateralAlongScreenRight < -2, 'negative steer must move left');
+assert.ok(Math.abs(result.response.initialRack) < 0.02, 'turn-in must not snap');
+assert.ok(result.response.turnInRack < -0.5, 'turn-in must remain responsive');
+assert.ok(result.response.counterRack > 0.5, 'counter-steer must cross the rack');
+assert.ok(Math.abs(result.response.releasedRack) < 0.12, 'released rack must recenter');
+assert.ok(result.response.maxRackStep < 0.105, 'rack position must remain continuous');
+assert.ok(result.response.maxVelocityStep < 0.44, 'rack acceleration must remain bounded');
 await browser.close();
 server.stop();

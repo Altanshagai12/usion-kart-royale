@@ -10,10 +10,11 @@ import { spawn } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
 import { startVite } from './vite-server.mjs';
 
-const root = new URL('..', import.meta.url).pathname;
+const root = fileURLToPath(new URL('..', import.meta.url));
 const PORT = 5181;
 const W = 844, H = 390; // iPhone 14-ish, landscape
 

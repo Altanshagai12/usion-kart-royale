@@ -17,8 +17,9 @@ import { spawn, execFileSync } from 'node:child_process';
 import { createConnection } from 'node:net';
 import { existsSync, realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const root = new URL('..', import.meta.url).pathname;
+const root = fileURLToPath(new URL('..', import.meta.url));
 
 /**
  * Which directory is the process listening on `port` actually serving?
@@ -83,10 +84,10 @@ export async function startVite(port, { timeoutMs = 36000 } = {}) {
     return { adopted: true, stop() {} };
   }
 
-  const bin = join(root, 'node_modules/.bin/vite');
+  const bin = join(root, 'node_modules/vite/bin/vite.js');
   if (!existsSync(bin)) throw new Error(`vite binary not found at ${bin} — run npm install`);
 
-  const proc = spawn(bin, ['--port', String(port), '--strictPort'], {
+  const proc = spawn(process.execPath, [bin, '--port', String(port), '--strictPort'], {
     cwd: root,
     stdio: 'ignore',
     // Own process group, so stop() can take down anything vite itself spawned.

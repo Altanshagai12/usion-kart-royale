@@ -20,6 +20,7 @@ import { Race } from './game/Race';
 import { ChaseCamera } from './game/Camera';
 import { HUD } from './ui/HUD';
 import { Audio } from './audio/Audio';
+import { DirectMultiplayer } from './net/DirectMultiplayer';
 
 const parent = document.getElementById('app')!;
 
@@ -72,6 +73,7 @@ function viewportSize(): { w: number; h: number } | null {
 
 const pipeline = new RenderPipeline(parent);
 const input = new Input();
+const multiplayer = new DirectMultiplayer();
 const sky = new Sky();
 const materials = new Materials();
 const track = new Track();
@@ -140,13 +142,13 @@ const ctx: Ctx = {
 //   drawBudget — LOD and shadow culling, measured from the posed camera, so it
 //               must be last: its lateUpdate has to run after the chase rig's.
 const systems: System[] = [
-  pipeline, input, sky, materials, track, scenery, race, items, effects, camera, hud, audio,
+  pipeline, input, multiplayer, sky, materials, track, scenery, race, items, effects, camera, hud, audio,
   drawBudget,
 ];
 
 /** Human-readable names for the boot progress readout, indexed with `systems`. */
 const SYSTEM_LABELS = [
-  'starting renderer', 'reading controls', 'raising the sun', 'mixing materials',
+  'starting renderer', 'reading controls', 'connecting racers', 'raising the sun', 'mixing materials',
   'laying the circuit', 'dressing the bay', 'rolling out the grid', 'loading item boxes',
   'lighting the effects', 'mounting the camera', 'drawing the hud', 'tuning the engines',
   'balancing the frame',
@@ -533,7 +535,7 @@ function installContextRecovery() {
   };
 }
 
-boot().catch((err) => {
+multiplayer.start().then(() => boot()).catch((err) => {
   console.error('[boot] failed', err);
   document.body.innerHTML =
     `<pre style="color:#f66;padding:24px;font:13px ui-monospace">Boot failed:\n${err?.stack || err}</pre>`;
@@ -544,6 +546,7 @@ boot().catch((err) => {
 // tools/perf.mjs turns this off to measure the un-LODed field for a before/after.
 (window as any).__drawBudget = drawBudget;
 (window as any).__camRig = camera; // TEMP-PROBE
+(window as any).__multiplayer = multiplayer;
 // Watchdog state, for the perf and soak harnesses: how many frames overran, and
 // what resolution rung the adaptive scaler has settled on.
 (window as any).__loopHealth = () => ({

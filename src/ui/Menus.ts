@@ -210,6 +210,11 @@ export class Menus {
   update(ctx: Ctx, _dt: number) {
     const race = ctx.race;
     const input = ctx.input.state;
+    const directMultiplayer = (race as unknown as { directMultiplayer?: boolean }).directMultiplayer === true;
+    if (directMultiplayer) {
+      this.localPause = false;
+      this.localTitle = false;
+    }
 
     // A race reset rewinds the clock; drop stale results so they rebuild.
     if (race.raceTime < this.lastRaceTime - 0.25) {
@@ -229,9 +234,9 @@ export class Menus {
     // It is gated on a screen actually being up. Without that gate the same
     // keypress that fires a shell also opens the pause menu, because with no
     // screen showing `onConfirm` falls through to its pause branch.
-    if (this.screen !== 'none') {
+    if (!directMultiplayer && this.screen !== 'none') {
       if (input.itemPressed || this.tapConfirm) this.onConfirm(ctx, inRace);
-    } else if (input.pausePressed && inRace) {
+    } else if (!directMultiplayer && input.pausePressed && inRace) {
       this.localPause = true;
       this.ui('pause');
     }
@@ -244,7 +249,8 @@ export class Menus {
     this.prevSteer = st;
 
     let want: ScreenName;
-    if (this.forced) want = this.forced;
+    if (directMultiplayer) want = 'none';
+    else if (this.forced) want = this.forced;
     else if (race.state === RaceState.Menu || this.localTitle) want = this.selecting ? 'select' : 'title';
     else if (race.state === RaceState.Paused || this.localPause) want = 'pause';
     else if (race.state === RaceState.Finished || race.state === RaceState.Results) want = 'results';
