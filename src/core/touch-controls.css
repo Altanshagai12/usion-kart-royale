@@ -1,0 +1,110 @@
+.tc-root {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  pointer-events: none;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  font: 800 clamp(9px, 2.25vmin, 16px)/1 system-ui, sans-serif;
+  letter-spacing: .05em;
+}
+
+.tc-top {
+  position: absolute;
+  top: calc(var(--kr-safe-top, 0px) + 1.8vmin);
+  left: calc(var(--kr-safe-left, 0px) + 25vmin);
+  display: flex;
+  gap: 1.4vmin;
+}
+
+.tc-chip {
+  pointer-events: auto;
+  min-width: 9vmin;
+  padding: 1.1vmin 1.6vmin;
+  border: 1.5px solid rgba(255,255,255,.28);
+  border-radius: 2.2vmin;
+  color: #eef4fb;
+  background: rgba(15,22,34,.62);
+  box-shadow: 0 4px 14px rgba(0,0,0,.3);
+  text-align: center;
+}
+
+.tc-chip.on { color: #1c2028; background: linear-gradient(#fff0ba, #f1b94e); }
+.tc-pause { min-width: 6vmin; }
+
+.tc-steer-cluster {
+  position: absolute;
+  left: calc(var(--kr-safe-left, 0px) + 3.5vmin);
+  bottom: calc(var(--kr-safe-bottom, 0px) + 3.5vmin);
+  width: 41vmin;
+  height: 23vmin;
+}
+
+.tc-action-cluster {
+  position: absolute;
+  right: calc(var(--kr-safe-right, 0px) + 3vmin);
+  bottom: calc(var(--kr-safe-bottom, 0px) + 3vmin);
+  width: 43vmin;
+  height: 39vmin;
+}
+
+.tc-btn {
+  position: absolute;
+  pointer-events: auto;
+  display: grid;
+  place-items: center;
+  color: #f6f9ff;
+  background: radial-gradient(circle at 45% 32%, rgba(255,255,255,.22), rgba(13,22,37,.48) 72%);
+  border: 2px solid rgba(255,255,255,.36);
+  box-shadow: 0 6px 20px rgba(0,0,0,.32), inset 0 1px 0 rgba(255,255,255,.24);
+  backdrop-filter: blur(4px);
+  text-shadow: 0 1px 3px rgba(0,0,0,.75);
+  transition: transform 55ms ease, background 55ms ease, box-shadow 55ms ease;
+}
+
+.tc-btn.down { transform: scale(.91); background-color: rgba(255,255,255,.22); }
+.tc-btn span { font-size: clamp(8px, 2.15vmin, 15px); }
+
+.tc-left, .tc-right {
+  bottom: 0;
+  width: 18vmin;
+  height: 22vmin;
+  border-radius: 6vmin;
+}
+.tc-left { left: 0; }
+.tc-right { right: 0; }
+.tc-left i, .tc-right i {
+  width: 8vmin;
+  height: 8vmin;
+  border-left: 1.8vmin solid rgba(255,255,255,.78);
+  border-bottom: 1.8vmin solid rgba(255,255,255,.78);
+  filter: drop-shadow(0 2px 3px rgba(0,0,0,.45));
+}
+.tc-left i { transform: translateX(1vmin) rotate(45deg); }
+.tc-right i { transform: translateX(-1vmin) rotate(225deg); }
+
+.tc-gas {
+  right: 0;
+  bottom: 0;
+  width: 20vmin;
+  height: 20vmin;
+  border-radius: 50%;
+  background: radial-gradient(circle at 42% 30%, rgba(255,216,132,.45), rgba(109,57,20,.56) 72%);
+  border-color: rgba(255,221,158,.68);
+}
+.tc-drift {
+  right: 22vmin;
+  bottom: 1vmin;
+  width: 16vmin;
+  height: 16vmin;
+  border-radius: 50%;
+  background: radial-gradient(circle at 42% 30%, rgba(112,221,255,.44), rgba(15,65,98,.58) 72%);
+  border-color: rgba(139,229,255,.7);
+}
+.tc-brake { right: 2vmin; bottom: 23vmin; width: 14vmin; height: 14vmin; border-radius: 50%; }
+.tc-look { right: 20vmin; bottom: 22vmin; width: 11vmin; height: 11vmin; border-radius: 50%; opacity: .8; }
+
+html[data-touch] .kr-speed { right: 44vmin; transform: scale(.76); }
+html[data-touch] .kr .kr-speed { --speed-s: .76; }

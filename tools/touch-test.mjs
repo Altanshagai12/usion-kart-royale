@@ -1,110 +1,64 @@
-/**
- * Verifies the on-screen controls on an emulated phone: that the pad mounts,
- * that dragging the left thumb actually steers, that the action buttons latch,
- * and — the case a single-pointer implementation gets wrong — that steering and
- * drifting work SIMULTANEOUSLY as two live touch points.
- *
- * Writes shots/touch/landscape.png for a look at the layout.
- */
-import { spawn } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
-import { createConnection } from 'node:net';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
 import { startVite } from './vite-server.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
-const PORT = 5181;
-const W = 844, H = 390; // iPhone 14-ish, landscape
-
-const open = (p) => new Promise((r) => {
-  const s = createConnection({ port: p, host: '127.0.0.1' });
-  s.on('connect', () => { s.destroy(); r(true); });
-  s.on('error', () => r(false));
-  setTimeout(() => { s.destroy(); r(false); }, 800);
-});
-
-const srv = await startVite(PORT);
-
+const server = await startVite(5181);
 const browser = await puppeteer.launch({
   headless: 'shell',
-  args: ['--no-sandbox', '--enable-unsafe-swiftshader', '--use-gl=angle', `--window-size=${W},${H}`],
+  args: ['--no-sandbox', '--enable-unsafe-swiftshader', '--use-gl=angle'],
 });
-const page = await browser.newPage();
-await page.setViewport({ width: W, height: H, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
-const cdp = await page.createCDPSession();
-await cdp.send('Emulation.setEmitTouchEventsForMouse', { enabled: false });
-
-await page.goto(`http://127.0.0.1:${PORT}/?quality=medium`, { waitUntil: 'domcontentloaded' });
-await page.waitForFunction('window.__gameReady === true', { timeout: 90000 });
-
-const touch = (type, points) =>
-  cdp.send('Input.dispatchTouchEvent', {
+try {
+  const page = await browser.newPage();
+  await page.setViewport({ width: 844, height: 390, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+  const cdp = await page.createCDPSession();
+  await cdp.send('Emulation.setEmitTouchEventsForMouse', { enabled: false });
+  await page.goto('http://127.0.0.1:5181/?quality=low', { waitUntil: 'domcontentloaded' });
+  await page.waitForFunction('window.__gameReady === true', { timeout: 90_000 });
+  await page.evaluate(() => document.querySelector('.kr-s-select .kr-btn')?.click());
+  await page.waitForFunction('window.__ctx.race.state !== 0', { timeout: 10_000 });
+  const center = (selector) => page.evaluate((query) => {
+    const rect = document.querySelector(query).getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  }, selector);
+  const touch = (type, points) => cdp.send('Input.dispatchTouchEvent', {
     type,
-    touchPoints: points.map((p, i) => ({ x: p.x, y: p.y, id: p.id ?? i, radiusX: 12, radiusY: 12, force: 1 })),
+    touchPoints: points.map((point, index) => ({ ...point, id: point.id ?? index, radiusX: 12, radiusY: 12, force: 1 })),
   });
-const frames = (n = 6) => page.evaluate((k) => new Promise((res) => {
-  let i = 0; const t = () => (++i < k ? requestAnimationFrame(t) : res());
-  requestAnimationFrame(t);
-}), n);
+  const frames = (count = 5) => page.evaluate((total) => new Promise((resolve) => {
+    let frame = 0;
+    const next = () => (++frame < total ? requestAnimationFrame(next) : resolve());
+    requestAnimationFrame(next);
+  }), count);
+  const read = () => page.evaluate(() => ({ ...window.__ctx.input.state }));
 
-const read = () => page.evaluate(() => {
-  const s = window.__ctx.input.state;
-  return {
-    steer: +s.steer.toFixed(3), accel: s.accel, brake: s.brake,
-    drift: s.drift, mounted: !!document.querySelector('.tc-root'),
-    touchMode: window.__ctx.input.touch,
-  };
-});
-
-const results = {};
-results.onLoad = await read();
-
-// --- steer right: thumb lands left-of-centre, drags right --------------------
-const stick = { x: 150, y: 260, id: 1 };
-await touch('touchStart', [stick]);
-await frames();
-await touch('touchMove', [{ ...stick, x: stick.x + 70 }]);
-await frames(10);
-results.dragRight = await read();
-
-// --- add a second finger on DRIFT while still steering ----------------------
-const driftBtn = await page.evaluate(() => {
-  const r = document.querySelector('.tc-drift').getBoundingClientRect();
-  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
-});
-await touch('touchStart', [{ ...stick, x: stick.x + 70 }, { ...driftBtn, id: 2 }]);
-await frames(10);
-results.steerPlusDrift = await read();
-
-await page.screenshot({ path: (mkdirSync(join(root, 'shots/touch'), { recursive: true }), join(root, 'shots/touch/landscape.png')) });
-
-// --- drag left --------------------------------------------------------------
-await touch('touchEnd', []);
-await frames();
-await touch('touchStart', [stick]);
-await frames();
-await touch('touchMove', [{ ...stick, x: stick.x - 70 }]);
-await frames(10);
-results.dragLeft = await read();
-
-// --- release: steering must return to centre and buttons must not latch ------
-await touch('touchEnd', []);
-await frames(20);
-results.released = await read();
-
-console.log(JSON.stringify(results, null, 2));
-
-const ok =
-  results.onLoad.mounted && results.onLoad.touchMode &&
-  results.onLoad.accel === 1 &&               // auto-accelerate on by default
-  results.dragRight.steer > 0.5 &&
-  results.dragLeft.steer < -0.5 &&
-  results.steerPlusDrift.drift === true && results.steerPlusDrift.steer > 0.5 &&
-  results.released.steer === 0 && results.released.drift === false;
-
-console.log(ok ? '\nPASS — touch controls behave correctly' : '\nFAIL — see values above');
-await browser.close();
-srv.stop();
-process.exit(ok ? 0 : 1);
+  const right = { ...(await center('.tc-right')), id: 1 };
+  const drift = { ...(await center('.tc-drift')), id: 2 };
+  await touch('touchStart', [right, drift]);
+  await frames();
+  const rightDrift = await read();
+  await touch('touchEnd', []);
+  const left = { ...(await center('.tc-left')), id: 3 };
+  const brake = { ...(await center('.tc-brake')), id: 4 };
+  await touch('touchStart', [left, brake]);
+  await frames();
+  const leftBrake = await read();
+  await touch('touchEnd', []);
+  await frames(12);
+  const released = await read();
+  const shots = join(root, 'shots', 'touch');
+  mkdirSync(shots, { recursive: true });
+  await page.screenshot({ path: join(shots, 'landscape-mobile-hud.png') });
+  const slots = await page.$$eval('.kr-item-slot', (nodes) => nodes.length);
+  const ok = rightDrift.steer > 0.5 && rightDrift.drift
+    && leftBrake.steer < -0.5 && leftBrake.brake === 1
+    && released.steer === 0 && !released.drift && released.brake === 0
+    && slots === 3;
+  console.log(JSON.stringify({ ok, rightDrift, leftBrake, released, slots }, null, 2));
+  if (!ok) throw new Error('fixed touch controls regression');
+} finally {
+  await browser.close();
+  server.stop();
+}

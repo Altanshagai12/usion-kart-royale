@@ -7,3 +7,5 @@
 - Prediction must pause while disconnected and reset its timing accumulator on every connection transition; neutral input is still an input, and a stale clock creates a catch-up burst after reconnect.
 - A portrait-locked host cannot satisfy a “rotate your device” gate. When the game requires landscape, rotate the game surface into a logical landscape viewport and transform touch coordinates with it.
 - Never silently remove a core gameplay system to make multiplayer authoritative. If items are not yet server-owned, keep their presentation explicit and add the missing authority instead of hiding the entire item layer.
+- Do not call sub-native phone rendering acceptable without measuring the actual drawing buffer. Start sharp, keep at least CSS-native density, and let an evidence-based adaptive scaler reduce only what the device cannot sustain.
+- A three-slot HUD is not a three-slot inventory. When the player asks for independently stored and directly usable items, the solo model, authoritative server, protocol validation, input selection, reconnect acknowledgement, and visible hit targets must all share the same slot index.

@@ -2,6 +2,7 @@ import {
   PROTOCOL_VERSION, SNAPSHOT_MAX_BYTES,
 } from './config.js';
 import { itemSnapshot } from './item-runtime.js';
+import { ensureItemSlots, syncLegacyItem } from '../shared/item-inventory.js';
 
 export function serializeSnapshot(room, { keyframe = false, advance = false } = {}) {
   if (advance) room.snapSeq += 1;
@@ -18,7 +19,9 @@ export function serializeSnapshot(room, { keyframe = false, advance = false } = 
     roster: room.roster(),
     ack,
     items: itemSnapshot(room.items),
-    players: room.players.map((player) => ({
+    players: room.players.map((player) => {
+      syncLegacyItem(player);
+      return ({
       slot: player.slot,
       user_id: player.userId,
       name: player.name,
@@ -36,6 +39,8 @@ export function serializeSnapshot(room, { keyframe = false, advance = false } = 
       item_kind: player.itemKind,
       item_count: player.itemCount,
       item_arm: player.itemArm,
+      item_slots: ensureItemSlots(player).map((item) => [item.kind, item.count, item.arm]),
+      item_slot_revisions: ensureItemSlots(player).map((item) => item.revision),
       item_revision: player.itemRevision,
       ack_item_seq: player.ackItemSeq,
       boost_time: player.boostTime,
@@ -46,7 +51,8 @@ export function serializeSnapshot(room, { keyframe = false, advance = false } = 
       place: player.place,
       finished: player.finished,
       finish_ms: player.finishMs,
-    })),
+      });
+    }),
   };
   const json = JSON.stringify({
     type: keyframe ? 'state_snapshot' : 'state_delta',

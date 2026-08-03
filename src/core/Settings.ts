@@ -445,12 +445,15 @@ const TEXTURE_CAP: Record<Quality, number> = {
 
 const PRESETS: Record<Quality, Omit<Settings, 'quality' | 'masterVolume'>> = {
   [Quality.Low]: {
-    // A phone at devicePixelRatio 3 rendering at renderScale 1 is drawing nine
-    // times the pixels of its own CSS layout. Capping the ratio at 1 and taking
-    // another 30% off is the single cheapest frame-time and bandwidth win on the
-    // device, and at this panel size it is very hard to see.
-    maxPixelRatio: 1, shadows: false, ssao: false, bloom: true, motionBlur: false,
-    dof: false, renderScale: 0.7, volumetrics: false, reflections: false,
+    // Phone UI is laid out in CSS pixels but a WebView normally supplies a 2x
+    // or 3x panel. The old 1.0 cap followed by a 0.7 render scale turned an
+    // 844x390 logical frame into a 591x273 buffer and then enlarged it: it was
+    // visibly sub-native before the adaptive scaler had measured a single
+    // frame. Start at 1.5x for clean road edges and readable distant props;
+    // RenderPipeline may step down under sustained GPU pressure, but never
+    // below CSS-native density on a touch display.
+    maxPixelRatio: 1.5, shadows: false, ssao: false, bloom: true, motionBlur: false,
+    dof: false, renderScale: 1, volumetrics: false, reflections: false,
     particleDensity: 0.35, foliageDensity: 0.3,
   },
   [Quality.Medium]: {

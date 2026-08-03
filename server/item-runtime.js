@@ -1,6 +1,9 @@
 import { randomBytes } from 'node:crypto';
 import { MAX_ITEM_ENTITIES, TRACK_LENGTH } from '../shared/constants.js';
 import {
+  ensureItemSlots, firstFreeItemSlot, firstOccupiedItemSlot, syncLegacyItem,
+} from '../shared/item-inventory.js';
+import {
   ITEM_ARM_TIME, ITEM_BOX_PICKUP_RADIUS, ITEM_BOX_RESPAWN,
   createItemBoxLayout,
 } from '../shared/item-layout.js';
@@ -43,7 +46,9 @@ export function stepItemRuntime(runtime, players, dt) {
   stepEntities(runtime, players, dt);
 
   for (const player of players) {
-    if (player.finished || player.itemKind !== ITEM_KIND.NONE) continue;
+    if (player.finished) continue;
+    const freeSlot = firstFreeItemSlot(player);
+    if (freeSlot < 0) continue;
     const lapDistance = mod(player.distance, TRACK_LENGTH);
     for (const box of runtime.boxes) {
       if (box.cooldown > 0) continue;
@@ -51,20 +56,29 @@ export function stepItemRuntime(runtime, players, dt) {
       along = Math.min(along, TRACK_LENGTH - along);
       if (along > ITEM_BOX_PICKUP_RADIUS
           || Math.abs(player.lateral - box.lateral) > ITEM_BOX_PICKUP_RADIUS) continue;
-      player.itemKind = roll(runtime, player.place, players.length);
-      player.itemCount = player.itemKind === ITEM_KIND.TRIPLE_MUSHROOM ? 3 : 1;
-      player.itemArm = ITEM_ARM_TIME;
+      const kind = roll(runtime, player.place, players.length);
+      const item = ensureItemSlots(player)[freeSlot];
+      item.kind = kind;
+      item.count = kind === ITEM_KIND.TRIPLE_MUSHROOM ? 3 : 1;
+      item.arm = ITEM_ARM_TIME;
+      item.revision += 1;
+      syncLegacyItem(player);
       player.itemRevision += 1;
       box.cooldown = ITEM_BOX_RESPAWN;
-      event(runtime, 'pickup', player.slot, player.itemKind);
+      event(runtime, 'pickup', player.slot, kind);
       break;
     }
   }
 }
 
-export function useItemRuntime(runtime, player, players, backwards = false) {
-  const kind = player.itemKind;
-  if (!kind || player.itemCount <= 0 || player.itemArm > 0 || player.stunTime > 0) return false;
+export function useItemRuntime(runtime, player, players, backwards = false, requestedSlot = -1) {
+  const slots = ensureItemSlots(player);
+  const slotIndex = Number.isSafeInteger(requestedSlot) && requestedSlot >= 0
+    && requestedSlot < slots.length ? requestedSlot : firstOccupiedItemSlot(player);
+  if (slotIndex < 0) return false;
+  const item = slots[slotIndex];
+  const kind = item.kind;
+  if (!kind || item.count <= 0 || item.arm > 0 || player.stunTime > 0) return false;
 
   if (kind === ITEM_KIND.MUSHROOM || kind === ITEM_KIND.TRIPLE_MUSHROOM) {
     player.boostTime = Math.max(player.boostTime, 1.55);
@@ -84,14 +98,16 @@ export function useItemRuntime(runtime, player, players, backwards = false) {
     if (!spawnEntity(runtime, kind, player, players, backwards)) return false;
   }
 
-  player.itemCount -= 1;
-  if (player.itemCount <= 0) {
-    player.itemKind = ITEM_KIND.NONE;
-    player.itemCount = 0;
-    player.itemArm = 0;
+  item.count -= 1;
+  if (item.count <= 0) {
+    item.kind = ITEM_KIND.NONE;
+    item.count = 0;
+    item.arm = 0;
   } else {
-    player.itemArm = 0.22;
+    item.arm = 0.22;
   }
+  item.revision += 1;
+  syncLegacyItem(player);
   player.itemRevision += 1;
   event(runtime, 'use', player.slot, kind);
   return true;

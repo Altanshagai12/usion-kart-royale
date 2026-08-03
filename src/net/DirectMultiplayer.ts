@@ -40,11 +40,14 @@ export class DirectMultiplayer implements System {
   private pendingItem: {
     item_seq: number;
     item_revision: number;
+    item_slot_revision: number;
     expected_kind: number;
+    item_slot: number;
     backwards: boolean;
     client_sent_at: number;
     sentAt: number;
   } | null = null;
+  private queuedItems: { slot: number; backwards: boolean }[] = [];
   private connectingRoom: string | null = null;
   private localMode = false;
   private language = 'en';
@@ -135,9 +138,32 @@ export class DirectMultiplayer implements System {
     ) {
       this.predictor?.advance(performance.now(), drive);
     }
-    if (input.itemPressed && !this.pendingItem) {
+    if (input.itemPressed) {
       const own = this.latest.players.find((row) => row.slot === this.ownSlot);
-      if (own?.item_kind) this.queueItemUse(own, input.brake > 0.5 || input.lookBack);
+      if (own) {
+        const slot = this.resolveItemSlot(own, input.itemSlot);
+        if (slot >= 0) {
+          const backwards = input.brake > 0.5 || input.lookBack;
+          if (this.pendingItem) {
+            // Input deliberately re-offers one physical tap for ~110 ms while
+            // the held-item fingerprint is unchanged. Do not turn those
+            // frame-level retries into multiple authoritative uses (notably,
+            // one tap must not drain all three mushrooms). A genuinely
+            // different slot/direction may still be buffered behind the
+            // in-flight request.
+            const duplicate = (
+              this.pendingItem.item_slot === slot && this.pendingItem.backwards === backwards
+            ) || this.queuedItems.some((item) => (
+              item.slot === slot && item.backwards === backwards
+            ));
+            if (!duplicate && this.queuedItems.length < 3) {
+              this.queuedItems.push({ slot, backwards });
+            }
+          } else {
+            this.queueItemUse(own, slot, backwards);
+          }
+        }
+      }
     }
     if (this.pendingItem && this.connection === 'connected'
         && performance.now() - this.pendingItem.sentAt >= 250) {
@@ -264,6 +290,7 @@ export class DirectMultiplayer implements System {
         this.itemSequence = Math.max(this.itemSequence, own.ack_item_seq || 0);
         if (this.pendingItem && own.ack_item_seq >= this.pendingItem.item_seq) {
           this.pendingItem = null;
+          this.flushQueuedItem(own);
         }
         const ack = snapshot.ack?.[String(this.ownSlot)] ?? snapshot.ack?.[this.ownSlot] ?? -1;
         if (fromJoin) this.predictor?.reset(own);
@@ -297,16 +324,35 @@ export class DirectMultiplayer implements System {
     else this.usion?.game?.realtime('drive', payload);
   }
 
-  private queueItemUse(row: DirectPlayerRow, backwards: boolean) {
+  private resolveItemSlot(row: DirectPlayerRow, requested: number) {
+    if (Number.isSafeInteger(requested) && requested >= 0 && requested < 3) {
+      return row.item_slots[requested][0] > 0 ? requested : -1;
+    }
+    return row.item_slots.findIndex((item) => item[0] > 0 && item[1] > 0);
+  }
+
+  private queueItemUse(row: DirectPlayerRow, slot: number, backwards: boolean) {
+    const item = row.item_slots[slot];
+    if (!item || item[0] <= 0 || item[1] <= 0) return;
     this.pendingItem = {
       item_seq: ++this.itemSequence,
       item_revision: row.item_revision,
-      expected_kind: row.item_kind,
+      item_slot_revision: row.item_slot_revisions[slot],
+      expected_kind: item[0],
+      item_slot: slot,
       backwards,
       client_sent_at: Date.now(),
       sentAt: 0,
     };
     this.sendPendingItem();
+  }
+
+  private flushQueuedItem(row: DirectPlayerRow) {
+    while (!this.pendingItem && this.queuedItems.length) {
+      const next = this.queuedItems.shift()!;
+      const slot = this.resolveItemSlot(row, next.slot);
+      if (slot >= 0) this.queueItemUse(row, slot, next.backwards);
+    }
   }
 
   private sendPendingItem() {

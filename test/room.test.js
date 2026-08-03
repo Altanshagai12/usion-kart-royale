@@ -5,6 +5,7 @@ import {
 } from '../shared/constants.js';
 import { Room } from '../server/Room.js';
 import { ITEM_KIND } from '../server/item-runtime.js';
+import { syncLegacyItem } from '../shared/item-inventory.js';
 
 class Socket {
   readyState = 1;
@@ -68,16 +69,18 @@ test('item actions are exactly-once and ignore client-authored item kinds', () =
   room.join(conn);
   room.phase = 'playing';
   const player = room.players[0];
-  player.itemKind = ITEM_KIND.TRIPLE_MUSHROOM;
-  player.itemCount = 3;
-  player.itemArm = 0;
+  Object.assign(player.itemSlots[0], { kind: ITEM_KIND.TRIPLE_MUSHROOM, count: 3, arm: 0 });
+  Object.assign(player.itemSlots[1], { kind: ITEM_KIND.BOLT, count: 1, arm: 0 });
+  syncLegacyItem(player);
 
   const action = {
     action_type: 'use_item',
     action_data: {
       item_seq: 1,
       item_revision: player.itemRevision,
+      item_slot_revision: player.itemSlots[0].revision,
       expected_kind: player.itemKind,
+      item_slot: 0,
       kind: ITEM_KIND.BOLT,
       hit_slot: 99,
     },
@@ -87,12 +90,40 @@ test('item actions are exactly-once and ignore client-authored item kinds', () =
   assert.equal(player.ackItemSeq, 1);
   assert.equal(player.itemKind, ITEM_KIND.TRIPLE_MUSHROOM);
   assert.equal(player.itemCount, 2);
+  assert.equal(player.itemSlots[1].kind, ITEM_KIND.BOLT);
   assert.ok(player.boostTime > 0);
+  const slotZeroRevision = player.itemSlots[0].revision;
+  const staleGlobalRevision = player.itemRevision;
+  player.itemSlots[0].arm = 0;
+  player.itemSlots[1].revision += 1;
+  player.itemRevision += 1;
+  room.input(conn, {
+    action_type: 'use_item',
+    action_data: {
+      item_seq: 2,
+      item_revision: staleGlobalRevision,
+      item_slot_revision: slotZeroRevision,
+      expected_kind: ITEM_KIND.TRIPLE_MUSHROOM,
+      item_slot: 0,
+    },
+  });
+  assert.equal(player.itemSlots[0].count, 1, 'another slot revision must not reject this use');
   room.input(conn, {
     action_type: 'use_item',
     action_data: { item_seq: Number.POSITIVE_INFINITY },
   });
-  assert.equal(player.ackItemSeq, 1);
+  assert.equal(player.ackItemSeq, 2);
+  room.input(conn, {
+    action_type: 'use_item',
+    action_data: {
+      item_seq: 3,
+      item_revision: player.itemRevision,
+      expected_kind: ITEM_KIND.BOLT,
+      item_slot: 9,
+    },
+  });
+  assert.equal(player.ackItemSeq, 3);
+  assert.equal(player.itemSlots[1].kind, ITEM_KIND.BOLT, 'invalid slot is acked but not consumed');
   room.destroy();
 });
 

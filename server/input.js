@@ -1,5 +1,6 @@
 import { sanitizeInput } from '../shared/race-sim.js';
 import { useItemRuntime } from './item-runtime.js';
+import { ensureItemSlots, firstOccupiedItemSlot } from '../shared/item-inventory.js';
 
 export function handlePlayerInput(room, conn, envelope) {
   const type = envelope.action_type;
@@ -22,13 +23,25 @@ export function handlePlayerInput(room, conn, envelope) {
     const itemSeq = Number(data.item_seq);
     if (!Number.isSafeInteger(itemSeq) || itemSeq <= 0) return;
     if (itemSeq <= player.ackItemSeq) return;
-    const revision = Number(data.item_revision);
-    if (!Number.isSafeInteger(revision) || revision !== player.itemRevision
-        || Number(data.expected_kind) !== player.itemKind) {
+    const hasRequestedSlot = data.item_slot !== undefined;
+    const requestedSlot = Number(data.item_slot);
+    if (hasRequestedSlot && (!Number.isSafeInteger(requestedSlot)
+        || requestedSlot < 0 || requestedSlot >= 3)) {
       player.ackItemSeq = itemSeq;
       return;
     }
-    useItemRuntime(room.items, player, room.players, data.backwards === true);
+    const slotIndex = hasRequestedSlot ? requestedSlot : firstOccupiedItemSlot(player);
+    const item = slotIndex >= 0 ? ensureItemSlots(player)[slotIndex] : null;
+    const revision = Number(data.item_revision);
+    const slotRevision = Number(data.item_slot_revision);
+    const revisionMatches = hasRequestedSlot
+      ? Number.isSafeInteger(slotRevision) && slotRevision === item?.revision
+      : Number.isSafeInteger(revision) && revision === player.itemRevision;
+    if (!revisionMatches || !item || Number(data.expected_kind) !== item.kind) {
+      player.ackItemSeq = itemSeq;
+      return;
+    }
+    useItemRuntime(room.items, player, room.players, data.backwards === true, slotIndex);
     player.ackItemSeq = itemSeq;
     return;
   }

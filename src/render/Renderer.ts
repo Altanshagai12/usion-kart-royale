@@ -16,7 +16,9 @@ import * as THREE from 'three';
 import { EffectComposer } from 'postprocessing';
 import { Quality, type Ctx, type Settings, type System } from '../types';
 import { PostFX } from './PostFX';
-import { glCapabilities, forcedFailure, type GLCapabilities } from '../core/Settings';
+import {
+  device as inputDevice, glCapabilities, forcedFailure, type GLCapabilities,
+} from '../core/Settings';
 import { logPipeline, recordShaderError, type FrameSample } from '../core/Diagnostics';
 
 interface DeviceProfile {
@@ -1075,7 +1077,16 @@ export class RenderPipeline implements System {
     const cap = this.device.software ? 1 : Math.max(0.5, s.maxPixelRatio);
     const scale = THREE.MathUtils.clamp(s.renderScale, 0.25, 2) * this.dynamicScale;
     const dpr = THREE.MathUtils.clamp(globalThis.devicePixelRatio || 1, 0.5, 4);
-    const ratio = Math.min(dpr, cap) * scale;
+    const requested = Math.min(dpr, cap) * scale;
+    // A sub-1 ratio is an upscale, not a low quality tier. On phones that made
+    // the whole 3D frame look like a 360p stream even though the DOM controls
+    // remained sharp. Keep at least one drawing-buffer pixel per CSS pixel on
+    // touch hardware; the explicit ?scale= diagnostic remains allowed to go
+    // lower for stress/screenshot harnesses.
+    const diagnosticScale = typeof location !== 'undefined'
+      && new URLSearchParams(location.search).has('scale');
+    const nativeFloor = inputDevice().touchPrimary && !diagnosticScale ? 1 : 0.25;
+    const ratio = Math.max(nativeFloor, requested);
 
     // Never ask for a buffer the driver cannot make.
     //

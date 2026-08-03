@@ -1108,11 +1108,25 @@
 
 /* --- ITEM — bottom-left --------------------------------------------------- */
 
-.kr-item,
 .kr-speed { position: absolute; bottom: 0; height: var(--rail); }
 
-.kr-item { left: 0; width: var(--rail); --accent: var(--sky-warm); --clip: var(--clip-tr); }
-.kr-item.has-item { --accent: var(--item-tint, var(--sky-warm)); }
+.kr-item {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  display: flex;
+  gap: clamp(4px, .8vmin, 12px);
+  height: calc(var(--rail) * .62);
+}
+.kr-item-slot {
+  position: relative;
+  flex: none;
+  width: calc(var(--rail) * .62);
+  height: calc(var(--rail) * .62);
+  --accent: var(--sky-warm);
+  --clip: var(--clip-tr);
+}
+.kr-item-slot.has-item { --accent: var(--item-tint, var(--sky-warm)); }
 .kr-item-frame {
   position: absolute;
   inset: 0;
@@ -1142,18 +1156,18 @@
   clip-path: var(--clip);
   background: var(--plate-bg);
 }
-.kr-item.has-item .kr-item-pulse,
-.kr-item.spinning .kr-item-pulse { animation: none; opacity: 0; }
+.kr-item-slot.has-item .kr-item-pulse,
+.kr-item-slot.spinning .kr-item-pulse { animation: none; opacity: 0; }
 @keyframes kr-slotPulse {
   0%, 100% { opacity: 0.06; }
   50%      { opacity: 0.42; }
 }
 
-.kr-item.has-item .kr-item-frame {
+.kr-item-slot.has-item .kr-item-frame {
   filter: var(--plate-shadow)
           drop-shadow(0 0 1.4vmin color-mix(in srgb, var(--item-tint, #fff) 60%, transparent));
 }
-.kr-item.spinning .kr-item-frame {
+.kr-item-slot.spinning .kr-item-frame {
   filter: var(--plate-shadow) drop-shadow(0 0 1.8vmin rgba(255, 207, 107, 0.7));
 }
 .kr-item-icon {
@@ -1171,8 +1185,8 @@
    could not tell at a glance whether you had something. Empty is now ghosted
    and desaturated, and the saturated, full-weight plate is reserved
    exclusively for an item you are actually holding. */
-.kr-item.empty .kr-item-icon { opacity: 0.34; filter: saturate(0.35) brightness(0.86); }
-.kr-item.spinning .kr-item-icon { transform: scaleY(1.08) scaleX(0.97); opacity: 0.9; }
+.kr-item-slot.empty .kr-item-icon { opacity: 0.34; filter: saturate(0.35) brightness(0.86); }
+.kr-item-slot.spinning .kr-item-icon { transform: scaleY(1.08) scaleX(0.97); opacity: 0.9; }
 .kr-item-icon.land { animation: kr-itemLand 0.72s var(--e-spring) both; }
 @keyframes kr-itemLand {
   0%   { transform: scale(1.36) rotate(-4deg); }
@@ -1199,7 +1213,22 @@
   transform: scale(0.5);
   transition: opacity 0.24s var(--e-out), transform 0.34s var(--e-spring);
 }
-.kr-item.multi .kr-item-count { opacity: 1; transform: scale(1); }
+.kr-item-slot.multi .kr-item-count { opacity: 1; transform: scale(1); }
+
+html[data-touch] .kr-item {
+  left: auto;
+  right: calc(var(--kr-safe-right, 0px) + 3vmin);
+  bottom: calc(var(--kr-safe-bottom, 0px) + 43vmin);
+  height: 12vmin;
+  gap: 1.3vmin;
+}
+html[data-touch] .kr-item-slot {
+  width: 12vmin;
+  height: 12vmin;
+  min-width: 44px;
+  min-height: 44px;
+  pointer-events: auto;
+}
 
 /* --- SPEEDOMETER — bottom-right ------------------------------------------ */
 .kr-speed {

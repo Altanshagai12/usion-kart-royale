@@ -128,6 +128,8 @@ export interface InputState {
   driftPressed: boolean;
   /** rising edge of item use this frame */
   itemPressed: boolean;
+  /** exact inventory slot requested this frame; -1 uses the first occupied */
+  itemSlot: number;
   /** rising edge — look behind */
   lookBack: boolean;
   /** rising edge — pause / confirm */
@@ -227,10 +229,12 @@ export interface IItems extends System {
   /** roll an item appropriate to `place` (1 = leading) */
   roll(place: number, racers: number): ItemKind;
   /** the item a kart is currently holding */
-  held(kart: IKart): { kind: ItemKind; count: number };
+  held(kart: IKart, slotIndex?: number): { kind: ItemKind; count: number };
+  /** all three stable inventory positions, including empty holes */
+  heldSlots(kart: IKart): readonly { kind: ItemKind; count: number }[];
   give(kart: IKart, kind: ItemKind, count?: number): void;
   /** fire/drop whatever the kart holds; returns false if it holds nothing */
-  use(kart: IKart, backwards: boolean): boolean;
+  use(kart: IKart, backwards: boolean, slotIndex?: number): boolean;
   /** open the roulette on the HUD for this kart */
   pickup(kart: IKart): void;
 }

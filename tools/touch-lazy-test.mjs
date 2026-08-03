@@ -67,12 +67,17 @@ const touch = (type, points) => cdp.send('Input.dispatchTouchEvent', {
   type, touchPoints: points.map((p, i) => ({ x: p.x, y: p.y, id: p.id ?? i, radiusX: 12, radiusY: 12, force: 1 })),
 });
 
-const stick = { x: 220, y: 520, id: 1 };
-await touch('touchStart', [stick]);
+const firstTouch = { x: 220, y: 520, id: 1 };
+await touch('touchStart', [firstTouch]);
 await frames();
 const afterTouch = await state();
 
-await touch('touchMove', [{ ...stick, x: stick.x + 90 }]);
+await touch('touchEnd', []);
+const right = await page.evaluate(() => {
+  const rect = document.querySelector('.tc-right').getBoundingClientRect();
+  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, id: 2 };
+});
+await touch('touchStart', [right]);
 await frames(12);
 const afterDrag = await state();
 

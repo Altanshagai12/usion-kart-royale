@@ -27,6 +27,8 @@ export interface DirectPlayerRow {
   item_kind: number;
   item_count: number;
   item_arm: number;
+  item_slots: DirectItemSlot[];
+  item_slot_revisions: [number, number, number];
   item_revision: number;
   ack_item_seq: number;
   boost_time: number;
@@ -38,6 +40,8 @@ export interface DirectPlayerRow {
   finished: boolean;
   finish_ms: number | null;
 }
+
+export type DirectItemSlot = [kind: number, count: number, arm: number];
 
 export interface DirectItemEntity {
   id: number;
@@ -132,18 +136,34 @@ export function normalizeSnapshot(value: unknown): DirectSnapshot | null {
     && Number.isSafeInteger(event?.kind) && event.kind >= 1 && event.kind <= 8
   ))) return null;
 
-  const players = frame.players.map((raw: any) => ({
-    ...raw,
-    item_kind: raw.item_kind ?? 0,
-    item_count: raw.item_count ?? 0,
-    item_arm: raw.item_arm ?? 0,
-    item_revision: raw.item_revision ?? 0,
-    ack_item_seq: raw.ack_item_seq ?? 0,
-    boost_time: raw.boost_time ?? 0,
-    stun_time: raw.stun_time ?? 0,
-    star_time: raw.star_time ?? 0,
-    shrink_time: raw.shrink_time ?? 0,
-  }));
+  const players = frame.players.map((raw: any) => {
+    const itemRevision = raw.item_revision ?? 0;
+    const legacy: DirectItemSlot = [
+      raw.item_kind ?? 0,
+      raw.item_count ?? 0,
+      raw.item_arm ?? 0,
+    ];
+    const itemSlots: DirectItemSlot[] = raw.item_slots
+      ?? [legacy, [0, 0, 0], [0, 0, 0]];
+    const first = Array.isArray(itemSlots)
+      ? itemSlots.find((slot) => Array.isArray(slot) && slot[0] > 0) ?? [0, 0, 0]
+      : [0, 0, 0];
+    return {
+      ...raw,
+      item_kind: first[0],
+      item_count: first[1],
+      item_arm: first[2],
+      item_slots: itemSlots,
+      item_slot_revisions: raw.item_slot_revisions
+        ?? [itemRevision, itemRevision, itemRevision],
+      item_revision: itemRevision,
+      ack_item_seq: raw.ack_item_seq ?? 0,
+      boost_time: raw.boost_time ?? 0,
+      stun_time: raw.stun_time ?? 0,
+      star_time: raw.star_time ?? 0,
+      shrink_time: raw.shrink_time ?? 0,
+    };
+  });
   if (!players.every((row: any) => (
     Number.isSafeInteger(row.slot) && row.slot >= 0 && row.slot < 4
     && typeof row.user_id === 'string'
@@ -155,6 +175,18 @@ export function normalizeSnapshot(value: unknown): DirectSnapshot | null {
     && Number.isSafeInteger(row.item_kind) && row.item_kind >= 0 && row.item_kind <= 8
     && Number.isSafeInteger(row.item_count) && row.item_count >= 0 && row.item_count <= 3
     && Number.isFinite(row.item_arm) && row.item_arm >= 0 && row.item_arm <= 2
+    && Array.isArray(row.item_slots) && row.item_slots.length === 3
+    && row.item_slots.every((item: unknown) => (
+      Array.isArray(item) && item.length === 3
+      && Number.isSafeInteger(item[0]) && item[0] >= 0 && item[0] <= 8
+      && Number.isSafeInteger(item[1]) && item[1] >= 0 && item[1] <= 3
+      && Number.isFinite(item[2]) && item[2] >= 0 && item[2] <= 2
+      && ((item[0] === 0 && item[1] === 0) || (item[0] > 0 && item[1] > 0))
+    ))
+    && Array.isArray(row.item_slot_revisions) && row.item_slot_revisions.length === 3
+    && row.item_slot_revisions.every((revision: unknown) => (
+      Number.isSafeInteger(revision) && (revision as number) >= 0
+    ))
     && Number.isSafeInteger(row.item_revision) && row.item_revision >= 0
     && Number.isSafeInteger(row.ack_item_seq) && row.ack_item_seq >= 0
     && Number.isFinite(row.boost_time)

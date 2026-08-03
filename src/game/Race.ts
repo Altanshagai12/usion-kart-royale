@@ -448,7 +448,7 @@ export class Race implements IRace {
           brake = input.brake;
           drift = input.drift;
           if (input.itemPressed) {
-            ctx.items.use(k, input.brake > 0.5 || input.lookBack);
+            ctx.items.use(k, input.brake > 0.5 || input.lookBack, input.itemSlot);
           }
         } else {
           const cmd = this.ai.drive(ctx, k, dt, this.karts, true);

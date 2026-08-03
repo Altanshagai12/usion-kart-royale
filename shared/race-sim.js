@@ -8,6 +8,9 @@ import {
   WHEELBASE, YAW_RESPONSE, YAW_RETURN_RESPONSE, MAX_YAW_ACCEL,
   MAX_LATERAL_ACCEL, HEADING_DAMP,
 } from './constants.js';
+import {
+  cloneItemSlots, createItemSlots, ensureItemSlots, syncLegacyItem,
+} from './item-inventory.js';
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 const moveToward = (v, target, d) => (
@@ -81,6 +84,7 @@ export function createPlayer({ slot, userId, name }) {
     input: neutralInput(), ackIseq: 0,
     ackItemSeq: 0,
     drifting: false, driftDir: 0, driftCharge: 0,
+    itemSlots: createItemSlots(),
     itemKind: 0, itemCount: 0, itemArm: 0,
     itemRevision: 0,
     boostTime: 0, stunTime: 0, starTime: 0, shrinkTime: 0,
@@ -104,16 +108,18 @@ export function sanitizeInput(raw = {}) {
 }
 
 export function stepPlayer(player, rawInput, dt) {
-  let p = { ...player };
+  let p = { ...player, itemSlots: cloneItemSlots(player) };
   const input = sanitizeInput(rawInput);
   const steps = Math.max(1, Math.ceil(dt * 120 - 1e-9));
   const h = dt / steps;
   for (let i = 0; i < steps; i++) p = stepPlayerSubstep(p, input, h);
   for (const key of [
     'distance', 'lateral', 'speed', 'heading', 'yawRate', 'rack',
-    'rackVelocity', 'driftCharge', 'itemArm', 'boostTime', 'stunTime',
+    'rackVelocity', 'driftCharge', 'boostTime', 'stunTime',
     'starTime', 'shrinkTime',
   ]) p[key] = q(p[key]);
+  for (const slot of ensureItemSlots(p)) slot.arm = q(slot.arm);
+  syncLegacyItem(p);
   return p;
 }
 
@@ -121,7 +127,8 @@ function stepPlayerSubstep(player, input, dt) {
   const p = { ...player };
   const stunned = p.stunTime > 0;
   if (stunned) input = neutralInput();
-  p.itemArm = Math.max(0, (p.itemArm || 0) - dt);
+  for (const slot of ensureItemSlots(p)) slot.arm = Math.max(0, slot.arm - dt);
+  syncLegacyItem(p);
   p.boostTime = Math.max(0, (p.boostTime || 0) - dt);
   p.stunTime = Math.max(0, (p.stunTime || 0) - dt);
   p.starTime = Math.max(0, (p.starTime || 0) - dt);

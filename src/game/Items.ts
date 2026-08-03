@@ -93,13 +93,17 @@ const WEIGHTS: Record<number, [number, number, number]> = {
 };
 const KINDS = Object.keys(WEIGHTS).map(Number) as ItemKind[];
 
-interface Slot {
+interface ItemEntry {
   kind: ItemKind;
   count: number;
   /** seconds until the item may be spent — the roulette is not decoration */
   arm: number;
   /** handle of a projectile being trailed as a shield, or -1 */
   carried: number;
+}
+
+interface Slot {
+  items: [ItemEntry, ItemEntry, ItemEntry];
   /** shrunk-by-bolt timer */
   shrink: number;
   /** cooldown on star knock-asides so one pass is not eight hits */
@@ -506,7 +510,7 @@ export class Items implements IItems {
   private lastDirectEventId = 0;
 
   private slots = new Map<number, Slot>();
-  private heldViews = new Map<number, { kind: ItemKind; count: number }>();
+  private heldViews = new Map<number, { kind: ItemKind; count: number }[]>();
   private boxes: Box[] = [];
   private proj = new Projectiles();
   private karts: readonly IKart[] = [];
@@ -541,8 +545,16 @@ export class Items implements IItems {
     for (const k of this.karts) this.slots.set(k.id, this.freshSlot());
   }
 
+  private freshItem(): ItemEntry {
+    return { kind: ItemKind.None, count: 0, arm: 0, carried: -1 };
+  }
+
   private freshSlot(): Slot {
-    return { kind: ItemKind.None, count: 0, arm: 0, carried: -1, shrink: 0, starHit: 0 };
+    return {
+      items: [this.freshItem(), this.freshItem(), this.freshItem()],
+      shrink: 0,
+      starHit: 0,
+    };
   }
 
   setRacingLine(l: RacingLine) {
@@ -558,10 +570,12 @@ export class Items implements IItems {
   reset() {
     for (const k of this.karts) {
       const s = this.slots.get(k.id) ?? this.freshSlot();
-      s.kind = ItemKind.None;
-      s.count = 0;
-      s.arm = 0;
-      s.carried = -1;
+      for (const item of s.items) {
+        item.kind = ItemKind.None;
+        item.count = 0;
+        item.arm = 0;
+        item.carried = -1;
+      }
       s.shrink = 0;
       s.starHit = 0;
       this.slots.set(k.id, s);
@@ -603,10 +617,14 @@ export class Items implements IItems {
       const kart = this.karts[row.slot];
       if (!kart) continue;
       const slot = this.slot(kart);
-      slot.kind = clamp(Math.trunc(row.item_kind), ItemKind.None, ItemKind.Bomb) as ItemKind;
-      slot.count = Math.max(0, Math.trunc(row.item_count));
-      slot.arm = Math.max(0, row.item_arm);
-      slot.carried = -1;
+      for (let i = 0; i < slot.items.length; i++) {
+        const source = row.item_slots[i];
+        const item = slot.items[i];
+        item.kind = clamp(Math.trunc(source[0]), ItemKind.None, ItemKind.Bomb) as ItemKind;
+        item.count = Math.max(0, Math.trunc(source[1]));
+        item.arm = Math.max(0, source[2]);
+        item.carried = -1;
+      }
     }
     const maxEventId = snapshot.items.events.reduce(
       (max, event) => Math.max(max, event.id),
@@ -832,21 +850,35 @@ export class Items implements IItems {
    * what it was towing and no driver could ever collect another box for the
    * rest of the race. One kart's first banana ended its item game.
    */
-  held(kart: IKart) {
+  held(kart: IKart, slotIndex = -1) {
     const s = this.slots.get(kart.id);
-    let out = this.heldViews.get(kart.id);
-    if (!out) {
-      out = { kind: ItemKind.None, count: 0 };
-      this.heldViews.set(kart.id, out);
+    let views = this.heldViews.get(kart.id);
+    if (!views) {
+      views = Array.from({ length: 3 }, () => ({ kind: ItemKind.None, count: 0 }));
+      this.heldViews.set(kart.id, views);
     }
-    if (s && s.kind === ItemKind.None && s.carried >= 0) {
-      out.kind = this.proj.carriedKind(s.carried, kart.id);
+    const index = s ? this.itemIndex(s, slotIndex) : -1;
+    const viewIndex = slotIndex >= 0 && slotIndex < 3 ? slotIndex : Math.max(0, index);
+    const out = views[viewIndex];
+    const item = s && index >= 0 ? s.items[index] : null;
+    if (item && item.kind === ItemKind.None && item.carried >= 0) {
+      out.kind = this.proj.carriedKind(item.carried, kart.id);
       out.count = out.kind === ItemKind.None ? 0 : 1;
     } else {
-      out.kind = s ? s.kind : ItemKind.None;
-      out.count = s ? s.count : 0;
+      out.kind = item ? item.kind : ItemKind.None;
+      out.count = item ? item.count : 0;
     }
     return out;
+  }
+
+  heldSlots(kart: IKart) {
+    let views = this.heldViews.get(kart.id);
+    if (!views) {
+      views = Array.from({ length: 3 }, () => ({ kind: ItemKind.None, count: 0 }));
+      this.heldViews.set(kart.id, views);
+    }
+    for (let i = 0; i < 3; i++) this.held(kart, i);
+    return views;
   }
 
   /**
@@ -856,45 +888,53 @@ export class Items implements IItems {
    */
   towing(kart: IKart): ItemKind {
     const s = this.slots.get(kart.id);
-    if (!s || s.carried < 0) return ItemKind.None;
-    return this.proj.carriedKind(s.carried, kart.id);
+    if (!s) return ItemKind.None;
+    const item = s.items.find((candidate) => candidate.carried >= 0);
+    return item ? this.proj.carriedKind(item.carried, kart.id) : ItemKind.None;
   }
 
-  give(kart: IKart, kind: ItemKind, count = 1) {
+  give(kart: IKart, kind: ItemKind, count = 1, slotIndex = -1) {
     const s = this.slot(kart);
-    s.kind = kind;
-    s.count = kind === ItemKind.TripleMushroom ? Math.max(count, 3) : count;
-    s.arm = ARM_TIME;
+    const index = slotIndex >= 0 && slotIndex < 3 ? slotIndex : this.freeItemIndex(s);
+    if (index < 0) return;
+    const item = s.items[index];
+    item.kind = kind;
+    item.count = kind === ItemKind.TripleMushroom ? Math.max(count, 3) : count;
+    item.arm = ARM_TIME;
+    item.carried = -1;
   }
 
   pickup(kart: IKart) {
     const s = this.slot(kart);
-    if (s.kind !== ItemKind.None || s.carried >= 0) return;
+    if (this.freeItemIndex(s) < 0) return;
     const racers = this.karts.length || 8;
     this.give(kart, this.roll(kart.place || racers, racers));
     this.ctx.bus.emit({ type: 'item-pickup', kart });
   }
 
-  use(kart: IKart, backwards: boolean): boolean {
+  use(kart: IKart, backwards: boolean, slotIndex = -1): boolean {
     const s = this.slot(kart);
+    const index = this.itemIndex(s, slotIndex);
+    if (index < 0) return false;
+    const item = s.items[index];
     const ctx = this.ctx;
 
     // A trailing shield is released by the same button that deployed it.
-    if (s.carried >= 0) {
-      if (this.proj.isCarried(s.carried, kart.id)) {
+    if (item.carried >= 0) {
+      if (this.proj.isCarried(item.carried, kart.id)) {
         const target = backwards ? -1 : this.targetAhead(kart);
-        this.proj.release(s.carried, kart, backwards, target);
-        s.carried = -1;
+        this.proj.release(item.carried, kart, backwards, target);
+        item.carried = -1;
         return true;
       }
-      s.carried = -1;
+      item.carried = -1;
     }
 
-    if (s.kind === ItemKind.None || s.count <= 0) return false;
-    if (s.arm > 0) return false;
+    if (item.kind === ItemKind.None || item.count <= 0) return false;
+    if (item.arm > 0) return false;
     if (kart.stunTime > 0) return false;
 
-    const kind = s.kind;
+    const kind = item.kind;
     let consumed = true;
 
     switch (kind) {
@@ -920,7 +960,7 @@ export class Items implements IItems {
         const target = kind === ItemKind.RedShell && !carry ? this.targetAhead(kart) : -1;
         const h = this.proj.spawn(kind, kart, backwards, carry, target);
         if (h < 0) return false;
-        if (carry) s.carried = h;
+        if (carry) item.carried = h;
         break;
       }
 
@@ -932,13 +972,13 @@ export class Items implements IItems {
     if (!consumed) return false;
     ctx.bus.emit({ type: 'item-use', kart, kind });
 
-    s.count--;
-    if (s.count <= 0) {
-      s.kind = ItemKind.None;
-      s.count = 0;
+    item.count--;
+    if (item.count <= 0) {
+      item.kind = ItemKind.None;
+      item.count = 0;
     } else {
       // a triple is spent one at a time, and each one arms briefly
-      s.arm = 0.22;
+      item.arm = 0.22;
     }
     return true;
   }
@@ -952,6 +992,15 @@ export class Items implements IItems {
       this.slots.set(kart.id, s);
     }
     return s;
+  }
+
+  private itemIndex(slot: Slot, requested = -1): number {
+    if (requested >= 0 && requested < slot.items.length) return requested;
+    return slot.items.findIndex((item) => item.kind !== ItemKind.None || item.carried >= 0);
+  }
+
+  private freeItemIndex(slot: Slot): number {
+    return slot.items.findIndex((item) => item.kind === ItemKind.None && item.carried < 0);
   }
 
   /** The kart one place ahead — the red shell's rightful victim. */
@@ -976,9 +1025,10 @@ export class Items implements IItems {
       const s = this.slot(k);
       s.shrink = BOLT_TIME;
       // dropping whatever they were towing is half the point of the bolt
-      if (s.carried >= 0) {
-        this.proj.drop(s.carried);
-        s.carried = -1;
+      for (const item of s.items) {
+        if (item.carried < 0) continue;
+        this.proj.drop(item.carried);
+        item.carried = -1;
       }
       this.ctx.bus.emit({ type: 'hit', kart: k, kind: ItemKind.Bolt });
     }
@@ -1033,9 +1083,11 @@ export class Items implements IItems {
     // --- per-kart item state ------------------------------------------------
     for (const k of karts) {
       const s = this.slot(k);
-      if (s.arm > 0) s.arm = Math.max(0, s.arm - step);
+      for (const item of s.items) {
+        if (item.arm > 0) item.arm = Math.max(0, item.arm - step);
+        if (item.carried >= 0 && !this.proj.isCarried(item.carried, k.id)) item.carried = -1;
+      }
       if (s.starHit > 0) s.starHit -= step;
-      if (s.carried >= 0 && !this.proj.isCarried(s.carried, k.id)) s.carried = -1;
 
       // bolt: shrunk, slowed, and visibly smaller until it wears off
       if (s.shrink > 0) {
@@ -1104,7 +1156,7 @@ export class Items implements IItems {
           _v.y = 0;
           if (_v.lengthSq() > BOX_PICKUP_R * BOX_PICKUP_R) continue;
           const s = this.slot(k);
-          if (s.kind !== ItemKind.None || s.carried >= 0) continue;
+          if (this.freeItemIndex(s) < 0) continue;
           this.pickup(k);
           b.down = BOX_RESPAWN;
           b.scale = 0;
@@ -1201,20 +1253,23 @@ export class Items implements IItems {
     let n = 0;
     for (const k of karts) {
       const s = this.slots.get(k.id);
-      if (!s || s.kind !== ItemKind.TripleMushroom || s.count <= 0) continue;
+      if (!s) continue;
       const scale = k.object.scale.x || 1;
-      for (let i = 0; i < s.count && n < 24; i++) {
-        const a = now * 2.1 + (i / Math.max(1, s.count)) * Math.PI * 2;
-        const r = 1.55 * scale;
-        _v2.set(
-          k.position.x + Math.sin(a) * r,
-          k.position.y + 0.42 * scale + Math.sin(now * 3.2 + i) * 0.06,
-          k.position.z + Math.cos(a) * r,
-        );
-        _q.setFromAxisAngle(UP, -a);
-        _s.setScalar(0.95 * scale);
-        _m.compose(_v2, _q, _s);
-        this.orbitMesh.setMatrixAt(n++, _m);
+      for (const item of s.items) {
+        if (item.kind !== ItemKind.TripleMushroom || item.count <= 0) continue;
+        for (let i = 0; i < item.count && n < 24; i++) {
+          const a = now * 2.1 + (i / Math.max(1, item.count)) * Math.PI * 2;
+          const r = 1.55 * scale;
+          _v2.set(
+            k.position.x + Math.sin(a) * r,
+            k.position.y + 0.42 * scale + Math.sin(now * 3.2 + i) * 0.06,
+            k.position.z + Math.cos(a) * r,
+          );
+          _q.setFromAxisAngle(UP, -a);
+          _s.setScalar(0.95 * scale);
+          _m.compose(_v2, _q, _s);
+          this.orbitMesh.setMatrixAt(n++, _m);
+        }
       }
     }
     this.orbitMesh.count = n;

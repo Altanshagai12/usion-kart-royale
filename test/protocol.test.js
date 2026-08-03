@@ -42,6 +42,36 @@ test('legacy v1 snapshots normalize to an empty authoritative item state', () =>
   assert.deepEqual(normalized.items, { box_down: [], entities: [], events: [] });
   assert.equal(normalized.players[0].item_kind, 0);
   assert.equal(normalized.players[0].item_revision, 0);
+  assert.deepEqual(normalized.players[0].item_slots, [[0, 0, 0], [0, 0, 0], [0, 0, 0]]);
+  assert.deepEqual(normalized.players[0].item_slot_revisions, [0, 0, 0]);
+});
+
+test('snapshot parser accepts exactly three item slots and derives the legacy view', () => {
+  const snapshot = legacySnapshot();
+  snapshot.players[0].item_slots = [[0, 0, 0], [7, 1, 0.5], [2, 3, 0]];
+  snapshot.players[0].item_slot_revisions = [2, 4, 6];
+  const normalized = normalizeSnapshot(snapshot);
+  assert.ok(normalized);
+  assert.deepEqual(normalized.players[0].item_slots, snapshot.players[0].item_slots);
+  assert.deepEqual(normalized.players[0].item_slot_revisions, [2, 4, 6]);
+  assert.equal(normalized.players[0].item_kind, 7);
+  assert.equal(normalized.players[0].item_count, 1);
+
+  for (const bad of [
+    [[1, 1, 0]],
+    [[1, 1, 0], [0, 0, 0], [0, 0, Number.NaN]],
+    [[1, 4, 0], [0, 0, 0], [0, 0, 0]],
+    [[0, 1, 0], [0, 0, 0], [0, 0, 0]],
+  ]) {
+    const malformed = legacySnapshot();
+    malformed.players[0].item_slots = bad;
+    assert.equal(normalizeSnapshot(malformed), null);
+  }
+  for (const revisions of [[1], [0, -1, 2], [0, 1.5, 2]]) {
+    const malformed = legacySnapshot();
+    malformed.players[0].item_slot_revisions = revisions;
+    assert.equal(normalizeSnapshot(malformed), null);
+  }
 });
 
 test('snapshot parser rejects malformed, non-finite, oversized, and unknown data', () => {

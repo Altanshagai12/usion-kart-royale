@@ -87,6 +87,15 @@ function dialMax(kmh: number) {
 
 const ROULETTE_TIME = 1.15;
 
+type ItemHudSlot = {
+  wrap: HTMLDivElement;
+  icon: HTMLDivElement;
+  canvas: HTMLCanvasElement;
+  g: CanvasRenderingContext2D;
+  count: HTMLDivElement;
+  shown: ItemKind;
+};
+
 // --- the drift -> mini-turbo -> boost loop ---------------------------------
 // ROUND 11. Measured on the shipped build at 1920x1080, with the kart posed at
 // `driftTier = 2, driftCharge = 0.72`: the ONLY thing on screen that said so
@@ -215,15 +224,13 @@ export class HUD implements System {
 
   // item
   private itemWrap!: HTMLDivElement;
-  private itemIcon!: HTMLDivElement;
-  private itemCanvas!: HTMLCanvasElement;
-  private itemG!: CanvasRenderingContext2D;
-  private itemCount!: HTMLDivElement;
+  private itemSlots: ItemHudSlot[] = [];
   private atlas = new ItemIconAtlas();
-  private shownKind: ItemKind = -1 as ItemKind;
   private rouletteT = -1;
   private rouletteNext = 0;
   private rouletteIdx = 0;
+  private rouletteSlot = -1;
+  private lastItemKinds: ItemKind[] = [ItemKind.None, ItemKind.None, ItemKind.None];
 
   // speedometer
   private speedWrap!: HTMLDivElement;
@@ -439,14 +446,20 @@ export class HUD implements System {
 
   private buildItem() {
     this.itemWrap = el('div', 'kr-item', this.hud);
-    const frame = el('div', 'kr-item-frame', this.itemWrap);
-    // The pulse rim is a child rather than a pseudo-element: ::before is the
-    // plate body in the round-8 two-layer plate recipe.
-    el('div', 'kr-item-pulse', frame);
-    this.itemIcon = el('div', 'kr-item-icon', this.itemWrap);
-    this.itemCanvas = el('canvas', undefined, this.itemIcon);
-    this.itemG = this.itemCanvas.getContext('2d')!;
-    this.itemCount = el('div', 'kr-item-count', this.itemWrap, '×2');
+    for (let i = 0; i < 3; i++) {
+      const wrap = el('div', 'kr-item-slot empty', this.itemWrap);
+      wrap.dataset.itemSlot = String(i);
+      wrap.setAttribute('aria-label', `Use item slot ${i + 1}`);
+      const frame = el('div', 'kr-item-frame', wrap);
+      el('div', 'kr-item-pulse', frame);
+      const icon = el('div', 'kr-item-icon', wrap);
+      const canvas = el('canvas', undefined, icon);
+      const count = el('div', 'kr-item-count', wrap, '×2');
+      this.itemSlots.push({
+        wrap, icon, canvas, g: canvas.getContext('2d')!, count,
+        shown: -1 as ItemKind,
+      });
+    }
   }
 
   private buildSpeedo() {
@@ -623,18 +636,22 @@ export class HUD implements System {
   // --------------------------------------------------------------- roulette
 
   private startRoulette() {
+    const player = this.ctx?.race?.player;
+    const held = player ? this.ctx.items.heldSlots(player) : [];
+    let slot = held.findIndex((item, index) => item.kind !== this.lastItemKinds[index]);
+    if (slot < 0) slot = held.findIndex((item) => item.kind !== ItemKind.None);
+    if (slot < 0) return;
+    if (this.rouletteSlot >= 0) this.itemSlots[this.rouletteSlot]?.wrap.classList.remove('spinning');
+    this.rouletteSlot = slot;
     this.rouletteT = 0;
     this.rouletteNext = 0;
-    this.itemWrap.classList.add('spinning');
+    this.itemSlots[slot].wrap.classList.add('spinning');
   }
 
   private updateItem(ctx: Ctx, dt: number) {
     const player = ctx.race.player;
-    const held = player ? ctx.items.held(player) : null;
-    const kind = held ? held.kind : ItemKind.None;
-    const count = held ? held.count : 0;
-
-    let show = kind;
+    const held = player ? ctx.items.heldSlots(player) : null;
+    let rouletteKind = ItemKind.None;
     if (this.rouletteT >= 0) {
       this.rouletteT += dt;
       if (this.rouletteT >= this.rouletteNext) {
@@ -642,35 +659,33 @@ export class HUD implements System {
         const f = clamp(this.rouletteT / ROULETTE_TIME, 0, 1);
         this.rouletteNext = this.rouletteT + 0.040 + 0.215 * f * f * f;
       }
-      show = ROULETTE_ORDER[this.rouletteIdx];
+      rouletteKind = ROULETTE_ORDER[this.rouletteIdx];
       if (this.rouletteT >= ROULETTE_TIME) {
         this.rouletteT = -1;
-        this.itemWrap.classList.remove('spinning');
-        show = kind;
-        retrigger(this.itemIcon, 'land');
+        const landed = this.itemSlots[this.rouletteSlot];
+        landed?.wrap.classList.remove('spinning');
+        if (landed) retrigger(landed.icon, 'land');
       }
     }
-
-    const held2 = kind !== ItemKind.None && this.rouletteT < 0;
-    this.itemWrap.classList.toggle('has-item', held2);
-    // EMPTY IS A DIFFERENT STATE, VISIBLY. Round 1 drew the empty slot at full
-    // opacity with a saturated gold diamond, identical in weight to a held
-    // item — at a glance you could not tell whether you were carrying
-    // anything. Empty is now the item-box cube, ghosted and desaturated; the
-    // full-weight, saturated, glowing plate means "you are holding something"
-    // and nothing else. Gold is reserved for the position accent.
-    this.itemWrap.classList.toggle('empty', !held2 && this.rouletteT < 0);
-    this.itemWrap.classList.toggle('multi', count > 1);
-    if (count > 1) setText(this.itemCount, '×' + count);
-    setStyle(this.itemWrap, '--item-tint', ITEM_TINT[show] || '#ffffff');
-
-    if (show !== this.shownKind) {
-      this.shownKind = show;
-      const s = this.itemCanvas.width;
-      this.itemG.clearRect(0, 0, s, s);
-      // ItemKind.None now draws too — it is the dimensional "?" item box, from
-      // the same atlas, on the same optical grid as every other icon.
-      this.itemG.drawImage(this.atlas.get(show), 0, 0, s, s);
+    for (let i = 0; i < this.itemSlots.length; i++) {
+      const ui = this.itemSlots[i];
+      const kind = held?.[i]?.kind ?? ItemKind.None;
+      const count = held?.[i]?.count ?? 0;
+      const spinning = this.rouletteT >= 0 && this.rouletteSlot === i;
+      const show = spinning ? rouletteKind : kind;
+      const hasItem = kind !== ItemKind.None && !spinning;
+      ui.wrap.classList.toggle('has-item', hasItem);
+      ui.wrap.classList.toggle('empty', !hasItem && !spinning);
+      ui.wrap.classList.toggle('multi', count > 1);
+      if (count > 1) setText(ui.count, '×' + count);
+      setStyle(ui.wrap, '--item-tint', ITEM_TINT[show] || '#ffffff');
+      if (show !== ui.shown) {
+        ui.shown = show;
+        const size = ui.canvas.width;
+        ui.g.clearRect(0, 0, size, size);
+        ui.g.drawImage(this.atlas.get(show), 0, 0, size, size);
+      }
+      this.lastItemKinds[i] = kind;
     }
   }
 
@@ -680,13 +695,17 @@ export class HUD implements System {
     if (!this.root) return;
     const dpr = Math.min(2, window.devicePixelRatio || 1);
 
-    const ir = this.itemIcon.getBoundingClientRect();
-    const ipx = Math.max(64, Math.round(ir.width * dpr));
-    if (this.itemCanvas.width !== ipx) {
-      this.itemCanvas.width = this.itemCanvas.height = ipx;
-      this.atlas.ensure(ipx);
-      this.shownKind = -1 as ItemKind; // force a redraw at the new size
+    let atlasSize = 64;
+    for (const item of this.itemSlots) {
+      const rect = item.icon.getBoundingClientRect();
+      const pixels = Math.max(64, Math.round(rect.width * dpr));
+      atlasSize = Math.max(atlasSize, pixels);
+      if (item.canvas.width !== pixels) {
+        item.canvas.width = item.canvas.height = pixels;
+        item.shown = -1 as ItemKind;
+      }
     }
+    this.atlas.ensure(atlasSize);
 
     const sr = this.speedWrap.getBoundingClientRect();
     const sw = Math.max(120, Math.round(sr.width * dpr));

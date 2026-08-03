@@ -93,7 +93,8 @@ const RUMBLE_GAP = 0.055;
 export class Input implements IInput {
   state: InputState = {
     steer: 0, accel: 0, brake: 0, drift: false, driftPressed: false,
-    itemPressed: false, lookBack: false, pausePressed: false, anyPressed: false,
+    itemPressed: false, itemSlot: -1,
+    lookBack: false, pausePressed: false, anyPressed: false,
   };
   touch = false;
 
@@ -126,6 +127,8 @@ export class Input implements IInput {
   private driftMin = 0;
   /** remaining seconds an unaccepted item press keeps being re-offered */
   private itemBuf = 0;
+  /** slot that originated the buffered item press; -1 = first occupied */
+  private itemBufSlot = -1;
   /** held-item fingerprint at the moment the buffered press was raised */
   private itemSig = -1;
 
@@ -372,7 +375,8 @@ export class Input implements IInput {
     // Space fires items. It used to be a third accelerate binding, which wasted
     // the most reachable key on the board on a function two other keys already
     // cover, and left firing on Ctrl — a modifier the OS intercepts.
-    let item = hit('Space', 'Enter', 'KeyE', 'ControlLeft', 'ControlRight');
+    let itemSlot = hit('Digit1') ? 0 : hit('Digit2') ? 1 : hit('Digit3') ? 2 : -1;
+    let item = itemSlot >= 0 || hit('Space', 'Enter', 'KeyE', 'ControlLeft', 'ControlRight');
     let look = has('KeyQ', 'AltLeft');
     let pause = hit('Escape', 'KeyP');
     /** true if the player did something deliberate this frame */
@@ -398,6 +402,7 @@ export class Input implements IInput {
       brake = Math.max(brake, t.brake);
       drift = drift || t.drift;
       item = item || t.item;
+      if (t.item) itemSlot = t.itemSlot;
       look = look || t.look;
       pause = pause || this.pad.consumePause();
     }
@@ -491,14 +496,19 @@ export class Input implements IInput {
     const live = ctx.race?.state === RaceState.Racing;
     if (itemPressed) {
       this.itemBuf = live ? ITEM_BUFFER : 0;
-      this.itemSig = this.heldItemSig();
+      this.itemBufSlot = itemSlot;
+      this.itemSig = this.heldItemSig(this.itemBufSlot);
     } else if (this.itemBuf > 0) {
       this.itemBuf -= dt;
-      const sig = this.heldItemSig();
+      const sig = this.heldItemSig(this.itemBufSlot);
       if (!live || sig < 0 || sig !== this.itemSig) this.itemBuf = 0;
-      else if (this.itemBuf > 0) itemPressed = true;
+      else if (this.itemBuf > 0) {
+        itemPressed = true;
+        itemSlot = this.itemBufSlot;
+      }
     }
     s.itemPressed = itemPressed;
+    s.itemSlot = itemPressed ? itemSlot : -1;
 
     if (drift || item || pause || look) acted = true;
     s.anyPressed = acted && !this.wasAny;
@@ -517,11 +527,11 @@ export class Input implements IInput {
    * A fingerprint of what the player is holding: kind and count folded into one
    * integer, -1 when it cannot be read. Only ever compared for inequality.
    */
-  private heldItemSig(): number {
+  private heldItemSig(slotIndex = -1): number {
     const ctx = this.ctx;
     const player = ctx?.race?.player;
     if (!ctx || !player || !ctx.items) return -1;
-    const h = ctx.items.held(player);
+    const h = ctx.items.held(player, slotIndex);
     return h ? (h.kind | 0) * 64 + (h.count | 0) : -1;
   }
 }
