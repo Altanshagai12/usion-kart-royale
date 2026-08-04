@@ -232,6 +232,7 @@ export class DirectMultiplayer implements System {
       if (roomId) void this.connectPlatformRoom(roomId, this.usion.config?.serviceId);
     });
     game.onConnectionState((state: string) => {
+      if (!this.active || this.phase === 'finished') return;
       if (state === 'disconnected' || state === 'rejoining') this.setConnection('reconnecting');
       else if (state === 'connected' || state === 'reconnected') this.setConnection('connected');
     });

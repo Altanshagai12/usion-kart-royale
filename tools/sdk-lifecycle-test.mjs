@@ -148,10 +148,20 @@ try {
     connects: 1,
     disconnects: 1,
   });
+  await page.evaluate(() => window.__usionMock.handlers.connectionState('disconnected'));
+  assert.equal(
+    await page.evaluate(() => document.querySelector('.kr-network')?.textContent),
+    'Race finished',
+  );
   await page.evaluate(() => window.__usionMock.handlers.finished({ reason: 'host_left' }));
   await page.waitForFunction(
     'document.querySelector(".kr-network")?.textContent === "Host left the room"',
     { timeout: 5000 },
+  );
+  await page.evaluate(() => window.__usionMock.handlers.connectionState('disconnected'));
+  assert.equal(
+    await page.evaluate(() => document.querySelector('.kr-network')?.textContent),
+    'Host left the room',
   );
   assert.equal(await page.evaluate(() => window.__usionMock.disconnects), 2);
 
