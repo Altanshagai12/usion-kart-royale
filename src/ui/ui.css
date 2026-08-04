@@ -1217,18 +1217,27 @@
 
 html[data-touch] .kr-item {
   left: auto;
-  right: calc(var(--kr-safe-right, 0px) + 3vmin);
-  bottom: calc(var(--kr-safe-bottom, 0px) + 43vmin);
-  height: 12vmin;
-  gap: 1.3vmin;
+  right: 0;
+  bottom: 0;
+  width: 43vmin;
+  height: 51vmin;
+  display: block;
 }
 html[data-touch] .kr-item-slot {
+  position: absolute;
   width: 12vmin;
   height: 12vmin;
   min-width: 44px;
   min-height: 44px;
   pointer-events: auto;
+  transition: transform 55ms var(--e-out), filter 120ms var(--e-out);
 }
+/* Three inventory slots make a readable fan around the drift/brake cluster,
+   matching the thumb arc instead of forming a detached toolbar above it. */
+html[data-touch] .kr-item-slot:nth-child(1) { right: 0; bottom: 39vmin; }
+html[data-touch] .kr-item-slot:nth-child(2) { right: 14vmin; bottom: 36vmin; }
+html[data-touch] .kr-item-slot:nth-child(3) { right: 27vmin; bottom: 29vmin; }
+html[data-touch] .kr-item-slot.down { transform: scale(.9); filter: brightness(1.18); }
 
 /* --- SPEEDOMETER — bottom-right ------------------------------------------ */
 .kr-speed {
@@ -1237,7 +1246,7 @@ html[data-touch] .kr-item-slot {
   transform-origin: 100% 100%;
   --accent: var(--kerb-red);
   /* The dial's resting scale, as a token. TouchControls.ts sets the widget to
-     scale(.82) to clear the thumb cluster; the tier pop below animates
+     scale(.76) for the centred touch layout; the tier pop below animates
      `transform`, and an animation beats an inline or author rule, so on touch
      the whole speedometer used to jump to full size for the half second of
      every mini-turbo and snap back. The keyframes now multiply this token
@@ -1246,9 +1255,16 @@ html[data-touch] .kr-item-slot {
 }
 /* Higher specificity than TouchControls' own `html[data-touch] .kr-speed`,
    which is injected after this sheet — it must set the token, not just the
-   transform, or the pop reintroduces the jump. The VALUE is deliberately the
-   same .82 that rule uses; if that number ever changes, change it here too. */
-html[data-touch] .kr .kr-speed { --speed-s: 0.82; transform: scale(var(--speed-s)); }
+   transform, or the pop reintroduces the jump. Keep this value in sync with
+   the touch-controls.css rule below. */
+html[data-touch] .kr .kr-speed {
+  left: 50%;
+  right: auto;
+  translate: -50% 0;
+  transform-origin: 50% 100%;
+  --speed-s: 0.76;
+  transform: scale(var(--speed-s));
+}
 
 .kr-speed-face { --clip: var(--clip-tl); position: absolute; inset: 0; transform-origin: 100% 100%; }
 .kr-speed-face canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
@@ -1319,6 +1335,7 @@ html[data-touch] .kr .kr-speed { --speed-s: 0.82; transform: scale(var(--speed-s
   align-items: flex-end;
   width: clamp(140px, 26vmin, 380px);
 }
+html[data-touch] .kr-bottom { bottom: calc(var(--rail) * .72); }
 .kr-toasts {
   position: relative;
   display: grid;

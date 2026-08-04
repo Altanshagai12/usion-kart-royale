@@ -36,10 +36,10 @@
 
 .tc-steer-cluster {
   position: absolute;
-  left: calc(var(--kr-safe-left, 0px) + 3.5vmin);
-  bottom: calc(var(--kr-safe-bottom, 0px) + 3.5vmin);
-  width: 41vmin;
-  height: 23vmin;
+  left: calc(var(--kr-safe-left, 0px) + 3vmin);
+  bottom: calc(var(--kr-safe-bottom, 0px) + 3vmin);
+  width: 42vmin;
+  height: 22vmin;
 }
 
 .tc-action-cluster {
@@ -69,9 +69,9 @@
 
 .tc-left, .tc-right {
   bottom: 0;
-  width: 18vmin;
-  height: 22vmin;
-  border-radius: 6vmin;
+  width: 19.5vmin;
+  height: 21vmin;
+  border-radius: 8vmin;
 }
 .tc-left { left: 0; }
 .tc-right { right: 0; }
@@ -87,24 +87,49 @@
 
 .tc-gas {
   right: 0;
-  bottom: 0;
-  width: 20vmin;
-  height: 20vmin;
+  bottom: 22vmin;
+  width: 13vmin;
+  height: 13vmin;
   border-radius: 50%;
   background: radial-gradient(circle at 42% 30%, rgba(255,216,132,.45), rgba(109,57,20,.56) 72%);
   border-color: rgba(255,221,158,.68);
 }
 .tc-drift {
-  right: 22vmin;
-  bottom: 1vmin;
-  width: 16vmin;
-  height: 16vmin;
+  right: 0;
+  bottom: 0;
+  width: 20vmin;
+  height: 20vmin;
   border-radius: 50%;
   background: radial-gradient(circle at 42% 30%, rgba(112,221,255,.44), rgba(15,65,98,.58) 72%);
   border-color: rgba(139,229,255,.7);
 }
-.tc-brake { right: 2vmin; bottom: 23vmin; width: 14vmin; height: 14vmin; border-radius: 50%; }
-.tc-look { right: 20vmin; bottom: 22vmin; width: 11vmin; height: 11vmin; border-radius: 50%; opacity: .8; }
+.tc-brake {
+  right: 22vmin;
+  bottom: 1vmin;
+  width: 15vmin;
+  height: 15vmin;
+  border-radius: 50%;
+  background: radial-gradient(circle at 42% 30%, rgba(255,139,121,.4), rgba(104,34,31,.56) 72%);
+  border-color: rgba(255,170,151,.68);
+}
+.tc-look {
+  right: 17vmin;
+  bottom: 22vmin;
+  width: 10vmin;
+  height: 10vmin;
+  border-radius: 50%;
+  opacity: .8;
+}
 
-html[data-touch] .kr-speed { right: 44vmin; transform: scale(.76); }
+/* The touch HUD has three deliberate anchors: steering on the left, the
+   instrument at true centre, and the action fan on the right. `translate` is
+   independent from `transform`, so the speedometer stays centred while its
+   mini-turbo scale animation runs. */
+html[data-touch] .kr-speed {
+  left: 50%;
+  right: auto;
+  translate: -50% 0;
+  transform: scale(.76);
+  transform-origin: 50% 100%;
+}
 html[data-touch] .kr .kr-speed { --speed-s: .76; }
