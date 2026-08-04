@@ -90,3 +90,32 @@ test('releasing steering settles the travel heading without an edge snap', () =>
   );
   assert.ok(state.speed > 16, 'steering release should preserve forward momentum');
 });
+
+test('road edge recovery is smooth, frame-rate stable, and cannot trap the kart', () => {
+  const outcomes = [30, 60, 120].map((hz) => {
+    const distance = 420;
+    const edge = halfWidthAt(distance) - KART_RADIUS;
+    let state = {
+      ...createPlayer({ slot: 0, userId: `edge-${hz}`, name: 'Edge' }),
+      distance,
+      lateral: edge + 0.8,
+      speed: 12,
+      heading: 0.55,
+      yawRate: 0.45,
+    };
+    let largestHeadingStep = 0;
+    for (let i = 0; i < hz * 2; i++) {
+      const before = state.heading;
+      state = stepPlayer(state, { steer: 0, accel: 1 }, 1 / hz);
+      largestHeadingStep = Math.max(largestHeadingStep, Math.abs(state.heading - before));
+    }
+    assert.ok(Math.abs(state.lateral) < edge - 0.15, `${hz} Hz stayed pinned at ${state.lateral}`);
+    assert.ok(state.speed > 8, `${hz} Hz edge recovery killed momentum (${state.speed})`);
+    assert.ok(largestHeadingStep < 0.12, `${hz} Hz heading snapped by ${largestHeadingStep}`);
+    return state;
+  });
+  const lateral = outcomes.map((row) => row.lateral);
+  const speed = outcomes.map((row) => row.speed);
+  assert.ok(Math.max(...lateral) - Math.min(...lateral) < 0.25, `lateral: ${lateral}`);
+  assert.ok(Math.max(...speed) - Math.min(...speed) < 0.25, `speed: ${speed}`);
+});

@@ -3,6 +3,7 @@ import { Race } from '../game/Race';
 import { Items } from '../game/Items';
 import { ConnectionOverlay } from './ConnectionOverlay';
 import { LocalDirectSocket } from './LocalDirectSocket';
+import { WaitingRoomOverlay } from './WaitingRoomOverlay';
 import { RacePredictor } from './RacePredictor';
 import { RemoteInterpolation } from './RemoteInterpolation';
 import {
@@ -22,6 +23,10 @@ export class DirectMultiplayer implements System {
   private usion: any = null;
   private ctx: Ctx | null = null;
   private overlay = new ConnectionOverlay();
+  private lobby = new WaitingRoomOverlay(
+    (ready) => this.sendLobbyReady(ready),
+    () => this.sendLobbyStart(),
+  );
   private localSocket: LocalDirectSocket | null = null;
   private predictor: RacePredictor | null = null;
   private interpolation: RemoteInterpolation | null = null;
@@ -51,6 +56,7 @@ export class DirectMultiplayer implements System {
   private connectingRoom: string | null = null;
   private localMode = false;
   private language = 'en';
+  private autoStartSolo = false;
 
   start(): Promise<void> {
     this.usion = (window as any).Usion;
@@ -91,8 +97,13 @@ export class DirectMultiplayer implements System {
           this.language = config?.language || this.usion.getLanguage?.() || 'en';
           this.registerPlatformHandlers();
           const launch = this.usion.getLaunchParams?.() || config || {};
+          const launchMode = launch?.mode === 'multiplayer' ? 'multiplayer' : 'single';
           const roomId = config?.roomId || launch?.roomId || this.usion.config?.roomId;
-          if (roomId) {
+          this.autoStartSolo = launchMode === 'single';
+          // A solo launch may still receive an auto-created room id. Trust the
+          // host's explicit mode: solo races start immediately with local bots,
+          // then onRoomAssigned promotes that live session if the user shares.
+          if (launchMode === 'multiplayer' && roomId) {
             void this.connectPlatformRoom(
               roomId,
               config?.serviceId || launch?.serviceId || this.usion.config?.serviceId,
@@ -109,6 +120,12 @@ export class DirectMultiplayer implements System {
 
   init(ctx: Ctx) {
     this.ctx = ctx;
+  }
+
+  takeSoloAutoStart() {
+    const value = this.autoStartSolo;
+    this.autoStartSolo = false;
+    return value;
   }
 
   update(ctx: Ctx, dt: number) {
@@ -198,6 +215,7 @@ export class DirectMultiplayer implements System {
   dispose() {
     this.localSocket?.close();
     this.overlay.dispose();
+    this.lobby.dispose();
   }
 
   private registerPlatformHandlers() {
@@ -301,27 +319,52 @@ export class DirectMultiplayer implements System {
     this.paintPhase();
   }
 
-  private handleMatchEnd(_payload: unknown) {
+  private handleMatchEnd(payload: any) {
     this.phase = 'finished';
-    this.overlay.show(this.copy('Race finished', 'Тэмцээн дууслаа'), 'waiting');
+    this.active = false;
+    this.joined = false;
+    this.localSocket?.close();
+    if (!this.localMode) this.usion?.game?.disconnect?.();
+    this.lobby.hide();
+    const hostLeft = payload?.reason === 'host_left';
+    this.overlay.show(
+      hostLeft
+        ? this.copy('Host left the room', 'Өрөөний эзэн гарлаа')
+        : this.copy('Race finished', 'Тэмцээн дууслаа'),
+      hostLeft ? 'warning' : 'waiting',
+    );
   }
 
   private setRoster(value: unknown) {
     if (!Array.isArray(value)) return;
     if (value.every((row) => typeof row === 'string')) {
       this.roster = value.map((id, slot) => ({
-        slot, user_id: id, name: id, connected: true,
+        slot, user_id: id, name: id, connected: true, ready: false, is_host: slot === 0,
       }));
+      this.paintPhase();
       return;
     }
     this.roster = value
       .filter((row) => Number.isInteger(row?.slot) && typeof row?.user_id === 'string')
       .slice(0, 4);
+    this.paintPhase();
   }
 
   private sendDrive(payload: DrivePayload) {
     if (this.localSocket) this.localSocket.send('drive', payload);
     else this.usion?.game?.realtime('drive', payload);
+  }
+
+  private sendLobbyReady(ready: boolean) {
+    if (this.phase !== 'waiting' || this.connection !== 'connected') return;
+    if (this.localSocket) this.localSocket.send('lobby_ready', { ready });
+    else this.usion?.game?.realtime('lobby_ready', { ready });
+  }
+
+  private sendLobbyStart() {
+    if (this.phase !== 'waiting' || this.connection !== 'connected') return;
+    if (this.localSocket) this.localSocket.send('lobby_start', {});
+    else this.usion?.game?.realtime('lobby_start', {});
   }
 
   private resolveItemSlot(row: DirectPlayerRow, requested: number) {
@@ -384,10 +427,13 @@ export class DirectMultiplayer implements System {
     if (state !== this.connection) this.predictor?.resetClock();
     this.connection = state;
     if (state === 'connecting') {
+      this.lobby.hide();
       this.overlay.show(this.copy('Connecting racers…', 'Тоглогчдыг холбож байна…'));
     } else if (state === 'reconnecting') {
+      this.lobby.hide();
       this.overlay.show(this.copy('Reconnecting…', 'Дахин холбогдож байна…'), 'warning');
     } else if (state === 'error') {
+      this.lobby.hide();
       this.overlay.show(this.copy('Connection failed', 'Холболт амжилтгүй'), 'error');
     } else if (state === 'connected') {
       this.paintPhase();
@@ -397,8 +443,12 @@ export class DirectMultiplayer implements System {
   private paintPhase() {
     if (!this.active || this.connection !== 'connected') return;
     if (this.phase === 'waiting') {
-      this.overlay.show(this.copy('Waiting for racers…', 'Тоглогч хүлээж байна…'));
-    } else if (this.phase === 'countdown') {
+      this.overlay.hide();
+      this.lobby.show(this.roster, this.ownSlot, this.language);
+      return;
+    }
+    this.lobby.hide();
+    if (this.phase === 'countdown') {
       this.overlay.show(this.copy('Get ready', 'Бэлэн бай'));
     } else {
       this.overlay.hide();

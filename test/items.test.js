@@ -3,10 +3,11 @@ import test from 'node:test';
 import { createPlayer } from '../shared/race-sim.js';
 import { createItemBoxLayout, ITEM_BOX_RESPAWN } from '../shared/item-layout.js';
 import {
-  ITEM_KIND, createItemRuntime, stepItemRuntime, useItemRuntime,
+  ACTIVE_ITEM_KINDS, ITEM_KIND, createItemRuntime, stepItemRuntime, useItemRuntime,
 } from '../server/item-runtime.js';
 import { MAX_ITEM_ENTITIES } from '../shared/constants.js';
 import { syncLegacyItem } from '../shared/item-inventory.js';
+import { activateShield, SHIELD_SECONDS } from '../shared/item-effects.js';
 
 function setItem(player, slot, kind, count = 1, arm = 0) {
   Object.assign(player.itemSlots[slot], { kind, count, arm });
@@ -36,9 +37,33 @@ test('server owns pickup exclusivity and box respawn', () => {
   assert.notEqual(first.itemKind, ITEM_KIND.NONE);
   assert.equal(second.itemKind, ITEM_KIND.NONE);
   assert.ok(box.cooldown > ITEM_BOX_RESPAWN - 0.1);
+  assert.deepEqual(runtime.events.at(-1), {
+    id: 1, type: 'pickup', slot: 0, kind: first.itemKind, box_id: box.id,
+  });
 
   stepItemRuntime(runtime, [first], ITEM_BOX_RESPAWN + 0.01);
   assert.equal(first.itemSlots.filter((item) => item.kind > 0).length, 2);
+});
+
+test('roulette awards exactly the six Kart Royale items', () => {
+  const awarded = new Set();
+  for (let seed = 1; seed <= 800; seed++) {
+    const runtime = createItemRuntime((seed * 2654435761) >>> 0);
+    const box = runtime.boxes[0];
+    const player = createPlayer({ slot: 0, userId: `p-${seed}`, name: 'racer' });
+    player.distance = box.distance;
+    player.lateral = box.lateral;
+    player.place = 1 + (seed % 4);
+    const field = [player, ...[1, 2, 3].map((slot) => {
+      const rival = createPlayer({ slot, userId: `r-${seed}-${slot}`, name: 'rival' });
+      rival.distance = box.distance + 100 + slot;
+      rival.place = slot + 1;
+      return rival;
+    })];
+    stepItemRuntime(runtime, field, 1 / 60);
+    awarded.add(player.itemKind);
+  }
+  assert.deepEqual([...awarded].sort((a, b) => a - b), [...ACTIVE_ITEM_KINDS]);
 });
 
 test('three stable inventory slots fill independently and a full inventory leaves boxes live', () => {
@@ -75,6 +100,43 @@ test('authoritative item use consumes once and applies server effects', () => {
   assert.equal(user.itemSlots[1].kind, ITEM_KIND.NONE);
   assert.ok(target.stunTime > 0);
   assert.ok(target.shrinkTime > 0);
+});
+
+test('Shield is pure damage immunity and never changes speed or boost state', () => {
+  const target = createPlayer({ slot: 0, userId: 'shield', name: 'shield' });
+  target.speed = 17;
+  target.boostTime = 0;
+  assert.equal(activateShield(target), SHIELD_SECONDS);
+  assert.equal(target.speed, 17);
+  assert.equal(target.boostTime, 0);
+
+  const runtime = createItemRuntime(13);
+  const attacker = createPlayer({ slot: 1, userId: 'attacker', name: 'attacker' });
+  setItem(attacker, 0, ITEM_KIND.BOLT);
+  assert.equal(useItemRuntime(runtime, attacker, [target, attacker]), true);
+  assert.equal(target.stunTime, 0, 'Shield absorbs Devil damage');
+  assert.equal(target.shrinkTime, 0, 'Shield absorbs Devil slowdown');
+  assert.equal(target.speed, 17);
+});
+
+test('Shield absorbs every active track projectile instead of passing it through', () => {
+  for (const kind of [ITEM_KIND.GREEN_SHELL, ITEM_KIND.RED_SHELL, ITEM_KIND.BANANA]) {
+    const runtime = createItemRuntime(17 + kind);
+    const target = createPlayer({ slot: 0, userId: `shield-${kind}`, name: 'shield' });
+    const attacker = createPlayer({ slot: 1, userId: `attacker-${kind}`, name: 'attacker' });
+    target.distance = 100;
+    target.speed = 18;
+    activateShield(target);
+    runtime.entities.push({
+      id: kind, kind, owner: attacker.slot, target: target.slot,
+      distance: target.distance, lateral: target.lateral,
+      direction: 1, speed: 0, ttl: 5, ownerLock: 0,
+    });
+    stepItemRuntime(runtime, [target, attacker], 1 / 60);
+    assert.equal(runtime.entities.length, 0, `Shield must consume item ${kind}`);
+    assert.equal(target.stunTime, 0);
+    assert.equal(target.speed, 18);
+  }
 });
 
 test('server projectile state, not client hit claims, decides shell hits', () => {

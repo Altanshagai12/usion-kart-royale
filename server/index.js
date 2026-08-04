@@ -83,7 +83,7 @@ wss.on('connection', (ws, request) => {
   const url = new URL(request.url || '/', `http://localhost:${PORT}`);
   const token = url.searchParams.get('token');
   const conn = {
-    ws, userId: null, name: null, sessionId: null, room: null, spectator: false,
+    ws, userId: null, name: null, sessionId: null, hostUserId: null, room: null, spectator: false,
     lastSeenMs: Date.now(), lastSeq: 0,
     tokens: RATE_BURST, refilledAt: Date.now(), warned: false,
   };
@@ -157,9 +157,13 @@ wss.on('connection', (ws, request) => {
       conn.userId = identity.sub;
       conn.name = identity.name;
       conn.sessionId = identity.session_id;
+      conn.hostUserId = identity.host_id || null;
       let room = rooms.get(identity.room_id);
       if (!room) {
-        room = new Room(identity.room_id, { onDestroy: (id) => rooms.delete(id) });
+        room = new Room(identity.room_id, {
+          hostUserId: identity.host_id || null,
+          onDestroy: (id) => rooms.delete(id),
+        });
         rooms.set(identity.room_id, room);
       }
       conn.room = room;

@@ -63,6 +63,30 @@ test('stale input is ignored and reconnect replaces the old transport', () => {
   room.destroy();
 });
 
+test('waiting room requires guest readiness and an authorized host start', () => {
+  const room = new Room('lobby-room', { onDestroy() {} });
+  const host = connection('host', room);
+  const guest = connection('guest', room);
+  room.join(host);
+  room.join(guest);
+
+  assert.equal(room.phase, 'waiting');
+  assert.equal(room.roster().find((row) => row.user_id === 'host').is_host, true);
+  assert.equal(room.roster().find((row) => row.user_id === 'guest').ready, false);
+  assert.equal(room.requestStart(guest), false, 'a guest must never start the room');
+  assert.equal(room.requestStart(host), false, 'host must wait until guests are ready');
+
+  room.input(guest, { action_type: 'lobby_ready', action_data: { ready: true } });
+  assert.equal(room.roster().find((row) => row.user_id === 'guest').ready, true);
+  assert.equal(room.requestStart(host), true);
+  assert.equal(room.phase, 'countdown');
+
+  const late = connection('late', room);
+  room.join(late);
+  assert.equal(late.spectator, true, 'the host start locks the race roster');
+  room.destroy();
+});
+
 test('item actions are exactly-once and ignore client-authored item kinds', () => {
   const room = new Room('item-room', { onDestroy() {} });
   const conn = connection('one', room);
@@ -158,20 +182,55 @@ test('waiting-room cleanup preserves every surviving player slot', () => {
   const room = new Room('stable-slot-room', { onDestroy() {} });
   const first = connection('first', room);
   const second = connection('second', room);
+  const third = connection('third', room);
   room.join(first);
   room.join(second);
+  room.join(third);
   assert.equal(room.players.find((player) => player.userId === 'second').slot, 1);
 
-  room.detach(first);
-  room.players.find((player) => player.userId === 'first').disconnectedAt =
+  room.detach(second);
+  room.players.find((player) => player.userId === 'second').disconnectedAt =
     Date.now() - RECONNECT_GRACE_MS - 1;
   room.sweepConnections();
-  assert.equal(room.players.find((player) => player.userId === 'second').slot, 1);
+  assert.equal(room.players.find((player) => player.userId === 'third').slot, 2);
 
   const replacement = connection('replacement', room);
   room.join(replacement);
-  assert.equal(room.players.find((player) => player.userId === 'replacement').slot, 0);
-  assert.equal(room.players.find((player) => player.userId === 'second').slot, 1);
+  assert.equal(room.players.find((player) => player.userId === 'replacement').slot, 1);
+  assert.equal(room.players.find((player) => player.userId === 'third').slot, 2);
+  room.destroy();
+});
+
+test('host expiry closes the waiting room instead of silently migrating authority', () => {
+  const room = new Room('host-left-room', { onDestroy() {} });
+  const host = connection('host', room);
+  const guest = connection('guest', room);
+  room.join(host);
+  room.join(guest);
+  room.detach(host);
+  room.players.find((player) => player.userId === 'host').disconnectedAt =
+    Date.now() - RECONNECT_GRACE_MS - 1;
+  room.sweepConnections();
+  assert.equal(room.phase, 'finished');
+  assert.ok(guest.ws.sent.some((message) => (
+    message.type === 'match_end' && message.payload.reason === 'host_left'
+      && message.payload.winner_ids.length === 0
+  )));
+  room.destroy();
+});
+
+test('guest readiness survives a reconnect inside the grace window', () => {
+  const room = new Room('ready-reconnect-room', { onDestroy() {} });
+  const host = connection('host', room);
+  const guest = connection('guest', room);
+  room.join(host);
+  room.join(guest);
+  room.setReady(guest, true);
+  room.detach(guest);
+  const reconnect = connection('guest', room);
+  room.join(reconnect);
+  assert.equal(room.roster().find((row) => row.user_id === 'guest').ready, true);
+  assert.equal(room.requestStart(host), true);
   room.destroy();
 });
 

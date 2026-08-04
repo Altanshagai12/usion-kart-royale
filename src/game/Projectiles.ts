@@ -18,6 +18,7 @@
  * ============================================================================
  */
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { ItemKind, Quality, Surface, type Ctx, type IKart } from '../types';
 import { registerPrewarm } from '../core/Prewarm';
 import type { HazardLike, RacingLine } from './AI';
@@ -430,6 +431,49 @@ export function shellArt(base: string, rim: string, spot: string, glow: number, 
   return { geo: lathe(SHELL_PROFILE, 30), mat };
 }
 
+/** A low, unmistakable slowing disc — not a recoloured legacy shell. */
+export function slowDiscArt(): MatSet {
+  const rim = new THREE.CylinderGeometry(0.48, 0.48, 0.16, 32, 1);
+  const hub = new THREE.CylinderGeometry(0.21, 0.21, 0.22, 24, 1);
+  const geo = mergeGeometries([rim, hub], false)!;
+  geo.name = 'slow-disc-geometry';
+  const mat = new THREE.MeshPhysicalMaterial({
+    color: 0x38bde1,
+    emissive: 0x0d668f,
+    emissiveIntensity: 0.22,
+    metalness: 0.46,
+    roughness: 0.24,
+    clearcoat: 1,
+    clearcoatRoughness: 0.08,
+  });
+  mat.name = 'slow-disc-material';
+  return { geo, mat };
+}
+
+/** Homing fly ball with a joined orb-and-wings silhouette. */
+export function flyBallArt(): MatSet {
+  const orb = new THREE.SphereGeometry(0.34, 24, 16);
+  const left = new THREE.BoxGeometry(0.38, 0.08, 0.28);
+  left.rotateZ(0.34);
+  left.translate(-0.43, 0.04, 0);
+  const right = new THREE.BoxGeometry(0.38, 0.08, 0.28);
+  right.rotateZ(-0.34);
+  right.translate(0.43, 0.04, 0);
+  const geo = mergeGeometries([orb, left, right], false)!;
+  geo.name = 'fly-ball-geometry';
+  const mat = new THREE.MeshPhysicalMaterial({
+    color: 0xf04e68,
+    emissive: 0x7d1731,
+    emissiveIntensity: 0.22,
+    metalness: 0.08,
+    roughness: 0.2,
+    clearcoat: 1,
+    clearcoatRoughness: 0.07,
+  });
+  mat.name = 'fly-ball-material';
+  return { geo, mat };
+}
+
 export function bananaArt(S = 128): MatSet {
   const alb = pad(S);
   const g = alb.g;
@@ -662,8 +706,8 @@ export class Projectiles {
     const big = this.mobile ? 128 : 256;
     const small = this.mobile ? 64 : 128;
 
-    this.art.set(ItemKind.GreenShell, shellArt('#3fbf52', '#f2ece0', '#2b8f3d', 0.10, big));
-    this.art.set(ItemKind.RedShell, shellArt('#e8433f', '#f2ece0', '#a92a2c', 0.16, big));
+    this.art.set(ItemKind.GreenShell, slowDiscArt());
+    this.art.set(ItemKind.RedShell, flyBallArt());
     this.art.set(ItemKind.Banana, bananaArt(small));
     this.art.set(ItemKind.Bomb, bombArt(small));
 

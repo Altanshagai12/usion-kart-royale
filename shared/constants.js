@@ -28,6 +28,13 @@ export const BRAKE = 18;
 export const COAST_DRAG = 1.5;
 export const AERO_DRAG = 0.008;
 export const OFFROAD_SPEED_MUL = 0.72;
+/** Gentle per-second speed retention while the kart is outside the road edge. */
+export const OFFROAD_RECOVERY_ANGLE = 0.18;
+/** Response toward the road when the edge would otherwise trap a stopped kart. */
+export const OFFROAD_RECOVERY_RESPONSE = 3.2;
+/** Damps the outward yaw impulse without flipping heading every simulation tick. */
+export const OFFROAD_YAW_DAMP = 5.5;
+export const OFFROAD_EDGE_INSET = 0.04;
 
 export const WHEELBASE = 2.05;
 export const MAX_STEER_RAD = 0.48;

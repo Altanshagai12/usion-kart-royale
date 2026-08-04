@@ -20,7 +20,7 @@ import { ItemKind, RaceState, type Ctx, type IItems, type IKart } from '../types
 import type { RacingLine } from './AI';
 import {
   BlobShadows, Projectiles, bananaArt, bombArt, mushroomArt, pad, padTexture,
-  radialSprite, roundedBox, shellArt,
+  radialSprite, roundedBox, slowDiscArt, flyBallArt,
 } from './Projectiles';
 import type { DirectItemEntity, DirectSnapshot } from '../net/protocol';
 import {
@@ -31,6 +31,8 @@ import {
 } from '../../shared/item-layout.js';
 import { TRACK_LENGTH as DIRECT_TRACK_LENGTH } from '../../shared/constants.js';
 import { MAX_ITEM_ENTITIES } from '../../shared/constants.js';
+import { ACTIVE_ITEM_KINDS, ITEM_ROLL_WEIGHTS } from '../../shared/item-catalog.js';
+import { activateShield } from '../../shared/item-effects.js';
 
 // --- tuning ------------------------------------------------------------------
 const BOX_SIZE = 1.55;
@@ -57,7 +59,6 @@ const ARM_TIME = 1.05;
 
 const MUSHROOM_BOOST = 1.55;
 const MUSHROOM_STRENGTH = 1.3;
-const STAR_TIME = 7.4;
 const BOLT_TIME = 6.5;
 const BOLT_STUN = 0.65;
 
@@ -81,17 +82,8 @@ const BOLT_STUN = 0.65;
 // --- distribution ------------------------------------------------------------
 // Columns are leader / midfield / last. Everything between is a lerp, so an
 // eight-kart field gets a smooth gradient rather than three step changes.
-const WEIGHTS: Record<number, [number, number, number]> = {
-  [ItemKind.Mushroom]:       [10, 26, 16],
-  [ItemKind.TripleMushroom]: [0, 10, 21],
-  [ItemKind.GreenShell]:     [33, 19, 6],
-  [ItemKind.RedShell]:       [4, 21, 17],
-  [ItemKind.Banana]:         [38, 13, 4],
-  [ItemKind.Star]:           [0, 4, 17],
-  [ItemKind.Bolt]:           [0, 2, 10],
-  [ItemKind.Bomb]:           [15, 11, 5],
-};
-const KINDS = Object.keys(WEIGHTS).map(Number) as ItemKind[];
+const WEIGHTS = ITEM_ROLL_WEIGHTS as unknown as Record<number, readonly [number, number, number]>;
+const KINDS = [...ACTIVE_ITEM_KINDS] as ItemKind[];
 
 interface ItemEntry {
   kind: ItemKind;
@@ -106,8 +98,6 @@ interface Slot {
   items: [ItemEntry, ItemEntry, ItemEntry];
   /** shrunk-by-bolt timer */
   shrink: number;
-  /** cooldown on star knock-asides so one pass is not eight hits */
-  starHit: number;
 }
 
 interface Box {
@@ -553,7 +543,6 @@ export class Items implements IItems {
     return {
       items: [this.freshItem(), this.freshItem(), this.freshItem()],
       shrink: 0,
-      starHit: 0,
     };
   }
 
@@ -577,7 +566,6 @@ export class Items implements IItems {
         item.carried = -1;
       }
       s.shrink = 0;
-      s.starHit = 0;
       this.slots.set(k.id, s);
       k.object.scale.setScalar(1);
       k.starTime = 0;
@@ -640,7 +628,11 @@ export class Items implements IItems {
       const kart = this.karts[event.slot];
       if (!kart) continue;
       const kind = event.kind as ItemKind;
-      if (event.type === 'pickup') this.ctx.bus.emit({ type: 'item-pickup', kart });
+      if (event.type === 'pickup') {
+        const box = this.boxes[event.box_id ?? -1];
+        if (box) this.ctx.bus.emit({ type: 'item-box-vanish', position: box.pos });
+        this.ctx.bus.emit({ type: 'item-pickup', kart });
+      }
       else if (event.type === 'use') this.ctx.bus.emit({ type: 'item-use', kart, kind });
       else this.ctx.bus.emit({ type: 'hit', kart, kind });
     }
@@ -797,8 +789,8 @@ export class Items implements IItems {
 
   private buildDirectEntities() {
     const art = new Map<ItemKind, ReturnType<typeof bananaArt>>([
-      [ItemKind.GreenShell, shellArt('#3fbf52', '#f2ece0', '#2b8f3d', 0.10)],
-      [ItemKind.RedShell, shellArt('#e8433f', '#f2ece0', '#a92a2c', 0.16)],
+      [ItemKind.GreenShell, slowDiscArt()],
+      [ItemKind.RedShell, flyBallArt()],
       [ItemKind.Banana, bananaArt()],
       [ItemKind.Bomb, bombArt()],
     ]);
@@ -944,8 +936,7 @@ export class Items implements IItems {
         break;
 
       case ItemKind.Star:
-        kart.starTime = Math.max(kart.starTime, STAR_TIME);
-        kart.applyBoost(0.8, 1.2);
+        activateShield(kart);
         break;
 
       case ItemKind.Bolt:
@@ -956,11 +947,12 @@ export class Items implements IItems {
       case ItemKind.RedShell:
       case ItemKind.Banana:
       case ItemKind.Bomb: {
-        const carry = backwards && kind !== ItemKind.Bomb;
-        const target = kind === ItemKind.RedShell && !carry ? this.targetAhead(kart) : -1;
-        const h = this.proj.spawn(kind, kart, backwards, carry, target);
+        // Kart Royale projectiles launch immediately in both solo and direct
+        // multiplayer. Legacy tow-behind shells created a rules mismatch with
+        // the authoritative server and made the renamed items act like shields.
+        const target = kind === ItemKind.RedShell && !backwards ? this.targetAhead(kart) : -1;
+        const h = this.proj.spawn(kind, kart, backwards, false, target);
         if (h < 0) return false;
-        if (carry) item.carried = h;
         break;
       }
 
@@ -1087,8 +1079,6 @@ export class Items implements IItems {
         if (item.arm > 0) item.arm = Math.max(0, item.arm - step);
         if (item.carried >= 0 && !this.proj.isCarried(item.carried, k.id)) item.carried = -1;
       }
-      if (s.starHit > 0) s.starHit -= step;
-
       // bolt: shrunk, slowed, and visibly smaller until it wears off
       if (s.shrink > 0) {
         s.shrink = Math.max(0, s.shrink - step);
@@ -1102,32 +1092,10 @@ export class Items implements IItems {
         k.launch(_v);
         if (s.shrink <= 0) k.object.scale.setScalar(1);
       }
-
-      // star: barge anyone you touch out of the way
-      if (!paused && k.starTime > 0 && s.starHit <= 0) this.starSweep(ctx, k, s);
     }
 
     this.proj.update(ctx, step, karts);
     this.updateOrbit(karts, now);
-  }
-
-  private starSweep(ctx: Ctx, star: IKart, s: Slot) {
-    for (const o of this.karts) {
-      if (o === star || o.starTime > 0) continue;
-      _v.subVectors(o.position, star.position);
-      if (Math.abs(_v.y) > 2) continue;
-      _v.y = 0;
-      if (_v.lengthSq() > 3.2 * 3.2) continue;
-      const before = o.stunTime;
-      o.spinOut(1.25);
-      if (o.stunTime <= before) continue;
-      if (_v.lengthSq() < 1e-4) _v.set(0, 0, 1);
-      _v.normalize().multiplyScalar(11);
-      _v.y = 5.5;
-      o.launch(_v);
-      ctx.bus.emit({ type: 'hit', kart: o, kind: ItemKind.Star });
-      s.starHit = 0.4;
-    }
   }
 
   // ---------------------------------------------------------------- item boxes
@@ -1158,6 +1126,7 @@ export class Items implements IItems {
           const s = this.slot(k);
           if (this.freeItemIndex(s) < 0) continue;
           this.pickup(k);
+          this.ctx.bus.emit({ type: 'item-box-vanish', position: b.pos });
           b.down = BOX_RESPAWN;
           b.scale = 0;
           break;

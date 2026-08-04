@@ -53,6 +53,7 @@
  *     OPTICAL centroid (OPT_Y) rather than on its bounding box.
  */
 import { ItemKind } from '../types';
+import { drawKartRoyaleItem } from './KartRoyaleItemArt';
 
 const INK = '#241a2e';
 /** the one keyline weight, in unit-box coordinates */
@@ -60,13 +61,13 @@ const LW = 0.055;
 
 export const ITEM_NAMES: Record<number, string> = {
   [ItemKind.None]: '',
-  [ItemKind.Mushroom]: 'Turbo Can',
+  [ItemKind.Mushroom]: 'Turbo',
   [ItemKind.TripleMushroom]: 'Triple Turbo',
-  [ItemKind.GreenShell]: 'Glass Float',
-  [ItemKind.RedShell]: 'Homing Float',
-  [ItemKind.Banana]: 'Lemon',
-  [ItemKind.Star]: 'Golden Hour',
-  [ItemKind.Bolt]: 'Squall',
+  [ItemKind.GreenShell]: 'Slow Disc',
+  [ItemKind.RedShell]: 'Fly Ball',
+  [ItemKind.Banana]: 'Banana',
+  [ItemKind.Star]: 'Shield',
+  [ItemKind.Bolt]: 'Devil',
   [ItemKind.Bomb]: 'Harbour Mine',
 };
 
@@ -89,12 +90,10 @@ export const ITEM_TINT: Record<number, string> = {
 export const ROULETTE_ORDER: ItemKind[] = [
   ItemKind.Mushroom,
   ItemKind.GreenShell,
+  ItemKind.RedShell,
   ItemKind.Banana,
   ItemKind.Star,
-  ItemKind.RedShell,
-  ItemKind.TripleMushroom,
   ItemKind.Bolt,
-  ItemKind.Bomb,
 ];
 
 /**
@@ -554,13 +553,13 @@ function drawEmptyBox(g: G) {
 
 const TABLE: Record<number, (g: G) => void> = {
   [ItemKind.None]: drawEmptyBox,
-  [ItemKind.Mushroom]: drawTurboCan,
+  [ItemKind.Mushroom]: (g) => { drawKartRoyaleItem(g, ItemKind.Mushroom); },
   [ItemKind.TripleMushroom]: drawTripleTurbo,
-  [ItemKind.GreenShell]: drawGreenFloat,
-  [ItemKind.RedShell]: drawRedFloat,
-  [ItemKind.Banana]: drawLemon,
-  [ItemKind.Star]: drawGoldenHour,
-  [ItemKind.Bolt]: drawSquall,
+  [ItemKind.GreenShell]: (g) => { drawKartRoyaleItem(g, ItemKind.GreenShell); },
+  [ItemKind.RedShell]: (g) => { drawKartRoyaleItem(g, ItemKind.RedShell); },
+  [ItemKind.Banana]: (g) => { drawKartRoyaleItem(g, ItemKind.Banana); },
+  [ItemKind.Star]: (g) => { drawKartRoyaleItem(g, ItemKind.Star); },
+  [ItemKind.Bolt]: (g) => { drawKartRoyaleItem(g, ItemKind.Bolt); },
   [ItemKind.Bomb]: drawMine,
 };
 

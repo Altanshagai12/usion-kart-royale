@@ -38,6 +38,7 @@ import { AIField, type DriveCmd } from './AI';
 import { Items } from './Items';
 import type { DirectPlayerRow, DirectRosterRow, DirectSnapshot } from '../net/protocol';
 import { TRACK_LENGTH as DIRECT_TRACK_LENGTH } from '../../shared/constants.js';
+import { stepVergeRecovery } from '../../shared/roadside-recovery.js';
 
 const ROSTER: KartStats[] = [
   { name: 'Vela',   color: new THREE.Color(0xff3b5c), accelMul: 1.00, topSpeedMul: 1.00, weightMul: 1.0,  handlingMul: 1.00 },
@@ -101,6 +102,8 @@ interface Progress {
   wrongT: number;
   badT: number;
   stuckT: number;
+  vergeT: number;
+  watchDistance: number;
   /** no-throttle hold after a drop */
   respawnT: number;
   /** how long the throttle has been held during the countdown */
@@ -224,7 +227,8 @@ export class Race implements IRace {
       this.karts.push(k);
       this.prog.push({
         lapIndex: -1, cp: 0, lapStart: 0, best: Infinity, finishOrder: 0, finishTime: 0,
-        wrongT: 0, badT: 0, stuckT: 0, respawnT: 0, hold: 0, effort: 0,
+        wrongT: 0, badT: 0, stuckT: 0, vergeT: 0, watchDistance: 0,
+        respawnT: 0, hold: 0, effort: 0,
       });
       this.standings.push(k);
     }
@@ -327,7 +331,8 @@ export class Race implements IRace {
       p.best = Infinity;
       p.finishOrder = 0;
       p.finishTime = 0;
-      p.wrongT = p.badT = p.stuckT = p.respawnT = p.hold = p.effort = 0;
+      p.wrongT = p.badT = p.stuckT = p.vergeT = p.respawnT = p.hold = p.effort = 0;
+      p.watchDistance = k.raceDistance;
       this.standings[i] = k;
     }
     this.updateProgress();
@@ -724,7 +729,22 @@ export class Race implements IRace {
       const crawling = p.effort > 0.15 && Math.abs(k.forwardSpeed) < 0.7 && k.stunTime <= 0;
       p.stuckT = crawling ? p.stuckT + dt : 0;
 
-      if (p.badT > OOB_LIMIT || p.stuckT > STUCK_LIMIT) this.respawn(ctx, k, p);
+      const verge = stepVergeRecovery(
+        { timer: p.vergeT, lastDistance: p.watchDistance },
+        {
+          onVerge: k.surface === Surface.Grass || k.surface === Surface.Sand,
+          effort: p.effort,
+          stunned: k.stunTime > 0,
+          distance: k.raceDistance,
+        },
+        dt,
+      );
+      p.vergeT = verge.timer;
+      p.watchDistance = verge.lastDistance;
+
+      if (p.badT > OOB_LIMIT || p.stuckT > STUCK_LIMIT || verge.shouldRespawn) {
+        this.respawn(ctx, k, p);
+      }
     }
   }
 
@@ -753,6 +773,8 @@ export class Race implements IRace {
     k.invulnTime = 1.9;
     p.badT = 0;
     p.stuckT = 0;
+    p.vergeT = 0;
+    p.watchDistance = k.raceDistance;
     p.respawnT = 0.55;
     ctx.bus.emit({ type: 'ui', name: k.isPlayer ? 'respawn' : 'respawn-rival' });
   }
@@ -786,7 +808,6 @@ export class Race implements IRace {
     const raw = clamp(Math.abs(k.forwardSpeed) / top, 0, 1.2);
     let want = Math.pow(clamp((raw - 0.34) / 0.72, 0, 1), 1.35);
     if (k.boostTime > 0) want = Math.min(1.4, want + 0.35);
-    if (k.starTime > 0) want = Math.min(1.4, want + 0.12);
     if (this.state === RaceState.Countdown) want = 0;
     ctx.speedIntensity += (want - ctx.speedIntensity) * Math.min(1, dt * 5);
 

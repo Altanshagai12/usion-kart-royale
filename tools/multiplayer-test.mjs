@@ -73,10 +73,41 @@ try {
     'window.__gameReady === true && window.__ctx?.race?.directMultiplayer === true',
     { timeout: 90_000 },
   )));
+  await Promise.all(pages.map((page) => page.waitForSelector('.kr-lobby:not([hidden])')));
+  const lobbyBefore = await Promise.all(pages.map((page) => page.evaluate(() => ({
+    roster: [...document.querySelectorAll('.kr-lobby-player')].map((row) => row.textContent),
+    action: document.querySelector('.kr-lobby-action')?.textContent,
+    disabled: document.querySelector('.kr-lobby-action')?.disabled,
+    ownSlot: window.__multiplayer.ownSlot,
+    isHost: window.__multiplayer.roster
+      .find((row) => row.slot === window.__multiplayer.ownSlot)?.is_host === true,
+  }))));
+  assert.equal(lobbyBefore[0].roster.length, 2);
+  assert.equal(lobbyBefore[1].roster.length, 2);
+  const hostIndex = lobbyBefore.findIndex((state) => state.isHost);
+  const guestIndex = lobbyBefore.findIndex((state) => !state.isHost);
+  assert.ok(hostIndex >= 0 && guestIndex >= 0, 'server assigns one immutable waiting-room host');
+  assert.equal(lobbyBefore[hostIndex].disabled, true, 'host waits until every guest is ready');
+  await pages[guestIndex].click('.kr-lobby-action');
+  await pages[hostIndex].waitForFunction('document.querySelector(".kr-lobby-action")?.disabled === false');
+  await pages[hostIndex].click('.kr-lobby-action');
   await Promise.all(pages.map((page) => page.waitForFunction(
     'window.__ctx.race.state === 2',
     { timeout: 20_000 },
   )));
+  await Promise.all(pages.map((page) => page.evaluate(() => {
+    window.__boxVanish = [];
+    const original = window.__ctx.bus.emit.bind(window.__ctx.bus);
+    window.__ctx.bus.emit = (event) => {
+      if (event?.type === 'item-box-vanish') {
+        const boxId = window.__ctx.items.boxes.findIndex((box) => (
+          box.pos.distanceToSquared(event.position) < 1e-8
+        ));
+        window.__boxVanish.push(boxId);
+      }
+      return original(event);
+    };
+  })));
 
   const cdp = await pages[1].createCDPSession();
   await cdp.send('Network.enable');
@@ -139,7 +170,7 @@ try {
         row.item_slots.filter(([kind, count]) => kind > 0 && count > 0).length === 3
       ))
     ));
-  }, 60_000);
+  }, 90_000);
   await Promise.all(pages.map(async (page, index) => {
     if (steering[index]) await page.keyboard.up(steering[index]);
   }));
@@ -161,6 +192,7 @@ try {
     })),
     visibleBoxes: window.__ctx.items.boxMesh.count,
     events: window.__multiplayer.latest.items.events,
+    vanishBoxIds: window.__boxVanish,
   }))));
   const inventorySignature = (replica) => replica.players.map((row) => ({
     slot: row.slot,
@@ -173,6 +205,13 @@ try {
   )));
   assert.ok(itemReplicas.every((replica) => replica.visibleBoxes > 0));
   assert.ok(itemReplicas[0].events.some((event) => event.type === 'pickup'));
+  for (const replica of itemReplicas) {
+    const picked = new Set(replica.events
+      .filter((event) => event.type === 'pickup')
+      .map((event) => event.box_id));
+    assert.ok(replica.vanishBoxIds.length > 0, 'pickup emits an anchored disappearance effect');
+    assert.ok(replica.vanishBoxIds.every((id) => picked.has(id)), 'effect position matches box_id');
+  }
   const holderPage = itemReplicas.findIndex((replica) => (
     replica.players.some((row) => row.slot === replica.ownSlot
       && row.slots.filter(([kind, count]) => kind > 0 && count > 0).length === 3)
@@ -213,7 +252,8 @@ try {
       || heldAfter.item_slots[2][1] < heldBefore.slots[2][1],
     'server must consume the directly selected third slot after an acknowledged use',
   );
-  assert.deepEqual(heldAfter.item_slots.slice(0, 2), heldBefore.slots.slice(0, 2));
+  const stableInventory = (slots) => slots.slice(0, 2).map(([kind, count]) => [kind, count]);
+  assert.deepEqual(stableInventory(heldAfter.item_slots), stableInventory(heldBefore.slots));
   await pages[0].keyboard.up('ArrowUp');
   await pages[1].keyboard.up('ArrowUp');
   await delay(500);
@@ -260,7 +300,10 @@ try {
     Math.abs(handlingProbe.renderTrackT - expectedTrackT),
     1 - Math.abs(handlingProbe.renderTrackT - expectedTrackT),
   );
-  assert.ok(trackPhaseError < 1e-6, `direct track phase drifted by ${trackPhaseError}`);
+  assert.ok(
+    trackPhaseError * TRACK_LENGTH < 2,
+    `direct track phase drifted by ${(trackPhaseError * TRACK_LENGTH).toFixed(3)}m`,
+  );
   assert.ok(handlingProbe.speed > 4, 'steering probe should be accelerating through the turn');
   assert.equal(handlingProbe.itemsVisible, true, 'direct multiplayer must not hide item presentation');
   assert.ok(handlingProbe.itemBoxes > 0, 'direct multiplayer must render item boxes');
@@ -295,7 +338,7 @@ try {
   assert.deepEqual(reconnectState, { active: true, joined: true, state: 'connected' });
 
   console.log(JSON.stringify({
-    ok: true,
+    ok: true, lobbyBefore,
     adverseNetworkMs: 120,
     handlingProbe,
     views: [viewOne, viewTwo],

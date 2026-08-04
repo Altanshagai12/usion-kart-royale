@@ -1,4 +1,5 @@
 import { MAX_ITEM_ENTITIES } from '../../shared/constants.js';
+import { ACTIVE_ITEM_KINDS } from '../../shared/item-catalog.js';
 
 const MAX_EFFECT_SECONDS = 60;
 
@@ -7,6 +8,8 @@ export interface DirectRosterRow {
   user_id: string;
   name: string;
   connected?: boolean;
+  ready?: boolean;
+  is_host?: boolean;
 }
 
 export interface DirectPlayerRow {
@@ -61,6 +64,7 @@ export interface DirectItemEvent {
   type: 'pickup' | 'use' | 'hit';
   slot: number;
   kind: number;
+  box_id?: number;
 }
 
 export interface DirectSnapshot {
@@ -108,6 +112,8 @@ export function normalizeSnapshot(value: unknown): DirectSnapshot | null {
       || !frame.roster.every((row: any) => (
         Number.isSafeInteger(row?.slot) && row.slot >= 0 && row.slot < 4
         && typeof row?.user_id === 'string' && typeof row?.name === 'string'
+        && (row.ready === undefined || typeof row.ready === 'boolean')
+        && (row.is_host === undefined || typeof row.is_host === 'boolean')
       ))
       || !frame.ack || typeof frame.ack !== 'object'
       || !Array.isArray(frame.players)
@@ -124,7 +130,7 @@ export function normalizeSnapshot(value: unknown): DirectSnapshot | null {
       || !Array.isArray(rawItems.entities) || rawItems.entities.length > MAX_ITEM_ENTITIES
       || !rawItems.entities.every((entity: any) => (
         Number.isSafeInteger(entity?.id)
-        && [3, 4, 5, 8].includes(entity?.kind)
+        && [3, 4, 5].includes(entity?.kind)
         && Number.isFinite(entity?.distance)
         && Number.isFinite(entity?.lateral)
       ))) return null;
@@ -133,7 +139,11 @@ export function normalizeSnapshot(value: unknown): DirectSnapshot | null {
     Number.isSafeInteger(event?.id)
     && ['pickup', 'use', 'hit'].includes(event?.type)
     && Number.isSafeInteger(event?.slot) && event.slot >= 0 && event.slot < 4
-    && Number.isSafeInteger(event?.kind) && event.kind >= 1 && event.kind <= 8
+    && ACTIVE_ITEM_KINDS.includes(event?.kind)
+    && (event.type !== 'pickup'
+      || (Number.isSafeInteger(event?.box_id) && event.box_id >= 0 && event.box_id < 64))
+    && (event.box_id === undefined
+      || (Number.isSafeInteger(event.box_id) && event.box_id >= 0 && event.box_id < 64))
   ))) return null;
 
   const players = frame.players.map((raw: any) => {
@@ -172,13 +182,15 @@ export function normalizeSnapshot(value: unknown): DirectSnapshot | null {
     && Number.isFinite(row.rack) && Number.isFinite(row.rack_velocity)
     && typeof row.drifting === 'boolean'
     && Number.isFinite(row.drift_dir) && Number.isFinite(row.drift_charge)
-    && Number.isSafeInteger(row.item_kind) && row.item_kind >= 0 && row.item_kind <= 8
+    && Number.isSafeInteger(row.item_kind)
+    && (row.item_kind === 0 || ACTIVE_ITEM_KINDS.includes(row.item_kind))
     && Number.isSafeInteger(row.item_count) && row.item_count >= 0 && row.item_count <= 3
     && Number.isFinite(row.item_arm) && row.item_arm >= 0 && row.item_arm <= 2
     && Array.isArray(row.item_slots) && row.item_slots.length === 3
     && row.item_slots.every((item: unknown) => (
       Array.isArray(item) && item.length === 3
-      && Number.isSafeInteger(item[0]) && item[0] >= 0 && item[0] <= 8
+      && Number.isSafeInteger(item[0])
+      && (item[0] === 0 || ACTIVE_ITEM_KINDS.includes(item[0]))
       && Number.isSafeInteger(item[1]) && item[1] >= 0 && item[1] <= 3
       && Number.isFinite(item[2]) && item[2] >= 0 && item[2] <= 2
       && ((item[0] === 0 && item[1] === 0) || (item[0] > 0 && item[1] > 0))

@@ -7,6 +7,10 @@ import {
   ITEM_ARM_TIME, ITEM_BOX_PICKUP_RADIUS, ITEM_BOX_RESPAWN,
   createItemBoxLayout,
 } from '../shared/item-layout.js';
+import { ACTIVE_ITEM_KINDS, ITEM_ROLL_WEIGHTS } from '../shared/item-catalog.js';
+import { activateShield } from '../shared/item-effects.js';
+
+export { ACTIVE_ITEM_KINDS } from '../shared/item-catalog.js';
 
 export const ITEM_KIND = Object.freeze({
   NONE: 0,
@@ -20,11 +24,8 @@ export const ITEM_KIND = Object.freeze({
   BOMB: 8,
 });
 
-const WEIGHTS = {
-  1: [10, 26, 16], 2: [0, 10, 21], 3: [33, 19, 6], 4: [4, 21, 17],
-  5: [38, 13, 4], 6: [0, 4, 17], 7: [0, 2, 10], 8: [15, 11, 5],
-};
-const KINDS = Object.keys(WEIGHTS).map(Number);
+const WEIGHTS = ITEM_ROLL_WEIGHTS;
+const KINDS = ACTIVE_ITEM_KINDS;
 const q = (v) => Math.round(v * 1000) / 1000;
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const mod = (v, n) => ((v % n) + n) % n;
@@ -59,13 +60,13 @@ export function stepItemRuntime(runtime, players, dt) {
       const kind = roll(runtime, player.place, players.length);
       const item = ensureItemSlots(player)[freeSlot];
       item.kind = kind;
-      item.count = kind === ITEM_KIND.TRIPLE_MUSHROOM ? 3 : 1;
+      item.count = 1;
       item.arm = ITEM_ARM_TIME;
       item.revision += 1;
       syncLegacyItem(player);
       player.itemRevision += 1;
       box.cooldown = ITEM_BOX_RESPAWN;
-      event(runtime, 'pickup', player.slot, kind);
+      event(runtime, 'pickup', player.slot, kind, { box_id: box.id });
       break;
     }
   }
@@ -84,8 +85,7 @@ export function useItemRuntime(runtime, player, players, backwards = false, requ
     player.boostTime = Math.max(player.boostTime, 1.55);
     player.speed += 4.5;
   } else if (kind === ITEM_KIND.STAR) {
-    player.starTime = Math.max(player.starTime, 7.4);
-    player.boostTime = Math.max(player.boostTime, 0.8);
+    activateShield(player);
   } else if (kind === ITEM_KIND.BOLT) {
     for (const target of players) {
       if (target === player || target.finished || target.starTime > 0) continue;
@@ -172,12 +172,15 @@ function stepEntities(runtime, players, dt) {
     if (entity.ttl <= 0) continue;
 
     const hit = players.find((target) => {
-      if (target.finished || target.starTime > 0) return false;
+      if (target.finished) return false;
       if (target.slot === entity.owner && entity.ownerLock > 0) return false;
       return Math.abs(target.distance - entity.distance) < 1.8
         && Math.abs(target.lateral - entity.lateral) < 1.55;
     });
     if (hit) {
+      // Shield absorbs the projectile itself. Letting it phase through would
+      // make direct multiplayer differ from solo and punish the racer behind.
+      if (hit.starTime > 0) continue;
       hit.stunTime = Math.max(hit.stunTime, entity.kind === ITEM_KIND.BANANA ? 1.15 : 1.5);
       hit.speed *= entity.kind === ITEM_KIND.BANANA ? 0.6 : 0.48;
       event(runtime, 'hit', hit.slot, entity.kind);
@@ -200,8 +203,8 @@ function explode(runtime, entity, players) {
   }
 }
 
-function event(runtime, type, slot, kind) {
-  runtime.events.push({ id: runtime.nextEventId++, type, slot, kind });
+function event(runtime, type, slot, kind, detail = null) {
+  runtime.events.push({ id: runtime.nextEventId++, type, slot, kind, ...(detail || {}) });
   if (runtime.events.length > 32) runtime.events.splice(0, runtime.events.length - 32);
 }
 

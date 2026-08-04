@@ -3,6 +3,8 @@ import {
   DRIFT_CHARGE_T2, DRIFT_CHARGE_T3, DRIFT_MIN_SPEED, DRIFT_MIN_STEER,
   DRIFT_YAW_MUL, GRID_BACK0, GRID_LAT, GRID_ROW_DS, GRID_STAGGER,
   KART_RADIUS, MAX_SPEED, MAX_STEER_RAD, OFFROAD_SPEED_MUL,
+  OFFROAD_EDGE_INSET, OFFROAD_RECOVERY_ANGLE, OFFROAD_RECOVERY_RESPONSE,
+  OFFROAD_YAW_DAMP,
   STATE_PRECISION, STEER_ACCEL, STEER_RATE_HIGH, STEER_RATE_LOW,
   STEER_RESPONSE, TOTAL_LAPS, TRACK_LEGS, TRACK_LENGTH, TRACK_WIDTH,
   WHEELBASE, YAW_RESPONSE, YAW_RETURN_RESPONSE, MAX_YAW_ACCEL,
@@ -143,10 +145,10 @@ function stepPlayerSubstep(player, input, dt) {
   p.rackVelocity = moveToward(p.rackVelocity, desiredRackVelocity, STEER_ACCEL * dt);
   p.rack = clamp(p.rack + p.rackVelocity * dt, -1, 1);
 
-  const effectAccel = p.boostTime > 0 ? 5.5 : p.starTime > 0 ? 2.2 : 0;
+  const effectAccel = p.boostTime > 0 ? 5.5 : 0;
   const longitudinal = input.accel * ACCEL + effectAccel - input.brake * BRAKE
     - COAST_DRAG - AERO_DRAG * p.speed * p.speed;
-  const effectMax = MAX_SPEED + (p.boostTime > 0 ? 5 : 0) + (p.starTime > 0 ? 2 : 0);
+  const effectMax = MAX_SPEED + (p.boostTime > 0 ? 5 : 0);
   const shrinkMul = p.shrinkTime > 0 ? 0.78 : 1;
   p.speed = clamp(p.speed + longitudinal * dt, 0, effectMax * shrinkMul);
 
@@ -201,10 +203,17 @@ function stepPlayerSubstep(player, input, dt) {
 
   const edge = Math.max(1.2, halfWidthAt(p.distance) - KART_RADIUS);
   if (Math.abs(p.lateral) > edge) {
-    p.lateral = clamp(p.lateral, -edge, edge);
-    p.heading *= -0.35;
-    p.yawRate *= 0.55;
-    p.speed *= OFFROAD_SPEED_MUL;
+    const side = Math.sign(p.lateral) || 1;
+    p.lateral = side * Math.max(0, edge - OFFROAD_EDGE_INSET);
+
+    // Recover continuously instead of flipping heading and removing 28% of
+    // speed on every simulation tick. The previous impulse caused the visible
+    // edge snap and left too little momentum to steer back onto the road.
+    const recoveryHeading = -side * OFFROAD_RECOVERY_ANGLE;
+    const response = 1 - Math.exp(-OFFROAD_RECOVERY_RESPONSE * dt);
+    p.heading += (recoveryHeading - p.heading) * response;
+    p.yawRate *= Math.exp(-OFFROAD_YAW_DAMP * dt);
+    p.speed *= Math.pow(OFFROAD_SPEED_MUL, dt);
   }
 
   p.lap = p.distance < 0 ? 0 : Math.min(TOTAL_LAPS, Math.floor(p.distance / TRACK_LENGTH) + 1);

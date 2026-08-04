@@ -1594,6 +1594,10 @@ export class Effects implements System {
         this.sparkleBurst(e.kart.position, e.kart.stats.color, 18);
         break;
 
+      case 'item-box-vanish':
+        this.sparkleBurst(e.position, C_GOLD, 28);
+        break;
+
       case 'coin':
         this.sparkleBurst(e.kart.position, C_GOLD, 12);
         break;

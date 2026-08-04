@@ -78,6 +78,25 @@ test('direct server joins, starts, reconnects, and rejects unsafe frames', { tim
   const joinedOne = await waitFor(() => one.messages.find((message) => message.type === 'joined'));
   await waitFor(() => two.messages.find((message) => message.type === 'joined'));
   assert.equal(joinedOne.payload.slot, 0);
+  await delay(5_200);
+  assert.equal(
+    one.messages.some((message) => message.payload?.phase === 'countdown'),
+    false,
+    'two racers must remain in the host-controlled waiting room',
+  );
+  send(two, 2, 'input', { action_type: 'lobby_ready', action_data: { ready: true } });
+  await waitFor(() => one.messages.find((message) => (
+    message.type === 'player_joined'
+    && message.payload.roster?.find((row) => row.user_id === 'two')?.ready === true
+  )));
+  send(two, 3, 'input', { action_type: 'lobby_start', action_data: {} });
+  await delay(100);
+  assert.equal(
+    one.messages.some((message) => message.payload?.phase === 'countdown'),
+    false,
+    'guest start must be ignored',
+  );
+  send(one, 2, 'input', { action_type: 'lobby_start', action_data: {} });
   await waitFor(() => one.messages.find(
     (message) => message.type === 'state_delta' && message.payload.phase === 'countdown',
   ), 8000);

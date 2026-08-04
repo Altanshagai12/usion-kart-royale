@@ -285,6 +285,7 @@ export type GameEvent =
   | { type: 'land'; kart: IKart; impact: number }
   | { type: 'collide'; kart: IKart; other: IKart | null; impulse: number }
   | { type: 'item-pickup'; kart: IKart }
+  | { type: 'item-box-vanish'; position: THREE.Vector3 }
   | { type: 'item-use'; kart: IKart; kind: ItemKind }
   | { type: 'hit'; kart: IKart; kind: ItemKind }
   | { type: 'lap'; kart: IKart; lap: number }

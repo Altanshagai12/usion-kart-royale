@@ -56,11 +56,18 @@ export async function validateAccessToken(token, { jwksUrl, serviceId }) {
   if (!payload.sub || !payload.room_id || !payload.session_id) {
     throw new Error('missing identity, room, or session claim');
   }
+  const signedPlayerIds = Array.isArray(payload.player_ids)
+    ? payload.player_ids.filter((id) => typeof id === 'string' && id.length > 0)
+    : [];
+  const signedHostId = typeof payload.host_id === 'string' && payload.host_id.length > 0
+    ? payload.host_id
+    : signedPlayerIds[0];
   return {
     sub: String(payload.sub),
     room_id: String(payload.room_id),
     session_id: String(payload.session_id),
     name: String(payload.name || payload.username || payload.sub),
+    ...(signedHostId ? { host_id: signedHostId } : {}),
   };
 }
 

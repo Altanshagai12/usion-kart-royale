@@ -1,5 +1,5 @@
 import {
-  AUTO_START_MS, COUNTDOWN_MS, KEYFRAME_EVERY_NET_TICKS, LONE_PLAYER_END_MS,
+  COUNTDOWN_MS, KEYFRAME_EVERY_NET_TICKS, LONE_PLAYER_END_MS,
   MAX_PLAYERS, MIN_PLAYERS, NET_EVERY_SIM_TICKS,
   RECONNECT_GRACE_MS, SESSION_SILENT_TIMEOUT_MS,
   SIM_DT_MS, SNAPSHOT_MAX_BYTES,
@@ -17,10 +17,12 @@ import { handlePlayerInput } from './input.js';
 const SWEEP_MS = 5000;
 
 export class Room {
-  constructor(roomId, { onDestroy }) {
+  constructor(roomId, { onDestroy, hostUserId = null }) {
     this.roomId = roomId;
     this.onDestroy = onDestroy;
     this.phase = 'waiting';
+    this.hostUserId = hostUserId;
+    this.hostWasPresent = false;
     this.players = [];
     this.connections = new Map();
     this.spectators = new Set();
@@ -33,8 +35,8 @@ export class Room {
     this.firstFinishAt = 0;
     this.loneSince = 0;
     this.items = createItemRuntime();
-    this.startTimer = null;
     this.tickTimer = null;
+    this.closeTimer = null;
     this.lastTickAt = 0;
     this.destroyed = false;
     this.sweep = setInterval(() => this.sweepConnections(), SWEEP_MS);
@@ -63,6 +65,8 @@ export class Room {
   roster() {
     return this.players.map((p) => ({
       slot: p.slot, user_id: p.userId, name: p.name, connected: p.connected,
+      ready: p.userId === this.hostUserId || p.ready === true,
+      is_host: p.userId === this.hostUserId,
     }));
   }
 
@@ -114,6 +118,7 @@ export class Room {
       existing.disconnectedAt = 0;
       existing.input = neutralInput();
       existing.ackIseq = 0;
+      if (existing.userId === this.hostUserId) this.hostWasPresent = true;
       this.sendJoined(conn, existing.slot, false);
       this.broadcast('player_joined', { roster: this.roster(), slot: existing.slot });
       return;
@@ -122,18 +127,18 @@ export class Room {
     const occupiedSlots = new Set(this.players.map((player) => player.slot));
     const freeSlot = Array.from({ length: MAX_PLAYERS }, (_, slot) => slot)
       .find((slot) => !occupiedSlots.has(slot));
-    const canRace = ['waiting', 'countdown'].includes(this.phase)
-      && freeSlot !== undefined;
+    const canRace = this.phase === 'waiting' && freeSlot !== undefined;
     if (canRace) {
       const player = createPlayer({
         slot: freeSlot, userId: conn.userId, name: conn.name,
       });
+      if (!this.hostUserId) this.hostUserId = conn.userId;
+      player.ready = player.userId === this.hostUserId;
+      if (player.ready) this.hostWasPresent = true;
       this.players.push(player);
       this.connections.set(conn.userId, conn);
       this.sendJoined(conn, player.slot, false);
       this.broadcast('player_joined', { roster: this.roster(), slot: player.slot });
-      this.armStart();
-      if (this.players.length === MAX_PLAYERS) this.startCountdown();
       return;
     }
 
@@ -154,22 +159,39 @@ export class Room {
     handlePlayerInput(this, conn, envelope);
   }
 
-  armStart() {
-    const connected = this.players.filter((p) => p.connected).length;
-    if (this.phase !== 'waiting' || connected < MIN_PLAYERS || this.startTimer) return;
-    this.startTimer = setTimeout(() => {
-      this.startTimer = null;
-      if (this.phase === 'waiting'
-          && this.players.filter((p) => p.connected).length >= MIN_PLAYERS) {
-        this.startCountdown();
-      }
-    }, AUTO_START_MS);
+  setReady(conn, ready) {
+    if (this.phase !== 'waiting') return false;
+    const player = this.players.find((candidate) => candidate.userId === conn.userId);
+    if (!player || !player.connected || player.userId === this.hostUserId) return false;
+    player.ready = ready === true;
+    this.broadcast('player_joined', { roster: this.roster(), slot: player.slot });
+    return true;
+  }
+
+  requestStart(conn) {
+    if (this.phase !== 'waiting' || conn.userId !== this.hostUserId) return false;
+    const connected = this.players.filter((player) => player.connected);
+    if (connected.length < MIN_PLAYERS) return false;
+    if (!connected.every((player) => player.userId === this.hostUserId || player.ready === true)) {
+      return false;
+    }
+    this.startCountdown();
+    return true;
+  }
+
+  closeWaiting(reason) {
+    if (this.phase !== 'waiting') return;
+    this.phase = 'finished';
+    // `match_end` is a standard Usion direct-protocol frame. Custom frame
+    // names are intentionally ignored by the SDK, so use the terminal frame
+    // to make host departure observable in both embedded and local clients.
+    this.broadcast('match_end', { reason, winner_ids: [], placements: [] });
+    this.closeTimer = setTimeout(() => this.destroy(), 100);
+    this.closeTimer.unref?.();
   }
 
   startCountdown() {
     if (this.phase !== 'waiting') return;
-    if (this.startTimer) clearTimeout(this.startTimer);
-    this.startTimer = null;
     this.phase = 'countdown';
     this.countdownMs = COUNTDOWN_MS;
     this.lastTickAt = performance.now();
@@ -264,7 +286,10 @@ export class Room {
     }
     if (this.phase === 'waiting') {
       this.players = this.players.filter((p) => p.connected || now - p.disconnectedAt < RECONNECT_GRACE_MS);
-      this.armStart();
+      if (this.hostWasPresent && !this.players.some((p) => p.userId === this.hostUserId)) {
+        this.closeWaiting('host_left');
+        return;
+      }
       if (this.connections.size === 0 && this.spectators.size === 0 && this.players.length === 0) {
         this.destroy();
       }
@@ -274,7 +299,7 @@ export class Room {
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
-    for (const timer of [this.startTimer, this.tickTimer]) {
+    for (const timer of [this.tickTimer, this.closeTimer]) {
       if (timer) clearTimeout(timer);
     }
     if (this.sweep) clearInterval(this.sweep);

@@ -18,6 +18,14 @@ export function handlePlayerInput(room, conn, envelope) {
   }
 
   const player = room.players.find((candidate) => candidate.userId === conn.userId);
+  if (type === 'lobby_ready') {
+    room.setReady(conn, data.ready === true);
+    return;
+  }
+  if (type === 'lobby_start') {
+    room.requestStart(conn);
+    return;
+  }
   if (!player || player.finished) return;
   if (type === 'use_item' && room.phase === 'playing') {
     const itemSeq = Number(data.item_seq);

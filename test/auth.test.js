@@ -45,6 +45,14 @@ test('RS256 access tokens enforce issuer, audience, service, and play permission
     session_id: 'session-1',
     name: 'Racer',
   });
+  const hosted = await validateAccessToken(await sign({
+    player_ids: ['user-host', 'user-1'],
+  }), { jwksUrl, serviceId });
+  assert.equal(hosted.host_id, 'user-host', 'only a signed room roster can declare the host');
+  const compactHost = await validateAccessToken(await sign({
+    host_id: 'user-host',
+  }), { jwksUrl, serviceId });
+  assert.equal(compactHost.host_id, 'user-host', 'a signed compact host claim declares authority');
   await assert.rejects(
     validateAccessToken(await sign({ permissions: ['spectate'] }), { jwksUrl, serviceId }),
     /play/,

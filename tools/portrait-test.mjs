@@ -47,6 +47,15 @@ try {
       const physicalY = rect.top + rect.height / 2;
       return { x: physicalY, y: window.innerWidth - physicalX };
     };
+    const logicalRect = (selector) => {
+      const rect = document.querySelector(selector).getBoundingClientRect();
+      return {
+        x: rect.top,
+        y: window.innerWidth - rect.right,
+        width: rect.height,
+        height: rect.width,
+      };
+    };
     return {
       logical,
       quality: window.__ctx.settings.quality,
@@ -58,6 +67,14 @@ try {
         left: logicalCenter('.tc-left'), right: logicalCenter('.tc-right'),
         brake: logicalCenter('.tc-brake'), gas: logicalCenter('.tc-gas'),
         drift: logicalCenter('.tc-drift'), item0: logicalCenter('[data-item-slot="0"]'),
+      },
+      speed: logicalRect('.kr-speed'),
+      itemRects: [0, 1, 2].map((slot) => logicalRect(`[data-item-slot="${slot}"]`)),
+      worldArt: {
+        slowDisc: window.__ctx.items.proj.art.get(3)?.geo?.name,
+        flyBall: window.__ctx.items.proj.art.get(4)?.geo?.name,
+        directSlowDisc: window.__ctx.items.directEntityMeshes.get(3)?.geometry?.name,
+        directFlyBall: window.__ctx.items.directEntityMeshes.get(4)?.geometry?.name,
       },
     };
   });
@@ -105,6 +122,13 @@ try {
   });
 
   const { logical, controls } = metrics;
+  const speedCenter = metrics.speed.x + metrics.speed.width / 2;
+  const itemRectsSeparate = metrics.itemRects.every((a, index) => (
+    metrics.itemRects.slice(index + 1).every((b) => (
+      a.x + a.width <= b.x || b.x + b.width <= a.x
+      || a.y + a.height <= b.y || b.y + b.height <= a.y
+    ))
+  ));
   const ok = logical.width === 844 && logical.height === 390
     && metrics.quality === 0
     && metrics.pixelRatio >= 1.45
@@ -114,6 +138,13 @@ try {
     && controls.left.y > logical.height * 0.6 && controls.right.y > logical.height * 0.6
     && controls.brake.x > logical.width * 0.7 && controls.gas.x > logical.width * 0.7
     && controls.drift.x > logical.width * 0.55 && controls.item0.x > logical.width * 0.55
+    && Math.abs(speedCenter - logical.width / 2) < logical.width * 0.08
+    && metrics.itemRects.every((rect) => rect.x > logical.width * 0.55)
+    && itemRectsSeparate
+    && metrics.worldArt.slowDisc === 'slow-disc-geometry'
+    && metrics.worldArt.flyBall === 'fly-ball-geometry'
+    && metrics.worldArt.directSlowDisc === 'slow-disc-geometry'
+    && metrics.worldArt.directFlyBall === 'fly-ball-geometry'
     && combined.steer > 0.5 && combined.brake === 1 && combined.drift
     && itemHit && itemEdgeHit.join(',') === 'false,true,false'
     && resized.logical.width === 800 && resized.logical.height === 360

@@ -48,7 +48,7 @@ test('legacy v1 snapshots normalize to an empty authoritative item state', () =>
 
 test('snapshot parser accepts exactly three item slots and derives the legacy view', () => {
   const snapshot = legacySnapshot();
-  snapshot.players[0].item_slots = [[0, 0, 0], [7, 1, 0.5], [2, 3, 0]];
+  snapshot.players[0].item_slots = [[0, 0, 0], [7, 1, 0.5], [3, 1, 0]];
   snapshot.players[0].item_slot_revisions = [2, 4, 6];
   const normalized = normalizeSnapshot(snapshot);
   assert.ok(normalized);
@@ -97,6 +97,22 @@ test('snapshot parser rejects malformed, non-finite, oversized, and unknown data
   };
   assert.equal(normalizeSnapshot(oversized), null);
   assert.equal(normalizeSnapshot({ ...legacySnapshot(), v: 2 }), null);
+});
+
+test('pickup events carry a bounded item-box id for anchored disappearance effects', () => {
+  const snapshot = legacySnapshot();
+  snapshot.items = {
+    box_down: [[7, 2.5]], entities: [],
+    events: [{ id: 1, type: 'pickup', slot: 0, kind: 1, box_id: 7 }],
+  };
+  assert.ok(normalizeSnapshot(snapshot));
+
+  for (const boxId of [undefined, -1, 64, 1.5, '7']) {
+    const malformed = structuredClone(snapshot);
+    if (boxId === undefined) delete malformed.items.events[0].box_id;
+    else malformed.items.events[0].box_id = boxId;
+    assert.equal(normalizeSnapshot(malformed), null);
+  }
 });
 
 test('snapshot parser bounds every authoritative item-effect duration', () => {

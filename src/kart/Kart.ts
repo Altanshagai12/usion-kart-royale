@@ -1286,8 +1286,7 @@ export class Kart implements IKart {
     const surfMax = grounded ? sus.maxSpeedMul : 1;
     const boosting = this.boostTime > 0;
     this.topSpeed =
-      BASE_TOP_SPEED * this.stats.topSpeedMul * surfMax * (boosting ? this.boostStrength : 1) *
-      (this.starTime > 0 ? 1.06 : 1);
+      BASE_TOP_SPEED * this.stats.topSpeedMul * surfMax * (boosting ? this.boostStrength : 1);
 
     const vf = fwdBefore;
     this.forwardSpeed = vf;
@@ -1381,7 +1380,6 @@ export class Kart implements IKart {
       let grip = SURFACE_PROPS[w.surface].gripMul;
       if (!w.front) grip *= rearGripMul;
       if (stunned) grip *= 0.45;
-      if (this.starTime > 0) grip *= 1.05;
 
       const res2 = solveTyre(
         res,

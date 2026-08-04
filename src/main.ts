@@ -194,10 +194,14 @@ async function boot() {
     `(${warm.objectsRevealed} hidden objects included) in ${warm.ms}ms`,
   );
 
-  // Deliberately NOT race.start(): the director already sits in RaceState.Menu,
-  // which is what puts the title screen and character select on screen. Booting
-  // straight into a countdown skipped the entire front end — it dated from the
-  // original scaffold, written before there was a front end to skip.
+  // Usion solo launches go straight into the local eight-kart race. The
+  // platform can later promote the running solo session through Share;
+  // onRoomAssigned then swaps it onto the authoritative multiplayer room.
+  if (multiplayer.takeSoloAutoStart()) race.reset();
+
+  // Standalone launches deliberately remain in RaceState.Menu so the title and
+  // character-select flow is preserved; only an explicit Usion solo launch
+  // takes the direct-to-race path above.
   bootProgress(1, 'ready');
 
   // Press R to record. Deliberately not a System: it owns no scene state and
