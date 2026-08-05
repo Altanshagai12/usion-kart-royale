@@ -28,7 +28,7 @@ page.on('request', (request) => {
   if (request.url().startsWith('https://usions.com/')) request.abort();
   else request.continue();
 });
-await page.goto(`http://127.0.0.1:${PORT}/?quality=low`, { waitUntil: 'domcontentloaded' });
+await page.goto(`http://127.0.0.1:${PORT}/?quality=low&prewarm=skip`, { waitUntil: 'domcontentloaded' });
 // Steering only needs the authored track and the kart. Waiting for
 // `__gameReady` also waits for the whole-world shader prewarm, which is both
 // irrelevant here and nondeterministically slow on CI's software renderer.

@@ -24,6 +24,10 @@ import { Audio } from './audio/Audio';
 import { DirectMultiplayer } from './net/DirectMultiplayer';
 
 const parent = document.getElementById('app')!;
+const skipDevelopmentPrewarm = Boolean(
+  (import.meta as ImportMeta & { env?: { DEV?: boolean } }).env?.DEV,
+)
+  && new URLSearchParams(location.search).get('prewarm') === 'skip';
 
 /**
  * The size the canvas will actually be displayed at, in CSS pixels.
@@ -187,12 +191,16 @@ async function boot() {
   // costs a moment of boot; not doing it costs a dropped frame mid-race every
   // time a new material first appears, which reads as the screen flashing black.
   bootProgress(systems.length / (systems.length + 1), 'compiling shaders');
-  await new Promise((r) => requestAnimationFrame(r));
-  const warm = await prewarm(ctx);
-  console.info(
-    `[prewarm] ${warm.programsBefore} -> ${warm.programsAfter} programs ` +
-    `(${warm.objectsRevealed} hidden objects included) in ${warm.ms}ms`,
-  );
+  if (skipDevelopmentPrewarm) {
+    console.info('[prewarm] skipped by development test harness');
+  } else {
+    await new Promise((r) => requestAnimationFrame(r));
+    const warm = await prewarm(ctx);
+    console.info(
+      `[prewarm] ${warm.programsBefore} -> ${warm.programsAfter} programs ` +
+      `(${warm.objectsRevealed} hidden objects included) in ${warm.ms}ms`,
+    );
+  }
 
   // Usion solo launches go straight into the local eight-kart race. The
   // platform can later promote the running solo session through Share;

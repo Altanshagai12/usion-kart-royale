@@ -64,7 +64,7 @@ try {
       else request.continue();
     });
     await page.goto(
-      `http://127.0.0.1:${port}/?multiplayer=1&room=browser-room&player=${player}&quality=low`,
+      `http://127.0.0.1:${port}/?multiplayer=1&room=browser-room&player=${player}&quality=low&prewarm=skip`,
       { waitUntil: 'domcontentloaded' },
     );
     return page;

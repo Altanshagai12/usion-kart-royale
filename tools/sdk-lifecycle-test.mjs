@@ -69,7 +69,7 @@ try {
     };
   });
 
-  await page.goto(`http://127.0.0.1:${PORT}/?quality=low`, { waitUntil: 'domcontentloaded' });
+  await page.goto(`http://127.0.0.1:${PORT}/?quality=low&prewarm=skip`, { waitUntil: 'domcontentloaded' });
   await page.waitForFunction('window.__gameReady === true', { timeout: 90_000 });
   const registration = await page.evaluate(() => ({
     events: window.__usionMock.events,
@@ -205,7 +205,7 @@ try {
       },
     };
   });
-  await soloPage.goto(`http://127.0.0.1:${PORT}/?quality=low`, { waitUntil: 'domcontentloaded' });
+  await soloPage.goto(`http://127.0.0.1:${PORT}/?quality=low&prewarm=skip`, { waitUntil: 'domcontentloaded' });
   await soloPage.waitForFunction('window.__gameReady === true', { timeout: 90_000 });
   const solo = await soloPage.evaluate(() => ({
     state: window.__ctx.race.state,
