@@ -353,6 +353,9 @@ export class Minimap {
       if (!this.tryBuild(ctx)) return;
       this.resize();
     }
+    // A portrait WebView can finish the logical landscape transform one frame
+    // after the HUD first builds. Do not permanently freeze a zero-size canvas.
+    if (this.w < 4 || this.h < 4) this.resize();
     const g = this.g;
     const W = this.w, H = this.h;
     if (W < 4) return;
@@ -362,7 +365,10 @@ export class Minimap {
     g.drawImage(this.base, 0, 0);
 
     const d = this.u;
-    const karts = ctx.race.karts;
+    // `standings` is all eight racers in solo, but only the authoritative room
+    // roster in direct multiplayer. The preallocated hidden bot karts must not
+    // leak back onto the map as anonymous dots.
+    const karts = ctx.race.standings;
     const player = ctx.race.player;
     const s = this.scratch;
     const n = karts.length;
@@ -429,12 +435,12 @@ export class Minimap {
       const i = order[oi];
       const k = karts[i];
       if (k === player) continue;
-      this.dot(g, px[i], py[i], rivalR, this.colors[i] || '#f2ece0', k.starTime > 0, d);
+      this.dot(g, px[i], py[i], rivalR, this.colors[k.id] || '#f2ece0', k.starTime > 0, d);
     }
 
     if (player) {
       const i = karts.indexOf(player);
-      this.playerMark(g, px[i], py[i], playerR, player, this.colors[i] || '#ff3b5c', d);
+      this.playerMark(g, px[i], py[i], playerR, player, this.colors[player.id] || '#ff3b5c', d);
     }
   }
 

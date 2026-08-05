@@ -46,8 +46,13 @@ export const YAW_RESPONSE = 5.5;
 /** Faster self-aligning response when the rack target returns to centre. */
 export const YAW_RETURN_RESPONSE = 10;
 export const MAX_YAW_ACCEL = 7;
-/** Tyre-grip envelope for the server-authoritative planar simulation, m/s^2. */
-export const MAX_LATERAL_ACCEL = 15;
+/**
+ * Tyre-grip envelope for the server-authoritative planar simulation, m/s^2.
+ * At 15, the tightest authored bend consumed almost all full-lock authority at
+ * top speed, leaving only 2.35 degrees/s to move back toward the apex. This
+ * restores a measured correction margin without changing rack acceleration.
+ */
+export const MAX_LATERAL_ACCEL = 18.5;
 /** Exponential tyre self-alignment once the player releases the steering. */
 export const HEADING_DAMP = 2;
 

@@ -264,6 +264,7 @@ export interface IRace extends System {
   /** completed lap times for the player, seconds */
   readonly lapTimes: number[];
   readonly standings: IKart[];
+  readonly directMultiplayer: boolean;
   start(): void;
   reset(): void;
   /**

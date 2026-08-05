@@ -91,6 +91,31 @@ try {
   }));
   await touch('touchEnd', []);
 
+  // Prove that the same portrait touch reaches the local Kart physics used by
+  // the default bot race, not only the direct-multiplayer predictor. Keep the
+  // simulation deterministic so headless renderer speed cannot weaken it.
+  await touch('touchStart', [right]);
+  await frames(4);
+  const localSteering = await page.evaluate(() => {
+    const ctx = window.__ctx;
+    const kart = ctx.race.player;
+    const Vec3 = kart.position.constructor;
+    ctx.race.state = 2;
+    ctx.race.autoDrive = false;
+    const sample = ctx.track.sample(0.05);
+    kart.placeAt(sample.pos.clone(), Math.atan2(sample.tangent.x, sample.tangent.z), 0.05);
+    kart.velocity.copy(kart.forward).multiplyScalar(18);
+    const origin = kart.position.clone();
+    const screenRight = kart.forward.clone().cross(new Vec3(0, 1, 0)).normalize();
+    const touchSteer = ctx.input.state.steer;
+    for (let i = 0; i < 60; i++) kart.step(ctx, 1 / 60, touchSteer, 1, 0, false);
+    return {
+      touchSteer,
+      lateral: kart.position.clone().sub(origin).dot(screenRight),
+    };
+  });
+  await touch('touchEnd', []);
+
   const item1Edge = await page.evaluate(() => {
     const rect = document.querySelector('[data-item-slot="1"]').getBoundingClientRect();
     return { x: rect.left + 1, y: rect.top + rect.height / 2, id: 5 };
@@ -146,11 +171,14 @@ try {
     && metrics.worldArt.directSlowDisc === 'slow-disc-geometry'
     && metrics.worldArt.directFlyBall === 'fly-ball-geometry'
     && combined.steer > 0.5 && combined.brake === 1 && combined.drift
+    && localSteering.touchSteer > 0.9 && localSteering.lateral > 3
     && itemHit && itemEdgeHit.join(',') === 'false,true,false'
     && resized.logical.width === 800 && resized.logical.height === 360
     && resized.pixelRatio >= 1
     && resized.buffer.width >= 800 && resized.buffer.height >= 360;
-  console.log(JSON.stringify({ ok, metrics, combined, itemHit, itemEdgeHit, resized }, null, 2));
+  console.log(JSON.stringify({
+    ok, metrics, combined, localSteering, itemHit, itemEdgeHit, resized,
+  }, null, 2));
   if (!ok) throw new Error('portrait sharpness/control-layout regression');
 } finally {
   await browser?.close();

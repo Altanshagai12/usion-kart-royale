@@ -57,7 +57,10 @@ try {
   });
   const pages = await Promise.all(['one', 'two'].map(async (player) => {
     const page = await browser.newPage();
-    await page.setViewport({ width: 800, height: 600 });
+    page.on('pageerror', (error) => console.error(`[browser:${player}] ${error.stack || error}`));
+    await page.setViewport({
+      width: 390, height: 844, isMobile: true, hasTouch: true, deviceScaleFactor: 1,
+    });
     await page.setRequestInterception(true);
     page.on('request', (request) => {
       if (request.url().startsWith('https://usions.com/')) request.abort();
@@ -100,9 +103,56 @@ try {
   await pages[hostIndex].waitForFunction('document.querySelector(".kr-lobby-action")?.disabled === false');
   await pages[hostIndex].evaluate(() => document.querySelector('.kr-lobby-action')?.click());
   await Promise.all(pages.map((page) => page.waitForFunction(
+    'window.__multiplayer.phase === "countdown" && window.__ctx.race.state === 1',
+    { timeout: 10_000 },
+  )));
+  await delay(300);
+  const countdownFacing = await Promise.all(pages.map((page) => page.evaluate(() => {
+    const ctx = window.__ctx;
+    const kart = ctx.race.player;
+    const view = ctx.camera.position.clone();
+    ctx.camera.getWorldDirection(view);
+    return {
+      trackAlignment: kart.forward.dot(ctx.track.sample(kart.t).tangent),
+      cameraBehind: ctx.camera.position.clone().sub(kart.position).dot(kart.forward),
+      viewAlignment: view.dot(kart.forward),
+    };
+  })));
+  for (const pose of countdownFacing) {
+    assert.ok(pose.trackAlignment > 0.9, `countdown heading reversed: ${pose.trackAlignment}`);
+    assert.ok(pose.cameraBehind < -1, `countdown camera is in front: ${pose.cameraBehind}`);
+    assert.ok(pose.viewAlignment > 0.7, `countdown camera looks backwards: ${pose.viewAlignment}`);
+  }
+  await Promise.all(pages.map((page) => page.waitForFunction(
     'window.__ctx.race.state === 2',
     { timeout: 20_000 },
   )));
+  await Promise.all(pages.map((page) => page.waitForFunction(() => {
+    const kart = window.__ctx.race.player;
+    return window.__ctx.camera.position.clone().sub(kart.position).dot(kart.forward) < -1;
+  }, { timeout: 10_000 })));
+  const startFacing = await Promise.all(pages.map((page) => page.evaluate(() => {
+    const kart = window.__ctx.race.player;
+    const tangent = window.__ctx.track.sample(kart.t).tangent;
+    return {
+      trackAlignment: kart.forward.dot(tangent),
+      cameraBehind: window.__ctx.camera.position.clone().sub(kart.position).dot(kart.forward),
+    };
+  })));
+  for (const pose of startFacing) {
+    assert.ok(pose.trackAlignment > 0.9, `start heading reversed: ${pose.trackAlignment}`);
+    assert.ok(pose.cameraBehind < -1, `start camera crossed in front: ${pose.cameraBehind}`);
+  }
+  const directRacerMembership = await Promise.all(pages.map((page) => page.evaluate(() => ({
+    standings: window.__ctx.race.standings.map((kart) => kart.id).sort((a, b) => a - b),
+    visible: window.__ctx.race.karts.filter((kart) => kart.object.visible)
+      .map((kart) => kart.id).sort((a, b) => a - b),
+    roster: window.__multiplayer.roster.map((row) => row.slot).sort((a, b) => a - b),
+  }))));
+  for (const replica of directRacerMembership) {
+    assert.deepEqual(replica.standings, replica.roster, 'minimap source is the authoritative roster');
+    assert.deepEqual(replica.visible, replica.roster, 'non-roster bot karts stay hidden');
+  }
   await Promise.all(pages.map((page) => page.evaluate(() => {
     window.__boxVanish = [];
     const original = window.__ctx.bus.emit.bind(window.__ctx.bus);
@@ -128,20 +178,52 @@ try {
   });
 
   await pages[0].keyboard.down('ArrowUp');
-  await pages[1].keyboard.down('ArrowUp');
-  await pages[1].keyboard.down('ArrowRight');
+  await pages[1].bringToFront();
+  const serverBeforeTouch = await pages[1].evaluate(() => {
+    const multiplayer = window.__multiplayer;
+    const slot = multiplayer.ownSlot;
+    return {
+      sequence: multiplayer.latest?.s ?? -1,
+      ack: multiplayer.latest?.ack?.[String(slot)] ?? -1,
+    };
+  });
+  if (!(await pages[1].$('.tc-right'))) {
+    await cdp.send('Input.dispatchTouchEvent', {
+      type: 'touchStart',
+      touchPoints: [{ x: 20, y: 20, id: 6, radiusX: 12, radiusY: 12, force: 1 }],
+    });
+    await delay(50);
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  }
+  await pages[1].waitForSelector('.tc-right', { timeout: 5000 });
+  const rightButton = await pages[1].evaluate(() => {
+    const rect = document.querySelector('.tc-right').getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  });
+  await cdp.send('Input.dispatchTouchEvent', {
+    type: 'touchStart',
+    touchPoints: [{ ...rightButton, id: 7, radiusX: 12, radiusY: 12, force: 1 }],
+  });
   await delay(900);
   const handlingProbe = await pages[1].evaluate(() => {
     const ctx = window.__ctx;
     const slot = window.__multiplayer.ownSlot;
     const kart = ctx.race.karts[slot];
     const predicted = window.__multiplayer.predictor?.view?.();
+    const latest = window.__multiplayer.latest;
+    const authoritative = latest?.players?.find((row) => row.slot === slot);
     const sample = ctx.track.sample(kart.t);
     const ground = ctx.track.probe(kart.position, kart.t);
     return {
-      authoritativeDistance: predicted?.distance ?? 0,
+      authoritativeDistance: authoritative?.distance ?? 0,
+      authoritativeLateral: authoritative?.lateral ?? 0,
+      authoritativeRack: authoritative?.rack ?? 0,
       renderTrackT: kart.t,
-      authoritativeHeading: predicted?.heading ?? 0,
+      authoritativeHeading: authoritative?.heading ?? 0,
+      serverSequence: latest?.s ?? -1,
+      serverAck: latest?.ack?.[String(slot)] ?? -1,
+      predictedHeading: predicted?.heading ?? 0,
+      touchSteer: ctx.input.state.steer,
       visualHeading: Math.atan2(
         kart.forward.dot(sample.binormal),
         kart.forward.dot(sample.tangent),
@@ -153,7 +235,7 @@ try {
       itemSnapshot: window.__multiplayer.latest?.items,
     };
   });
-  await pages[1].keyboard.up('ArrowRight');
+  await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
   // Keep the browser players on the road while they cross three item rows. A
   // fixed ArrowUp-only test eventually scrapes an edge on this curved circuit,
   // making inventory coverage depend on machine speed instead of netcode.
@@ -295,11 +377,24 @@ try {
     prediction: window.__multiplayer.predictor?.view?.(),
   }))));
   console.log(JSON.stringify({
-    viewOne, viewTwo, diagnostics, handlingProbe, itemReplicas, heldAfter,
+    viewOne, viewTwo, diagnostics, countdownFacing, startFacing, handlingProbe, itemReplicas, heldAfter,
   }, null, 2));
   assert.ok(
-    Math.abs(handlingProbe.authoritativeHeading) > 0.08,
-    'steering probe should create a measurable heading',
+    handlingProbe.touchSteer > 0.9,
+    `mobile touch did not deliver full steering: ${handlingProbe.touchSteer}`,
+  );
+  assert.ok(
+    handlingProbe.serverSequence > serverBeforeTouch.sequence
+      && handlingProbe.serverAck > serverBeforeTouch.ack,
+    `server did not acknowledge touch inputs: ${JSON.stringify({ serverBeforeTouch, handlingProbe })}`,
+  );
+  assert.ok(
+    handlingProbe.authoritativeRack > 0.75,
+    `server steering rack was too weak: ${handlingProbe.authoritativeRack}`,
+  );
+  assert.ok(
+    handlingProbe.authoritativeHeading > 0.3,
+    `mobile steering response was too weak: ${handlingProbe.authoritativeHeading}`,
   );
   assert.ok(
     Math.sign(handlingProbe.visualHeading) === Math.sign(handlingProbe.authoritativeHeading)
@@ -358,6 +453,8 @@ try {
   console.log(JSON.stringify({
     ok: true, lobbyBefore,
     adverseNetworkMs: 120,
+    countdownFacing,
+    startFacing,
     handlingProbe,
     views: [viewOne, viewTwo],
     items: { replicas: itemReplicas, heldAfter },

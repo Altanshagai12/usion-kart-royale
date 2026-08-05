@@ -67,8 +67,31 @@ test('full steering at race speed stays grip-limited and controllable', () => {
     peakLateralAccel <= MAX_LATERAL_ACCEL + 0.2,
     `lateral acceleration escaped grip limit: ${peakLateralAccel}`,
   );
-  assert.ok(Math.abs(state.lateral) < 4, `full lock crossed ${state.lateral}m in one second`);
+  assert.ok(
+    state.lateral > 4 && state.lateral < 5.5,
+    `full lock response escaped the usable window: ${state.lateral}m in one second`,
+  );
   assert.ok(state.speed > 14, 'a one-second turn must not slam the kart into the edge');
+});
+
+test('full steering retains correction authority in the tightest bend at top speed', () => {
+  let state = {
+    ...createPlayer({ slot: 0, userId: 'tight-left', name: 'Tight left' }),
+    distance: 1214,
+    lateral: 0,
+    speed: 30,
+  };
+  for (let i = 0; i < 60; i++) {
+    state = stepPlayer(state, { steer: -1, accel: 1 }, 1 / 60);
+  }
+  assert.ok(
+    state.heading < 0,
+    `full lock never overcame the bend's outward heading: ${state.heading}`,
+  );
+  assert.ok(
+    state.lateral < 1.8,
+    `full lock left the kart drifting outward by ${state.lateral}m`,
+  );
 });
 
 test('releasing steering settles the travel heading without an edge snap', () => {
