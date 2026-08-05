@@ -39,6 +39,7 @@ import { Items } from './Items';
 import type { DirectPlayerRow, DirectRosterRow, DirectSnapshot } from '../net/protocol';
 import { TRACK_LENGTH as DIRECT_TRACK_LENGTH } from '../../shared/constants.js';
 import { stepVergeRecovery } from '../../shared/roadside-recovery.js';
+import { applyDevilSteering } from '../../shared/item-effects.js';
 
 const ROSTER: KartStats[] = [
   { name: 'Vela',   color: new THREE.Color(0xff3b5c), accelMul: 1.00, topSpeedMul: 1.00, weightMul: 1.0,  handlingMul: 1.00 },
@@ -486,6 +487,8 @@ export class Race implements IRace {
         steer = o.steer; throttle = o.throttle; brake = o.brake; drift = o.drift;
         if (o.useItem) ctx.items.use(k, o.itemBackwards);
       }
+
+      steer = applyDevilSteering(steer, this.items?.devilActive(k) === true);
 
       p.effort = Math.max(throttle, brake);
 

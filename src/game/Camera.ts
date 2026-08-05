@@ -1325,12 +1325,13 @@ export class ChaseCamera implements System {
     if (mode === 'wide') { this.poseWide(ctx, k); return POSE_WIDE; }
     if (mode === 'close') { this.poseClose(ctx, k); return POSE_CLOSE; }
 
-    // In direct multiplayer the countdown is already the playable hand-off
-    // from the shared lobby. The solo grid fly-by swings almost 180 degrees
-    // around the kart and makes the authoritative launch look reversed. Keep
-    // the lens behind the local racer from the first countdown frame instead.
+    // In direct multiplayer the waiting room and countdown are one playable
+    // hand-off. Keep the lens behind the local racer throughout so entering the
+    // countdown cannot look like the kart suddenly reversed off the grid.
     if (ctx.race.directMultiplayer
-        && (state === RaceState.Countdown || state === RaceState.Racing)) {
+        && (state === RaceState.Menu
+          || state === RaceState.Countdown
+          || state === RaceState.Racing)) {
       this.introT = INTRO_DUR;
       this.prevState = state;
       return POSE_CHASE;

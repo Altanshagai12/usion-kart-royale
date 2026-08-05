@@ -56,7 +56,7 @@ const KART_RADIUS = 0.86;
 const WHEELBASE = DEFAULT_SUSPENSION.halfBase * 2;
 
 /** peak steering angle at a standstill, radians */
-const MAX_STEER = 0.55;
+const MAX_STEER = 0.53;
 /**
  * The rack is a single acceleration-limited steering authority. Speed reduces
  * its maximum travel rate, while the acceleration cap removes the instant
@@ -1505,7 +1505,7 @@ export class Kart implements IKart {
         // Steer toward the Ackermann yaw rate, but never past what the tyres
         // could actually hold — otherwise full lock at speed commands a corner
         // radius no amount of grip could produce and the kart pirouettes.
-        const maxYaw = (24 * gripBlend) / Math.max(5, Math.abs(fwdBefore));
+        const maxYaw = (23 * gripBlend) / Math.max(5, Math.abs(fwdBefore));
         const target = clamp((fwdBefore / WHEELBASE) * Math.tan(this.steerAngle), -maxYaw, maxYaw);
         // Gain 3.4, not 2.0. This term is what carries the nose through the
         // first tenth of a second of a turn, before the tyres have built a slip

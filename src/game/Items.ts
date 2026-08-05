@@ -60,7 +60,6 @@ const ARM_TIME = 1.05;
 const MUSHROOM_BOOST = 1.55;
 const MUSHROOM_STRENGTH = 1.3;
 const BOLT_TIME = 6.5;
-const BOLT_STUN = 0.65;
 
 /** rows of boxes around the lap, avoiding the boost strips */
 
@@ -873,6 +872,10 @@ export class Items implements IItems {
     return views;
   }
 
+  devilActive(kart: IKart): boolean {
+    return (this.slots.get(kart.id)?.shrink ?? 0) > 0;
+  }
+
   /**
    * What this kart is towing behind it, or `None`. Distinct from `held`: a
    * towed item is spent by *releasing* it, which is a different decision from
@@ -1011,9 +1014,6 @@ export class Items implements IItems {
     for (const k of this.karts) {
       if (k === user || k.finished) continue;
       if (k.starTime > 0) continue;
-      const before = k.stunTime;
-      k.squash(BOLT_STUN);
-      if (k.stunTime <= before) continue;   // invulnerable, nothing landed
       const s = this.slot(k);
       s.shrink = BOLT_TIME;
       // dropping whatever they were towing is half the point of the bolt

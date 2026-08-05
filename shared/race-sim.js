@@ -13,6 +13,7 @@ import {
 import {
   cloneItemSlots, createItemSlots, ensureItemSlots, syncLegacyItem,
 } from './item-inventory.js';
+import { applyDevilSteering } from './item-effects.js';
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 const moveToward = (v, target, d) => (
@@ -129,6 +130,7 @@ function stepPlayerSubstep(player, input, dt) {
   const p = { ...player };
   const stunned = p.stunTime > 0;
   if (stunned) input = neutralInput();
+  const effectiveSteer = applyDevilSteering(input.steer, p.shrinkTime > 0);
   for (const slot of ensureItemSlots(p)) slot.arm = Math.max(0, slot.arm - dt);
   syncLegacyItem(p);
   p.boostTime = Math.max(0, (p.boostTime || 0) - dt);
@@ -138,7 +140,7 @@ function stepPlayerSubstep(player, input, dt) {
   const speedMix = clamp(Math.abs(p.speed) / MAX_SPEED, 0, 1);
   const maxRackRate = STEER_RATE_LOW + (STEER_RATE_HIGH - STEER_RATE_LOW) * speedMix;
   const desiredRackVelocity = clamp(
-    (input.steer - p.rack) * STEER_RESPONSE,
+    (effectiveSteer - p.rack) * STEER_RESPONSE,
     -maxRackRate,
     maxRackRate,
   );
@@ -183,7 +185,7 @@ function stepPlayerSubstep(player, input, dt) {
   // while retaining the bicycle response at low speed and small steering input.
   const gripYawRate = MAX_LATERAL_ACCEL / Math.max(1, Math.abs(p.speed));
   const targetYawRate = clamp(bicycleYawRate, -gripYawRate, gripYawRate);
-  const yawResponse = Math.abs(input.steer) < 0.03
+  const yawResponse = Math.abs(effectiveSteer) < 0.03
     ? YAW_RETURN_RESPONSE
     : YAW_RESPONSE;
   p.yawRate += clamp(
@@ -194,7 +196,7 @@ function stepPlayerSubstep(player, input, dt) {
 
   const curvature = curvatureAt(p.distance);
   p.heading += (p.yawRate - curvature * p.speed) * dt;
-  if (Math.abs(input.steer) < 0.03) p.heading *= Math.exp(-HEADING_DAMP * dt);
+  if (Math.abs(effectiveSteer) < 0.03) p.heading *= Math.exp(-HEADING_DAMP * dt);
   p.heading = clamp(p.heading, -1.05, 1.05);
 
   const denom = Math.max(0.35, 1 - curvature * p.lateral);

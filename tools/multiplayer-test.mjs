@@ -118,30 +118,30 @@ try {
   await waitFor(() => pages[hostIndex].evaluate(() => (
     document.querySelector('.kr-lobby-action')?.disabled === false
   )), 60_000);
-  // Exercise the direct countdown camera deterministically. The server's 3.4s
-  // countdown is wall-clock based, while two SwiftShader pages can render less
-  // than one frame in that window on a shared CI runner. Waiting to sample the
-  // transient phase therefore tests machine speed, not the camera contract.
-  const countdownFacing = await Promise.all(pages.map((page) => page.evaluate(() => {
+  await waitFor(async () => {
+    const behind = await Promise.all(pages.map((page) => page.evaluate(() => {
+      const kart = window.__ctx.race.player;
+      return window.__ctx.camera.position.clone().sub(kart.position).dot(kart.forward) < -1;
+    })));
+    return behind.every(Boolean);
+  }, 60_000);
+  const waitingFacing = await Promise.all(pages.map((page) => page.evaluate(() => {
     const ctx = window.__ctx;
-    const previousState = ctx.race.state;
-    ctx.race.state = 1;
-    window.__camRig.lateUpdate(ctx, 1 / 60);
     const kart = ctx.race.player;
     const view = ctx.camera.position.clone();
     ctx.camera.getWorldDirection(view);
-    const pose = {
+    return {
       trackAlignment: kart.forward.dot(ctx.track.sample(kart.t).tangent),
       cameraBehind: ctx.camera.position.clone().sub(kart.position).dot(kart.forward),
       viewAlignment: view.dot(kart.forward),
+      cameraOffset: ctx.camera.position.clone().sub(kart.position).normalize().toArray(),
+      view: view.toArray(),
     };
-    ctx.race.state = previousState;
-    return pose;
   })));
-  for (const pose of countdownFacing) {
-    assert.ok(pose.trackAlignment > 0.9, `countdown heading reversed: ${pose.trackAlignment}`);
-    assert.ok(pose.cameraBehind < -1, `countdown camera is in front: ${pose.cameraBehind}`);
-    assert.ok(pose.viewAlignment > 0.7, `countdown camera looks backwards: ${pose.viewAlignment}`);
+  for (const pose of waitingFacing) {
+    assert.ok(pose.trackAlignment > 0.9, `waiting heading reversed: ${pose.trackAlignment}`);
+    assert.ok(pose.cameraBehind < -1, `waiting camera is in front: ${pose.cameraBehind}`);
+    assert.ok(pose.viewAlignment > 0.7, `waiting camera looks backwards: ${pose.viewAlignment}`);
   }
   const startDispatch = await pages[hostIndex].evaluate(() => {
     const multiplayer = window.__multiplayer;
@@ -195,6 +195,34 @@ try {
     throw new Error(`host start was not replicated: ${JSON.stringify({ startDispatch, replicas })}`, {
       cause: error,
     });
+  }
+  await waitFor(async () => {
+    const countdown = await Promise.all(pages.map((page) => page.evaluate(() => (
+      window.__ctx.race.state === 1
+    ))));
+    return countdown.every(Boolean);
+  }, 60_000);
+  const countdownFacing = await Promise.all(pages.map((page) => page.evaluate(() => {
+    const ctx = window.__ctx;
+    const kart = ctx.race.player;
+    const view = ctx.camera.position.clone();
+    ctx.camera.getWorldDirection(view);
+    return {
+      trackAlignment: kart.forward.dot(ctx.track.sample(kart.t).tangent),
+      cameraBehind: ctx.camera.position.clone().sub(kart.position).dot(kart.forward),
+      viewAlignment: view.dot(kart.forward),
+      cameraOffset: ctx.camera.position.clone().sub(kart.position).normalize().toArray(),
+      view: view.toArray(),
+    };
+  })));
+  const dot = (a, b) => a.reduce((sum, value, index) => sum + value * b[index], 0);
+  for (let i = 0; i < countdownFacing.length; i++) {
+    const pose = countdownFacing[i];
+    assert.ok(pose.trackAlignment > 0.9, `countdown heading reversed: ${pose.trackAlignment}`);
+    assert.ok(pose.cameraBehind < -1, `countdown camera is in front: ${pose.cameraBehind}`);
+    assert.ok(pose.viewAlignment > 0.7, `countdown camera looks backwards: ${pose.viewAlignment}`);
+    assert.ok(dot(waitingFacing[i].cameraOffset, pose.cameraOffset) > 0.8, 'camera crossed the kart at Start');
+    assert.ok(dot(waitingFacing[i].view, pose.view) > 0.8, 'view direction flipped at Start');
   }
   await waitFor(async () => {
     const racing = await Promise.all(pages.map((page) => page.evaluate(() => (

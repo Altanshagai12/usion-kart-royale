@@ -42,6 +42,39 @@ test('steering response is stable at 30, 60, and 120 Hz', () => {
   for (const row of results) assert.ok(Math.abs(row.rack) < 0.12, 'rack should recenter');
 });
 
+test('full steering is slightly softer without weakening rack response', () => {
+  const results = [30, 60, 120].map((hz) => {
+    let state = {
+      ...createPlayer({ slot: 0, userId: `calibration-${hz}`, name: 'Calibration' }),
+      lateral: 0,
+      speed: 20,
+    };
+    for (let i = 0; i < hz * 0.5; i++) {
+      state = stepPlayer(state, { steer: 1, accel: 0 }, 1 / hz);
+    }
+    return state;
+  });
+  const lateral = results.map((row) => row.lateral);
+  for (const row of results) {
+    assert.ok(row.rack > 0.9, `rack response weakened to ${row.rack}`);
+    assert.ok(row.lateral > 0.62 && row.lateral < 0.66, `turn escaped calibrated range: ${row.lateral}`);
+  }
+  assert.ok(Math.max(...lateral) - Math.min(...lateral) < 0.02, `lateral spread: ${lateral}`);
+});
+
+test('Devil mirrors authoritative steering with equal rack travel', () => {
+  const normal = createPlayer({ slot: 0, userId: 'normal', name: 'Normal' });
+  const devil = { ...createPlayer({ slot: 1, userId: 'devil', name: 'Devil' }), shrinkTime: 1 };
+  const normalLeft = stepPlayer(normal, { steer: -0.72, accel: 1, brake: 0, drift: false }, 1 / 60);
+  const devilRight = stepPlayer(devil, { steer: 0.72, accel: 1, brake: 0, drift: false }, 1 / 60);
+  assert.equal(devilRight.rack, normalLeft.rack);
+  assert.equal(devilRight.rackVelocity, normalLeft.rackVelocity);
+
+  const devilLeft = stepPlayer(devil, { steer: -0.72, accel: 1, brake: 0, drift: false }, 1 / 60);
+  assert.equal(devilLeft.rack, -devilRight.rack);
+  assert.equal(devilLeft.rackVelocity, -devilRight.rackVelocity);
+});
+
 test('small analog input stays proportional instead of snapping to full lock', () => {
   const gentle = run(60, [[0.6, 0.25]]).state;
   const full = run(60, [[0.6, 1]]).state;

@@ -37,7 +37,7 @@ export const OFFROAD_YAW_DAMP = 5.5;
 export const OFFROAD_EDGE_INSET = 0.04;
 
 export const WHEELBASE = 2.05;
-export const MAX_STEER_RAD = 0.48;
+export const MAX_STEER_RAD = 0.46;
 export const STEER_RESPONSE = 8;
 export const STEER_ACCEL = 26;
 export const STEER_RATE_LOW = 5.8;

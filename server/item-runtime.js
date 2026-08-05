@@ -89,7 +89,6 @@ export function useItemRuntime(runtime, player, players, backwards = false, requ
   } else if (kind === ITEM_KIND.BOLT) {
     for (const target of players) {
       if (target === player || target.finished || target.starTime > 0) continue;
-      target.stunTime = Math.max(target.stunTime, 0.65);
       target.shrinkTime = Math.max(target.shrinkTime, 6.5);
       target.speed *= 0.68;
       event(runtime, 'hit', target.slot, kind);

@@ -7,7 +7,9 @@ import {
 } from '../server/item-runtime.js';
 import { MAX_ITEM_ENTITIES } from '../shared/constants.js';
 import { syncLegacyItem } from '../shared/item-inventory.js';
-import { activateShield, SHIELD_SECONDS } from '../shared/item-effects.js';
+import {
+  activateShield, applyDevilSteering, SHIELD_SECONDS,
+} from '../shared/item-effects.js';
 
 function setItem(player, slot, kind, count = 1, arm = 0) {
   Object.assign(player.itemSlots[slot], { kind, count, arm });
@@ -98,8 +100,16 @@ test('authoritative item use consumes once and applies server effects', () => {
   assert.equal(useItemRuntime(runtime, user, [user, target], false, 1), true);
   assert.equal(user.itemSlots[0].count, 2, 'selected slot use leaves neighbours unchanged');
   assert.equal(user.itemSlots[1].kind, ITEM_KIND.NONE);
-  assert.ok(target.stunTime > 0);
+  assert.equal(target.stunTime, 0, 'Devil must not trigger the generic spin stun');
   assert.ok(target.shrinkTime > 0);
+});
+
+test('Devil reverses steering exactly without changing its magnitude', () => {
+  for (const steer of [-1, -0.72, -0.15, 0, 0.15, 0.72, 1]) {
+    assert.equal(applyDevilSteering(steer, true), -steer);
+    assert.equal(Math.abs(applyDevilSteering(steer, true)), Math.abs(steer));
+    assert.equal(applyDevilSteering(steer, false), steer);
+  }
 });
 
 test('consuming the last indexed item cannot resurrect it from the legacy view', () => {
