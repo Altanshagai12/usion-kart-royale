@@ -69,8 +69,10 @@ try {
     );
     return page;
   }));
+  // Multiplayer readiness is the initialized authoritative replica, not eight
+  // completed render frames; the latter makes two-page CI depend on SwiftShader.
   await Promise.all(pages.map((page) => page.waitForFunction(
-    'window.__gameReady === true && window.__ctx?.race?.directMultiplayer === true',
+    'window.__ctx?.race?.karts?.length >= 2 && window.__ctx.race.directMultiplayer === true',
     { timeout: 90_000 },
   )));
   await Promise.all(pages.map((page) => page.waitForSelector('.kr-lobby:not([hidden])')));
@@ -88,9 +90,15 @@ try {
   const guestIndex = lobbyBefore.findIndex((state) => !state.isHost);
   assert.ok(hostIndex >= 0 && guestIndex >= 0, 'server assigns one immutable waiting-room host');
   assert.equal(lobbyBefore[hostIndex].disabled, true, 'host waits until every guest is ready');
-  await pages[guestIndex].click('.kr-lobby-action');
+  const guestSlot = lobbyBefore[guestIndex].ownSlot;
+  await pages[guestIndex].evaluate(() => document.querySelector('.kr-lobby-action')?.click());
+  await Promise.all(pages.map((page) => page.waitForFunction(
+    (slot) => window.__multiplayer.roster.find((row) => row.slot === slot)?.ready === true,
+    { timeout: 30_000 },
+    guestSlot,
+  )));
   await pages[hostIndex].waitForFunction('document.querySelector(".kr-lobby-action")?.disabled === false');
-  await pages[hostIndex].click('.kr-lobby-action');
+  await pages[hostIndex].evaluate(() => document.querySelector('.kr-lobby-action')?.click());
   await Promise.all(pages.map((page) => page.waitForFunction(
     'window.__ctx.race.state === 2',
     { timeout: 20_000 },
