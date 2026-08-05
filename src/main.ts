@@ -24,8 +24,8 @@ import { Audio } from './audio/Audio';
 import { DirectMultiplayer } from './net/DirectMultiplayer';
 
 const parent = document.getElementById('app')!;
-const skipDevelopmentPrewarm = Boolean(
-  (import.meta as ImportMeta & { env?: { DEV?: boolean } }).env?.DEV,
+const skipDevelopmentPrewarm = (
+  location.hostname === '127.0.0.1' || location.hostname === 'localhost'
 )
   && new URLSearchParams(location.search).get('prewarm') === 'skip';
 
