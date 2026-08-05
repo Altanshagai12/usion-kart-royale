@@ -112,15 +112,6 @@
   background: radial-gradient(circle at 42% 30%, rgba(255,139,121,.4), rgba(104,34,31,.56) 72%);
   border-color: rgba(255,170,151,.68);
 }
-.tc-look {
-  right: 17vmin;
-  bottom: 22vmin;
-  width: 10vmin;
-  height: 10vmin;
-  border-radius: 50%;
-  opacity: .8;
-}
-
 /* The touch HUD has three deliberate anchors: steering on the left, the
    instrument at true centre, and the action fan on the right. `translate` is
    independent from `transform`, so the speedometer stays centred while its

@@ -403,7 +403,6 @@ export class Input implements IInput {
       drift = drift || t.drift;
       item = item || t.item;
       if (t.item) itemSlot = t.itemSlot;
-      look = look || t.look;
       pause = pause || this.pad.consumePause();
     }
 

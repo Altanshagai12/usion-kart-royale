@@ -62,6 +62,9 @@ try {
       pixelRatio: window.__ctx.renderer.getPixelRatio(),
       buffer: { width: canvas.width, height: canvas.height },
       blocker: !!document.querySelector('.tc-rotate'),
+      lookControl: !!document.querySelector('.tc-look, [data-btn="look"]'),
+      buttonIds: [...document.querySelectorAll('.tc-btn[data-btn]')]
+        .map((node) => node.dataset.btn).sort(),
       itemSlots: document.querySelectorAll('.kr-item-slot').length,
       controls: {
         left: logicalCenter('.tc-left'), right: logicalCenter('.tc-right'),
@@ -88,6 +91,7 @@ try {
     steer: window.__ctx.input.state.steer,
     brake: window.__ctx.input.state.brake,
     drift: window.__ctx.input.state.drift,
+    lookBack: window.__ctx.input.state.lookBack,
   }));
   await touch('touchEnd', []);
 
@@ -116,6 +120,13 @@ try {
   });
   await touch('touchEnd', []);
 
+  await page.keyboard.down('q');
+  await frames(4);
+  const keyboardLookHeld = await page.evaluate(() => window.__ctx.input.state.lookBack);
+  await page.keyboard.up('q');
+  await frames(4);
+  const keyboardLookReleased = await page.evaluate(() => window.__ctx.input.state.lookBack);
+
   const item1Edge = await page.evaluate(() => {
     const rect = document.querySelector('[data-item-slot="1"]').getBoundingClientRect();
     return { x: rect.left + 1, y: rect.top + rect.height / 2, id: 5 };
@@ -143,6 +154,9 @@ try {
       logical: { width: window.__ctx.width, height: window.__ctx.height },
       buffer: { width: canvas.width, height: canvas.height },
       pixelRatio: window.__ctx.renderer.getPixelRatio(),
+      lookControl: !!document.querySelector('.tc-look, [data-btn="look"]'),
+      buttonIds: [...document.querySelectorAll('.tc-btn[data-btn]')]
+        .map((node) => node.dataset.btn).sort(),
     };
   });
 
@@ -158,7 +172,9 @@ try {
     && metrics.quality === 0
     && metrics.pixelRatio >= 1.45
     && metrics.buffer.width >= logical.width && metrics.buffer.height >= logical.height
-    && !metrics.blocker && metrics.itemSlots === 3
+    && !metrics.blocker && !metrics.lookControl
+    && metrics.buttonIds.join(',') === 'brake,drift,gas,left,right'
+    && metrics.itemSlots === 3
     && controls.left.x < logical.width * 0.25 && controls.right.x < logical.width * 0.35
     && controls.left.y > logical.height * 0.6 && controls.right.y > logical.height * 0.6
     && controls.brake.x > logical.width * 0.7 && controls.gas.x > logical.width * 0.7
@@ -170,14 +186,18 @@ try {
     && metrics.worldArt.flyBall === 'fly-ball-geometry'
     && metrics.worldArt.directSlowDisc === 'slow-disc-geometry'
     && metrics.worldArt.directFlyBall === 'fly-ball-geometry'
-    && combined.steer > 0.5 && combined.brake === 1 && combined.drift
+    && combined.steer > 0.5 && combined.brake === 1 && combined.drift && !combined.lookBack
     && localSteering.touchSteer > 0.9 && localSteering.lateral > 3
+    && keyboardLookHeld && !keyboardLookReleased
     && itemHit && itemEdgeHit.join(',') === 'false,true,false'
     && resized.logical.width === 800 && resized.logical.height === 360
     && resized.pixelRatio >= 1
-    && resized.buffer.width >= 800 && resized.buffer.height >= 360;
+    && resized.buffer.width >= 800 && resized.buffer.height >= 360
+    && !resized.lookControl
+    && resized.buttonIds.join(',') === 'brake,drift,gas,left,right';
   console.log(JSON.stringify({
-    ok, metrics, combined, localSteering, itemHit, itemEdgeHit, resized,
+    ok, metrics, combined, localSteering, keyboardLookHeld, keyboardLookReleased,
+    itemHit, itemEdgeHit, resized,
   }, null, 2));
   if (!ok) throw new Error('portrait sharpness/control-layout regression');
 } finally {

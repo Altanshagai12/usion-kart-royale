@@ -98,11 +98,18 @@ try {
     action: document.querySelector('.kr-lobby-action')?.textContent,
     disabled: document.querySelector('.kr-lobby-action')?.disabled,
     ownSlot: window.__multiplayer.ownSlot,
+    lookControl: !!document.querySelector('.tc-look, [data-btn="look"]'),
+    touchButtons: [...document.querySelectorAll('.tc-btn[data-btn]')]
+      .map((node) => node.dataset.btn).sort(),
     isHost: window.__multiplayer.roster
       .find((row) => row.slot === window.__multiplayer.ownSlot)?.is_host === true,
   }))));
   assert.equal(lobbyBefore[0].roster.length, 2);
   assert.equal(lobbyBefore[1].roster.length, 2);
+  for (const state of lobbyBefore) {
+    assert.equal(state.lookControl, false, 'obsolete touch Look control must stay removed');
+    assert.deepEqual(state.touchButtons, ['brake', 'drift', 'gas', 'left', 'right']);
+  }
   const hostIndex = lobbyBefore.findIndex((state) => state.isHost);
   const guestIndex = lobbyBefore.findIndex((state) => !state.isHost);
   assert.ok(hostIndex >= 0 && guestIndex >= 0, 'server assigns one immutable waiting-room host');
@@ -130,18 +137,31 @@ try {
     const kart = ctx.race.player;
     const view = ctx.camera.position.clone();
     ctx.camera.getWorldDirection(view);
+    const sample = ctx.track.sample(kart.t);
+    const offset = ctx.camera.position.clone().sub(kart.position);
+    const behind = offset.dot(kart.forward);
+    const elevation = offset.dot(sample.normal);
+    const subject = kart.position.clone().addScaledVector(sample.normal, 0.55).project(ctx.camera);
     return {
       trackAlignment: kart.forward.dot(ctx.track.sample(kart.t).tangent),
-      cameraBehind: ctx.camera.position.clone().sub(kart.position).dot(kart.forward),
+      cameraBehind: behind,
       viewAlignment: view.dot(kart.forward),
-      cameraOffset: ctx.camera.position.clone().sub(kart.position).normalize().toArray(),
+      cameraOffset: offset.clone().normalize().toArray(),
       view: view.toArray(),
+      elevation,
+      elevationAngle: Math.atan2(elevation, -behind),
+      sideRatio: Math.abs(offset.dot(sample.binormal)) / Math.max(1, -behind),
+      subjectX: subject.x,
     };
   })));
   for (const pose of waitingFacing) {
     assert.ok(pose.trackAlignment > 0.9, `waiting heading reversed: ${pose.trackAlignment}`);
     assert.ok(pose.cameraBehind < -1, `waiting camera is in front: ${pose.cameraBehind}`);
     assert.ok(pose.viewAlignment > 0.7, `waiting camera looks backwards: ${pose.viewAlignment}`);
+    assert.ok(pose.elevation > 1.7 && pose.elevation < 2.5, `waiting camera elevation: ${pose.elevation}`);
+    assert.ok(pose.elevationAngle > 0.29 && pose.elevationAngle < 0.38, `waiting angle: ${pose.elevationAngle}`);
+    assert.ok(pose.sideRatio < 0.05, `waiting camera drifted sideways: ${pose.sideRatio}`);
+    assert.ok(Math.abs(pose.subjectX) < 0.05, `waiting kart is off-centre: ${pose.subjectX}`);
   }
   const startDispatch = await pages[hostIndex].evaluate(() => {
     const multiplayer = window.__multiplayer;
@@ -207,12 +227,21 @@ try {
     const kart = ctx.race.player;
     const view = ctx.camera.position.clone();
     ctx.camera.getWorldDirection(view);
+    const sample = ctx.track.sample(kart.t);
+    const offset = ctx.camera.position.clone().sub(kart.position);
+    const behind = offset.dot(kart.forward);
+    const elevation = offset.dot(sample.normal);
+    const subject = kart.position.clone().addScaledVector(sample.normal, 0.55).project(ctx.camera);
     return {
       trackAlignment: kart.forward.dot(ctx.track.sample(kart.t).tangent),
-      cameraBehind: ctx.camera.position.clone().sub(kart.position).dot(kart.forward),
+      cameraBehind: behind,
       viewAlignment: view.dot(kart.forward),
-      cameraOffset: ctx.camera.position.clone().sub(kart.position).normalize().toArray(),
+      cameraOffset: offset.clone().normalize().toArray(),
       view: view.toArray(),
+      elevation,
+      elevationAngle: Math.atan2(elevation, -behind),
+      sideRatio: Math.abs(offset.dot(sample.binormal)) / Math.max(1, -behind),
+      subjectX: subject.x,
     };
   })));
   const dot = (a, b) => a.reduce((sum, value, index) => sum + value * b[index], 0);
@@ -221,6 +250,10 @@ try {
     assert.ok(pose.trackAlignment > 0.9, `countdown heading reversed: ${pose.trackAlignment}`);
     assert.ok(pose.cameraBehind < -1, `countdown camera is in front: ${pose.cameraBehind}`);
     assert.ok(pose.viewAlignment > 0.7, `countdown camera looks backwards: ${pose.viewAlignment}`);
+    assert.ok(pose.elevation > 1.7 && pose.elevation < 2.5, `countdown camera elevation: ${pose.elevation}`);
+    assert.ok(pose.elevationAngle > 0.29 && pose.elevationAngle < 0.38, `countdown angle: ${pose.elevationAngle}`);
+    assert.ok(pose.sideRatio < 0.05, `countdown camera drifted sideways: ${pose.sideRatio}`);
+    assert.ok(Math.abs(pose.subjectX) < 0.05, `countdown kart is off-centre: ${pose.subjectX}`);
     assert.ok(dot(waitingFacing[i].cameraOffset, pose.cameraOffset) > 0.8, 'camera crossed the kart at Start');
     assert.ok(dot(waitingFacing[i].view, pose.view) > 0.8, 'view direction flipped at Start');
   }

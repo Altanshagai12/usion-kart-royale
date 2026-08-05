@@ -87,10 +87,9 @@ const PIVOT_UP = 0.62;
  *  arm that grows to match holds the subject at a constant size in every shot. */
 const ARM_DIST = 5.6;
 const ARM_DIST_SPEED = 0.55;
-/** Metres above the pivot, i.e. ~1.8 m over the road. A chase camera that
- *  looks down is a map; this one runs level so the horizon sits near the
- *  middle of the frame and the road compresses toward it. */
-const ARM_HEIGHT = 1.15;
+/** Metres above the pivot, i.e. ~2.0 m over the road. Keep a shallow elevated
+ *  rear-chase angle rather than the steep top-down view of a map camera. */
+const ARM_HEIGHT = 1.40;
 const ARM_HEIGHT_SPEED = -0.22;
 /** Boost: the arm comes in and drops. Paired with FOV_BOOST — the field opens
  *  by the matching proportion, so the kart holds its size while the world

@@ -48,15 +48,32 @@ try {
   await touch('touchEnd', []);
   await frames(12);
   const released = await read();
+  const controls = await page.evaluate(() => ({
+    lookControl: !!document.querySelector('.tc-look, [data-btn="look"]'),
+    buttonIds: [...document.querySelectorAll('.tc-btn[data-btn]')]
+      .map((node) => node.dataset.btn).sort(),
+  }));
+  await page.keyboard.down('q');
+  await frames();
+  const keyboardLookHeld = (await read()).lookBack;
+  await page.keyboard.up('q');
+  await frames();
+  const keyboardLookReleased = (await read()).lookBack;
   const shots = join(root, 'shots', 'touch');
   mkdirSync(shots, { recursive: true });
   await page.screenshot({ path: join(shots, 'landscape-mobile-hud.png') });
   const slots = await page.$$eval('.kr-item-slot', (nodes) => nodes.length);
   const ok = rightDrift.steer > 0.5 && rightDrift.drift
-    && leftBrake.steer < -0.5 && leftBrake.brake === 1
+    && leftBrake.steer < -0.5 && leftBrake.brake === 1 && !leftBrake.lookBack
     && released.steer === 0 && !released.drift && released.brake === 0
+    && !controls.lookControl
+    && controls.buttonIds.join(',') === 'brake,drift,gas,left,right'
+    && keyboardLookHeld && !keyboardLookReleased
     && slots === 3;
-  console.log(JSON.stringify({ ok, rightDrift, leftBrake, released, slots }, null, 2));
+  console.log(JSON.stringify({
+    ok, rightDrift, leftBrake, released, controls,
+    keyboardLookHeld, keyboardLookReleased, slots,
+  }, null, 2));
   if (!ok) throw new Error('fixed touch controls regression');
 } finally {
   await browser.close();

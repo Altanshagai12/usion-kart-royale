@@ -9,13 +9,12 @@ export interface TouchState {
   item: boolean;
   /** exact visible inventory slot, -1 when no item button was pressed */
   itemSlot: number;
-  look: boolean;
   pause: boolean;
   steering: boolean;
   active: boolean;
 }
 
-type ButtonId = 'left' | 'right' | 'drift' | 'brake' | 'look' | 'gas'
+type ButtonId = 'left' | 'right' | 'drift' | 'brake' | 'gas'
   | 'item0' | 'item1' | 'item2';
 
 type Btn = {
@@ -28,7 +27,7 @@ type Btn = {
   r2: number;
 };
 
-const BASE_BUTTONS: ButtonId[] = ['left', 'right', 'drift', 'brake', 'look', 'gas'];
+const BASE_BUTTONS: ButtonId[] = ['left', 'right', 'drift', 'brake', 'gas'];
 
 /** Fixed, reference-style mobile controls with independent multi-touch claims. */
 export class TouchControls {
@@ -39,7 +38,6 @@ export class TouchControls {
     drift: false,
     item: false,
     itemSlot: -1,
-    look: false,
     pause: false,
     steering: false,
     active: false,
@@ -106,7 +104,7 @@ export class TouchControls {
     this.free.clear();
     Object.assign(this.state, {
       steer: 0, accel: 0, brake: 0, drift: false, item: false,
-      itemSlot: -1, look: false, steering: false, active: false,
+      itemSlot: -1, steering: false, active: false,
     });
   }
 
@@ -220,7 +218,6 @@ export class TouchControls {
     state.brake = pressed('brake') ? 1 : 0;
     const gas = pressed('gas');
     state.accel = this.auto ? (state.brake > 0 ? 0 : 1) : gas ? 1 : 0;
-    state.look = pressed('look');
     state.itemSlot = itemSlot;
     state.item = itemSlot >= 0;
     state.active = this.buttons.some((button) => button.pointer >= 0 || button.tapped);
@@ -244,7 +241,6 @@ const MARKUP = `
   <div class="tc-btn tc-right" data-btn="right" aria-label="Steer right"><i></i></div>
 </div>
 <div class="tc-action-cluster">
-  <div class="tc-btn tc-look" data-btn="look"><span>LOOK</span></div>
   <div class="tc-btn tc-brake" data-btn="brake"><span>BRAKE</span></div>
   <div class="tc-btn tc-gas" data-btn="gas"><span>GAS</span></div>
   <div class="tc-btn tc-drift" data-btn="drift"><span>DRIFT</span></div>
