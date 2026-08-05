@@ -23,8 +23,19 @@ const browser = await puppeteer.launch({
 });
 const page = await browser.newPage();
 await page.setViewport({ width: 800, height: 600 });
+await page.setRequestInterception(true);
+page.on('request', (request) => {
+  if (request.url().startsWith('https://usions.com/')) request.abort();
+  else request.continue();
+});
 await page.goto(`http://127.0.0.1:${PORT}/?quality=low`, { waitUntil: 'domcontentloaded' });
-await page.waitForFunction('window.__gameReady === true', { timeout: 90000 });
+// Steering only needs the authored track and the kart. Waiting for
+// `__gameReady` also waits for the whole-world shader prewarm, which is both
+// irrelevant here and nondeterministically slow on CI's software renderer.
+await page.waitForFunction(
+  'window.__ctx?.race?.player && typeof window.__ctx?.track?.sample === "function"',
+  { timeout: 90_000 },
+);
 
 const result = await page.evaluate(() => {
   const ctx = window.__ctx;
