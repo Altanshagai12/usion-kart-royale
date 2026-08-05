@@ -154,10 +154,13 @@ try {
     'window.__ctx.race.state === 2',
     { timeout: 60_000, polling: 50 },
   )));
-  await Promise.all(pages.map((page) => page.waitForFunction(() => {
-    const kart = window.__ctx.race.player;
-    return window.__ctx.camera.position.clone().sub(kart.position).dot(kart.forward) < -1;
-  }, { timeout: 10_000 })));
+  await waitFor(async () => {
+    const behind = await Promise.all(pages.map((page) => page.evaluate(() => {
+      const kart = window.__ctx.race.player;
+      return window.__ctx.camera.position.clone().sub(kart.position).dot(kart.forward) < -1;
+    })));
+    return behind.every(Boolean);
+  }, 60_000);
   const startFacing = await Promise.all(pages.map((page) => page.evaluate(() => {
     const kart = window.__ctx.race.player;
     const tangent = window.__ctx.track.sample(kart.t).tangent;
