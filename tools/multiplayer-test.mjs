@@ -61,6 +61,13 @@ try {
     await page.setViewport({
       width: 390, height: 844, isMobile: true, hasTouch: true, deviceScaleFactor: 1,
     });
+    // `hasTouch` updates viewport emulation, but some headless Linux builds do
+    // not expose maxTouchPoints to the document before first navigation. Set
+    // the CDP capability explicitly so production Input eagerly mounts its pad.
+    const emulation = await page.createCDPSession();
+    await emulation.send('Emulation.setTouchEmulationEnabled', {
+      enabled: true, maxTouchPoints: 5,
+    });
     await page.setRequestInterception(true);
     page.on('request', (request) => {
       if (request.url().startsWith('https://usions.com/')) request.abort();
@@ -215,7 +222,7 @@ try {
     await delay(50);
     await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
   }
-  await pages[1].waitForSelector('.tc-right', { timeout: 5000 });
+  await pages[1].waitForSelector('.tc-right', { timeout: 30_000 });
   const rightButton = await pages[1].evaluate(() => {
     const rect = document.querySelector('.tc-right').getBoundingClientRect();
     return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
