@@ -15,9 +15,16 @@ import {
 import { handlePlayerInput } from './input.js';
 
 const SWEEP_MS = 5000;
+export const JOIN_TIMEOUT_MS = 15_000;
+export const MAX_PENDING_CONNECTIONS = MAX_PLAYERS * 2;
 
 export class Room {
-  constructor(roomId, { onDestroy, hostUserId = null }) {
+  constructor(roomId, {
+    onDestroy,
+    hostUserId = null,
+    joinTimeoutMs = JOIN_TIMEOUT_MS,
+    maxPendingConnections = MAX_PENDING_CONNECTIONS,
+  }) {
     this.roomId = roomId;
     this.onDestroy = onDestroy;
     this.phase = 'waiting';
@@ -26,6 +33,9 @@ export class Room {
     this.players = [];
     this.connections = new Map();
     this.spectators = new Set();
+    this.pendingConnections = new Set();
+    this.joinTimeoutMs = joinTimeoutMs;
+    this.maxPendingConnections = maxPendingConnections;
     this.lastSessionId = null;
     this.snapSeq = 0;
     this.serverTick = 0;
@@ -108,6 +118,7 @@ export class Room {
   }
 
   join(conn) {
+    this.releasePending(conn);
     this.lastSessionId = conn.sessionId;
     const existing = this.players.find((p) => p.userId === conn.userId);
     if (existing) {
@@ -145,6 +156,30 @@ export class Room {
     conn.spectator = true;
     this.spectators.add(conn);
     this.sendJoined(conn, null, true);
+  }
+
+  attachPending(conn) {
+    if (this.destroyed || this.pendingConnections.size >= this.maxPendingConnections) {
+      this.send(conn, 'error', {
+        code: 'ROOM_JOIN_CAPACITY', message: 'Too many connections are waiting to join',
+      });
+      conn.ws.close(1013, 'Join capacity reached');
+      return false;
+    }
+    this.pendingConnections.add(conn);
+    conn.joinTimer = setTimeout(() => {
+      if (!this.pendingConnections.has(conn)) return;
+      this.send(conn, 'error', { code: 'JOIN_TIMEOUT', message: 'Join timed out' });
+      this.detach(conn, true);
+    }, this.joinTimeoutMs);
+    conn.joinTimer.unref?.();
+    return true;
+  }
+
+  releasePending(conn) {
+    this.pendingConnections.delete(conn);
+    if (conn.joinTimer) clearTimeout(conn.joinTimer);
+    conn.joinTimer = null;
   }
 
   sendJoined(conn, slot, spectator) {
@@ -266,22 +301,26 @@ export class Room {
   }
 
   detach(conn, close = false) {
-    if (this.spectators.delete(conn)) return;
-    if (this.connections.get(conn.userId) !== conn) return;
-    this.connections.delete(conn.userId);
-    const player = this.players.find((p) => p.userId === conn.userId);
-    if (player) {
-      player.connected = false;
-      player.disconnectedAt = Date.now();
-      player.input = neutralInput();
-      this.broadcast('player_left', { user_id: player.userId, slot: player.slot, roster: this.roster() });
+    this.releasePending(conn);
+    this.spectators.delete(conn);
+    if (this.connections.get(conn.userId) === conn) {
+      this.connections.delete(conn.userId);
+      const player = this.players.find((p) => p.userId === conn.userId);
+      if (player) {
+        player.connected = false;
+        player.disconnectedAt = Date.now();
+        player.input = neutralInput();
+        this.broadcast('player_left', { user_id: player.userId, slot: player.slot, roster: this.roster() });
+      }
     }
-    if (close) conn.ws.close();
+    if (close && conn.ws.readyState < 2) conn.ws.close();
   }
 
   sweepConnections() {
     const now = Date.now();
-    for (const conn of [...this.connections.values(), ...this.spectators]) {
+    for (const conn of [
+      ...this.connections.values(), ...this.spectators, ...this.pendingConnections,
+    ]) {
       if (now - conn.lastSeenMs > SESSION_SILENT_TIMEOUT_MS) conn.ws.close();
     }
     if (this.phase === 'waiting') {
@@ -290,7 +329,8 @@ export class Room {
         this.closeWaiting('host_left');
         return;
       }
-      if (this.connections.size === 0 && this.spectators.size === 0 && this.players.length === 0) {
+      if (this.connections.size === 0 && this.spectators.size === 0
+          && this.pendingConnections.size === 0 && this.players.length === 0) {
         this.destroy();
       }
     }
@@ -303,9 +343,15 @@ export class Room {
       if (timer) clearTimeout(timer);
     }
     if (this.sweep) clearInterval(this.sweep);
-    for (const conn of [...this.connections.values(), ...this.spectators]) conn.ws.close();
+    for (const conn of [
+      ...this.connections.values(), ...this.spectators, ...this.pendingConnections,
+    ]) {
+      this.releasePending(conn);
+      conn.ws.close();
+    }
     this.connections.clear();
     this.spectators.clear();
+    this.pendingConnections.clear();
     this.onDestroy(this.roomId);
   }
 }

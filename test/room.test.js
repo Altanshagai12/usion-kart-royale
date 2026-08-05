@@ -27,6 +27,68 @@ function connection(id, room) {
   };
 }
 
+test('authenticated connection keeps an empty room alive until its join frame arrives', () => {
+  let destroys = 0;
+  const room = new Room('pending-room', { onDestroy() { destroys += 1; } });
+  const conn = connection('slow-boot', room);
+  room.attachPending(conn);
+
+  room.sweepConnections();
+  assert.equal(room.destroyed, false);
+  assert.equal(destroys, 0);
+
+  room.join(conn);
+  assert.equal(room.pendingConnections.size, 0);
+  assert.equal(room.players[0].userId, 'slow-boot');
+  room.destroy();
+});
+
+test('pre-join leave closes and fully detaches the authenticated socket', () => {
+  const room = new Room('pending-leave-room', { onDestroy() {} });
+  const conn = connection('leaving', room);
+  room.attachPending(conn);
+
+  room.handleMessage(conn, { type: 'leave', seq: 1 });
+
+  assert.equal(conn.ws.readyState, 3);
+  assert.equal(room.pendingConnections.has(conn), false);
+  assert.equal(room.spectators.has(conn), false);
+  assert.equal(room.connections.has(conn.userId), false);
+  assert.equal(conn.joinTimer, null);
+  room.destroy();
+});
+
+test('heartbeat cannot extend the authenticated join deadline', async () => {
+  const room = new Room('pending-timeout-room', {
+    onDestroy() {}, joinTimeoutMs: 20,
+  });
+  const conn = connection('heartbeat-only', room);
+  room.attachPending(conn);
+  conn.lastSeenMs = Date.now();
+  room.handleMessage(conn, { type: 'heartbeat', seq: 1 });
+  await new Promise((resolve) => setTimeout(resolve, 35));
+
+  assert.equal(conn.ws.readyState, 3);
+  assert.equal(room.pendingConnections.has(conn), false);
+  assert.equal(conn.joinTimer, null);
+  room.destroy();
+});
+
+test('pending join capacity rejects excess authenticated sockets', () => {
+  const room = new Room('pending-cap-room', {
+    onDestroy() {}, maxPendingConnections: 1,
+  });
+  const first = connection('first-pending', room);
+  const excess = connection('excess-pending', room);
+
+  assert.equal(room.attachPending(first), true);
+  assert.equal(room.attachPending(excess), false);
+  assert.equal(room.pendingConnections.size, 1);
+  assert.equal(excess.ws.readyState, 3);
+  assert.equal(excess.joinTimer, undefined);
+  room.destroy();
+});
+
 test('unicast join and resync keyframes never consume broadcast sequence', () => {
   const room = new Room('seq-room', { onDestroy() {} });
   const conn = connection('one', room);

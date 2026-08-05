@@ -74,18 +74,25 @@ try {
       else request.continue();
     });
     await page.goto(
-      `http://127.0.0.1:${port}/?multiplayer=1&room=browser-room&player=${player}&quality=low&prewarm=skip`,
+      `http://127.0.0.1:${port}/?multiplayer=1&room=browser-room&player=${player}&quality=low&prewarm=skip&render=skip`,
       { waitUntil: 'domcontentloaded' },
     );
     return page;
   }));
   // Multiplayer readiness is the initialized authoritative replica, not eight
   // completed render frames; the latter makes two-page CI depend on SwiftShader.
-  await Promise.all(pages.map((page) => page.waitForFunction(
-    'window.__ctx?.race?.karts?.length >= 2 && window.__ctx.race.directMultiplayer === true',
-    { timeout: 90_000 },
-  )));
-  await Promise.all(pages.map((page) => page.waitForSelector('.kr-lobby:not([hidden])')));
+  await waitFor(async () => {
+    const ready = await Promise.all(pages.map((page) => page.evaluate(() => (
+      window.__ctx?.race?.karts?.length >= 2 && window.__ctx.race.directMultiplayer === true
+    ))));
+    return ready.every(Boolean);
+  }, 180_000);
+  await waitFor(async () => {
+    const visible = await Promise.all(pages.map((page) => page.evaluate(() => (
+      !!document.querySelector('.kr-lobby:not([hidden])')
+    ))));
+    return visible.every(Boolean);
+  }, 180_000);
   const lobbyBefore = await Promise.all(pages.map((page) => page.evaluate(() => ({
     roster: [...document.querySelectorAll('.kr-lobby-player')].map((row) => row.textContent),
     action: document.querySelector('.kr-lobby-action')?.textContent,
@@ -102,58 +109,99 @@ try {
   assert.equal(lobbyBefore[hostIndex].disabled, true, 'host waits until every guest is ready');
   const guestSlot = lobbyBefore[guestIndex].ownSlot;
   await pages[guestIndex].evaluate(() => document.querySelector('.kr-lobby-action')?.click());
-  await Promise.all(pages.map((page) => page.waitForFunction(
-    (slot) => window.__multiplayer.roster.find((row) => row.slot === slot)?.ready === true,
-    { timeout: 30_000 },
-    guestSlot,
-  )));
-  await pages[hostIndex].waitForFunction('document.querySelector(".kr-lobby-action")?.disabled === false');
+  await waitFor(async () => {
+    const ready = await Promise.all(pages.map((page) => page.evaluate((slot) => (
+      window.__multiplayer.roster.find((row) => row.slot === slot)?.ready === true
+    ), guestSlot)));
+    return ready.every(Boolean);
+  }, 60_000);
+  await waitFor(() => pages[hostIndex].evaluate(() => (
+    document.querySelector('.kr-lobby-action')?.disabled === false
+  )), 60_000);
   // Exercise the direct countdown camera deterministically. The server's 3.4s
   // countdown is wall-clock based, while two SwiftShader pages can render less
   // than one frame in that window on a shared CI runner. Waiting to sample the
   // transient phase therefore tests machine speed, not the camera contract.
-  const countdownFacing = await Promise.all(pages.map((page) => page.evaluate(() => (
-    new Promise((resolve) => {
-      const multiplayer = window.__multiplayer;
-      const previousPhase = multiplayer.phase;
-      const previousSnapshotPhase = multiplayer.latest.phase;
-      const previousCountdown = multiplayer.latest.countdown_ms;
-      multiplayer.phase = 'countdown';
-      multiplayer.latest.phase = 'countdown';
-      multiplayer.latest.countdown_ms = 3000;
-      // The production loop runs DirectMultiplayer, Race, then ChaseCamera
-      // before this later-registered callback reads the resulting lens pose.
-      requestAnimationFrame(() => {
-        const ctx = window.__ctx;
-        const kart = ctx.race.player;
-        const view = ctx.camera.position.clone();
-        ctx.camera.getWorldDirection(view);
-        const pose = {
-          trackAlignment: kart.forward.dot(ctx.track.sample(kart.t).tangent),
-          cameraBehind: ctx.camera.position.clone().sub(kart.position).dot(kart.forward),
-          viewAlignment: view.dot(kart.forward),
-        };
-        multiplayer.phase = previousPhase;
-        multiplayer.latest.phase = previousSnapshotPhase;
-        multiplayer.latest.countdown_ms = previousCountdown;
-        resolve(pose);
-      });
-    })
-  ))));
+  const countdownFacing = await Promise.all(pages.map((page) => page.evaluate(() => {
+    const ctx = window.__ctx;
+    const previousState = ctx.race.state;
+    ctx.race.state = 1;
+    window.__camRig.lateUpdate(ctx, 1 / 60);
+    const kart = ctx.race.player;
+    const view = ctx.camera.position.clone();
+    ctx.camera.getWorldDirection(view);
+    const pose = {
+      trackAlignment: kart.forward.dot(ctx.track.sample(kart.t).tangent),
+      cameraBehind: ctx.camera.position.clone().sub(kart.position).dot(kart.forward),
+      viewAlignment: view.dot(kart.forward),
+    };
+    ctx.race.state = previousState;
+    return pose;
+  })));
   for (const pose of countdownFacing) {
     assert.ok(pose.trackAlignment > 0.9, `countdown heading reversed: ${pose.trackAlignment}`);
     assert.ok(pose.cameraBehind < -1, `countdown camera is in front: ${pose.cameraBehind}`);
     assert.ok(pose.viewAlignment > 0.7, `countdown camera looks backwards: ${pose.viewAlignment}`);
   }
-  await pages[hostIndex].evaluate(() => document.querySelector('.kr-lobby-action')?.click());
-  await Promise.all(pages.map((page) => page.waitForFunction(
-    'window.__multiplayer.phase !== "waiting"',
-    { timeout: 30_000, polling: 50 },
-  )));
-  await Promise.all(pages.map((page) => page.waitForFunction(
-    'window.__ctx.race.state === 2',
-    { timeout: 60_000, polling: 50 },
-  )));
+  const startDispatch = await pages[hostIndex].evaluate(() => {
+    const multiplayer = window.__multiplayer;
+    const socket = multiplayer.localSocket;
+    const sent = [];
+    const original = socket.send;
+    socket.send = function capture(type, payload) {
+      sent.push(type);
+      return original.call(this, type, payload);
+    };
+    const action = document.querySelector('.kr-lobby-action');
+    const before = {
+      disabled: action?.disabled,
+      phase: multiplayer.phase,
+      connection: multiplayer.connection,
+      socketReady: socket.socket?.readyState,
+      sequence: socket.sequence,
+    };
+    action?.click();
+    const after = { sequence: socket.sequence };
+    socket.send = original;
+    return { before, after, sent };
+  });
+  assert.deepEqual({
+    disabled: startDispatch.before.disabled,
+    phase: startDispatch.before.phase,
+    connection: startDispatch.before.connection,
+  }, { disabled: false, phase: 'waiting', connection: 'connected' });
+  assert.equal(startDispatch.before.socketReady, 1, 'host WebSocket must be open before start');
+  assert.deepEqual(startDispatch.sent, ['lobby_start'], 'host button must dispatch one start frame');
+  assert.equal(
+    startDispatch.after.sequence,
+    startDispatch.before.sequence + 1,
+    'lobby_start must enter the open WebSocket envelope',
+  );
+  try {
+    await waitFor(async () => {
+      const started = await Promise.all(pages.map((page) => page.evaluate(() => (
+        window.__multiplayer.phase !== 'waiting'
+      ))));
+      return started.every(Boolean);
+    }, 60_000);
+  } catch (error) {
+    const replicas = await Promise.all(pages.map((page) => page.evaluate(() => ({
+      phase: window.__multiplayer.phase,
+      connection: window.__multiplayer.connection,
+      socketReady: window.__multiplayer.localSocket?.socket?.readyState,
+      roster: window.__multiplayer.roster,
+      snapshotRoster: window.__multiplayer.latest?.roster,
+    }))));
+    throw new Error(`host start was not replicated: ${JSON.stringify({ startDispatch, replicas })}`, {
+      cause: error,
+    });
+  }
+  await waitFor(async () => {
+    const racing = await Promise.all(pages.map((page) => page.evaluate(() => (
+      window.__ctx.race.state === 2
+    ))));
+    return racing.every(Boolean);
+  }, 120_000);
   await waitFor(async () => {
     const behind = await Promise.all(pages.map((page) => page.evaluate(() => {
       const kart = window.__ctx.race.player;
@@ -225,7 +273,7 @@ try {
     await delay(50);
     await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
   }
-  await pages[1].waitForSelector('.tc-right', { timeout: 30_000 });
+  await waitFor(() => pages[1].evaluate(() => !!document.querySelector('.tc-right')), 60_000);
   const rightButton = await pages[1].evaluate(() => {
     const rect = document.querySelector('.tc-right').getBoundingClientRect();
     return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };

@@ -24,10 +24,14 @@ import { Audio } from './audio/Audio';
 import { DirectMultiplayer } from './net/DirectMultiplayer';
 
 const parent = document.getElementById('app')!;
-const skipDevelopmentPrewarm = (
+const developmentLoopback = (
   location.hostname === '127.0.0.1' || location.hostname === 'localhost'
-)
-  && new URLSearchParams(location.search).get('prewarm') === 'skip';
+);
+const developmentParams = new URLSearchParams(location.search);
+const skipDevelopmentPrewarm = developmentLoopback
+  && developmentParams.get('prewarm') === 'skip';
+const skipDevelopmentRender = developmentLoopback
+  && developmentParams.get('render') === 'skip';
 
 /**
  * The size the canvas will actually be displayed at, in CSS pixels.
@@ -155,6 +159,13 @@ const systems: System[] = [
   pipeline, input, multiplayer, sky, materials, track, scenery, race, items, effects, camera, hud, audio,
   drawBudget,
 ];
+// The loopback contract harness initializes the complete production world, but
+// only advances systems that own the behavior under test. This keeps two
+// software-rendered pages from starving WebSocket delivery while still running
+// the real input, authoritative replica, item, camera and HUD implementations.
+const frameSystems: System[] = skipDevelopmentRender
+  ? [input, multiplayer, race, items, camera, hud]
+  : systems;
 
 /** Human-readable names for the boot progress readout, indexed with `systems`. */
 const SYSTEM_LABELS = [
@@ -177,7 +188,13 @@ async function boot() {
     // Yield to the compositor so the bar actually repaints between steps —
     // without this the whole loop runs inside one frame and the player sees a
     // frozen bar, which looks worse than no bar at all.
-    await new Promise((r) => requestAnimationFrame(r));
+    // The secure loopback development harness also skips these cosmetic boot
+    // repaints, so CI readiness does not depend on SwiftShader producing one
+    // frame per subsystem inside a timeout. Production still animates every
+    // progress step exactly as before.
+    if (!skipDevelopmentPrewarm) {
+      await new Promise((r) => requestAnimationFrame(r));
+    }
     await systems[i].init?.(ctx);
   }
   frameWatch.init(ctx);
@@ -215,7 +232,7 @@ async function boot() {
   // Press R to record. Deliberately not a System: it owns no scene state and
   // must keep working while the game is paused or on a menu.
   new Recorder().install();
-  requestAnimationFrame(frame);
+  scheduleFrame();
   (window as any).__gameReady = false;
 }
 
@@ -302,8 +319,16 @@ function sceneDrawCalls(): number {
 }
 
 let last = performance.now();
+function scheduleFrame() {
+  if (skipDevelopmentRender) {
+    window.setTimeout(() => frame(performance.now()), 1000 / 30);
+  } else {
+    requestAnimationFrame(frame);
+  }
+}
+
 function frame(now: number) {
-  requestAnimationFrame(frame);
+  scheduleFrame();
 
   const raw = (now - last) / 1000;
   last = now;
@@ -328,8 +353,8 @@ function frame(now: number) {
 
   const t0 = performance.now();
 
-  for (const s of systems) s.update?.(ctx, dt);
-  for (const s of systems) s.lateUpdate?.(ctx, dt);
+  for (const s of frameSystems) s.update?.(ctx, dt);
+  for (const s of frameSystems) s.lateUpdate?.(ctx, dt);
 
   // The harness is entitled to a present on every frozen frame — retrying a
   // torn capture is the whole reason `__freeze` exists — and so are the first
@@ -339,7 +364,11 @@ function frame(now: number) {
   // Nothing usable can be presented onto a surface that is hidden or collapsed,
   // and attempting it is how a one-pixel buffer reaches the compositor. The
   // simulation keeps running; only the present is withheld.
-  if (!surfaceValid && maySkip) {
+  if (skipDevelopmentRender) {
+    // Contract/browser tests still run every update and lateUpdate (including
+    // physics, netcode, HUD, touch controls and camera), but do not ask a
+    // software GPU to rasterise two complete worlds on every polling frame.
+  } else if (!surfaceValid && maySkip) {
     // no present this frame
   } else if (skipRender > 0 && maySkip) {
     skipRender--;

@@ -167,6 +167,7 @@ wss.on('connection', (ws, request) => {
         rooms.set(identity.room_id, room);
       }
       conn.room = room;
+      if (!room.attachPending(conn)) return;
       authenticated = true;
       for (const message of buffered) route(message);
       buffered.length = 0;
