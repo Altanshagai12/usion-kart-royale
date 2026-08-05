@@ -134,10 +134,6 @@ try {
     });
     window.__usionMock.handlers.roomAssigned();
   });
-  await page.waitForFunction(
-    'window.__multiplayer.phase === "finished"',
-    { timeout: 5000 },
-  );
   const finished = await page.evaluate(() => ({
     phase: window.__multiplayer.phase,
     overlay: document.querySelector('.kr-network')?.textContent,
@@ -156,9 +152,9 @@ try {
     'Race finished',
   );
   await page.evaluate(() => window.__usionMock.handlers.finished({ reason: 'host_left' }));
-  await page.waitForFunction(
-    'document.querySelector(".kr-network")?.textContent === "Host left the room"',
-    { timeout: 5000 },
+  assert.equal(
+    await page.evaluate(() => document.querySelector('.kr-network')?.textContent),
+    'Host left the room',
   );
   await page.evaluate(() => window.__usionMock.handlers.connectionState('disconnected'));
   assert.equal(
