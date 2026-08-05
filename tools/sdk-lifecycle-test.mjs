@@ -230,8 +230,8 @@ try {
   await soloPage.evaluate(() => {
     window.__usionMock.handlers.roomAssigned({ roomId: 'shared-room' });
   });
-  await soloPage.waitForFunction('window.__usionMock.connects.length === 1');
   const promoted = await soloPage.evaluate(() => window.__usionMock.connects[0]);
+  assert.ok(promoted, 'roomAssigned must synchronously begin the direct-room connection');
   assert.equal(promoted.roomId, 'shared-room');
 
   console.log(JSON.stringify({ ok: true, registration, finished, solo, promoted }, null, 2));
