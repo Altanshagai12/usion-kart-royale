@@ -11,7 +11,9 @@ export function cloneItemSlots(player) {
 }
 
 export function ensureItemSlots(player) {
-  if (!Array.isArray(player.itemSlots) || player.itemSlots.length !== ITEM_SLOT_COUNT) {
+  const needsLegacyImport = !Array.isArray(player.itemSlots)
+    || player.itemSlots.length !== ITEM_SLOT_COUNT;
+  if (needsLegacyImport) {
     player.itemSlots = createItemSlots();
   }
   for (let i = 0; i < ITEM_SLOT_COUNT; i++) {
@@ -23,9 +25,10 @@ export function ensureItemSlots(player) {
       revision: Number.isSafeInteger(raw.revision) && raw.revision >= 0 ? raw.revision : 0,
     };
   }
-  // Rolling compatibility for tests/old state that only carried the legacy
-  // single-item fields. Once any real slot exists, the indexed inventory wins.
-  if (!player.itemSlots.some((slot) => slot.kind > 0)
+  // Import only state that never had indexed slots. An existing three-slot
+  // inventory stays authoritative even when empty, so a consumed final item
+  // cannot be resurrected from the stale legacy mirror.
+  if (needsLegacyImport
       && Number.isSafeInteger(player.itemKind) && player.itemKind > 0 && player.itemKind <= 8) {
     player.itemSlots[0] = {
       kind: player.itemKind,

@@ -102,6 +102,19 @@ test('authoritative item use consumes once and applies server effects', () => {
   assert.ok(target.shrinkTime > 0);
 });
 
+test('consuming the last indexed item cannot resurrect it from the legacy view', () => {
+  const runtime = createItemRuntime(17);
+  const player = createPlayer({ slot: 0, userId: 'shield', name: 'shield' });
+  setItem(player, 0, ITEM_KIND.STAR);
+
+  assert.equal(useItemRuntime(runtime, player, [player], false, 0), true);
+  assert.equal(player.itemSlots.every((item) => item.kind === ITEM_KIND.NONE), true);
+  assert.equal(player.itemKind, ITEM_KIND.NONE);
+  syncLegacyItem(player);
+  assert.equal(player.itemSlots.every((item) => item.kind === ITEM_KIND.NONE), true);
+  assert.equal(player.itemKind, ITEM_KIND.NONE);
+});
+
 test('Shield is pure damage immunity and never changes speed or boost state', () => {
   const target = createPlayer({ slot: 0, userId: 'shield', name: 'shield' });
   target.speed = 17;

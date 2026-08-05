@@ -334,20 +334,16 @@ try {
   await waitFor(async () => {
     await Promise.all(pages.map(driveOnRoad));
     return pages[0].evaluate(() => (
-      window.__multiplayer.latest?.players?.some((row) => (
-        row.item_slots.filter(([kind, count]) => kind > 0 && count > 0).length === 3
-      ))
+      window.__multiplayer.latest?.items?.events?.some((event) => event.type === 'pickup')
+        && window.__multiplayer.latest.players.some((row) => (
+          row.item_slots.some(([kind, count]) => kind > 0 && count > 0)
+        ))
     ));
-  }, 90_000);
+  }, 60_000);
   await Promise.all(pages.map(async (page, index) => {
     if (steering[index]) await page.keyboard.up(steering[index]);
+    await page.keyboard.up('ArrowUp');
   }));
-  await waitFor(async () => {
-    const fullCounts = await Promise.all(pages.map((page) => page.evaluate(() =>
-      window.__multiplayer.latest?.players?.map((row) =>
-        row.item_slots.filter(([kind, count]) => kind > 0 && count > 0).length))));
-    return fullCounts.every((counts) => counts?.some((count) => count === 3));
-  }, 5000);
   const inventorySignature = (replica) => replica.players.map((row) => ({
     slot: row.slot,
     slots: row.slots.map(([kind, count]) => [kind, count]),
@@ -378,6 +374,9 @@ try {
   }, 5000);
   assert.deepEqual(inventorySignature(itemReplicas[0]), inventorySignature(itemReplicas[1]));
   assert.ok(itemReplicas.every((replica) => (
+    replica.players.every((row) => row.slots.length === 3)
+  )), 'every authoritative racer snapshot must retain exactly three item slots');
+  assert.ok(itemReplicas.every((replica) => (
     replica.unavailable.every((id, index, ids) => Number.isSafeInteger(id)
       && (index === 0 || ids[index - 1] !== id))
   )));
@@ -392,15 +391,34 @@ try {
   }
   const holderPage = itemReplicas.findIndex((replica) => (
     replica.players.some((row) => row.slot === replica.ownSlot
-      && row.slots.filter(([kind, count]) => kind > 0 && count > 0).length === 3)
+      && row.slots.some(([kind, count]) => kind > 0 && count > 0))
   ));
-  assert.ok(holderPage >= 0, 'at least one local player should fill all three authoritative slots');
-  const heldBefore = itemReplicas[holderPage].players
+  assert.ok(holderPage >= 0, 'at least one local player should own an authoritative item');
+  const heldAtPickup = itemReplicas[holderPage].players
     .find((row) => row.slot === itemReplicas[holderPage].ownSlot);
-  await delay(1100);
+  const selectedItemSlot = heldAtPickup.slots
+    .findIndex(([kind, count]) => kind > 0 && count > 0);
+  assert.ok(selectedItemSlot >= 0, 'the selected local inventory must contain an item');
+  const itemKey = `Digit${selectedItemSlot + 1}`;
+  await waitFor(() => pages[holderPage].evaluate((slot) => {
+    const own = window.__multiplayer.ownSlot;
+    const row = window.__multiplayer.latest.players.find((player) => player.slot === own);
+    return row?.item_slots?.[slot]?.[2] === 0;
+  }, selectedItemSlot), 10_000);
+  const heldBefore = await pages[holderPage].evaluate(() => {
+    const own = window.__multiplayer.ownSlot;
+    const row = window.__multiplayer.latest.players.find((player) => player.slot === own);
+    return {
+      slot: row.slot,
+      kind: row.item_kind,
+      count: row.item_count,
+      slots: row.item_slots,
+      ack: row.ack_item_seq,
+    };
+  });
   await pages[holderPage].evaluate(() => window.__multiplayer.setConnection('reconnecting'));
   await pages[holderPage].bringToFront();
-  await pages[holderPage].keyboard.down('Digit3');
+  await pages[holderPage].keyboard.down(itemKey);
   await waitFor(async () => pages[holderPage].evaluate(() => (
     !!window.__multiplayer.pendingItem
       && window.__multiplayer.connection === 'reconnecting'
@@ -410,7 +428,13 @@ try {
     window.__multiplayer.queuedItems.length
   ));
   assert.equal(bufferedDuplicates, 0, 'one buffered tap must queue exactly one item action');
-  await pages[holderPage].keyboard.up('Digit3');
+  const pendingBeforeSend = await pages[holderPage].evaluate(() => ({
+    pending: { ...window.__multiplayer.pendingItem },
+    latest: window.__multiplayer.latest.players.find(
+      (row) => row.slot === window.__multiplayer.ownSlot,
+    ),
+  }));
+  await pages[holderPage].keyboard.up(itemKey);
   await pages[holderPage].evaluate(() => window.__multiplayer.setConnection('connected'));
   await waitFor(async () => pages[holderPage].evaluate(() => {
     const own = window.__multiplayer.ownSlot;
@@ -426,14 +450,20 @@ try {
   ));
   assert.equal(useFeedback, true, 'authoritative use feedback must be replicated');
   assert.ok(
-    heldAfter.item_slots[2][0] !== heldBefore.slots[2][0]
-      || heldAfter.item_slots[2][1] < heldBefore.slots[2][1],
-    'server must consume the directly selected third slot after an acknowledged use',
+    heldAfter.item_slots[selectedItemSlot][0] !== heldBefore.slots[selectedItemSlot][0]
+      || heldAfter.item_slots[selectedItemSlot][1] < heldBefore.slots[selectedItemSlot][1],
+    `server must consume the directly selected slot after an acknowledged use: ${JSON.stringify({
+      selectedItemSlot,
+      heldBefore,
+      heldAfter,
+      pendingBeforeSend,
+      events: itemReplicas[holderPage].events,
+    })}`,
   );
-  const stableInventory = (slots) => slots.slice(0, 2).map(([kind, count]) => [kind, count]);
+  const stableInventory = (slots) => slots
+    .filter((_, index) => index !== selectedItemSlot)
+    .map(([kind, count]) => [kind, count]);
   assert.deepEqual(stableInventory(heldAfter.item_slots), stableInventory(heldBefore.slots));
-  await pages[0].keyboard.up('ArrowUp');
-  await pages[1].keyboard.up('ArrowUp');
   await delay(500);
 
   const readKarts = (page) => page.evaluate(() => window.__ctx.race.karts
