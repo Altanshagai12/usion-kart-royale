@@ -26,7 +26,7 @@ await page.setViewport({ width: 800, height: 600 });
 await page.goto(`http://127.0.0.1:${PORT}/?quality=low`, { waitUntil: 'domcontentloaded' });
 await page.waitForFunction('window.__gameReady === true', { timeout: 90000 });
 
-const result = await page.evaluate(async () => {
+const result = await page.evaluate(() => {
   const ctx = window.__ctx;
   const k = ctx.race.player;
   const Vec3 = k.position.constructor;
@@ -47,9 +47,10 @@ const result = await page.evaluate(async () => {
     // screen-right for a camera looking along f0 with world up
     const screenRight = f0.clone().cross(new Vec3(0, 1, 0)).normalize();
 
+    // This is a fixed-step physics test. Waiting for requestAnimationFrame here
+    // lets headless software rendering throttle the test for minutes in CI.
     for (let i = 0; i < 90; i++) {
       k.step(ctx, 1 / 60, steer, 1, 0, false);
-      await new Promise((r) => requestAnimationFrame(r));
     }
 
     const drift = k.position.clone().sub(p0);
