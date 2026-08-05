@@ -76,37 +76,49 @@ test('direct server joins, starts, reconnects, and rejects unsafe frames', { tim
   send(one, 1, 'join');
   send(two, 1, 'join');
   const joinedOne = await waitFor(() => one.messages.find((message) => message.type === 'joined'));
-  await waitFor(() => two.messages.find((message) => message.type === 'joined'));
-  assert.equal(joinedOne.payload.slot, 0);
+  const joinedTwo = await waitFor(() => two.messages.find((message) => message.type === 'joined'));
+  const roster = await waitFor(() => {
+    const updates = [...one.messages, ...two.messages].filter((message) => (
+      message.type === 'player_joined' && message.payload.roster?.length === 2
+    ));
+    return updates.length > 0 ? updates[updates.length - 1].payload.roster : null;
+  });
+  const hostUserId = roster.find((row) => row.is_host)?.user_id;
+  assert.ok(hostUserId === 'one' || hostUserId === 'two');
+  const host = hostUserId === 'one' ? one : two;
+  const guest = hostUserId === 'one' ? two : one;
+  const hostJoined = hostUserId === 'one' ? joinedOne : joinedTwo;
+  const guestUserId = hostUserId === 'one' ? 'two' : 'one';
+  assert.equal(hostJoined.payload.slot, 0);
   await delay(5_200);
   assert.equal(
-    one.messages.some((message) => message.payload?.phase === 'countdown'),
+    host.messages.some((message) => message.payload?.phase === 'countdown'),
     false,
     'two racers must remain in the host-controlled waiting room',
   );
-  send(two, 2, 'input', { action_type: 'lobby_ready', action_data: { ready: true } });
-  await waitFor(() => one.messages.find((message) => (
+  send(guest, 2, 'input', { action_type: 'lobby_ready', action_data: { ready: true } });
+  await waitFor(() => host.messages.find((message) => (
     message.type === 'player_joined'
-    && message.payload.roster?.find((row) => row.user_id === 'two')?.ready === true
+    && message.payload.roster?.find((row) => row.user_id === guestUserId)?.ready === true
   )));
-  send(two, 3, 'input', { action_type: 'lobby_start', action_data: {} });
+  send(guest, 3, 'input', { action_type: 'lobby_start', action_data: {} });
   await delay(100);
   assert.equal(
-    one.messages.some((message) => message.payload?.phase === 'countdown'),
+    host.messages.some((message) => message.payload?.phase === 'countdown'),
     false,
     'guest start must be ignored',
   );
-  send(one, 2, 'input', { action_type: 'lobby_start', action_data: {} });
-  await waitFor(() => one.messages.find(
+  send(host, 2, 'input', { action_type: 'lobby_start', action_data: {} });
+  await waitFor(() => host.messages.find(
     (message) => message.type === 'state_delta' && message.payload.phase === 'countdown',
   ), 8000);
 
-  const replacement = await openClient(`${base}dev:one:integration-room`);
+  const replacement = await openClient(`${base}dev:${hostUserId}:integration-room`);
   t.after(() => replacement.ws.close());
   send(replacement, 1, 'join');
   const rejoined = await waitFor(() => replacement.messages.find((message) => message.type === 'joined'));
   assert.equal(rejoined.payload.slot, 0);
-  await waitFor(() => one.ws.readyState === WebSocket.CLOSED);
+  await waitFor(() => host.ws.readyState === WebSocket.CLOSED);
 
   const badSequence = await openClient(`${base}dev:badseq:sequence-room`);
   t.after(() => badSequence.ws.close());
