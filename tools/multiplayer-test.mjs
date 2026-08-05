@@ -180,7 +180,12 @@ try {
         row.item_slots.filter(([kind, count]) => kind > 0 && count > 0).length))));
     return fullCounts.every((counts) => counts?.some((count) => count === 3));
   }, 5000);
-  const itemReplicas = await Promise.all(pages.map((page) => page.evaluate(() => ({
+  const inventorySignature = (replica) => replica.players.map((row) => ({
+    slot: row.slot,
+    slots: row.slots.map(([kind, count]) => [kind, count]),
+  }));
+  const readItemReplicas = () => Promise.all(pages.map((page) => page.evaluate(() => ({
+    sequence: window.__multiplayer.latest.s,
     ownSlot: window.__multiplayer.ownSlot,
     unavailable: window.__multiplayer.latest.items.box_down.map(([id]) => id).sort((a, b) => a - b),
     players: window.__multiplayer.latest.players.map((row) => ({
@@ -194,10 +199,15 @@ try {
     events: window.__multiplayer.latest.items.events,
     vanishBoxIds: window.__boxVanish,
   }))));
-  const inventorySignature = (replica) => replica.players.map((row) => ({
-    slot: row.slot,
-    slots: row.slots.map(([kind, count]) => [kind, count]),
-  }));
+  // A pickup can land between two page.evaluate calls. Compare replicas only
+  // when both clients have consumed the same authoritative snapshot sequence.
+  const itemReplicas = await waitFor(async () => {
+    const replicas = await readItemReplicas();
+    if (replicas[0].sequence !== replicas[1].sequence) return null;
+    if (JSON.stringify(inventorySignature(replicas[0]))
+        !== JSON.stringify(inventorySignature(replicas[1]))) return null;
+    return replicas;
+  }, 5000);
   assert.deepEqual(inventorySignature(itemReplicas[0]), inventorySignature(itemReplicas[1]));
   assert.ok(itemReplicas.every((replica) => (
     replica.unavailable.every((id, index, ids) => Number.isSafeInteger(id)

@@ -70,7 +70,9 @@ try {
   });
 
   await page.goto(`http://127.0.0.1:${PORT}/?quality=low&prewarm=skip`, { waitUntil: 'domcontentloaded' });
-  await page.waitForFunction('window.__gameReady === true', { timeout: 90_000 });
+  // This test owns the SDK contract, not renderer warm-up. Waiting for eight
+  // fully rendered frames makes it depend on SwiftShader throughput in CI.
+  await page.waitForFunction('window.__usionMock.connects.length === 1', { timeout: 90_000 });
   const registration = await page.evaluate(() => ({
     events: window.__usionMock.events,
     connects: window.__usionMock.connects,
@@ -164,6 +166,9 @@ try {
     'Host left the room',
   );
   assert.equal(await page.evaluate(() => window.__usionMock.disconnects), 2);
+  // Release the first WebGL context before booting the solo instance. Keeping
+  // both worlds resident can starve GitHub's software renderer.
+  await page.close();
 
   const soloPage = await browser.newPage();
   await soloPage.setViewport({ width: 800, height: 600 });
@@ -206,7 +211,10 @@ try {
     };
   });
   await soloPage.goto(`http://127.0.0.1:${PORT}/?quality=low&prewarm=skip`, { waitUntil: 'domcontentloaded' });
-  await soloPage.waitForFunction('window.__gameReady === true', { timeout: 90_000 });
+  await soloPage.waitForFunction(
+    'window.__ctx?.race?.karts?.length === 8 && (window.__ctx.race.state === 1 || window.__ctx.race.state === 2)',
+    { timeout: 90_000 },
+  );
   const solo = await soloPage.evaluate(() => ({
     state: window.__ctx.race.state,
     racers: window.__ctx.race.karts.length,
