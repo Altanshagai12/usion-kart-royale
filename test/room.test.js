@@ -308,3 +308,107 @@ test('race completion sends a final finished snapshot before match_end', () => {
   assert.equal(conn.ws.sent[1].type, 'match_end');
   room.destroy();
 });
+
+test('every connected racer must vote before the same room resets for a rematch', () => {
+  const room = new Room('rematch-room', { onDestroy() {} });
+  const host = connection('host', room);
+  const guest = connection('guest', room);
+  room.join(host);
+  room.join(guest);
+  room.phase = 'playing';
+  Object.assign(room.players[0], { finished: true, finishMs: 65_432, distance: 4_800 });
+  Object.assign(room.players[1], { finished: false, finishMs: null, distance: 4_700 });
+  room.items.events.push({ id: 1, type: 'hit', slot: 1, kind: ITEM_KIND.BOLT });
+  room.finish('race_complete');
+
+  const result = host.ws.sent.findLast((message) => message.type === 'match_end')?.payload;
+  assert.deepEqual(result.placements, [
+    { user_id: 'host', place: 1, finish_ms: 65_432 },
+    { user_id: 'guest', place: 2, finish_ms: null },
+  ]);
+  assert.ok(room.closeTimer, 'finished room must have a bounded cleanup timer');
+  const finishSequence = room.snapSeq;
+  const initialCloseTimer = room.closeTimer;
+
+  room.handleMessage(host, { type: 'rematch', payload: {} });
+  assert.equal(room.phase, 'finished', 'one racer cannot force a room-wide reset');
+  assert.notEqual(room.closeTimer, initialCloseTimer, 'an accepted vote refreshes the result deadline');
+  assert.deepEqual(
+    host.ws.sent.findLast((message) => message.type === 'match_end')?.payload.rematch_user_ids,
+    ['host'],
+  );
+
+  room.handleMessage(guest, { type: 'rematch', payload: {} });
+  assert.equal(room.phase, 'waiting');
+  assert.equal(room.closeTimer, null);
+  assert.equal(room.resultPayload, null);
+  assert.equal(room.snapSeq, finishSequence + 1, 'snapshot sequence must remain monotonic');
+  assert.equal(room.connections.get('host'), host);
+  assert.equal(room.connections.get('guest'), guest);
+  assert.equal(room.players.every((player) => (
+    player.finished === false && player.finishMs === null && player.speed === 0
+  )), true);
+  assert.equal(room.items.events.length, 0);
+  assert.equal(room.roster().find((row) => row.user_id === 'host').ready, true);
+  assert.equal(room.roster().find((row) => row.user_id === 'guest').ready, false);
+  const reset = host.ws.sent.findLast((message) => message.type === 'state_snapshot');
+  assert.equal(reset?.payload.phase, 'waiting');
+  assert.equal(reset?.payload.k, true);
+  room.destroy();
+});
+
+test('rematch consensus is reevaluated when an uncommitted guest leaves', () => {
+  const room = new Room('rematch-leave-room', { onDestroy() {} });
+  const host = connection('host', room);
+  const guest = connection('guest', room);
+  const leaving = connection('leaving', room);
+  room.join(host);
+  room.join(guest);
+  room.join(leaving);
+  room.phase = 'playing';
+  room.finish('race_complete');
+
+  room.handleMessage(host, { type: 'rematch', payload: {} });
+  room.handleMessage(guest, { type: 'rematch', payload: {} });
+  assert.equal(room.phase, 'finished');
+  room.detach(leaving, true);
+
+  assert.equal(room.phase, 'waiting', 'the two remaining voters should return to the lobby');
+  assert.equal(room.players.find((player) => player.userId === 'leaving').connected, false);
+  assert.equal(room.closeTimer, null);
+  room.destroy();
+});
+
+test('finished-room reconnect reevaluates votes and explicit host exit closes rematch', () => {
+  const reconnectRoom = new Room('rematch-reconnect-room', { onDestroy() {} });
+  const firstHost = connection('host', reconnectRoom);
+  const guest = connection('guest', reconnectRoom);
+  reconnectRoom.join(firstHost);
+  reconnectRoom.join(guest);
+  reconnectRoom.phase = 'playing';
+  reconnectRoom.finish('race_complete');
+  reconnectRoom.handleMessage(firstHost, { type: 'rematch', payload: {} });
+  reconnectRoom.detach(firstHost);
+  reconnectRoom.handleMessage(guest, { type: 'rematch', payload: {} });
+  assert.equal(reconnectRoom.phase, 'finished');
+
+  const secondHost = connection('host', reconnectRoom);
+  reconnectRoom.join(secondHost);
+  assert.equal(reconnectRoom.phase, 'waiting', 'restoring the final voter must reset the room');
+  reconnectRoom.destroy();
+
+  const exitRoom = new Room('rematch-host-exit-room', { onDestroy() {} });
+  const exitingHost = connection('host', exitRoom);
+  const remainingGuest = connection('guest', exitRoom);
+  exitRoom.join(exitingHost);
+  exitRoom.join(remainingGuest);
+  exitRoom.phase = 'playing';
+  exitRoom.finish('race_complete');
+  exitRoom.detach(exitingHost, true);
+  const terminal = remainingGuest.ws.sent.findLast((message) => message.type === 'match_end');
+  assert.equal(terminal?.payload.reason, 'host_left');
+  assert.deepEqual(terminal?.payload.rematch_user_ids, []);
+  assert.equal(exitRoom.resultPayload, null);
+  assert.ok(exitRoom.closeTimer);
+  exitRoom.destroy();
+});

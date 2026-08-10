@@ -15,7 +15,8 @@ export function finishRoom(room, reason) {
       : b.distance - a.distance;
   });
   const winner = placements[0];
-  room.broadcast('match_end', {
+  room.rematchVotes.clear();
+  room.resultPayload = {
     winner_ids: winner ? [winner.userId] : [],
     reason,
     placements: placements.map((player, index) => ({
@@ -23,7 +24,8 @@ export function finishRoom(room, reason) {
       place: index + 1,
       finish_ms: player.finishMs,
     })),
-  });
+  };
+  room.broadcast('match_end', { ...room.resultPayload, rematch_user_ids: [] });
   submitResult({
     roomId: room.roomId,
     sessionId: room.lastSessionId || 'unknown',
@@ -40,5 +42,5 @@ export function finishRoom(room, reason) {
       })),
     },
   }).catch((error) => console.error('[RESULT]', error));
-  setTimeout(() => room.destroy(), RESULTS_LINGER_MS).unref?.();
+  room.armClose(RESULTS_LINGER_MS);
 }

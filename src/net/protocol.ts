@@ -212,6 +212,8 @@ export function normalizeSnapshot(value: unknown): DirectSnapshot | null {
     && Number.isSafeInteger(row.lap) && row.lap >= 0
     && Number.isSafeInteger(row.place) && row.place >= 1 && row.place <= 4
     && typeof row.finished === 'boolean'
+    && (row.finish_ms === null
+      || (Number.isFinite(row.finish_ms) && row.finish_ms >= 0))
   ))) return null;
 
   return {

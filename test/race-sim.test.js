@@ -35,3 +35,42 @@ test('finish crossing clamps at the line and prediction cannot drive beyond it',
   assert.equal(predicted.lateral, pose.lateral);
   assert.equal(predicted.heading, pose.heading);
 });
+
+function raceFor(players, seconds) {
+  let rows = players;
+  for (let frame = 0; frame < seconds * 60; frame++) rows = stepRace(rows, 1 / 60);
+  return rows;
+}
+
+function movingPlayer(slot, lateral, distance = 1_000) {
+  const player = createPlayer({ slot, userId: `driver-${slot}`, name: `Driver ${slot}` });
+  Object.assign(player, {
+    distance, lateral, speed: 25,
+    input: { steer: 0, accel: 1, brake: 0, drift: false, iseq: 1 },
+  });
+  return player;
+}
+
+test('side-by-side contact separates karts without welding their forward speed', () => {
+  const baseline = raceFor([movingPlayer(0, 0)], 3)[0];
+  for (const gap of [1, 1.79]) {
+    const pair = raceFor([
+      movingPlayer(0, -gap / 2), movingPlayer(1, gap / 2),
+    ], 3);
+    assert.ok(Math.abs(pair[0].lateral - pair[1].lateral) >= 1.79);
+    assert.ok(
+      baseline.speed - pair[0].speed < 2,
+      `side contact lost too much speed at ${gap} m: ${pair[0].speed} vs ${baseline.speed}`,
+    );
+    assert.ok(Math.abs(pair[0].speed - pair[1].speed) < 1e-6, 'contact must be symmetric');
+  }
+});
+
+test('longitudinal contact costs more speed than a pure side scrape', () => {
+  const side = stepRace([movingPlayer(0, -0.5), movingPlayer(1, 0.5)], 1 / 60);
+  const diagonal = stepRace([
+    movingPlayer(0, -0.5, 200), movingPlayer(1, 0.5, 201),
+  ], 1 / 60);
+  assert.ok(diagonal[0].speed < side[0].speed);
+  assert.ok(diagonal.every((player) => Number.isFinite(player.speed) && player.speed >= 0));
+});

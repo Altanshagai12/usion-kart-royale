@@ -264,8 +264,14 @@ function resolveKartContacts(players) {
       const push = (1.8 - across) * 0.5;
       a.lateral += sign * push;
       b.lateral -= sign * push;
-      a.speed *= 0.93;
-      b.speed *= 0.93;
+      // Side-by-side contact should separate the karts without repeatedly
+      // draining their forward speed. Keep the full 7% cost only for a
+      // longitudinal impact and smoothly reduce it toward zero for a scrape.
+      const longitudinalShare = (along * along)
+        / Math.max(1e-6, along * along + across * across);
+      const retention = 1 - 0.07 * longitudinalShare;
+      a.speed *= retention;
+      b.speed *= retention;
     }
   }
 }

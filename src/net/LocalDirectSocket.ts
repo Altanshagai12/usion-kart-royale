@@ -29,6 +29,10 @@ export class LocalDirectSocket {
     this.envelope('ping', { last_sequence: Math.max(0, lastSequence) });
   }
 
+  requestRematch() {
+    this.envelope('rematch', {});
+  }
+
   close() {
     this.closed = true;
     if (this.heartbeat !== null) clearInterval(this.heartbeat);

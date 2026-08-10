@@ -13,6 +13,9 @@ import {
   createItemRuntime, stepItemRuntime,
 } from './item-runtime.js';
 import { handlePlayerInput } from './input.js';
+import {
+  closeFinishedAfterHostExit, evaluateRematch, requestRematch, resultWithVotes,
+} from './rematch.js';
 
 const SWEEP_MS = 5000;
 export const JOIN_TIMEOUT_MS = 15_000;
@@ -47,6 +50,8 @@ export class Room {
     this.items = createItemRuntime();
     this.tickTimer = null;
     this.closeTimer = null;
+    this.rematchVotes = new Set();
+    this.resultPayload = null;
     this.lastTickAt = 0;
     this.destroyed = false;
     this.sweep = setInterval(() => this.sweepConnections(), SWEEP_MS);
@@ -105,6 +110,8 @@ export class Room {
         return;
       case 'sync':
         return this.unicastKeyframe(conn);
+      case 'rematch':
+        return requestRematch(this, conn);
       case 'leave':
         this.detach(conn, true);
         return;
@@ -131,6 +138,11 @@ export class Room {
       existing.ackIseq = 0;
       if (existing.userId === this.hostUserId) this.hostWasPresent = true;
       this.sendJoined(conn, existing.slot, false);
+      if (this.phase === 'finished') {
+        const result = resultWithVotes(this);
+        if (result) this.send(conn, 'match_end', result);
+        evaluateRematch(this);
+      }
       this.broadcast('player_joined', { roster: this.roster(), slot: existing.slot });
       return;
     }
@@ -156,6 +168,10 @@ export class Room {
     conn.spectator = true;
     this.spectators.add(conn);
     this.sendJoined(conn, null, true);
+    if (this.phase === 'finished') {
+      const result = resultWithVotes(this);
+      if (result) this.send(conn, 'match_end', result);
+    }
   }
 
   attachPending(conn) {
@@ -221,8 +237,7 @@ export class Room {
     // names are intentionally ignored by the SDK, so use the terminal frame
     // to make host departure observable in both embedded and local clients.
     this.broadcast('match_end', { reason, winner_ids: [], placements: [] });
-    this.closeTimer = setTimeout(() => this.destroy(), 100);
-    this.closeTimer.unref?.();
+    this.armClose(100);
   }
 
   startCountdown() {
@@ -300,6 +315,12 @@ export class Room {
     finishRoom(this, reason);
   }
 
+  armClose(delayMs) {
+    if (this.closeTimer) clearTimeout(this.closeTimer);
+    this.closeTimer = setTimeout(() => this.destroy(), delayMs);
+    this.closeTimer.unref?.();
+  }
+
   detach(conn, close = false) {
     this.releasePending(conn);
     this.spectators.delete(conn);
@@ -311,6 +332,8 @@ export class Room {
         player.disconnectedAt = Date.now();
         player.input = neutralInput();
         this.broadcast('player_left', { user_id: player.userId, slot: player.slot, roster: this.roster() });
+        if (close && player.userId === this.hostUserId) closeFinishedAfterHostExit(this);
+        else evaluateRematch(this);
       }
     }
     if (close && conn.ws.readyState < 2) conn.ws.close();

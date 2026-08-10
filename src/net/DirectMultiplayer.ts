@@ -4,6 +4,7 @@ import { Items } from '../game/Items';
 import { ConnectionOverlay } from './ConnectionOverlay';
 import { LocalDirectSocket } from './LocalDirectSocket';
 import { WaitingRoomOverlay } from './WaitingRoomOverlay';
+import { RaceResultsOverlay } from './RaceResultsOverlay';
 import { RacePredictor } from './RacePredictor';
 import { RemoteInterpolation } from './RemoteInterpolation';
 import {
@@ -26,6 +27,10 @@ export class DirectMultiplayer implements System {
   private lobby = new WaitingRoomOverlay(
     (ready) => this.sendLobbyReady(ready),
     () => this.sendLobbyStart(),
+  );
+  private results = new RaceResultsOverlay(
+    () => this.sendRematch(),
+    () => this.exitRoom(),
   );
   private localSocket: LocalDirectSocket | null = null;
   private predictor: RacePredictor | null = null;
@@ -230,6 +235,7 @@ export class DirectMultiplayer implements System {
     this.localSocket?.close();
     this.overlay.dispose();
     this.lobby.dispose();
+    this.results.dispose();
   }
 
   private registerPlatformHandlers() {
@@ -246,7 +252,7 @@ export class DirectMultiplayer implements System {
       if (roomId) void this.connectPlatformRoom(roomId, this.usion.config?.serviceId);
     });
     game.onConnectionState((state: string) => {
-      if (!this.active || this.phase === 'finished') return;
+      if (!this.active) return;
       if (state === 'disconnected' || state === 'rejoining') this.setConnection('reconnecting');
       else if (state === 'connected' || state === 'reconnected') this.setConnection('connected');
     });
@@ -311,42 +317,61 @@ export class DirectMultiplayer implements System {
       this.requestSync();
     }
     if (fresh) this.lastSnapshotSequence = snapshot.s;
+    const previousPhase = this.phase;
     this.latest = snapshot;
     const directItems = this.ctx?.items as Items | undefined;
     directItems?.setDirectMultiplayer(true);
     directItems?.applyDirectSnapshot(snapshot);
     this.phase = snapshot.phase;
     this.setRoster(snapshot.roster);
+    const restarted = previousPhase === 'finished' && snapshot.phase === 'waiting';
     if (this.ownSlot !== null) {
       const own = snapshot.players.find((row) => row.slot === this.ownSlot);
       if (own) {
+        if (restarted) {
+          this.ownFinished = false;
+          this.pendingItem = null;
+          this.queuedItems.length = 0;
+          this.interpolation?.clear();
+        }
         this.itemSequence = Math.max(this.itemSequence, own.ack_item_seq || 0);
         if (this.pendingItem && own.ack_item_seq >= this.pendingItem.item_seq) {
           this.pendingItem = null;
           this.flushQueuedItem(own);
         }
         const ack = snapshot.ack?.[String(this.ownSlot)] ?? snapshot.ack?.[this.ownSlot] ?? -1;
-        if (fromJoin) this.predictor?.reset(own);
+        if (fromJoin || restarted) this.predictor?.reset(own);
         else this.predictor?.reconcile(own, ack);
       }
     }
     this.interpolation?.add(snapshot.players, snapshot.server_ts, this.ownSlot);
+    if (snapshot.phase === 'waiting') {
+      this.results.hide();
+    } else {
+      const own = snapshot.players.find((row) => row.slot === this.ownSlot);
+      if (own?.finished || this.results.visible) {
+        this.results.showLive(snapshot.players, this.roster, this.ownSlot, this.language);
+      }
+    }
     this.paintPhase();
   }
 
   private handleMatchEnd(payload: any) {
     this.phase = 'finished';
-    this.active = false;
-    this.joined = false;
-    this.localSocket?.close();
-    if (!this.localMode) this.usion?.game?.disconnect?.();
     this.lobby.hide();
     const hostLeft = payload?.reason === 'host_left';
-    this.overlay.show(
-      hostLeft
-        ? this.copy('Host left the room', 'Өрөөний эзэн гарлаа')
-        : this.copy('Race finished', 'Тэмцээн дууслаа'),
-      hostLeft ? 'warning' : 'waiting',
+    if (hostLeft) {
+      this.active = false;
+      this.joined = false;
+      this.results.hide();
+      this.localSocket?.close();
+      if (!this.localMode) this.usion?.game?.disconnect?.();
+      this.overlay.show(this.copy('Host left the room', 'Өрөөний эзэн гарлаа'), 'warning');
+      return;
+    }
+    this.overlay.hide();
+    this.results.showFinal(
+      payload || {}, this.latest?.players || [], this.roster, this.ownSlot, this.language,
     );
   }
 
@@ -380,6 +405,30 @@ export class DirectMultiplayer implements System {
     if (this.phase !== 'waiting' || this.connection !== 'connected') return;
     if (this.localSocket) this.localSocket.send('lobby_start', {});
     else this.usion?.game?.realtime('lobby_start', {});
+  }
+
+  private sendRematch() {
+    if (this.phase !== 'finished' || this.connection !== 'connected') return false;
+    if (this.localSocket) this.localSocket.requestRematch();
+    else this.usion?.game?.requestRematch?.();
+    return true;
+  }
+
+  private exitRoom() {
+    this.results.hide();
+    this.lobby.hide();
+    this.active = false;
+    this.joined = false;
+    if (this.localMode) {
+      this.localSocket?.close();
+      const target = new URL(location.href);
+      for (const key of ['multiplayer', 'room', 'player']) target.searchParams.delete(key);
+      location.assign(`${target.pathname}${target.search}`);
+      return;
+    }
+    this.usion?.game?.leave?.();
+    this.usion?.game?.disconnect?.();
+    this.usion?.exit?.();
   }
 
   private resolveItemSlot(row: DirectPlayerRow, requested: number) {
@@ -441,6 +490,7 @@ export class DirectMultiplayer implements System {
   private setConnection(state: ConnectionState) {
     if (state !== this.connection) this.predictor?.resetClock();
     this.connection = state;
+    this.results.setConnected(state === 'connected');
     if (state === 'connecting') {
       this.lobby.hide();
       this.overlay.show(this.copy('Connecting racers…', 'Тоглогчдыг холбож байна…'));
@@ -458,6 +508,7 @@ export class DirectMultiplayer implements System {
   private paintPhase() {
     if (!this.active || this.connection !== 'connected') return;
     if (this.phase === 'waiting') {
+      this.results.hide();
       this.overlay.hide();
       this.lobby.show(this.roster, this.ownSlot, this.language);
       return;

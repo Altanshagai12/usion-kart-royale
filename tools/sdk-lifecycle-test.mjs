@@ -22,6 +22,9 @@ try {
     const events = [];
     const connects = [];
     let disconnects = 0;
+    let rematches = 0;
+    let leaves = 0;
+    let exits = 0;
     const bind = (name) => (callback) => {
       handlers[name] = callback;
       events.push(`on:${name}`);
@@ -34,12 +37,17 @@ try {
     };
     window.ReactNativeWebView = { postMessage() {} };
     window.__usionMock = {
-      handlers, events, connects, config, get disconnects() { return disconnects; },
+      handlers, events, connects, config,
+      get disconnects() { return disconnects; },
+      get rematches() { return rematches; },
+      get leaves() { return leaves; },
+      get exits() { return exits; },
     };
     window.Usion = {
       config,
       getLaunchParams: () => config,
       getLanguage: () => 'en',
+      exit() { exits += 1; },
       init(callback) {
         events.push('init');
         callback(config);
@@ -64,6 +72,8 @@ try {
         },
         realtime() {},
         requestSync() {},
+        requestRematch() { rematches += 1; },
+        leave() { leaves += 1; },
         disconnect() { disconnects += 1; },
       },
     };
@@ -88,7 +98,16 @@ try {
   assert.ok(expected.every((name) => registration.events.indexOf(`on:${name}`) < connectAt));
 
   await page.evaluate(() => {
-    const roster = [{ slot: 0, user_id: 'user-1', name: 'SDK Racer', connected: true }];
+    const roster = [
+      { slot: 0, user_id: 'user-1', name: 'SDK Racer', connected: true, is_host: true },
+      { slot: 1, user_id: 'user-2', name: 'Guest Racer', connected: true, ready: true },
+    ];
+    const player = {
+      slot: 0, user_id: 'user-1', name: 'SDK Racer', connected: true,
+      distance: 0, lateral: 0, speed: 0, heading: 0, yaw_rate: 0,
+      rack: 0, rack_velocity: 0, drifting: false, drift_dir: 0, drift_charge: 0,
+      lap: 1, place: 1, finished: false, finish_ms: null,
+    };
     const snapshot = {
       v: 1,
       s: 1,
@@ -99,27 +118,11 @@ try {
       countdown_ms: 0,
       roster,
       ack: { 0: 0 },
-      players: [{
-        slot: 0,
-        user_id: 'user-1',
-        name: 'SDK Racer',
-        connected: true,
-        distance: 0,
-        lateral: 0,
-        speed: 0,
-        heading: 0,
-        yaw_rate: 0,
-        rack: 0,
-        rack_velocity: 0,
-        drifting: false,
-        drift_dir: 0,
-        drift_charge: 0,
-        lap: 1,
-        place: 1,
-        finished: false,
-        finish_ms: null,
+      players: [player, {
+        ...player, slot: 1, user_id: 'user-2', name: 'Guest Racer', place: 2,
       }],
     };
+    window.__sdkSnapshot = snapshot;
     window.__usionMock.handlers.joined({
       room_id: 'sdk-room',
       slot: 0,
@@ -128,40 +131,101 @@ try {
       phase: 'playing',
       snapshot,
     });
+    const live = structuredClone(snapshot);
+    live.s = 2;
+    live.elapsed_ms = 65_432;
+    live.players[0].finished = true;
+    live.players[0].finish_ms = 65_432;
+    window.__usionMock.handlers.realtime(live);
+  });
+  assert.deepEqual(await page.evaluate(() => ({
+    modal: document.querySelector('.kr-results')?.hidden === false,
+    rows: [...document.querySelectorAll('.kr-results-row')].map((row) => (
+      [...row.children].map((child) => child.textContent)
+    )),
+    rematch: {
+      text: document.querySelector('.kr-results-rematch')?.textContent,
+      disabled: document.querySelector('.kr-results-rematch')?.disabled,
+    },
+  })), {
+    modal: true,
+    rows: [['1', 'SDK Racer', '1:05.432'], ['2', 'Guest Racer', 'Racing…']],
+    rematch: { text: 'Available when the race ends', disabled: true },
+  });
+  await page.evaluate(() => {
     window.__usionMock.handlers.finished({
       winner_ids: ['user-1'],
       reason: 'race_complete',
+      placements: [
+        { user_id: 'user-1', place: 1, finish_ms: 65_432 },
+        { user_id: 'user-2', place: 2, finish_ms: null },
+      ],
+      rematch_user_ids: [],
     });
     window.__usionMock.handlers.roomAssigned();
   });
   const finished = await page.evaluate(() => ({
     phase: window.__multiplayer.phase,
-    overlay: document.querySelector('.kr-network')?.textContent,
+    modal: document.querySelector('.kr-results')?.hidden === false,
+    rows: [...document.querySelectorAll('.kr-results-row')].map((row) => (
+      [...row.children].map((child) => child.textContent)
+    )),
+    buttons: [...document.querySelectorAll('.kr-results button')].map((button) => ({
+      text: button.textContent, disabled: button.disabled,
+    })),
     connects: window.__usionMock.connects.length,
     disconnects: window.__usionMock.disconnects,
   }));
   assert.deepEqual(finished, {
     phase: 'finished',
-    overlay: 'Race finished',
+    modal: true,
+    rows: [['1', 'SDK Racer', '1:05.432'], ['2', 'Guest Racer', 'DNF']],
+    buttons: [
+      { text: 'Race again', disabled: false },
+      { text: 'Exit', disabled: false },
+    ],
     connects: 1,
-    disconnects: 1,
+    disconnects: 0,
   });
   await page.evaluate(() => window.__usionMock.handlers.connectionState('disconnected'));
-  assert.equal(
-    await page.evaluate(() => document.querySelector('.kr-network')?.textContent),
-    'Race finished',
-  );
-  await page.evaluate(() => window.__usionMock.handlers.finished({ reason: 'host_left' }));
-  assert.equal(
-    await page.evaluate(() => document.querySelector('.kr-network')?.textContent),
-    'Host left the room',
-  );
-  await page.evaluate(() => window.__usionMock.handlers.connectionState('disconnected'));
-  assert.equal(
-    await page.evaluate(() => document.querySelector('.kr-network')?.textContent),
-    'Host left the room',
-  );
-  assert.equal(await page.evaluate(() => window.__usionMock.disconnects), 2);
+  assert.deepEqual(await page.evaluate(() => ({
+    modalHidden: document.querySelector('.kr-results')?.hidden,
+    text: document.querySelector('.kr-results-rematch')?.textContent,
+    disabled: document.querySelector('.kr-results-rematch')?.disabled,
+  })), { modalHidden: false, text: 'Reconnecting…', disabled: true });
+  await page.$eval('.kr-results-rematch', (button) => button.click());
+  assert.equal(await page.evaluate(() => window.__usionMock.rematches), 0);
+  await page.evaluate(() => window.__usionMock.handlers.connectionState('connected'));
+  assert.equal(await page.$eval('.kr-results-rematch', (button) => button.disabled), false);
+  await page.$eval('.kr-results-rematch', (button) => button.click());
+  assert.equal(await page.evaluate(() => window.__usionMock.rematches), 1);
+  assert.equal(await page.$eval('.kr-results-rematch', (button) => button.disabled), true);
+  await page.evaluate(() => {
+    const reset = structuredClone(window.__sdkSnapshot);
+    reset.s = 3;
+    reset.phase = 'waiting';
+    reset.roster[1].ready = false;
+    window.__usionMock.handlers.realtime(reset);
+  });
+  assert.deepEqual(await page.evaluate(() => ({
+    phase: window.__multiplayer.phase,
+    modalHidden: document.querySelector('.kr-results')?.hidden,
+    lobbyHidden: document.querySelector('.kr-lobby')?.hidden,
+  })), { phase: 'waiting', modalHidden: true, lobbyHidden: false });
+
+  await page.evaluate(() => window.__usionMock.handlers.finished({
+    reason: 'race_complete',
+    placements: [
+      { user_id: 'user-1', place: 1, finish_ms: 65_432 },
+      { user_id: 'user-2', place: 2, finish_ms: null },
+    ],
+  }));
+  await page.$eval('.kr-results-exit', (button) => button.click());
+  assert.deepEqual(await page.evaluate(() => ({
+    leaves: window.__usionMock.leaves,
+    disconnects: window.__usionMock.disconnects,
+    exits: window.__usionMock.exits,
+  })), { leaves: 1, disconnects: 1, exits: 1 });
   // Release the first WebGL context before booting the solo instance. Keeping
   // both worlds resident can starve GitHub's software renderer.
   await page.close();
