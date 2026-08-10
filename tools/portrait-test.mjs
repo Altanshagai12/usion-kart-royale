@@ -62,6 +62,10 @@ try {
       pixelRatio: window.__ctx.renderer.getPixelRatio(),
       buffer: { width: canvas.width, height: canvas.height },
       blocker: !!document.querySelector('.tc-rotate'),
+      autoThrottle: {
+        accel: window.__ctx.input.state.accel,
+        accelHeld: window.__ctx.input.state.accelHeld,
+      },
       lookControl: !!document.querySelector('.tc-look, [data-btn="look"]'),
       buttonIds: [...document.querySelectorAll('.tc-btn[data-btn]')]
         .map((node) => node.dataset.btn).sort(),
@@ -127,6 +131,27 @@ try {
   await frames(4);
   const keyboardLookReleased = await page.evaluate(() => window.__ctx.input.state.lookBack);
 
+  const gamepadThrottle = await page.evaluate(() => {
+    const input = window.__ctx.input;
+    const originalGetGamepads = navigator.getGamepads.bind(navigator);
+    const buttons = Array.from({ length: 16 }, () => ({ pressed: false, touched: false, value: 0 }));
+    const gamepad = {
+      axes: [0, 0, 0, 0], buttons, connected: true, id: 'threshold-test',
+      index: 0, mapping: 'standard', timestamp: performance.now(), vibrationActuator: null,
+    };
+    Object.defineProperty(navigator, 'getGamepads', { configurable: true, value: () => [gamepad] });
+    input.padIndex = 0;
+    buttons[7].value = 0.49;
+    input.update(window.__ctx, 1 / 60);
+    const belowThreshold = input.state.accelHeld;
+    buttons[7].value = 0.55;
+    input.update(window.__ctx, 1 / 60);
+    const aboveThreshold = input.state.accelHeld;
+    Object.defineProperty(navigator, 'getGamepads', { configurable: true, value: originalGetGamepads });
+    input.padIndex = -1;
+    return { belowThreshold, aboveThreshold };
+  });
+
   const item1Edge = await page.evaluate(() => {
     const rect = document.querySelector('[data-item-slot="1"]').getBoundingClientRect();
     return { x: rect.left + 1, y: rect.top + rect.height / 2, id: 5 };
@@ -172,7 +197,9 @@ try {
     && metrics.quality === 0
     && metrics.pixelRatio >= 1.45
     && metrics.buffer.width >= logical.width && metrics.buffer.height >= logical.height
-    && !metrics.blocker && !metrics.lookControl
+    && !metrics.blocker
+    && metrics.autoThrottle.accel > 0.9 && !metrics.autoThrottle.accelHeld
+    && !metrics.lookControl
     && metrics.buttonIds.join(',') === 'brake,drift,gas,left,right'
     && metrics.itemSlots === 3
     && controls.left.x < logical.width * 0.25 && controls.right.x < logical.width * 0.35
@@ -189,6 +216,7 @@ try {
     && combined.steer > 0.5 && combined.brake === 1 && combined.drift && !combined.lookBack
     && localSteering.touchSteer > 0.9 && localSteering.lateral > 3
     && keyboardLookHeld && !keyboardLookReleased
+    && !gamepadThrottle.belowThreshold && gamepadThrottle.aboveThreshold
     && itemHit && itemEdgeHit.join(',') === 'false,true,false'
     && resized.logical.width === 800 && resized.logical.height === 360
     && resized.pixelRatio >= 1
@@ -196,7 +224,7 @@ try {
     && !resized.lookControl
     && resized.buttonIds.join(',') === 'brake,drift,gas,left,right';
   console.log(JSON.stringify({
-    ok, metrics, combined, localSteering, keyboardLookHeld, keyboardLookReleased,
+    ok, metrics, combined, localSteering, keyboardLookHeld, keyboardLookReleased, gamepadThrottle,
     itemHit, itemEdgeHit, resized,
   }, null, 2));
   if (!ok) throw new Error('portrait sharpness/control-layout regression');

@@ -446,9 +446,12 @@ export class Race implements IRace {
         // dropped in: hands off until the suspension has taken the landing
         p.respawnT -= dt;
       } else if (rolling) {
-        // The player is handed back to the AI once their race is run, so the
-        // results screen has a moving circuit behind it rather than a statue.
-        if (k.isPlayer && !this.autoDrive && !k.finished && this.state !== RaceState.Results) {
+        // Rivals keep circulating behind the live classification, but the
+        // player's kart owns the finish line once it takes the flag. Handing it
+        // to the AI here made a correct finish look roughly 170 m late.
+        if (k.isPlayer && k.finished) {
+          this.holdOnGrid(k);
+        } else if (k.isPlayer && !this.autoDrive && this.state !== RaceState.Results) {
           steer = input.steer;
           throttle = input.accel;
           brake = input.brake;
@@ -472,7 +475,10 @@ export class Race implements IRace {
       } else if (this.state === RaceState.Countdown) {
         // hold station, but watch the throttle for a rocket start
         if (k.isPlayer) {
-          if (input.accel > 0.5) p.hold += dt;
+          // Touch auto-drive is a convenience, not a four-second deliberate
+          // over-rev. Only a real GAS/key/trigger hold participates in the
+          // rocket-start and burnout timing.
+          if (input.accelHeld) p.hold += dt;
           else p.hold = 0;
         }
         this.ai.drive(ctx, k, dt, this.karts, false);
@@ -558,8 +564,9 @@ export class Race implements IRace {
         k.applyBoost(1.35, 1.26);
         ctx.bus.emit({ type: 'boost', kart: k, tier: 2 });
       } else if (hold > BURNOUT_WINDOW) {
-        // over-revved on the line and bogged down
-        k.spinOut(0.75);
+        // Over-revving forfeits the rocket boost, which is already the launch
+        // penalty at standstill. Never use a combat spin here: it rotates a
+        // correctly aligned kart backwards at GO.
         ctx.bus.emit({ type: 'ui', name: 'burnout' });
       }
       p.hold = 0;

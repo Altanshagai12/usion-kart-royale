@@ -120,6 +120,8 @@ export interface InputState {
   steer: number;
   /** 0..1 */
   accel: number;
+  /** deliberate throttle press, excluding touch auto-drive */
+  accelHeld: boolean;
   /** 0..1 */
   brake: number;
   /** held this frame */

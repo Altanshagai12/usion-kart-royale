@@ -391,7 +391,6 @@ const PROP_SKIP = new RegExp([
 
 // --- cinematics ------------------------------------------------------------
 
-const INTRO_DUR = 3.55;       // countdown fly-in length, seconds
 const FINISH_HOLD = 2.3;      // seconds the finish cut holds trackside
 const WIDE_RANGE = 42;        // establishing plate: range and lens, solved
 const WIDE_FOV = 31;          //   backwards from "the kart must be findable"
@@ -400,7 +399,7 @@ const WIDE_FRAME_Y = -0.26;
 const CLOSE_FOV = 34;
 
 /** Which pose built the frame — see `poseKind`. */
-const POSE_CHASE = 0, POSE_WIDE = 1, POSE_CLOSE = 2, POSE_ORBIT = 3, POSE_FINISH = 4, POSE_INTRO = 5;
+const POSE_CHASE = 0, POSE_WIDE = 1, POSE_CLOSE = 2, POSE_ORBIT = 3, POSE_FINISH = 4;
 
 /**
  * A teleport is a CUT, not a move. Stated as a speed and integrated against dt,
@@ -594,8 +593,6 @@ export class ChaseCamera implements System {
   private traumaDecay = 3.3;
 
   // --- cinematics --------------------------------------------------------
-  private introT = INTRO_DUR;
-  private introAng = 0.5;
   private finishT = 0;
   private orbit = 0;
   private prevState: RaceState = RaceState.Menu;
@@ -603,8 +600,7 @@ export class ChaseCamera implements System {
    *  shot, and a shot change is a cut in both position and orientation — the
    *  results orbit and the chase rig have nothing to say to each other, and
    *  easing between them at the comfort ceiling spends a second and a quarter
-   *  with the subject off frame. The intro is the one exception: it lerps onto
-   *  the chase pose deliberately, so its handover is already seamless. */
+   *  with the subject off frame. */
   private poseKind = 0;
   private prevMode: CamMode | null = null;
   private cutPos = new THREE.Vector3();
@@ -1308,11 +1304,8 @@ export class ChaseCamera implements System {
   private poseCinematic(ctx: Ctx, k: IKart, mode: CamMode, state: RaceState, dt: number): boolean {
     const kind = this.pickPose(ctx, k, mode, state, dt);
     if (kind !== this.poseKind) {
-      // POSE_INTRO -> POSE_CHASE is the one seamless handover in the file.
-      if (!(this.poseKind === POSE_INTRO && kind === POSE_CHASE)) {
-        this.hasPrevEye = false;
-        this.hasPrevQuat = false;
-      }
+      this.hasPrevEye = false;
+      this.hasPrevQuat = false;
       this.poseKind = kind;
     }
     return kind !== POSE_CHASE;
@@ -1324,22 +1317,17 @@ export class ChaseCamera implements System {
     if (mode === 'wide') { this.poseWide(ctx, k); return POSE_WIDE; }
     if (mode === 'close') { this.poseClose(ctx, k); return POSE_CLOSE; }
 
-    // In direct multiplayer the waiting room and countdown are one playable
-    // hand-off. Keep the lens behind the local racer throughout so entering the
-    // countdown cannot look like the kart suddenly reversed off the grid.
-    if (ctx.race.directMultiplayer
-        && (state === RaceState.Menu
-          || state === RaceState.Countdown
-          || state === RaceState.Racing)) {
-      this.introT = INTRO_DUR;
+    // Every playable start uses one stable rear view. The old solo intro put
+    // the lens in front and swept it through almost 180 degrees at GO, making a
+    // correctly aligned kart look as if it flipped around and drove backward.
+    // Direct multiplayer also owns a playable waiting-room view in Menu.
+    if ((ctx.race.directMultiplayer && state === RaceState.Menu)
+        || state === RaceState.Countdown
+        || state === RaceState.Racing) {
       this.prevState = state;
       return POSE_CHASE;
     }
 
-    if (state === RaceState.Countdown && this.prevState !== RaceState.Countdown) {
-      this.introT = 0;
-      this.chooseIntroBearing(ctx);
-    }
     if (state === RaceState.Finished && this.prevState !== RaceState.Finished) {
       this.finishT = 0;
       this.captureFinishCut(ctx, k);
@@ -1350,85 +1338,7 @@ export class ChaseCamera implements System {
     if (state === RaceState.Results || state === RaceState.Menu) { this.poseOrbit(ctx, k, state === RaceState.Menu, dt); return POSE_ORBIT; }
     if (state === RaceState.Finished) { this.finishT += dt; this.poseFinish(k); return POSE_FINISH; }
 
-    // The countdown pose holds through the GO frame and releases the instant
-    // the player is actually driving, so the intro can never eat the race.
-    const live = state === RaceState.Countdown
-      || (this.introT < INTRO_DUR && state === RaceState.Racing && Math.abs(k.forwardSpeed) < 2.5);
-    if (this.introT < INTRO_DUR) {
-      // A player already at racing speed has been driving for a while; whatever
-      // the countdown was doing, the fly-in is over. Without this the intro can
-      // still own the frame a second and a half into a race that has plainly
-      // started — which is exactly what a mid-countdown reset produces.
-      if (state === RaceState.Racing && Math.abs(k.forwardSpeed) > 8) this.introT = INTRO_DUR;
-      else this.introT += live ? dt : dt * 2.6;   // released early: hurry the settle
-      const p = clamp(this.introT / INTRO_DUR, 0, 1);
-      if (p < 1) { this.poseIntro(ctx, k, p); return POSE_INTRO; }
-    }
     return POSE_CHASE;
-  }
-
-  /**
-   * Bearing for the countdown hold, chosen once when the intro arms.
-   *
-   * The sun is fixed by the art bible (low, roughly west), so the grid shot is
-   * composed AGAINST it rather than in ignorance of it: score a fan of
-   * candidate bearings on how far the lens points away from the sun and how
-   * close to head-on it stays, and take the best. On a start straight running
-   * away from the sun this picks a near-head-on 20-30 degrees; on one running
-   * into it, it swings out until the sun rakes the grid from the side and
-   * rim-lights the field instead of burning through it.
-   */
-  private chooseIntroBearing(ctx: Ctx) {
-    _tmp.copy(ctx.sunDirection); _tmp.y = 0;
-    if (_tmp.lengthSq() < 1e-6) { this.introAng = 0.5; return; }
-    _tmp.normalize();
-    _right.crossVectors(this.arm, WORLD_UP);
-    if (_right.lengthSq() < 1e-6) { this.introAng = 0.5; return; }
-    _right.normalize();
-    const sunFwd = _tmp.dot(this.arm);
-    const sunRight = _tmp.dot(_right);
-
-    let best = 0.5;
-    let bestScore = -1e9;
-    for (let i = 0; i < 12; i++) {
-      const a = (i < 6 ? 1 : -1) * (0.34 + (i % 6) * 0.142);   // 20 to 60 degrees off head-on
-      const look = -Math.cos(a) * sunFwd + Math.sin(a) * sunRight;
-      const score = -Math.max(0, look - 0.30) * 7 - Math.abs(a) * 0.5;
-      if (score > bestScore) { bestScore = score; best = a; }
-    }
-    this.introAng = best;
-  }
-
-  private poseIntro(ctx: Ctx, k: IKart, p: number) {
-    // Two beats: a held front three-quarter of the grid — the shot that sells
-    // the field — then a sweep round the flank landing exactly on the chase
-    // pose as the lights go out. Low and near head-on, because the player is
-    // always pole: a lens in front of the player is a lens in front of the
-    // whole field, and the eight karts stack into rows instead of trailing off
-    // to a vanishing point.
-    const front = smootherstep(clamp(p / 0.62, 0, 1));
-    const settle = smootherstep(clamp((p - 0.58) / 0.42, 0, 1));
-
-    const side = this.introAng >= 0 ? 1 : -1;
-    const hold = this.introAng * (0.86 + front * 0.14);
-    const ang = hold + (side * 2.95 - hold) * settle;
-    const dist = 16.6 - front * 4.1 - settle * 4.4;
-    const height = 2.05 - front * 0.35 - settle * 0.16;
-
-    _q.setFromAxisAngle(WORLD_UP, ang);
-    _dir.copy(this.arm).applyQuaternion(_q);
-    _eye.copy(k.position).addScaledVector(_dir, dist).addScaledVector(WORLD_UP, height);
-    _aim.copy(k.position).addScaledVector(WORLD_UP, 1.05 + settle * 0.5).addScaledVector(this.arm, -5.0);
-
-    // A kerb-height lens swung well off the racing axis can end up behind a
-    // barrier; there is no arm sweep out here to catch it, so one analytic
-    // wall query puts it back on the tarmac.
-    const wall = ctx.track.collideWalls(_eye, CAM_RADIUS, k.t);
-    if (wall) _eye.add(wall.push);
-
-    // Ease home so the handover to gameplay has no seam.
-    _eye.lerp(_chaseEye, settle);
-    _aim.lerp(_chaseAim, settle);
   }
 
   private captureFinishCut(ctx: Ctx, k: IKart) {
@@ -1573,13 +1483,7 @@ export class ChaseCamera implements System {
     if (mode === 'wide') { target = WIDE_FOV; omega = 8; zeta = 1; }
     else if (mode === 'close') { target = CLOSE_FOV; omega = 8; zeta = 1; }
     else if (state === RaceState.Results || state === RaceState.Menu) { target = 40; omega = 7; zeta = 1; }
-    else if (this.introT < INTRO_DUR) {
-      // A long lens on the hold beat, opening only as the rig settles: the grid
-      // shot lives or dies on compression. At 40 degrees eight karts stack into
-      // rows; at 50 they fan out and stop reading as a pack.
-      target = 40 + (FOV_BASE - 40) * smootherstep(clamp((this.introT / INTRO_DUR - 0.58) / 0.42, 0, 1));
-      omega = 7; zeta = 1;
-    } else {
+    else {
       target = clamp(
         FOV_BASE
         + sp * feel.fovSpeed

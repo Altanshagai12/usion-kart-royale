@@ -57,6 +57,8 @@ export class DirectMultiplayer implements System {
   private localMode = false;
   private language = 'en';
   private autoStartSolo = false;
+  /** authoritative false -> true edge for immediate local finish feedback */
+  private ownFinished = false;
 
   start(): Promise<void> {
     this.usion = (window as any).Usion;
@@ -210,6 +212,18 @@ export class DirectMultiplayer implements System {
       dt,
       this.latest.elapsed_ms,
     );
+    const authoritativeOwn = this.ownSlot === null ? null
+      : this.latest.players.find((row) => row.slot === this.ownSlot) || null;
+    if (authoritativeOwn?.finished && !this.ownFinished) {
+      this.ownFinished = true;
+      ctx.bus.emit({
+        type: 'finish',
+        kart: race.player,
+        place: authoritativeOwn.place,
+      });
+    } else if (authoritativeOwn && !authoritativeOwn.finished) {
+      this.ownFinished = false;
+    }
   }
 
   dispose() {

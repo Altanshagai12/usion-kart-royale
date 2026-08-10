@@ -4,6 +4,8 @@ import { clientToSurface } from './Viewport';
 export interface TouchState {
   steer: number;
   accel: number;
+  /** true only while the player is pressing GAS, never for automatic throttle */
+  accelHeld: boolean;
   brake: number;
   drift: boolean;
   item: boolean;
@@ -34,6 +36,7 @@ export class TouchControls {
   readonly state: TouchState = {
     steer: 0,
     accel: 0,
+    accelHeld: false,
     brake: 0,
     drift: false,
     item: false,
@@ -103,7 +106,7 @@ export class TouchControls {
     this.itemButtons = [];
     this.free.clear();
     Object.assign(this.state, {
-      steer: 0, accel: 0, brake: 0, drift: false, item: false,
+      steer: 0, accel: 0, accelHeld: false, brake: 0, drift: false, item: false,
       itemSlot: -1, steering: false, active: false,
     });
   }
@@ -218,6 +221,7 @@ export class TouchControls {
     state.brake = pressed('brake') ? 1 : 0;
     const gas = pressed('gas');
     state.accel = this.auto ? (state.brake > 0 ? 0 : 1) : gas ? 1 : 0;
+    state.accelHeld = gas;
     state.itemSlot = itemSlot;
     state.item = itemSlot >= 0;
     state.active = this.buttons.some((button) => button.pointer >= 0 || button.tapped);

@@ -21,6 +21,7 @@ const moveToward = (v, target, d) => (
 );
 const q = (v) => Math.round(v * STATE_PRECISION) / STATE_PRECISION;
 const mod = (v, n) => ((v % n) + n) % n;
+const FINISH_DISTANCE = TRACK_LENGTH * TOTAL_LAPS;
 
 const CURVATURE_SAMPLES = buildCurvature();
 
@@ -128,6 +129,15 @@ export function stepPlayer(player, rawInput, dt) {
 
 function stepPlayerSubstep(player, input, dt) {
   const p = { ...player };
+  // The room keeps running briefly after the first finisher so the remaining
+  // racers can be classified. Client prediction uses this same primitive
+  // during that grace period, so a finished row must be spatially immutable
+  // here as well as in `stepRace` or the local kart drives past the flag.
+  if (p.finished) {
+    p.distance = Math.min(p.distance, FINISH_DISTANCE);
+    p.speed = Math.max(0, p.speed - BRAKE * 0.4 * dt);
+    return p;
+  }
   const stunned = p.stunTime > 0;
   if (stunned) input = neutralInput();
   const effectiveSteer = applyDevilSteering(input.steer, p.shrinkTime > 0);
@@ -219,7 +229,10 @@ function stepPlayerSubstep(player, input, dt) {
   }
 
   p.lap = p.distance < 0 ? 0 : Math.min(TOTAL_LAPS, Math.floor(p.distance / TRACK_LENGTH) + 1);
-  if (p.distance >= TRACK_LENGTH * TOTAL_LAPS) p.finished = true;
+  if (p.distance >= FINISH_DISTANCE) {
+    p.distance = FINISH_DISTANCE;
+    p.finished = true;
+  }
 
   return p;
 }

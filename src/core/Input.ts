@@ -92,7 +92,7 @@ const RUMBLE_GAP = 0.055;
 
 export class Input implements IInput {
   state: InputState = {
-    steer: 0, accel: 0, brake: 0, drift: false, driftPressed: false,
+    steer: 0, accel: 0, accelHeld: false, brake: 0, drift: false, driftPressed: false,
     itemPressed: false, itemSlot: -1,
     lookBack: false, pausePressed: false, anyPressed: false,
   };
@@ -370,6 +370,7 @@ export class Input implements IInput {
     // --- keyboard -------------------------------------------------------------
     let digital = (has('ArrowRight', 'KeyD') ? 1 : 0) - (has('ArrowLeft', 'KeyA') ? 1 : 0);
     let accel = has('ArrowUp', 'KeyW') ? 1 : 0;
+    let accelHeld = accel > 0;
     let brake = has('ArrowDown', 'KeyS') ? 1 : 0;
     let drift = hit('ShiftLeft', 'ShiftRight');
     // Space fires items. It used to be a third accelerate binding, which wasted
@@ -399,6 +400,7 @@ export class Input implements IInput {
       // rather than coasting back through the digital return ramp.
       if (t.steering) analogue = t.steer;
       accel = Math.max(accel, t.accel);
+      accelHeld = accelHeld || t.accelHeld;
       brake = Math.max(brake, t.brake);
       drift = drift || t.drift;
       item = item || t.item;
@@ -433,7 +435,11 @@ export class Input implements IInput {
       // stay as full-travel fallbacks for pads that report triggers as buttons.
       const rt = this.triggerValue(b[7]);
       const lt = this.triggerValue(b[6]);
-      accel = Math.max(accel, rt, b[0]?.pressed ? 1 : 0, b[12]?.pressed ? 1 : 0);
+      const padAccel = Math.max(rt, b[0]?.pressed ? 1 : 0, b[12]?.pressed ? 1 : 0);
+      accel = Math.max(accel, padAccel);
+      // Preserve the old countdown threshold so a lightly resting/noisy
+      // analogue trigger cannot accumulate a full burnout hold.
+      accelHeld = accelHeld || padAccel > 0.5;
       brake = Math.max(brake, lt, b[1]?.pressed ? 1 : 0, b[13]?.pressed ? 1 : 0);
       drift = drift || !!b[5]?.pressed || !!b[4]?.pressed;
       item = item || !!b[2]?.pressed || !!b[3]?.pressed;
@@ -469,6 +475,7 @@ export class Input implements IInput {
     if (this.driftMin > 0) drift = true;
 
     s.accel = accel;
+    s.accelHeld = accelHeld;
     s.brake = brake;
     s.drift = drift;
     s.lookBack = look;
