@@ -14,8 +14,8 @@
  *    same fact twice and neither read as authoritative.
  *
  *    The eight-row order moved to the pause screen and the results screen. In
- *    race, the position plate carries the whole story: your place, plus the
- *    ONE kart you are racing and your signed delta to it. The right-centre of
+ *    race, the position plate carries the whole story: your place and name,
+ *    plus the signed delta to the ONE kart you are racing. The right-centre of
  *    the frame is now empty, which is where the racing is.
  *
  * 2. THE COUNTDOWN IS DRIVEN FROM STATE, NOT FROM AN EVENT. grid.png caught
@@ -31,7 +31,7 @@
  *
  *      [LAP]            [-- MINIMAP --]             [TIME]
  *      [POSITION                                            ]
- *       + RIVAL]                                    (empty)
+ *       + PLAYER / GAP]                             (empty)
  *      [ITEM]              (toast)                  [SPEEDO]
  *
  * The minimap stays top-centre (§7 permits "bottom-centre or top-centre" and
@@ -433,8 +433,9 @@ export class HUD implements System {
     // plate's width (set by the interval row) rather than the numeral's.
     this.posArrow = el('span', 'kr-pos-arrow', this.posIn, '▲');
 
-    // THE RIVAL ROW — the whole replacement for the eight-driver tower. One
-    // livery chip, one name, one ALWAYS-SIGNED delta. Round 1 shipped three
+    // THE IDENTITY/GAP ROW — the replacement for the eight-driver tower. The
+    // local livery/name stays paired with the local ordinal, then one
+    // ALWAYS-SIGNED rival delta. Round 1 shipped three
     // vocabularies in this one slot ("LEAD 12.48", "GAP +0.13", a labelled
     // empty cell reading "GRID"), so the player had to re-read it rather than
     // glance at it.
@@ -1045,7 +1046,7 @@ export class HUD implements System {
   }
 
   /**
-   * The rival row — the whole in-race replacement for the standings tower.
+   * The identity/gap row — the in-race replacement for the standings tower.
    *
    * Two things round 1 got wrong are fixed here rather than papered over.
    *
@@ -1059,8 +1060,8 @@ export class HUD implements System {
    *
    * THE FORMAT CHANGED PER STATE. "LEAD 12.48" / "GAP +0.13" / a labelled
    * empty cell reading "GRID": three vocabularies for one slot. There is one
-   * now — the rival's livery chip and name, and a signed delta, ALWAYS signed,
-   * green when you are ahead and red when you are behind so the sign is read
+   * now — the local driver's livery/name and a signed rival delta, ALWAYS
+   * signed, green when ahead and red when behind so the sign is read
    * pre-attentively. No target, or on the grid: an em dash, which is a fact.
    */
   private updateRival(ctx: Ctx, place: number, counting: boolean) {
@@ -1071,25 +1072,25 @@ export class HUD implements System {
       this.liveries.length = 0;
       for (let i = 0; i < karts.length; i++) this.liveries.push(cssColor(karts[i].stats.color));
     }
+    // The ordinal is the local player's, so its adjacent identity must resolve
+    // from that same authoritative local kart. `other` below is gap data only.
+    const playerIdx = karts.indexOf(player);
+    setStyle(this.relChip, '--c', this.liveries[playerIdx] || '#8fa0bb');
+    setText(this.relName, player.stats.name);
 
     // The kart you are racing: the one ahead, or — if you are leading — the
     // one chasing you. That is the only rival whose gap you can act on.
     const want = place === 1 ? 2 : place - 1;
     let other: IKart | null = null;
-    let otherIdx = -1;
     for (let i = 0; i < karts.length; i++) {
-      if (karts[i] !== player && (karts[i].place | 0) === want) { other = karts[i]; otherIdx = i; break; }
+      if (karts[i] !== player && (karts[i].place | 0) === want) { other = karts[i]; break; }
     }
 
     if (!other) {
       this.setRelState('none');
-      setText(this.relName, 'Solo');
       setText(this.relVal, '—');
       return;
     }
-
-    setStyle(this.relChip, '--c', this.liveries[otherIdx] || '#8fa0bb');
-    setText(this.relName, other.stats.name);
 
     if (counting || player.finished) {
       this.setRelState('none');

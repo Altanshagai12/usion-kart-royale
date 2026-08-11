@@ -282,6 +282,32 @@ try {
     assert.ok(pose.trackAlignment > 0.9, `start heading reversed: ${pose.trackAlignment}`);
     assert.ok(pose.cameraBehind < -1, `start camera crossed in front: ${pose.cameraBehind}`);
   }
+  const readPositionIdentity = (page) => page.evaluate(() => {
+    const multiplayer = window.__multiplayer;
+    const own = multiplayer.roster.find((row) => row.slot === multiplayer.ownSlot);
+    const rivals = multiplayer.roster.filter((row) => row.slot !== multiplayer.ownSlot);
+    const player = window.__ctx.race.player;
+    return {
+      ownName: own?.name || '',
+      kartName: player.stats.name,
+      hudName: document.querySelector('.kr-rel-n')?.textContent?.trim() || '',
+      ordinal: document.querySelector('.kr-pos-n')?.textContent?.trim() || '',
+      place: player.place,
+      rivalNames: rivals.map((row) => row.name),
+    };
+  });
+  const assertPositionIdentity = (identity) => {
+    assert.ok(identity.ownName, 'the local authoritative roster member has a name');
+    assert.equal(identity.kartName, identity.ownName, 'local kart resolves from own slot');
+    assert.equal(identity.hudName, identity.ownName, 'position plate shows the local player name');
+    assert.equal(identity.ordinal, String(identity.place), 'position plate ordinal follows local place');
+    assert.equal(
+      identity.rivalNames.includes(identity.hudName), false,
+      'position plate must not substitute a rival name',
+    );
+  };
+  const positionIdentities = await Promise.all(pages.map(readPositionIdentity));
+  positionIdentities.forEach(assertPositionIdentity);
   const directRacerMembership = await Promise.all(pages.map((page) => page.evaluate(() => ({
     standings: window.__ctx.race.standings.map((kart) => kart.id).sort((a, b) => a - b),
     visible: window.__ctx.race.karts.filter((kart) => kart.object.visible)
@@ -618,6 +644,8 @@ try {
     state: window.__multiplayer.connection,
   }));
   assert.deepEqual(reconnectState, { active: true, joined: true, state: 'connected' });
+  const reconnectedIdentity = await readPositionIdentity(pages[0]);
+  assertPositionIdentity(reconnectedIdentity);
 
   console.log(JSON.stringify({
     ok: true, lobbyBefore,
@@ -628,6 +656,8 @@ try {
     views: [viewOne, viewTwo],
     items: { replicas: itemReplicas, heldAfter },
     reconnect: reconnectState,
+    positionIdentities,
+    reconnectedIdentity,
   }, null, 2));
 } catch (error) {
   console.error(serverLog);

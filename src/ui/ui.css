@@ -957,8 +957,8 @@
 
 /* --- POSITION — left-centre ----------------------------------------------- */
 
-/* The position plate now carries the WHOLE order story: your place, and the
-   one kart you are racing. That is what replaced the eight-row timing tower. */
+/* The position plate now carries the WHOLE order story: your place and name,
+   plus the gap to the one kart you are racing. */
 .kr-pos {
   --accent: var(--gold);
   --clip: var(--clip-br);
@@ -1032,10 +1032,10 @@
   100% { opacity: 0; transform: translateY(-0.35em) scale(0.95); }
 }
 
-/* --- THE RIVAL ROW --------------------------------------------------------
+/* --- THE IDENTITY / GAP ROW -----------------------------------------------
    This is the entire replacement for the 200x320 eight-driver timing tower.
-   One row: the livery chip and name of the kart you are racing, and your
-   signed delta to it. ONE label slot, ONE format, ALWAYS signed — round 7
+   One row: the local driver's livery/name, and their signed delta to the
+   actionable rival. ONE label slot, ONE format, ALWAYS signed — round 7
    invented "LEAD 12.48", "GAP +0.13" and a labelled empty cell reading "GRID"
    for the same slot in three different states. Negative means you are ahead
    (green); positive means you are behind (red); "—" means there is nobody to
@@ -1077,7 +1077,7 @@
   /* Widest real value is formatDelta's over-a-minute form, "+1:39.00":
      sign + 6 tabular digits + colon + point. In `ch` that is ~7.4; at 4.0em
      against the old face it was 6.7ch and the >60 s case overprinted the
-     rival's name. Fixed, so the plate cannot resize as the gap moves. */
+     driver's name. Fixed, so the plate cannot resize as the gap moves. */
   width: 7.6ch;
   flex: none;
   text-align: right;
@@ -1127,6 +1127,18 @@
   --clip: var(--clip-tr);
 }
 .kr-item-slot.has-item { --accent: var(--item-tint, var(--sky-warm)); }
+/* The HUD root deliberately ignores pointer input, so desktop inventory slots
+   must opt back in. Empty slots stay click-through; touch uses its dedicated
+   multi-pointer controller below. */
+html:not([data-touch]) .kr-item-slot.has-item {
+  pointer-events: auto;
+  cursor: pointer;
+  transition: transform 55ms var(--e-out), filter 120ms var(--e-out);
+}
+html:not([data-touch]) .kr-item-slot.has-item:active {
+  transform: scale(.94);
+  filter: brightness(1.16);
+}
 .kr-item-frame {
   position: absolute;
   inset: 0;

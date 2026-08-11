@@ -131,6 +131,8 @@ export class Input implements IInput {
   private itemBufSlot = -1;
   /** held-item fingerprint at the moment the buffered press was raised */
   private itemSig = -1;
+  /** exact desktop HUD slot clicked since the last frame; -1 = none */
+  private mouseItemSlot = -1;
 
   private ctx: Ctx | null = null;
   private offBus: (() => void) | null = null;
@@ -144,6 +146,7 @@ export class Input implements IInput {
     addEventListener('blur', this.onBlur);
     addEventListener('gamepadconnected', this.onPad);
     addEventListener('gamepaddisconnected', this.onPadOff);
+    addEventListener('pointerdown', this.onItemPointer);
     addEventListener('keydown', this.onFirstKey, { once: true });
 
     // Two-stage detection, because one stage is not enough.
@@ -208,6 +211,7 @@ export class Input implements IInput {
     removeEventListener('blur', this.onBlur);
     removeEventListener('gamepadconnected', this.onPad);
     removeEventListener('gamepaddisconnected', this.onPadOff);
+    removeEventListener('pointerdown', this.onItemPointer);
     removeEventListener('keydown', this.onFirstKey);
     removeEventListener('pointerdown', this.onFirstTouch, { capture: true } as any);
     this.offBus?.();
@@ -263,9 +267,27 @@ export class Input implements IInput {
   };
   private onUp = (e: KeyboardEvent) => { this.keys.delete(e.code); };
   /** Losing focus mid-corner must not leave a key stuck down. */
-  private onBlur = () => { this.keys.clear(); this.latched.clear(); };
+  private onBlur = () => { this.keys.clear(); this.latched.clear(); this.mouseItemSlot = -1; };
   private onPad = (e: GamepadEvent) => { this.padIndex = e.gamepad.index; };
   private onPadOff = () => { this.padIndex = -1; this.padSteered = false; };
+
+  /**
+   * Desktop inventory slots are real controls, but the action still belongs to
+   * Input. Latch the exact primary-mouse press here so solo and authoritative
+   * multiplayer consume it through the same edge/buffer path as 1/2/3 and
+   * Space. Touch remains owned by TouchControls, including hybrid devices.
+   */
+  private onItemPointer = (e: PointerEvent) => {
+    if (this.touch || e.pointerType !== 'mouse' || e.button !== 0) return;
+    const target = e.target instanceof Element
+      ? e.target.closest<HTMLElement>('.kr-item-slot.has-item[data-item-slot]')
+      : null;
+    const slot = Number(target?.dataset.itemSlot);
+    if (!target || !Number.isInteger(slot) || slot < 0 || slot > 2) return;
+    e.preventDefault();
+    e.stopPropagation();
+    this.mouseItemSlot = slot;
+  };
 
   // ---------------------------------------------------------------------------
   // gamepad
@@ -378,6 +400,12 @@ export class Input implements IInput {
     // cover, and left firing on Ctrl — a modifier the OS intercepts.
     let itemSlot = hit('Digit1') ? 0 : hit('Digit2') ? 1 : hit('Digit3') ? 2 : -1;
     let item = itemSlot >= 0 || hit('Space', 'Enter', 'KeyE', 'ControlLeft', 'ControlRight');
+    const clickedItemSlot = this.mouseItemSlot;
+    this.mouseItemSlot = -1;
+    if (clickedItemSlot >= 0) {
+      itemSlot = clickedItemSlot;
+      item = true;
+    }
     let look = has('KeyQ', 'AltLeft');
     let pause = hit('Escape', 'KeyP');
     /** true if the player did something deliberate this frame */
