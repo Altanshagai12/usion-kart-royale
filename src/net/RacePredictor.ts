@@ -5,6 +5,7 @@ import { stepPlayer } from '../../shared/race-sim.js';
 import type { DirectPlayerRow } from './protocol';
 
 const MAX_CATCHUP_MS = 250;
+const VIEW_SMOOTH_RATE_60HZ = 0.22;
 
 type PredictorCore = {
   state: any;
@@ -21,6 +22,10 @@ export class RacePredictor {
   private accumulator = 0;
   private initialized = false;
   private correction = 0;
+  /** Latest local command, used only to project the render pose through the
+   * fixed-step accumulator remainder. The authoritative/predicted state still
+   * advances exclusively in SIM_DT_MS ticks. */
+  private renderInput: object = {};
 
   constructor(private readonly usion: any) {
     const create = usion?.game?.createPredictor;
@@ -32,7 +37,7 @@ export class RacePredictor {
         }),
         smooth: {
           keys: 'distance lateral heading',
-          rate: 0.22,
+          rate: VIEW_SMOOTH_RATE_60HZ,
           snapTo: 0.001,
         },
       });
@@ -46,10 +51,12 @@ export class RacePredictor {
     this.initialized = true;
     this.lastAdvanceAt = 0;
     this.accumulator = 0;
+    this.renderInput = {};
   }
 
   advance(now: number, input: object) {
     if (!this.initialized || !this.core) return 0;
+    this.renderInput = input;
     if (this.lastAdvanceAt === 0) this.lastAdvanceAt = now;
     this.accumulator = Math.min(
       MAX_CATCHUP_MS,
@@ -78,9 +85,23 @@ export class RacePredictor {
     if (this.correction > DESYNC_SNAP_METERS) this.core.view(1);
   }
 
-  view(): DirectPlayerRow | null {
+  view(dt = 1 / 60): DirectPlayerRow | null {
     if (!this.initialized || !this.core) return null;
-    const row = this.core.view();
+    // Usion's view rate is a fraction consumed per call, so passing the same
+    // fraction at 144 Hz made reconciliation land 2.4x faster than at 60 Hz.
+    // Convert the authored 60 Hz fraction to an equivalent wall-clock rate.
+    const frameSeconds = Math.max(0, Math.min(0.1, dt));
+    const viewRate = 1 - Math.pow(1 - VIEW_SMOOTH_RATE_60HZ, frameSeconds * 60);
+    let row = this.core.view(viewRate);
+    // The server and predictor tick at 60 Hz, while a desktop display commonly
+    // presents at 120/144 Hz. Returning the last completed simulation tick made
+    // those extra presents repeat the same pose and then jump to the next one;
+    // mobile's 60 Hz cadence hid the fault. Project only the unsimulated wall-
+    // clock remainder for display, keeping reconciliation and input sequencing
+    // on the unchanged fixed-step state.
+    if (this.accumulator > 0.001 && !row.finished) {
+      row = stepPlayer(row, this.renderInput, this.accumulator / 1000);
+    }
     return {
       ...row,
       yaw_rate: row.yawRate ?? row.yaw_rate,
@@ -102,6 +123,7 @@ export class RacePredictor {
   resetClock() {
     this.lastAdvanceAt = 0;
     this.accumulator = 0;
+    this.renderInput = {};
   }
 
   lastCorrection() {

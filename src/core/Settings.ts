@@ -413,11 +413,27 @@ function detectQuality(dev: DeviceProfile): Quality {
   }
 
   const name = gl.renderer;
-  // Software rasterisers (SwiftShader / llvmpipe / ANGLE-on-CPU) show up in CI
-  // and headless captures; they cannot take the full pipeline at speed but we
-  // still want the full *look*, so they get High rather than Low.
-  if (gl.software) return Quality.High;
-  if (/Apple M[0-9]|RTX|Radeon RX|Arc A/i.test(name)) return Quality.Ultra;
+  // Hardware acceleration can be disabled even on a desktop. SwiftShader /
+  // llvmpipe cannot sustain the full post chain, and handing them High made the
+  // simulation advance behind a 25-40 fps picture. Explicit ?quality=high stays
+  // available to visual harnesses; automatic play must prefer smooth motion.
+  if (gl.software) return Quality.Low;
+  // This low-end OEM part exposes the same "Radeon RX" family prefix as a
+  // 7900-class card, but measured at 1440x900 it presents Ultra at 22-35 fps.
+  // Prefer cadence; explicit quality controls remain available to the player.
+  if (/Radeon RX\s*640(?:\D|$)/i.test(name)) return Quality.Low;
+  // Ultra is a high-end allowlist, not a family-name test. Family-wide matches
+  // promoted entry-level desktop/laptop parts into a pipeline they could not
+  // sustain before the adaptive scaler had time to react.
+  if (/Apple M[0-9]|RTX\s*(?:30[789]0|40[789]0|50[789]0)|Radeon RX\s*(?:6[89]00|7[89]00|[89]\d{3})|Arc A7(?:50|70)/i.test(name)) {
+    return Quality.Ultra;
+  }
+  // Integrated desktop GPUs have a real WebGL2 driver but share memory and
+  // bandwidth with the CPU. Medium keeps shadows and motion cues while dropping
+  // the three full-resolution passes that most often break present cadence.
+  if (/Intel|UHD|Iris|Radeon Graphics|AMD Radeon\(TM\) Graphics|Vega [0-9]|Radeon RX\s*(?:[0-6]\d{2,3}|7[0-6]\d{2})/i.test(name)) {
+    return Quality.Medium;
+  }
   return Quality.High;
 }
 

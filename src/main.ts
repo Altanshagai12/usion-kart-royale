@@ -265,8 +265,9 @@ function dismissBootScreen() {
 /** A single frame this long has already missed a dozen vsyncs. Let it drain. */
 const STALL_MS = 220;
 /**
- * Sustained cost above this (~22 fps) means the GPU cannot afford the frame at
- * the current resolution. The answer is FEWER PIXELS, not fewer presents.
+ * Sustained observed cadence above this (~45 fps) means the GPU cannot afford
+ * the frame at the current resolution. The answer is FEWER PIXELS, not fewer
+ * presents.
  *
  * This used to halve the present rate, and that was the wrong trade for a
  * racing game. Presenting every other frame does not reduce the work per frame
@@ -277,9 +278,9 @@ const STALL_MS = 220;
  * Dropping internal resolution instead makes the frame genuinely cheaper and
  * keeps every frame on screen.
  */
-const SLOW_MS = 45;
+const SLOW_MS = 22;
 /** Hysteresis, so the scale does not chatter around the threshold. */
-const RECOVER_MS = 26;
+const RECOVER_MS = 18;
 /** Resolution rungs. Each is ~30% fewer pixels than the one above. */
 const SCALE_RUNGS = [1, 0.85, 0.72, 0.6, 0.5];
 /**
@@ -293,6 +294,9 @@ const WATCHDOG_FROM_FRAME = 30;
 
 /** EMA of the cost of frames we actually presented, milliseconds. */
 let renderCostEma = 16.7;
+/** Observed present cadence. Unlike CPU submission cost, this includes the
+ * browser/driver waiting for a saturated GPU before the next rAF arrives. */
+let frameIntervalEma = 16.7;
 /** Frames still to skip presenting. */
 let skipRender = 0;
 /** Index into SCALE_RUNGS; 0 is full resolution. */
@@ -332,6 +336,19 @@ function frame(now: number) {
 
   const raw = (now - last) / 1000;
   last = now;
+
+  // WebGL submission is asynchronous, so `pipeline.render()` can return in 7ms
+  // while a saturated GPU delivers the next frame 30ms later. That gap is the
+  // cadence the player actually sees. Ignore hidden-tab/stall gaps and boot
+  // work; both are transient and reducing resolution for them only reallocates
+  // buffers at the worst possible time.
+  const intervalMs = raw * 1000;
+  if (!skipDevelopmentRender && ctx.frame > WATCHDOG_FROM_FRAME
+      && intervalMs >= 4 && intervalMs < 100) {
+    frameIntervalEma += (intervalMs - frameIntervalEma) * 0.08;
+  } else if (ctx.frame <= WATCHDOG_FROM_FRAME) {
+    frameIntervalEma = 16.7;
+  }
 
   // Context gone, or the tab is not being composited. Do not simulate, do not
   // draw, do not allocate — just keep the rAF alive so we notice when the world
@@ -419,15 +436,16 @@ function frame(now: number) {
       renderCostEma = 16.7;
     } else if (scaleCooldown > 0) {
       scaleCooldown--;
-    } else if (renderCostEma > SLOW_MS && scaleRung < SCALE_RUNGS.length - 1) {
+    } else if (Math.max(renderCostEma, frameIntervalEma) > SLOW_MS
+        && scaleRung < SCALE_RUNGS.length - 1) {
       scaleRung++;
       scaleCooldown = SCALE_COOLDOWN;
       pipeline.setDynamicScale(SCALE_RUNGS[scaleRung]);
       console.warn(
-        `[frame] sustained ${Math.round(renderCostEma)}ms frames; ` +
+        `[frame] sustained ${Math.round(Math.max(renderCostEma, frameIntervalEma))}ms frames; ` +
         `render scale -> ${SCALE_RUNGS[scaleRung]} (every frame still presented)`,
       );
-    } else if (renderCostEma < RECOVER_MS && scaleRung > 0) {
+    } else if (Math.max(renderCostEma, frameIntervalEma) < RECOVER_MS && scaleRung > 0) {
       scaleRung--;
       scaleCooldown = SCALE_COOLDOWN;
       pipeline.setDynamicScale(SCALE_RUNGS[scaleRung]);
@@ -599,6 +617,7 @@ multiplayer.start().then(() => boot()).catch((err) => {
 (window as any).__loopHealth = () => ({
   frame: ctx.frame,
   renderCostEma: +renderCostEma.toFixed(2),
+  frameIntervalEma: +frameIntervalEma.toFixed(2),
   renderScale: SCALE_RUNGS[scaleRung],
   scaleRung,
   stalls: stallCount,

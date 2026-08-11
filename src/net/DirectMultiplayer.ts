@@ -205,7 +205,7 @@ export class DirectMultiplayer implements System {
     }
 
     const views = this.interpolation?.views(this.ownSlot) || new Map();
-    const own = this.ownSlot === null ? null : this.predictor?.view()
+    const own = this.ownSlot === null ? null : this.predictor?.view(dt)
       || this.latest.players.find((row) => row.slot === this.ownSlot)
       || null;
     if (own && this.ownSlot !== null) views.set(this.ownSlot, own);

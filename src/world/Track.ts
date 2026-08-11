@@ -536,7 +536,19 @@ export class Track implements ITrack {
         const pad = BOOST_PADS[b];
         if (t >= pad.t0 && t <= pad.t1 && Math.abs(L - pad.lat) <= pad.hw) { surf = Surface.Boost; break; }
       }
-      out.normal.set(cl.nx[i], cl.ny[i], cl.nz[i]);
+      // Height already blends the two stations above; the ground frame must do
+      // the same. Keeping the nearest station's normal made a direct replica on
+      // a 120/144 Hz desktop hold one chassis tilt for several presents and then
+      // jump at each 0.5 m station boundary — visually a perfectly smooth road
+      // felt corrugated. Mobile at 60 Hz happened to cross roughly one station
+      // per frame and hid the staircase.
+      out.normal.set(
+        cl.nx[s0] + (cl.nx[s1] - cl.nx[s0]) * fr,
+        cl.ny[s0] + (cl.ny[s1] - cl.ny[s0]) * fr,
+        cl.nz[s0] + (cl.nz[s1] - cl.nz[s0]) * fr,
+      );
+      if (out.normal.lengthSq() < 1e-8) out.normal.set(0, 1, 0);
+      else out.normal.normalize();
     } else if (a <= edge) {
       surf = Surface.Road; // kerb: grippy, but the raised profile rattles you
       const sgn = L < 0 ? -1 : 1;
