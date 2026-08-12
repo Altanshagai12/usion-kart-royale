@@ -19,6 +19,7 @@ type ConnectionState = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'e
 
 const SERVICE_ID = 'kart-royale';
 const RESYNC_THROTTLE_MS = 500;
+const RECONNECT_WARNING_DELAY_MS = 650;
 
 export class DirectMultiplayer implements System {
   private usion: any = null;
@@ -62,6 +63,7 @@ export class DirectMultiplayer implements System {
   private localMode = false;
   private language = 'en';
   private autoStartSolo = false;
+  private reconnectWarningTimer: number | null = null;
   /** authoritative false -> true edge for immediate local finish feedback */
   private ownFinished = false;
 
@@ -233,6 +235,7 @@ export class DirectMultiplayer implements System {
 
   dispose() {
     this.localSocket?.close();
+    this.clearReconnectWarning();
     this.overlay.dispose();
     this.lobby.dispose();
     this.results.dispose();
@@ -296,6 +299,7 @@ export class DirectMultiplayer implements System {
   }
 
   private handleJoined(payload: DirectJoined) {
+    const resumed = this.joined;
     this.active = true;
     this.joined = true;
     this.ownSlot = payload.slot;
@@ -304,6 +308,9 @@ export class DirectMultiplayer implements System {
     this.interpolation?.clear();
     this.setRoster(payload.roster);
     if (payload.snapshot) this.handleSnapshot(payload.snapshot, true);
+    if (resumed && this.ctx) {
+      this.ctx.bus.emit({ type: 'camera-cut', kart: (this.ctx.race as Race).player });
+    }
     this.sendHello();
     this.setConnection('connected');
   }
@@ -489,6 +496,7 @@ export class DirectMultiplayer implements System {
 
   private setConnection(state: ConnectionState) {
     if (state !== this.connection) this.predictor?.resetClock();
+    if (state !== 'reconnecting') this.clearReconnectWarning();
     this.connection = state;
     this.results.setConnected(state === 'connected');
     if (state === 'connecting') {
@@ -496,12 +504,27 @@ export class DirectMultiplayer implements System {
       this.overlay.show(this.copy('Connecting racers…', 'Тоглогчдыг холбож байна…'));
     } else if (state === 'reconnecting') {
       this.lobby.hide();
-      this.overlay.show(this.copy('Reconnecting…', 'Дахин холбогдож байна…'), 'warning');
+      this.overlay.hide();
+      if (this.reconnectWarningTimer === null) {
+        this.reconnectWarningTimer = window.setTimeout(() => {
+          this.reconnectWarningTimer = null;
+          if (this.connection === 'reconnecting') {
+            this.overlay.show(this.copy('Reconnecting…', 'Дахин холбогдож байна…'), 'warning');
+          }
+        }, RECONNECT_WARNING_DELAY_MS);
+      }
     } else if (state === 'error') {
       this.lobby.hide();
       this.overlay.show(this.copy('Connection failed', 'Холболт амжилтгүй'), 'error');
     } else if (state === 'connected') {
       this.paintPhase();
+    }
+  }
+
+  private clearReconnectWarning() {
+    if (this.reconnectWarningTimer !== null) {
+      clearTimeout(this.reconnectWarningTimer);
+      this.reconnectWarningTimer = null;
     }
   }
 

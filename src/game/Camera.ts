@@ -408,6 +408,10 @@ const POSE_CHASE = 0, POSE_WIDE = 1, POSE_CLOSE = 2, POSE_ORBIT = 3, POSE_FINISH
  */
 const CUT_SPEED = 120;
 const CUT_MIN = 2.2;
+/** Authoritative direct poses can move farther than their reported velocity
+ *  during a stalled frame without crossing the ordinary teleport threshold.
+ *  Treat that unexplained part as a cut before the chase arm is left behind. */
+const CUT_RESIDUAL = 2.2;
 /**
  * ...and how far wrong the bearing has to be, after the teleport, before the
  * SHOT is cut as well as the position.
@@ -612,6 +616,11 @@ export class ChaseCamera implements System {
   private groundY = 0;
   private groundInit = false;
   private prevKart = new THREE.Vector3();
+  /** Exact subject displacement this rendered frame. The eye limiter must
+   *  remove this, rather than velocity * dt, because reconciliation and a
+   *  resumed WebView can move an authoritative replica without integrating
+   *  through every intervening frame. */
+  private kartDelta = new THREE.Vector3();
   private prevEye = new THREE.Vector3();
   private prevQuat = new THREE.Quaternion();
   /** Position continuity: false means the lens teleported and the eye-speed
@@ -623,6 +632,9 @@ export class ChaseCamera implements System {
    *  spin it, and treating the two as one event is what turns an ordinary
    *  off-track recovery into a 1800 deg/s whip. */
   private hasPrevQuat = false;
+  /** Rejoin snapshots reset prediction to an authoritative pose. Consume that
+   *  reset in lateUpdate, once the new kart pose has actually been applied. */
+  private subjectCutPending = false;
   private sampleFn: SampleFn | null = null;
   private smp: TrackSample | null = null;
   private smpB: TrackSample | null = null;
@@ -679,6 +691,13 @@ export class ChaseCamera implements System {
     // Screen shake arrives through ctx.shake() -> addShake(); these handlers
     // add only the rig displacements nothing else can produce.
     this.unsub = ctx.bus.on((e) => {
+      // In direct multiplayer the local player may occupy slot 1..3. Kart's
+      // immutable isPlayer flag belongs to the solo slot-0 chassis, so the
+      // authoritative local identity is Race.player for this event.
+      if (e.type === 'camera-cut') {
+        if (e.kart === ctx.race?.player) this.subjectCutPending = true;
+        return;
+      }
       if (!('kart' in e) || !e.kart?.isPlayer) return;
       switch (e.type) {
         // `impact` is a descent rate in m/s: a drop off the bridge thumps, a
@@ -716,6 +735,17 @@ export class ChaseCamera implements System {
     const mode: CamMode = ((window as any).__camMode as CamMode) || 'chase';
     const state = ctx.race.state;
     this.buildProps(ctx);
+
+    // The direct rejoin event arrives before Race applies the fresh snapshot.
+    // Handling it here guarantees the eye is rebuilt from the new pose, not
+    // from the stale pose that was on screen when the socket dropped.
+    if (this.subjectCutPending) {
+      this.seed(k);
+      this.compAng = 0;
+      this.prevKart.copy(k.position);
+      this.hasPrevQuat = false;
+      this.subjectCutPending = false;
+    }
 
     // A harness mode change is a cut, and the lens must be at its new focal
     // length on the very first frame: the composition is solved against the
@@ -763,9 +793,13 @@ export class ChaseCamera implements System {
     this.lookAmt = damp1(this.lookAmt, wantLook, this.lookVel, 0.19, dt);
 
     // --- 2. has the subject been teleported? ------------------------------
-    _tmp.copy(k.position).sub(this.prevKart);
-    const cut = this.ready
-      && _tmp.length() > Math.max(CUT_MIN, (CUT_SPEED + k.velocity.length() * 2.5) * dt);
+    this.kartDelta.copy(k.position).sub(this.prevKart);
+    _tmp.copy(this.kartDelta).addScaledVector(k.velocity, -dt);
+    const residualCut = ctx.race.directMultiplayer && _tmp.length() > CUT_RESIDUAL;
+    const cut = this.ready && (
+      this.kartDelta.length() > Math.max(CUT_MIN, (CUT_SPEED + k.velocity.length() * 2.5) * dt)
+      || residualCut
+    );
     this.prevKart.copy(k.position);
     if (!this.ready) this.seed(k);
     else if (cut) {
@@ -1165,7 +1199,7 @@ export class ChaseCamera implements System {
       // Measured RELATIVE TO THE KART, so following it down a straight at
       // 30 m/s costs nothing against the budget and only the rig's own motion
       // is charged.
-      _tmp.copy(_eye).sub(this.prevEye).addScaledVector(k.velocity, -dt);
+      _tmp.copy(_eye).sub(this.prevEye).sub(this.kartDelta);
       const len = _tmp.length();
       const maxStep = MAX_EYE_SLIP * dt;
       if (len > maxStep) _eye.sub(_tmp.multiplyScalar(1 - maxStep / len));

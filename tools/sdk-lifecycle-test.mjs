@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import puppeteer from 'puppeteer';
 import { startVite } from './vite-server.mjs';
 
-const PORT = 5184;
+const PORT = parseInt(process.env.SDK_LIFECYCLE_PORT || '5184', 10);
 const server = await startVite(PORT);
 const browser = await puppeteer.launch({
   headless: 'shell',
@@ -131,8 +131,78 @@ try {
       phase: 'playing',
       snapshot,
     });
-    const live = structuredClone(snapshot);
-    live.s = 2;
+  });
+
+  // A sub-second transport recovery must not flash a warning over ordinary
+  // mobile network handoffs. A persistent one still needs clear feedback.
+  await page.evaluate(() => window.__usionMock.handlers.connectionState('disconnected'));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  await page.evaluate(() => window.__usionMock.handlers.connectionState('connected'));
+  await new Promise((resolve) => setTimeout(resolve, 650));
+  assert.equal(await page.$eval('.kr-network', (el) => el.hidden), true);
+
+  await page.evaluate(() => window.__usionMock.handlers.connectionState('disconnected'));
+  await page.waitForFunction(
+    "document.querySelector('.kr-network')?.hidden === false && document.querySelector('.kr-network')?.dataset.tone === 'warning'",
+    { timeout: 10_000 },
+  );
+  assert.equal(await page.$eval('.kr-network', (el) => el.textContent), 'Reconnecting…');
+
+  // The local direct racer is not necessarily slot 0. Kart.isPlayer is an
+  // immutable solo-chassis flag, so the camera cut must follow Race.player.
+  assert.equal(await page.evaluate(() => {
+    const ctx = window.__ctx;
+    ctx.race.configureDirectReplica(1, [0, 1], false);
+    ctx.bus.emit({ type: 'camera-cut', kart: ctx.race.player });
+    const registered = window.__camRig.subjectCutPending === true;
+    ctx.race.configureDirectReplica(0, [0, 1], false);
+    return registered;
+  }), true, 'reconnect camera cut must follow a local racer in slot 1');
+
+  // Rejoin resets prediction to a fresh authoritative row. Simulate a stalled
+  // 50 ms mobile frame plus an 8 m correction: the camera must cut to the new
+  // subject pose instead of staying behind and letting the kart run away.
+  const cameraContinuity = await page.evaluate(async () => {
+    const frame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+    for (let i = 0; i < 4; i++) await frame();
+    const ctx = window.__ctx;
+    const before = ctx.camera.position.distanceTo(ctx.race.player.position);
+    const rejoin = structuredClone(window.__sdkSnapshot);
+    rejoin.s = 3;
+    rejoin.server_ts = Date.now();
+    rejoin.elapsed_ms = 2_000;
+    rejoin.players[0].distance = 8;
+    rejoin.players[0].speed = 31;
+    window.__usionMock.handlers.joined({
+      room_id: 'sdk-room', slot: 0, spectator: false,
+      roster: rejoin.roster, phase: 'playing', snapshot: rejoin,
+    });
+    const stallUntil = performance.now() + 70;
+    while (performance.now() < stallUntil) { /* mobile main-thread stall */ }
+    await frame();
+    const k = ctx.race.player;
+    const toEye = ctx.camera.position.clone().sub(k.position);
+    const ndc = k.position.clone().project(ctx.camera);
+    return {
+      before,
+      after: toEye.length(),
+      behind: toEye.dot(k.forward),
+      ndcX: ndc.x,
+      ndcY: ndc.y,
+      visible: ndc.z >= -1 && ndc.z <= 1,
+    };
+  });
+  assert.ok(cameraContinuity.behind < -1, `camera moved in front of kart: ${JSON.stringify(cameraContinuity)}`);
+  assert.ok(Math.abs(cameraContinuity.after - cameraContinuity.before) < 2.5,
+    `camera separated from kart on rejoin: ${JSON.stringify(cameraContinuity)}`);
+  assert.ok(cameraContinuity.visible && Math.abs(cameraContinuity.ndcX) < 0.6 && Math.abs(cameraContinuity.ndcY) < 0.7,
+    `kart left the reconnect frame: ${JSON.stringify(cameraContinuity)}`);
+
+  await page.evaluate(() => window.__usionMock.handlers.connectionState('connected'));
+  await page.evaluate(() => {
+    const live = structuredClone(window.__sdkSnapshot);
+    live.s = 4;
+    live.players[0].distance = 8;
     live.elapsed_ms = 65_432;
     live.players[0].finished = true;
     live.players[0].finish_ms = 65_432;
@@ -202,7 +272,7 @@ try {
   assert.equal(await page.$eval('.kr-results-rematch', (button) => button.disabled), true);
   await page.evaluate(() => {
     const reset = structuredClone(window.__sdkSnapshot);
-    reset.s = 3;
+    reset.s = 5;
     reset.phase = 'waiting';
     reset.roster[1].ready = false;
     window.__usionMock.handlers.realtime(reset);
@@ -294,7 +364,9 @@ try {
   assert.ok(promoted, 'roomAssigned must synchronously begin the direct-room connection');
   assert.equal(promoted.roomId, 'shared-room');
 
-  console.log(JSON.stringify({ ok: true, registration, finished, solo, promoted }, null, 2));
+  console.log(JSON.stringify({
+    ok: true, registration, cameraContinuity, finished, solo, promoted,
+  }, null, 2));
 } finally {
   await browser.close();
   server.stop();
