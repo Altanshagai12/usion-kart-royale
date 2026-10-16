@@ -10,7 +10,8 @@
 import puppeteer from 'puppeteer';
 import { startVite } from './vite-server.mjs';
 
-const PORT = Number(process.env.DESKTOP_MOTION_PORT || 5331);
+const portAt = process.argv.indexOf('--port');
+const PORT = Number(portAt >= 0 ? process.argv[portAt + 1] : process.env.DESKTOP_MOTION_PORT || 5331);
 const server = await startVite(PORT);
 let browser;
 

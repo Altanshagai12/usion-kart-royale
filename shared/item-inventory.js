@@ -17,13 +17,15 @@ export function ensureItemSlots(player) {
     player.itemSlots = createItemSlots();
   }
   for (let i = 0; i < ITEM_SLOT_COUNT; i++) {
-    const raw = player.itemSlots[i] || {};
-    player.itemSlots[i] = {
-      kind: Number.isSafeInteger(raw.kind) && raw.kind >= 0 && raw.kind <= 8 ? raw.kind : 0,
-      count: Number.isSafeInteger(raw.count) && raw.count >= 0 && raw.count <= 3 ? raw.count : 0,
-      arm: Number.isFinite(raw.arm) && raw.arm >= 0 ? raw.arm : 0,
-      revision: Number.isSafeInteger(raw.revision) && raw.revision >= 0 ? raw.revision : 0,
-    };
+    let slot = player.itemSlots[i];
+    if (!slot || typeof slot !== 'object' || Array.isArray(slot)) {
+      slot = { kind: 0, count: 0, arm: 0, revision: 0 };
+      player.itemSlots[i] = slot;
+    }
+    slot.kind = Number.isSafeInteger(slot.kind) && slot.kind >= 0 && slot.kind <= 8 ? slot.kind : 0;
+    slot.count = Number.isSafeInteger(slot.count) && slot.count >= 0 && slot.count <= 3 ? slot.count : 0;
+    slot.arm = Number.isFinite(slot.arm) && slot.arm >= 0 ? slot.arm : 0;
+    slot.revision = Number.isSafeInteger(slot.revision) && slot.revision >= 0 ? slot.revision : 0;
   }
   // Import only state that never had indexed slots. An existing three-slot
   // inventory stays authoritative even when empty, so a consumed final item

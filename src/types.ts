@@ -143,6 +143,8 @@ export interface IInput extends System {
   readonly state: InputState;
   /** true if the player is on a touch device and the virtual pad is shown */
   readonly touch: boolean;
+  /** Hide and release the virtual pad while a menu or modal owns the screen. */
+  setTouchSuppressed(suppressed: boolean): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +360,10 @@ export interface Ctx {
   time: number;
   /** clamped frame delta, seconds */
   dt: number;
+  /** calibrated native display interval, milliseconds */
+  displayFrameMs?: number;
+  /** 1 = meeting the native display cadence; >1 = missed-vsync pressure */
+  framePressure?: number;
   frame: number;
   width: number;
   height: number;

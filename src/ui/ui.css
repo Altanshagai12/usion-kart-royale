@@ -1677,7 +1677,6 @@ html[data-touch] .kr-bottom { bottom: calc(var(--rail) * .72); }
   gap: clamp(8px, 1.6vmin, 22px);
   width: 100%;
 }
-@media (max-aspect-ratio: 1/1) { .kr-roster { grid-template-columns: repeat(2, 1fr); } }
 
 .kr-card {
   position: relative;
@@ -1695,6 +1694,10 @@ html[data-touch] .kr-bottom { bottom: calc(var(--rail) * .72); }
   overflow: hidden;
 }
 .kr-card:hover { filter: saturate(0.85) brightness(0.95); transform: translateY(-0.5vmin); }
+.kr-card:focus-visible, .kr-btn:focus-visible {
+  outline: max(2px, 0.28vmin) solid #fff3cc;
+  outline-offset: max(2px, 0.32vmin);
+}
 .kr-card.sel {
   filter: none;
   transform: translateY(-1.4vmin) scale(1.045);
@@ -1791,6 +1794,10 @@ html[data-touch] .kr-bottom { bottom: calc(var(--rail) * .72); }
   pointer-events: auto;
   cursor: pointer;
   position: relative;
+  min-height: 44px;
+  display: grid;
+  place-items: center;
+  box-sizing: border-box;
   padding: 0.72em 1.4em 0.78em;
   border-radius: 999px;
   font-size: clamp(13px, 2.3vmin, 30px);
@@ -1827,7 +1834,12 @@ html[data-touch] .kr-bottom { bottom: calc(var(--rail) * .72); }
   width: 100%;
   align-items: start;
 }
-@media (max-aspect-ratio: 1/1) { .kr-results-grid { grid-template-columns: 1fr; } }
+.kr-results-grid .kr-menu-list {
+  width: 100%;
+  margin-top: 1.4vmin;
+  flex-direction: row;
+}
+.kr-results-grid .kr-btn { flex: 1 1 0; padding-inline: 0.7em; }
 
 .kr-standings { display: flex; flex-direction: column; gap: 0.55vmin; }
 .kr-row {
@@ -1844,7 +1856,7 @@ html[data-touch] .kr-bottom { bottom: calc(var(--rail) * .72); }
 .kr-screen.on .kr-row { animation: kr-rowIn 0.6s var(--e-out) both; animation-delay: var(--d); }
 /* Rebuilt rows (a straggler crossed and the board reordered) must not re-deal
    the whole entrance animation — the board is already on screen and being read. */
-.kr-screen.on .kr-standings.settled .kr-row { animation: none; }
+.kr-screen.on .kr-standings.settled .kr-row { animation: none; opacity: 1; transform: none; }
 @keyframes kr-rowIn {
   0%   { opacity: 0; transform: translateX(-3vmin) scale(0.97); }
   100% { opacity: 1; transform: translateX(0) scale(1); }
@@ -1951,7 +1963,6 @@ html[data-touch] .kr-bottom { bottom: calc(var(--rail) * .72); }
   width: 100%;
   align-items: start;
 }
-@media (max-aspect-ratio: 1/1) { .kr-pause-grid { grid-template-columns: 1fr; } }
 .kr-pause-grid .kr-menu-list { margin-top: 0; width: 100%; }
 .kr-order-title {
   font-family: var(--fd);

@@ -591,6 +591,15 @@ export class Items implements IItems {
     }
   }
 
+  /** Reset presentation cursors when the authoritative room starts a rematch. */
+  resetDirectRound() {
+    if (!this.directMultiplayer) return;
+    this.reset();
+    this.directEntities = [];
+    this.directEventsReady = false;
+    this.lastDirectEventId = 0;
+  }
+
   applyDirectSnapshot(snapshot: DirectSnapshot) {
     if (!this.directMultiplayer) this.setDirectMultiplayer(true);
     const down = new Map(snapshot.items.box_down);
@@ -1087,7 +1096,7 @@ export class Items implements IItems {
         const shrunk = 0.52 + 0.48 * Math.pow(1 - u, 2.2);
         k.object.scale.setScalar(shrunk);
         // a real speed penalty applied as drag, through the sanctioned command
-        _v.copy(k.velocity).multiplyScalar(-clamp(1.35 * dt, 0, 0.5) * u);
+        _v.copy(k.velocity).multiplyScalar(-clamp(1.35 * step, 0, 0.5) * u);
         _v.y = 0;
         k.launch(_v);
         if (s.shrink <= 0) k.object.scale.setScalar(1);

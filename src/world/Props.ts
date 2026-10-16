@@ -2796,6 +2796,60 @@ export class GeoAccum {
     this.pos = this.nrm = this.uv = this.col = this.idx = [];
     return g;
   }
+
+  /**
+   * Split already-baked world geometry into independently cullable cells.
+   * Triangles remain bit-for-bit intact; only their buffer ownership changes.
+   */
+  buildChunks(cellSize = 200): THREE.BufferGeometry[] {
+    if (!this.vcount) return [];
+    type Bucket = {
+      pos: number[]; nrm: number[]; uv: number[]; col: number[]; idx: number[];
+      remap: Map<number, number>;
+    };
+    const buckets = new Map<number, Bucket>();
+    const vertex = (bucket: Bucket, source: number) => {
+      const known = bucket.remap.get(source);
+      if (known !== undefined) return known;
+      const next = bucket.pos.length / 3;
+      const p3 = source * 3;
+      const p2 = source * 2;
+      bucket.pos.push(this.pos[p3], this.pos[p3 + 1], this.pos[p3 + 2]);
+      bucket.nrm.push(this.nrm[p3], this.nrm[p3 + 1], this.nrm[p3 + 2]);
+      bucket.col.push(this.col[p3], this.col[p3 + 1], this.col[p3 + 2]);
+      bucket.uv.push(this.uv[p2], this.uv[p2 + 1]);
+      bucket.remap.set(source, next);
+      return next;
+    };
+    for (let i = 0; i < this.idx.length; i += 3) {
+      const a = this.idx[i], b = this.idx[i + 1], c = this.idx[i + 2];
+      const x = (this.pos[a * 3] + this.pos[b * 3] + this.pos[c * 3]) / 3;
+      const z = (this.pos[a * 3 + 2] + this.pos[b * 3 + 2] + this.pos[c * 3 + 2]) / 3;
+      const cx = Math.floor(x / cellSize);
+      const cz = Math.floor(z / cellSize);
+      const key = cx * 65536 + (cz & 0xffff);
+      let bucket = buckets.get(key);
+      if (!bucket) {
+        bucket = { pos: [], nrm: [], uv: [], col: [], idx: [], remap: new Map() };
+        buckets.set(key, bucket);
+      }
+      bucket.idx.push(vertex(bucket, a), vertex(bucket, b), vertex(bucket, c));
+    }
+    const result: THREE.BufferGeometry[] = [];
+    for (const bucket of buckets.values()) {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.Float32BufferAttribute(bucket.pos, 3));
+      g.setAttribute('normal', new THREE.Float32BufferAttribute(bucket.nrm, 3));
+      g.setAttribute('uv', new THREE.Float32BufferAttribute(bucket.uv, 2));
+      g.setAttribute('color', new THREE.Float32BufferAttribute(bucket.col, 3));
+      g.setIndex(bucket.idx);
+      g.computeBoundingSphere();
+      result.push(g);
+    }
+    this.pos = this.nrm = this.uv = this.col = this.idx = [];
+    this.vcount = 0;
+    return result;
+  }
 }
 
 export interface InstOpts {
@@ -2952,7 +3006,7 @@ const _mv = new THREE.Vector3();
  * at once, so a typical frame touches two or three cells per material while the
  * 55 m shadow box usually touches one.
  */
-const STATIC_CELL = 400;
+const STATIC_CELL = 200;
 
 interface StaticBucket {
   mat: THREE.Material;
@@ -3074,6 +3128,7 @@ export function mergeStaticSets(
     mesh.castShadow = b.cast;
     mesh.receiveShadow = true;
     mesh.matrixAutoUpdate = false;
+    mesh.userData.cameraAggregate = true;
     merged.push(mesh);
   }
   return { merged, kept };

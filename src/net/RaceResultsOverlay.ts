@@ -189,25 +189,28 @@ export class RaceResultsOverlay {
     style.id = 'kr-results-style';
     style.textContent = `
       .kr-results{position:fixed;inset:0;z-index:52;display:grid;place-items:center;padding:4vmin;
-        pointer-events:auto;background:rgba(3,7,16,.62);backdrop-filter:blur(7px);
-        font:700 clamp(11px,2.1vmin,17px)/1.2 system-ui,sans-serif;color:#f6f8ff}
+        pointer-events:auto;background:rgba(18,9,5,.66);backdrop-filter:blur(7px);
+        font:700 clamp(11px,2.1vmin,17px)/1.2 system-ui,sans-serif;color:#fff4e2}
       .kr-results[hidden]{display:none}.kr-results-card{width:min(74vmin,590px);max-height:92vh;
-        padding:3vmin;border:1px solid rgba(255,255,255,.25);border-radius:2.8vmin;
-        background:rgba(9,16,31,.95);box-shadow:0 3vmin 9vmin rgba(0,0,0,.5)}
+        padding:3vmin;border:1px solid rgba(255,214,170,.3);border-radius:2.8vmin;
+        background:linear-gradient(180deg,rgba(84,64,47,.97),rgba(23,14,10,.98));
+        box-shadow:0 3vmin 9vmin rgba(0,0,0,.54),inset 0 .14vmin 0 rgba(255,244,226,.17)}
       .kr-results header{display:flex;align-items:center;justify-content:space-between}.kr-results h2{margin:0;
-        font-size:clamp(20px,4.2vmin,32px)}.kr-results header p{margin:.7vmin 0 1.8vmin;color:#9eb0cf}
+        font-size:clamp(20px,4.2vmin,32px)}.kr-results header p{margin:.7vmin 0 1.8vmin;color:rgba(255,230,196,.68)}
       .kr-results header>span{font-size:clamp(24px,6vmin,46px)}.kr-results-rows{display:grid;gap:.65vmin}
       .kr-results-row{display:grid;grid-template-columns:3.3vmin minmax(0,1fr) auto;align-items:center;
-        gap:1.3vmin;padding:1.1vmin 1.4vmin;border-radius:1.3vmin;background:rgba(255,255,255,.07)}
+        gap:1.3vmin;padding:1.1vmin 1.4vmin;border-radius:1.3vmin;background:rgba(18,10,6,.5);
+        border:1px solid rgba(255,226,188,.08)}
       .kr-results-row[data-own=true]{background:rgba(242,189,86,.18);outline:1px solid rgba(242,189,86,.5)}
       .kr-results-row strong{color:#f2bd56}.kr-results-row b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-      .kr-results-row span{color:#bde9ff;font-variant-numeric:tabular-nums}.kr-results footer{display:grid;
-        grid-template-columns:1fr auto;gap:1.1vmin;margin-top:2vmin}.kr-results button{min-height:7.5vmin;
+      .kr-results-row span{color:#ffe2aa;font-variant-numeric:tabular-nums}.kr-results footer{display:grid;
+        grid-template-columns:1fr auto;gap:1.1vmin;margin-top:2vmin}.kr-results button{min-height:max(44px,7.5vmin);
         padding:1.2vmin 2.3vmin;border:0;border-radius:1.5vmin;font:900 inherit;cursor:pointer}
-      .kr-results-rematch{background:#f2bd56;color:#17130b}.kr-results-exit{background:rgba(255,255,255,.12);color:#fff}
-      .kr-results button:disabled{cursor:default;color:rgba(242,246,255,.56);background:rgba(255,255,255,.1)}
+      .kr-results-rematch{background:#f2bd56;color:#17130b}.kr-results-exit{background:rgba(255,244,226,.12);color:#fff4e2}
+      .kr-results button:focus-visible{outline:3px solid #fff3cc;outline-offset:3px}
+      .kr-results button:disabled{cursor:default;color:rgba(255,244,226,.54);background:rgba(255,244,226,.09)}
       @media (max-height:430px){.kr-results-card{width:min(82vw,680px);padding:2.3vmin}.kr-results-row{padding:.8vmin 1.3vmin}
-        .kr-results button{min-height:6.5vmin}.kr-results header>span{font-size:4.5vmin}}
+        .kr-results button{min-height:max(44px,6.5vmin)}.kr-results header>span{font-size:4.5vmin}}
     `;
     document.head.appendChild(style);
   }

@@ -180,6 +180,14 @@ export class Menus {
       if (t.closest('.kr-btn')) this.ui('confirm');
       else if (t.closest('.kr-card')) this.ui('move');
     });
+    this.root.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      const control = (e.target as HTMLElement).closest<HTMLElement>('.kr-btn, .kr-card');
+      if (!control) return;
+      e.preventDefault();
+      e.stopPropagation();
+      control.click();
+    });
 
     // Tap-anywhere confirm. A real control that was tapped handles itself via
     // its own click handler, so those are excluded to avoid confirming twice.
@@ -390,6 +398,7 @@ export class Menus {
     this.rosterEl = el('div', 'kr-roster kr-stage', inner);
     const go = el('div', 'kr-menu-list kr-stage', inner);
     const btn = el('div', 'kr-btn sel', go, 'Start race');
+    this.makeInteractive(btn);
     btn.onclick = () => this.startRace(this.ctx);
     return s;
   }
@@ -400,6 +409,7 @@ export class Menus {
     this.cards.length = 0;
     karts.forEach((k, i) => {
       const c = el('div', 'kr-card', this.rosterEl);
+      this.makeInteractive(c);
       const col = cssColor(k.stats.color);
       c.style.setProperty('--c', col);
       const chip = el('div', 'kr-card-chip', c);
@@ -429,6 +439,7 @@ export class Menus {
   private syncCards() {
     for (let i = 0; i < this.cards.length; i++) {
       this.cards[i].classList.toggle('sel', i === this.selected);
+      this.cards[i].setAttribute('aria-pressed', String(i === this.selected));
     }
   }
 
@@ -465,6 +476,7 @@ export class Menus {
     const list = el('div', 'kr-menu-list', right);
 
     const resume = el('div', 'kr-btn', list, 'Resume');
+    this.makeInteractive(resume);
     // Clearing `localPause` alone is not enough: on a real race the director
     // owns the pause and `race.state` is `Paused`, which keeps `want` pinned to
     // this screen no matter what the UI's own flag says. Resume has to tell the
@@ -475,8 +487,10 @@ export class Menus {
       this.ctx?.race.setPaused(false);
     };
     const restart = el('div', 'kr-btn', list, 'Restart race');
+    this.makeInteractive(restart);
     restart.onclick = () => { this.localPause = false; this.forced = null; this.startRace(this.ctx); };
     const quit = el('div', 'kr-btn', list, 'Quit to title');
+    this.makeInteractive(quit);
     quit.onclick = () => {
       this.localPause = false;
       this.forced = null;
@@ -499,13 +513,20 @@ export class Menus {
     right.style.flexDirection = 'column';
     this.lapsEl = el('div', 'kr-laps', right);
 
-    const list = el('div', 'kr-menu-list kr-stage', inner);
+    const list = el('div', 'kr-menu-list kr-stage', right);
     const again = el('div', 'kr-btn', list, 'Race again');
+    this.makeInteractive(again);
     again.onclick = () => this.startRace(this.ctx);
     const title = el('div', 'kr-btn', list, 'Back to title');
+    this.makeInteractive(title);
     title.onclick = () => { this.localTitle = true; this.selecting = false; this.forced = null; this.ctx.race.reset(); };
     this.buttons.results = [again, title];
     return s;
+  }
+
+  private makeInteractive(control: HTMLDivElement) {
+    control.setAttribute('role', 'button');
+    control.tabIndex = 0;
   }
 
   private syncButtons() {

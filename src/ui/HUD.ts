@@ -744,6 +744,10 @@ export class HUD implements System {
     this.menus.update(ctx, dt);
 
     const blocked = this.menus.blocking;
+    ctx.input.setTouchSuppressed(
+      this.menus.screen !== 'none'
+      || (race.state !== RaceState.Countdown && race.state !== RaceState.Racing),
+    );
     const dimmed = !blocked && this.menus.screen === 'pause';
     this.root.classList.toggle('is-blocked', blocked);
     this.root.classList.toggle('is-dimmed', dimmed);

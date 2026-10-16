@@ -12,10 +12,11 @@
  */
 import { spawn } from 'node:child_process';
 import { createConnection } from 'node:net';
+import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
 import { startVite } from './vite-server.mjs';
 
-const root = new URL('..', import.meta.url).pathname;
+const root = fileURLToPath(new URL('..', import.meta.url));
 const PORT = 5182;
 const W = 1024, H = 768;
 

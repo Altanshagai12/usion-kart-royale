@@ -139,6 +139,10 @@ export class Input implements IInput {
   private rumbleCooldown = 0;
   private rumbleStrength = 0;
 
+  setTouchSuppressed(suppressed: boolean) {
+    this.pad.setSuppressed(suppressed);
+  }
+
   init(ctx: Ctx) {
     this.ctx = ctx;
     addEventListener('keydown', this.onDown);

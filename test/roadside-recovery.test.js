@@ -41,3 +41,9 @@ test('useful progress and returning to the road clear the verge timer', () => {
   assert.equal(state.timer, 0);
   assert.equal(state.shouldRespawn, false);
 });
+
+test('reversing on the verge is not useful race progress', () => {
+  const state = simulate({ seconds: VERGE_RECOVERY_SECONDS + 0.2, speed: -2 });
+  assert.equal(state.shouldRespawn, true);
+  assert.ok(state.progressMps < 0);
+});

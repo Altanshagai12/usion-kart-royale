@@ -243,6 +243,16 @@ export function stepRace(players, dt) {
       : stepPlayer(p, p.connected ? p.input : neutralInput(), dt)
   ));
   resolveKartContacts(next);
+  // Contact separation runs after each player's own road-edge constraint. A
+  // pair overlapping beside the kerb can therefore push one another outside
+  // the legal corridor unless the combined result is constrained as well.
+  // Re-clamp only live rows: a finished row is an immutable classification
+  // record and must never move after crossing the line.
+  for (const player of next) {
+    if (player.finished) continue;
+    const edge = Math.max(1.2, halfWidthAt(player.distance) - KART_RADIUS);
+    player.lateral = clamp(q(clamp(player.lateral, -edge, edge)), -edge, edge);
+  }
   const sorted = [...next].sort((a, b) => {
     if (a.finished && b.finished) return (a.finishMs ?? Infinity) - (b.finishMs ?? Infinity);
     if (a.finished !== b.finished) return a.finished ? -1 : 1;
@@ -257,6 +267,10 @@ function resolveKartContacts(players) {
     for (let j = i + 1; j < players.length; j++) {
       const a = players[i];
       const b = players[j];
+      // Finished karts are removed from race physics. Leaving them in this
+      // pass slides the winner sideways after the flag and lets an invisible
+      // parked collision drain racers that are still trying to finish.
+      if (a.finished || b.finished) continue;
       const along = Math.abs(a.distance - b.distance);
       const across = Math.abs(a.lateral - b.lateral);
       if (along >= 2.2 || across >= 1.8) continue;

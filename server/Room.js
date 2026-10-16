@@ -332,7 +332,10 @@ export class Room {
         player.disconnectedAt = Date.now();
         player.input = neutralInput();
         this.broadcast('player_left', { user_id: player.userId, slot: player.slot, roster: this.roster() });
-        if (close && player.userId === this.hostUserId) closeFinishedAfterHostExit(this);
+        if (close && player.userId === this.hostUserId) {
+          if (this.phase === 'waiting') this.closeWaiting('host_left');
+          else closeFinishedAfterHostExit(this);
+        }
         else evaluateRematch(this);
       }
     }

@@ -412,3 +412,18 @@ test('finished-room reconnect reevaluates votes and explicit host exit closes re
   assert.ok(exitRoom.closeTimer);
   exitRoom.destroy();
 });
+
+test('explicit host leave closes a waiting room immediately', () => {
+  const room = new Room('waiting-host-exit-room', { onDestroy() {} });
+  const host = connection('host', room);
+  const guest = connection('guest', room);
+  room.join(host);
+  room.join(guest);
+  room.handleMessage(host, { type: 'leave', payload: {} });
+
+  const terminal = guest.ws.sent.findLast((message) => message.type === 'match_end');
+  assert.equal(room.phase, 'finished');
+  assert.equal(terminal?.payload.reason, 'host_left');
+  assert.ok(room.closeTimer);
+  room.destroy();
+});

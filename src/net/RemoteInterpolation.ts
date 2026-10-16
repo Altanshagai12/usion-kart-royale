@@ -3,6 +3,8 @@ import type { DirectPlayerRow } from './protocol';
 export class RemoteInterpolation {
   private core: any = null;
   private latest = new Map<number, DirectPlayerRow>();
+  private output = new Map<number, DirectPlayerRow>();
+  private rendered = new Map<number, DirectPlayerRow>();
 
   constructor(usion: any) {
     const create = usion?.game?.createInterpolation;
@@ -38,13 +40,20 @@ export class RemoteInterpolation {
   }
 
   views(ownSlot: number | null) {
-    const out = new Map<number, DirectPlayerRow>();
+    const out = this.output;
+    out.clear();
     if (this.core) {
       const rows = this.core.calc('distance lateral speed heading rack') || [];
       for (const interpolated of rows) {
         const latest = this.latest.get(Number(interpolated.id));
         if (!latest) continue;
-        out.set(latest.slot, { ...latest, ...interpolated });
+        let row = this.rendered.get(latest.slot);
+        if (!row) {
+          row = { ...latest };
+          this.rendered.set(latest.slot, row);
+        }
+        Object.assign(row, latest, interpolated);
+        out.set(latest.slot, row);
       }
     }
     for (const [slot, latest] of this.latest) {
@@ -57,6 +66,8 @@ export class RemoteInterpolation {
   clear() {
     this.core?.vault?.clear?.();
     this.latest.clear();
+    this.output.clear();
+    this.rendered.clear();
   }
 
   bufferMs() {

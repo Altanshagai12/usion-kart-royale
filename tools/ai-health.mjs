@@ -1,9 +1,10 @@
 /** Do the AI drivers still get round the circuit? Progress, off-track time and respawns. */
 import { spawn } from 'node:child_process';
 import { createConnection } from 'node:net';
+import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
 import { startVite } from './vite-server.mjs';
-const root = new URL('..', import.meta.url).pathname, PORT = 5179;
+const root = fileURLToPath(new URL('..', import.meta.url)), PORT = 5179;
 const open = (p) => new Promise((r) => { const s = createConnection({ port: p, host: '127.0.0.1' });
   s.on('connect', () => { s.destroy(); r(true); }); s.on('error', () => r(false)); setTimeout(() => { s.destroy(); r(false); }, 800); });
 const srv = await startVite(PORT);

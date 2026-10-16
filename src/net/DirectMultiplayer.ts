@@ -37,6 +37,11 @@ export class DirectMultiplayer implements System {
   private predictor: RacePredictor | null = null;
   private interpolation: RemoteInterpolation | null = null;
   private roster: DirectRosterRow[] = [];
+  private rosterSlots: number[] = [];
+  private rosterVersion = 0;
+  private appliedRosterVersion = -1;
+  private replicaSlot = -1;
+  private replicaSpectator = false;
   private latest: DirectSnapshot | null = null;
   private ownSlot: number | null = null;
   private spectator = false;
@@ -142,11 +147,14 @@ export class DirectMultiplayer implements System {
     if (!this.active || !this.joined || !this.latest) return;
     const race = ctx.race as Race;
     const displaySlot = this.ownSlot ?? this.roster[0]?.slot ?? 0;
-    race.configureDirectReplica(
-      displaySlot,
-      this.roster.map((member) => member.slot),
-      this.spectator,
-    );
+    if (displaySlot !== this.replicaSlot
+        || this.spectator !== this.replicaSpectator
+        || this.rosterVersion !== this.appliedRosterVersion) {
+      race.configureDirectReplica(displaySlot, this.rosterSlots, this.spectator);
+      this.replicaSlot = displaySlot;
+      this.replicaSpectator = this.spectator;
+      this.appliedRosterVersion = this.rosterVersion;
+    }
     (ctx.items as Items).setDirectMultiplayer(true);
 
     const input = ctx.input.state;
@@ -325,13 +333,18 @@ export class DirectMultiplayer implements System {
     }
     if (fresh) this.lastSnapshotSequence = snapshot.s;
     const previousPhase = this.phase;
+    // A reconnecting client may have missed match_end while the remaining
+    // racers finished, voted and reset. Treat every active-round -> waiting
+    // transition as a new generation, not only the happy finished -> waiting
+    // path, or race-one item cursors suppress race-two events.
+    const restarted = previousPhase !== 'waiting' && snapshot.phase === 'waiting';
     this.latest = snapshot;
     const directItems = this.ctx?.items as Items | undefined;
     directItems?.setDirectMultiplayer(true);
+    if (restarted) directItems?.resetDirectRound();
     directItems?.applyDirectSnapshot(snapshot);
     this.phase = snapshot.phase;
     this.setRoster(snapshot.roster);
-    const restarted = previousPhase === 'finished' && snapshot.phase === 'waiting';
     if (this.ownSlot !== null) {
       const own = snapshot.players.find((row) => row.slot === this.ownSlot);
       if (own) {
@@ -388,13 +401,26 @@ export class DirectMultiplayer implements System {
       this.roster = value.map((id, slot) => ({
         slot, user_id: id, name: id, connected: true, ready: false, is_host: slot === 0,
       }));
+      this.cacheRosterSlots();
       this.paintPhase();
       return;
     }
     this.roster = value
       .filter((row) => Number.isInteger(row?.slot) && typeof row?.user_id === 'string')
       .slice(0, 4);
+    this.cacheRosterSlots();
     this.paintPhase();
+  }
+
+  private cacheRosterSlots() {
+    let changed = this.rosterSlots.length !== this.roster.length;
+    for (let i = 0; !changed && i < this.roster.length; i++) {
+      changed = this.roster[i].slot !== this.rosterSlots[i];
+    }
+    if (!changed) return;
+    this.rosterSlots = new Array(this.roster.length);
+    for (let i = 0; i < this.roster.length; i++) this.rosterSlots[i] = this.roster[i].slot;
+    this.rosterVersion++;
   }
 
   private sendDrive(payload: DrivePayload) {

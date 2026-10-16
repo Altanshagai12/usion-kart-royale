@@ -11,6 +11,14 @@
   letter-spacing: .05em;
 }
 
+.tc-root.is-suppressed {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.tc-root.is-suppressed * { pointer-events: none !important; }
+
 .tc-top {
   position: absolute;
   top: calc(var(--kr-safe-top, 0px) + 1.8vmin);

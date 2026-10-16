@@ -38,6 +38,10 @@ try {
     return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
   }, selector);
 
+  // Starting a race releases the intentionally suppressed menu controls in
+  // HUD.lateUpdate; wait through that hand-off before inspecting auto drive.
+  await frames(4);
+
   const metrics = await page.evaluate(() => {
     const canvas = document.querySelector('canvas');
     const logical = { width: window.__ctx.width, height: window.__ctx.height };

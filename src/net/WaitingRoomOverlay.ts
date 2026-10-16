@@ -122,21 +122,25 @@ export class WaitingRoomOverlay {
     style.id = 'kr-lobby-style';
     style.textContent = `
       .kr-lobby{position:fixed;inset:0;z-index:46;display:grid;place-items:center;
-        padding:5vmin;pointer-events:auto;background:rgba(4,8,18,.48);backdrop-filter:blur(5px);
-        font:700 clamp(11px,2.15vmin,17px)/1.2 system-ui,sans-serif;color:#f6f8ff}
+        padding:5vmin;pointer-events:auto;background:rgba(18,9,5,.56);backdrop-filter:blur(6px);
+        font:700 clamp(11px,2.15vmin,17px)/1.2 system-ui,sans-serif;color:#fff4e2}
       .kr-lobby[hidden]{display:none}.kr-lobby-card{width:min(72vmin,560px);padding:3.2vmin;
-        border:1px solid rgba(255,255,255,.24);border-radius:3vmin;background:rgba(9,16,31,.92);
-        box-shadow:0 2.5vmin 7vmin rgba(0,0,0,.46)}.kr-lobby header{display:flex;align-items:center;
+        border:1px solid rgba(255,214,170,.3);border-radius:3vmin;
+        background:linear-gradient(180deg,rgba(84,64,47,.96),rgba(23,14,10,.97));
+        box-shadow:0 2.5vmin 7vmin rgba(0,0,0,.5),inset 0 .14vmin 0 rgba(255,244,226,.17)}
+      .kr-lobby header{display:flex;align-items:center;
         justify-content:space-between}.kr-lobby h2{font-size:clamp(18px,4vmin,30px);letter-spacing:.02em}
-      .kr-lobby header span{padding:.7vmin 1.3vmin;border-radius:99px;background:rgba(255,255,255,.12)}
-      .kr-lobby-hint{margin:1vmin 0 2.2vmin;color:rgba(230,238,255,.68);font-weight:600}
+      .kr-lobby header span{padding:.7vmin 1.3vmin;border-radius:99px;background:rgba(255,244,226,.12);
+        color:#ffcf6b}.kr-lobby-hint{margin:1vmin 0 2.2vmin;color:rgba(255,230,196,.7);font-weight:600}
       .kr-lobby-roster{display:grid;gap:.8vmin}.kr-lobby-player{display:flex;justify-content:space-between;
-        padding:1.2vmin 1.5vmin;border-radius:1.4vmin;background:rgba(255,255,255,.07)}
+        padding:1.2vmin 1.5vmin;border-radius:1.4vmin;background:rgba(18,10,6,.5);
+        border:1px solid rgba(255,226,188,.09)}
       .kr-lobby-player[data-connected=false]{opacity:.48}.kr-lobby-player span{color:#ffbd7c}
-      .kr-lobby-player span[data-ready=true]{color:#79e3a4}.kr-lobby-action{width:100%;min-height:8vmin;
+      .kr-lobby-player span[data-ready=true]{color:#79e3a4}.kr-lobby-action{width:100%;min-height:max(44px,8vmin);
         margin-top:2.3vmin;padding:1.3vmin 2vmin;border:0;border-radius:1.8vmin;background:#f2bd56;
         color:#17130b;font:900 inherit;cursor:pointer}.kr-lobby-action[data-ready=true]{background:#89d9ff}
-      .kr-lobby-action:disabled{cursor:default;color:rgba(242,246,255,.58);background:rgba(255,255,255,.12)}
+      .kr-lobby-action:focus-visible{outline:3px solid #fff3cc;outline-offset:3px}
+      .kr-lobby-action:disabled{cursor:default;color:rgba(255,244,226,.56);background:rgba(255,244,226,.1)}
     `;
     document.head.appendChild(style);
   }

@@ -52,6 +52,7 @@ export class TouchControls {
   private buttons: Btn[] = [];
   private itemButtons: Btn[] = [];
   private mounted = false;
+  private suppressed = false;
   private dirty = true;
   private free = new Set<number>();
 
@@ -61,6 +62,7 @@ export class TouchControls {
     document.documentElement.setAttribute('data-touch', '');
     const root = document.createElement('div');
     root.className = 'tc-root';
+    root.classList.toggle('is-suppressed', this.suppressed);
     root.innerHTML = MARKUP;
     document.body.appendChild(root);
     this.root = root;
@@ -168,7 +170,7 @@ export class TouchControls {
   }
 
   private onDown = (event: PointerEvent) => {
-    if (!this.mounted) return;
+    if (!this.mounted || this.suppressed) return;
     const target = event.target as HTMLElement;
     if (target?.closest?.('.tc-chip')) return;
     this.bindItemButtons();
@@ -206,6 +208,10 @@ export class TouchControls {
   };
 
   update() {
+    if (this.suppressed) {
+      this.resetState();
+      return;
+    }
     this.bindItemButtons();
     const pressed = (id: ButtonId) => {
       const button = this.buttons.find((candidate) => candidate.id === id);
@@ -232,6 +238,30 @@ export class TouchControls {
     const value = this.state.pause;
     this.state.pause = false;
     return value;
+  }
+
+  setSuppressed(suppressed: boolean) {
+    if (this.suppressed === suppressed) return;
+    this.suppressed = suppressed;
+    this.root?.classList.toggle('is-suppressed', suppressed);
+    if (!suppressed) {
+      this.dirty = true;
+      return;
+    }
+    this.free.clear();
+    for (const button of this.buttons) {
+      button.pointer = -1;
+      button.tapped = false;
+      button.el.classList.remove('down');
+    }
+    this.resetState();
+  }
+
+  private resetState() {
+    Object.assign(this.state, {
+      steer: 0, accel: 0, accelHeld: false, brake: 0, drift: false, item: false,
+      itemSlot: -1, pause: false, steering: false, active: false,
+    });
   }
 }
 

@@ -37,6 +37,7 @@ import * as THREE from 'three';
 import { Quality, type Ctx, type System } from '../types';
 import { syncKartEnv } from '../kart/Liveries';
 import { registerPrewarm } from '../core/Prewarm';
+import { stepLodGovernor } from '../../shared/frame-pacing.js';
 
 /**
  * Distance at which a kart collapses to its merged bake, metres.
@@ -131,8 +132,8 @@ export class DrawBudget implements System {
   private boundId = '';
   private readonly frustum = new THREE.Frustum();
   private readonly viewProj = new THREE.Matrix4();
-  /** smoothed frame time, seconds; drives the governor. See GOVERNOR_FLOOR. */
-  private smoothDt = 1 / 60;
+  /** smoothed missed-vsync pressure; 1 means the display cadence is being met. */
+  private smoothPressure = 1;
   private governor = 1;
 
   /** 1 = the authored distances, GOVERNOR_FLOOR = as tight as it will ever go. */
@@ -177,13 +178,12 @@ export class DrawBudget implements System {
     if (!this.lods.length) return;
 
     // --- frame-time governor ------------------------------------------------
-    // `dt` arrives already clamped to 1/20 upstream, which is what we want: this
-    // has to chase a sustained deficit, not a single stall.
+    // Pressure is calibrated against this display's native cadence. A stable
+    // 30/40 Hz panel is therefore 1x healthy rather than permanently "hot".
     if (dt > 0) {
-      this.smoothDt += (dt - this.smoothDt) * Math.min(1, dt * 2.5);
-      const HOT = 1 / 55, COOL = 1 / 68;
-      if (this.smoothDt > HOT) this.governor = Math.max(GOVERNOR_FLOOR, this.governor - dt * 0.8);
-      else if (this.smoothDt < COOL) this.governor = Math.min(1, this.governor + dt * 0.06);
+      const pressure = ctx.framePressure ?? 1;
+      this.smoothPressure += (pressure - this.smoothPressure) * Math.min(1, dt * 2.5);
+      this.governor = stepLodGovernor(this.governor, this.smoothPressure, dt, GOVERNOR_FLOOR);
     }
 
     const q = ctx.settings.quality;

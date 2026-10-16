@@ -271,10 +271,24 @@ try {
   assert.equal(await page.evaluate(() => window.__usionMock.rematches), 1);
   assert.equal(await page.$eval('.kr-results-rematch', (button) => button.disabled), true);
   await page.evaluate(() => {
+    window.__rematchItemUses = 0;
+    window.__ctx.bus.on((event) => {
+      if (event.type === 'item-use') window.__rematchItemUses += 1;
+    });
+    // Model a client that disconnected during play, missed match_end, and
+    // rejoins only after the other racers reset the room. Its local phase and
+    // item request state are all still from race one.
+    window.__multiplayer.phase = 'playing';
+    window.__multiplayer.ownFinished = true;
+    window.__multiplayer.pendingItem = { item_seq: 9, sentAt: performance.now() };
+    window.__multiplayer.queuedItems = [{ slot: 0, backwards: false }];
+    window.__ctx.items.directEventsReady = true;
+    window.__ctx.items.lastDirectEventId = 9;
     const reset = structuredClone(window.__sdkSnapshot);
     reset.s = 5;
     reset.phase = 'waiting';
     reset.roster[1].ready = false;
+    reset.items = { box_down: [], entities: [], events: [] };
     window.__usionMock.handlers.realtime(reset);
   });
   assert.deepEqual(await page.evaluate(() => ({
@@ -282,6 +296,29 @@ try {
     modalHidden: document.querySelector('.kr-results')?.hidden,
     lobbyHidden: document.querySelector('.kr-lobby')?.hidden,
   })), { phase: 'waiting', modalHidden: true, lobbyHidden: false });
+  assert.deepEqual(await page.evaluate(() => ({
+    ready: window.__ctx.items.directEventsReady,
+    cursor: window.__ctx.items.lastDirectEventId,
+    pending: window.__multiplayer.pendingItem,
+    queued: window.__multiplayer.queuedItems.length,
+    ownFinished: window.__multiplayer.ownFinished,
+  })), {
+    ready: true, cursor: 0, pending: null, queued: 0, ownFinished: false,
+  }, 'playing-to-waiting rejoin resets every round-local cursor and queue');
+  await page.evaluate(() => {
+    const next = structuredClone(window.__sdkSnapshot);
+    next.s = 6;
+    next.phase = 'playing';
+    next.items = {
+      box_down: [], entities: [],
+      events: [{ id: 1, type: 'use', slot: 0, kind: 1 }],
+    };
+    window.__usionMock.handlers.realtime(next);
+  });
+  assert.deepEqual(await page.evaluate(() => ({
+    uses: window.__rematchItemUses,
+    cursor: window.__ctx.items.lastDirectEventId,
+  })), { uses: 1, cursor: 1 }, 'first rematch item event must not be suppressed');
 
   await page.evaluate(() => window.__usionMock.handlers.finished({
     reason: 'race_complete',

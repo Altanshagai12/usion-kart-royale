@@ -16,10 +16,11 @@ import { spawn } from 'node:child_process';
 import { mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
 import { startVite } from './vite-server.mjs';
 
-const root = new URL('..', import.meta.url).pathname;
+const root = fileURLToPath(new URL('..', import.meta.url));
 const argv = process.argv.slice(2);
 const arg = (n, d) => {
   const i = argv.indexOf('--' + n);

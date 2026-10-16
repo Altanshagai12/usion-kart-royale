@@ -13,7 +13,9 @@ export function stepVergeRecovery(state, sample, dt) {
   const safeDt = Math.max(0, Number(dt) || 0);
   const distance = Number(sample.distance) || 0;
   const previous = Number.isFinite(state.lastDistance) ? state.lastDistance : distance;
-  const progressMps = safeDt > 0 ? Math.abs(distance - previous) / safeDt : 0;
+  // Only forward distance is useful race progress. `abs` let a kart reverse
+  // forever through the verge while continuously clearing the watchdog.
+  const progressMps = safeDt > 0 ? (distance - previous) / safeDt : 0;
   let timer = Math.max(0, Number(state.timer) || 0);
 
   const trying = sample.onVerge === true

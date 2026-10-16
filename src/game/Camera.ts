@@ -369,7 +369,6 @@ const PROP_MAX_SPAN = 13;     // wider than this is architecture, not furniture
 const PROP_MAX_HEIGHT = 15;
 const PROP_MAX_COUNT = 2400;
 const PROP_MAX_INSTANCES = 384;
-const PROP_BUILD_FRAMES = [0, 12, 40, 110, 300];
 /** Shortest the furniture sweep alone may leave the arm. Terrain and walls are
  *  not floored — an eye inside a hill has no acceptable framing — but a sign is
  *  0.2 m thick and beside the road, and collapsing a 6 m arm to 1.8 m every
@@ -650,7 +649,6 @@ export class ChaseCamera implements System {
   // --- trackside furniture ------------------------------------------------
   private props: Float32Array | null = null;
   private propCount = 0;
-  private propStage = 0;
   private wideBlockers: THREE.Object3D[] | null = null;
 
   // =======================================================================
@@ -687,6 +685,11 @@ export class ChaseCamera implements System {
       this.boreBox.expandByScalar(16);
       this.buildBoreCeiling();
     }
+
+    // Init order guarantees scenery, race, items and effects are complete
+    // before the camera. Cache static collision boxes once here instead of
+    // traversing and allocating across the whole scene again mid-race.
+    this.buildProps(ctx);
 
     // Screen shake arrives through ctx.shake() -> addShake(); these handlers
     // add only the rig displacements nothing else can produce.
@@ -734,7 +737,6 @@ export class ChaseCamera implements System {
 
     const mode: CamMode = ((window as any).__camMode as CamMode) || 'chase';
     const state = ctx.race.state;
-    this.buildProps(ctx);
 
     // The direct rejoin event arrives before Race applies the fresh snapshot.
     // Handling it here guarantees the eye is rebuilt from the new pose, not
@@ -1582,9 +1584,8 @@ export class ChaseCamera implements System {
 
   /**
    * Flatten every solid, ground-planted, camera-sized piece of scenery into a
-   * flat Float32Array of world AABBs. Scenery is not all present on frame one
-   * and some of it is parented into groups that already exist, so the build is
-   * repeated at a few milestones and then never again.
+   * flat Float32Array of world AABBs. Camera init runs after every static world
+   * system, so one build is complete and avoids a visible mid-race traversal.
    *
    * Karts are excluded by identity, not by name: they move, so a cached box
    * would be a phantom blocker parked on the grid. Foliage is excluded because
@@ -1592,8 +1593,7 @@ export class ChaseCamera implements System {
    * architecture, and terrain and walls already answer for that.
    */
   private buildProps(ctx: Ctx) {
-    if (this.propStage >= PROP_BUILD_FRAMES.length || ctx.frame < PROP_BUILD_FRAMES[this.propStage]) return;
-    this.propStage++;
+    if (this.props) return;
 
     const skip = new Set<THREE.Object3D>();
     const karts = ctx.race?.karts;
@@ -1614,6 +1614,7 @@ export class ChaseCamera implements System {
       if (o.parent && skip.has(o.parent)) { skip.add(o); return; }
       const m = o as THREE.Mesh;
       if (!(m as any).isMesh || !m.visible || !m.geometry) return;
+      if (m.userData.cameraAggregate === true) return;
       if (PROP_SKIP.test(m.name)) return;
       const geo = m.geometry;
       if (!geo.boundingBox) geo.computeBoundingBox();

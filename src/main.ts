@@ -22,6 +22,11 @@ import { ChaseCamera } from './game/Camera';
 import { HUD } from './ui/HUD';
 import { Audio } from './audio/Audio';
 import { DirectMultiplayer } from './net/DirectMultiplayer';
+import {
+  measureFrameCadence,
+  normalizeFramePressure,
+  updateFrameIntervalEma,
+} from '../shared/frame-pacing.js';
 
 const parent = document.getElementById('app')!;
 const developmentLoopback = (
@@ -183,6 +188,10 @@ function bootProgress(frac: number, label: string) {
 }
 
 async function boot() {
+  displayFrameMs = await measureDisplayFrameMs();
+  ctx.displayFrameMs = displayFrameMs;
+  renderCostEma = displayFrameMs;
+  frameIntervalEma = displayFrameMs;
   for (let i = 0; i < systems.length; i++) {
     bootProgress(i / (systems.length + 1), SYSTEM_LABELS[i] ?? 'loading');
     // Yield to the compositor so the bar actually repaints between steps —
@@ -278,34 +287,49 @@ const STALL_MS = 220;
  * Dropping internal resolution instead makes the frame genuinely cheaper and
  * keeps every frame on screen.
  */
-const SLOW_MS = 22;
+const SLOW_PRESSURE = 1.28;
 /** Hysteresis, so the scale does not chatter around the threshold. */
-const RECOVER_MS = 18;
+const RECOVER_PRESSURE = 1.08;
 /** Resolution rungs. Each is ~30% fewer pixels than the one above. */
 const SCALE_RUNGS = [1, 0.85, 0.72, 0.6, 0.5];
 /**
- * Frames between resolution changes. Every change reallocates the composer's
- * buffers, so reacting instantly to a transient would cost more than the
- * transient did.
+ * Milliseconds between resolution changes. Every change reallocates the
+ * composer's buffers, so reacting instantly to a transient would cost more
+ * than the transient did. Wall time keeps recovery identical at 30–144 Hz.
  */
-const SCALE_COOLDOWN = 90;
+const SCALE_COOLDOWN_MS = 1500;
 /** The watchdog stays out of the way until the scene has settled. */
 const WATCHDOG_FROM_FRAME = 30;
 
 /** EMA of the cost of frames we actually presented, milliseconds. */
-let renderCostEma = 16.7;
+let displayFrameMs = 1000 / 60;
+let renderCostEma = displayFrameMs;
 /** Observed present cadence. Unlike CPU submission cost, this includes the
  * browser/driver waiting for a saturated GPU before the next rAF arrives. */
-let frameIntervalEma = 16.7;
+let frameIntervalEma = displayFrameMs;
 /** Frames still to skip presenting. */
 let skipRender = 0;
 /** Index into SCALE_RUNGS; 0 is full resolution. */
 let scaleRung = 0;
-let scaleCooldown = 0;
+let nextScaleChangeAt = 0;
 let stallCount = 0;
 let renderFailures = 0;
 /** Set between context loss and a completed restore; nothing runs meanwhile. */
 let suspended = false;
+
+/**
+ * Measure native rAF cadence before the 3D renderer starts doing work. Fixed
+ * 16.7 ms thresholds misclassify healthy 30/40 Hz phones and displays as GPU
+ * overload, then lower resolution and rival detail despite missing no vsyncs.
+ */
+async function measureDisplayFrameMs(): Promise<number> {
+  if (skipDevelopmentRender || document.hidden) return 1000 / 60;
+  return measureFrameCadence(requestAnimationFrame);
+}
+
+function currentFramePressure(): number {
+  return normalizeFramePressure(renderCostEma, frameIntervalEma, displayFrameMs);
+}
 
 /**
  * Draw calls attributable to the SCENE, not the post chain.
@@ -343,11 +367,10 @@ function frame(now: number) {
   // work; both are transient and reducing resolution for them only reallocates
   // buffers at the worst possible time.
   const intervalMs = raw * 1000;
-  if (!skipDevelopmentRender && ctx.frame > WATCHDOG_FROM_FRAME
-      && intervalMs >= 4 && intervalMs < 100) {
-    frameIntervalEma += (intervalMs - frameIntervalEma) * 0.08;
+  if (!skipDevelopmentRender && ctx.frame > WATCHDOG_FROM_FRAME) {
+    frameIntervalEma = updateFrameIntervalEma(frameIntervalEma, intervalMs, displayFrameMs);
   } else if (ctx.frame <= WATCHDOG_FROM_FRAME) {
-    frameIntervalEma = 16.7;
+    frameIntervalEma = displayFrameMs;
   }
 
   // Context gone, or the tab is not being composited. Do not simulate, do not
@@ -365,6 +388,7 @@ function frame(now: number) {
   const frozen = (window as any).__freeze === true;
   const dt = frozen ? 0 : Math.min(raw, 1 / 20);
   ctx.dt = dt;
+  ctx.framePressure = currentFramePressure();
   ctx.time += dt;
   ctx.frame++;
 
@@ -433,21 +457,22 @@ function frame(now: number) {
       // a rung at frame 9 off a 56ms EMA that was entirely startup cost, on a
       // machine that then ran at 8ms. Hold the EMA at the target until the
       // scene has actually settled.
-      renderCostEma = 16.7;
-    } else if (scaleCooldown > 0) {
-      scaleCooldown--;
-    } else if (Math.max(renderCostEma, frameIntervalEma) > SLOW_MS
+      renderCostEma = displayFrameMs;
+    } else if (now < nextScaleChangeAt) {
+      // Wait out the wall-clock cooldown without tying adaptation speed to Hz.
+    } else if (currentFramePressure() > SLOW_PRESSURE
         && scaleRung < SCALE_RUNGS.length - 1) {
       scaleRung++;
-      scaleCooldown = SCALE_COOLDOWN;
-      pipeline.setDynamicScale(SCALE_RUNGS[scaleRung]);
-      console.warn(
-        `[frame] sustained ${Math.round(Math.max(renderCostEma, frameIntervalEma))}ms frames; ` +
-        `render scale -> ${SCALE_RUNGS[scaleRung]} (every frame still presented)`,
-      );
-    } else if (Math.max(renderCostEma, frameIntervalEma) < RECOVER_MS && scaleRung > 0) {
+      nextScaleChangeAt = now + SCALE_COOLDOWN_MS;
+      const resized = pipeline.setDynamicScale(SCALE_RUNGS[scaleRung]);
+      if (!resized) {
+        pipeline.degrade('native-resolution floor under sustained frame pressure');
+      }
+      console.warn(`[frame] sustained ${currentFramePressure().toFixed(2)}x native cadence; ` +
+        (resized ? `render scale -> ${SCALE_RUNGS[scaleRung]}` : `effects -> ${pipeline.rungName()}`));
+    } else if (currentFramePressure() < RECOVER_PRESSURE && scaleRung > 0) {
       scaleRung--;
-      scaleCooldown = SCALE_COOLDOWN;
+      nextScaleChangeAt = now + SCALE_COOLDOWN_MS;
       pipeline.setDynamicScale(SCALE_RUNGS[scaleRung]);
       console.info(`[frame] recovered; render scale -> ${SCALE_RUNGS[scaleRung]}`);
     }
@@ -590,10 +615,13 @@ function installContextRecovery() {
     // frame as a catastrophic stall and start skipping presents on a pipeline
     // that is in fact perfectly healthy.
     last = performance.now();
-    renderCostEma = 16.7;
+    displayFrameMs = await measureDisplayFrameMs();
+    ctx.displayFrameMs = displayFrameMs;
+    renderCostEma = displayFrameMs;
+    frameIntervalEma = displayFrameMs;
     skipRender = 0;
     scaleRung = 0;
-    scaleCooldown = 0;
+    nextScaleChangeAt = 0;
     pipeline.setDynamicScale(1);
     renderFailures = 0;
     suspended = false;
@@ -618,6 +646,8 @@ multiplayer.start().then(() => boot()).catch((err) => {
   frame: ctx.frame,
   renderCostEma: +renderCostEma.toFixed(2),
   frameIntervalEma: +frameIntervalEma.toFixed(2),
+  displayFrameMs: +displayFrameMs.toFixed(2),
+  framePressure: +currentFramePressure().toFixed(3),
   renderScale: SCALE_RUNGS[scaleRung],
   scaleRung,
   stalls: stallCount,

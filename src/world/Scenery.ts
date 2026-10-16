@@ -5095,13 +5095,22 @@ export class Scenery implements System {
   private emit() {
     const M = this.mats;
     const mkMerged = (accKey: string, mat: THREE.Material, name: string, cast = true, receive = true) => {
-      const g = this.acc[accKey].build();
-      if (!g) return;
-      const mesh = new THREE.Mesh(g, mat);
-      mesh.name = name;
-      mesh.castShadow = cast;
-      mesh.receiveShadow = receive;
-      this.group.add(mesh);
+      // Opaque world-space batches are split without changing their material
+      // or triangles, so Three can reject offscreen course cells. Transparent
+      // ropes and the horizon backdrop remain global to preserve draw order.
+      const chunked = accKey !== 'rope' && accKey !== 'backdrop';
+      const geometries = chunked
+        ? this.acc[accKey].buildChunks(200)
+        : [this.acc[accKey].build()].filter((g): g is THREE.BufferGeometry => g !== null);
+      for (let i = 0; i < geometries.length; i++) {
+        const mesh = new THREE.Mesh(geometries[i], mat);
+        mesh.name = geometries.length === 1 ? name : `${name}@${i}`;
+        mesh.castShadow = cast;
+        mesh.receiveShadow = receive;
+        mesh.matrixAutoUpdate = false;
+        if (chunked) mesh.userData.cameraAggregate = true;
+        this.group.add(mesh);
+      }
     };
     mkMerged('wall', M.wall, 'village-walls');
     mkMerged('roof', M.roof, 'village-roofs');

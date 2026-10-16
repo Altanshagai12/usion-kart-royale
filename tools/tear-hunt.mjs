@@ -12,10 +12,11 @@
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
 import { startVite } from './vite-server.mjs';
 
-const root = new URL('..', import.meta.url).pathname;
+const root = fileURLToPath(new URL('..', import.meta.url));
 const FRAMES = parseInt(process.argv[2] || '60', 10);
 const QUALITY = process.argv[3] || 'high';
 const PORT = 5303;

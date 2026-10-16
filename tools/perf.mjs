@@ -16,15 +16,19 @@
 import { spawn } from 'node:child_process';
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
 import { startVite } from './vite-server.mjs';
 
-const root = new URL('..', import.meta.url).pathname;
+const root = fileURLToPath(new URL('..', import.meta.url));
 const argv = process.argv.slice(2);
 const arg = (n, d) => { const i = argv.indexOf('--' + n); return i >= 0 ? argv[i + 1] : d; };
 const OUT = join(root, arg('out', 'shots/perf'));
 const W = parseInt(arg('w', '1280'), 10);
 const H = parseInt(arg('h', '720'), 10);
+const DPR = parseFloat(arg('dpr', '1'));
+const QUALITY = arg('quality', 'high');
+const MOBILE = argv.includes('--mobile');
 const SETTLE = parseFloat(arg('settle', '3'));
 const PORT = parseInt(arg('port', '5173'), 10);
 const ONLY = (arg('only', '') || '').split(',').filter(Boolean);
@@ -222,12 +226,12 @@ const main = async () => {
       '--ignore-gpu-blocklist', '--enable-gpu-rasterization', `--window-size=${W},${H}`, '--hide-scrollbars'],
   });
   const page = await browser.newPage();
-  await page.setViewport({ width: W, height: H, deviceScaleFactor: 1 });
+  await page.setViewport({ width: W, height: H, deviceScaleFactor: DPR, isMobile: MOBILE, hasTouch: MOBILE });
   const errors = [];
   page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
   page.on('pageerror', (e) => errors.push('pageerror: ' + (e.stack || e.message)));
 
-  await page.goto(`http://127.0.0.1:${PORT}/?quality=high`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.goto(`http://127.0.0.1:${PORT}/?quality=${encodeURIComponent(QUALITY)}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForFunction('window.__gameReady === true', { timeout: 90000 });
   if (BASELINE) {
     await page.evaluate(() => {
@@ -253,7 +257,7 @@ const main = async () => {
   }
   await page.evaluate(INSTALL);
 
-  const report = { label: LABEL, w: W, h: H, shots: [], errors };
+  const report = { label: LABEL, w: W, h: H, dpr: DPR, quality: QUALITY, mobile: MOBILE, shots: [], errors };
 
   for (const shot of SHOTS) {
     if (ONLY.length && !ONLY.includes(shot.name)) continue;

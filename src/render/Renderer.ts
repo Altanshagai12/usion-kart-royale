@@ -1065,11 +1065,15 @@ export class RenderPipeline implements System {
    * full rate underneath, so halving the present only added judder and changed
    * nothing about latency.
    */
-  setDynamicScale(scale: number): void {
+  setDynamicScale(scale: number): boolean {
     const next = THREE.MathUtils.clamp(scale, 0.5, 1);
-    if (Math.abs(next - this.dynamicScale) < 0.01) return;
+    if (Math.abs(next - this.dynamicScale) < 0.01) return false;
+    const beforeW = this.appliedW;
+    const beforeH = this.appliedH;
+    const beforeRatio = this.appliedRatio;
     this.dynamicScale = next;
     this.applyResolution();
+    return beforeW !== this.appliedW || beforeH !== this.appliedH || beforeRatio !== this.appliedRatio;
   }
 
   private effectivePixelRatio(): number {
@@ -1168,10 +1172,10 @@ export class RenderPipeline implements System {
     // receives at least 2.25 geometric samples before MSAA is applied at all,
     // and SMAA still runs last on top of the resolve.
     //
-    // Below 1.5 there is no supersampling to lean on and the 4 samples are
-    // doing real work on the kerb stripes, the railings and the fence posts —
-    // §9.6's "aliasing crawl on thin geometry" — so they stay.
-    return this.effectivePixelRatio() >= 1.5 ? 2 : 4;
+    // Keep cost monotonic: dynamic resolution exists to reduce fragment work,
+    // so crossing a ratio threshold must never double MSAA and make the next
+    // rung more expensive than the previous one. SMAA still runs last.
+    return 2;
   }
 
   /**

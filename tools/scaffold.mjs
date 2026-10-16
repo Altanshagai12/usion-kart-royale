@@ -3,8 +3,9 @@
 // wholesale. Never run this again after the real implementations land.
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const root = new URL('..', import.meta.url).pathname;
+const root = fileURLToPath(new URL('..', import.meta.url));
 const files = {};
 
 files['src/core/Input.ts'] = `import type { Ctx, IInput, InputState } from '../types';

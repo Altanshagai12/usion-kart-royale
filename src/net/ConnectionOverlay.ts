@@ -31,10 +31,10 @@ export class ConnectionOverlay {
         transform: translateX(-50%);
         max-width: min(84vw, 520px);
         padding: 1.1vmin 2.2vmin;
-        border: 1px solid rgba(255,255,255,.28);
+        border: 1px solid rgba(255,214,170,.34);
         border-radius: 999px;
-        color: #f5f8ff;
-        background: rgba(7,12,24,.76);
+        color: #fff4e2;
+        background: rgba(35,22,15,.86);
         box-shadow: 0 6px 24px rgba(0,0,0,.34);
         backdrop-filter: blur(9px);
         pointer-events: none;

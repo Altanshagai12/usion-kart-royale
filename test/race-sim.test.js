@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { TOTAL_LAPS, TRACK_LENGTH } from '../shared/constants.js';
-import { createPlayer, stepPlayer, stepRace } from '../shared/race-sim.js';
+import { KART_RADIUS, TOTAL_LAPS, TRACK_LENGTH } from '../shared/constants.js';
+import { createPlayer, halfWidthAt, stepPlayer, stepRace } from '../shared/race-sim.js';
 
 test('finish crossing clamps at the line and prediction cannot drive beyond it', () => {
   const finishDistance = TRACK_LENGTH * TOTAL_LAPS;
@@ -73,4 +73,37 @@ test('longitudinal contact costs more speed than a pure side scrape', () => {
   ], 1 / 60);
   assert.ok(diagonal[0].speed < side[0].speed);
   assert.ok(diagonal.every((player) => Number.isFinite(player.speed) && player.speed >= 0));
+});
+
+test('finished karts are immutable and cannot obstruct racers at the line', () => {
+  const finishDistance = TRACK_LENGTH * TOTAL_LAPS;
+  const winner = movingPlayer(0, 0, finishDistance);
+  Object.assign(winner, { finished: true, finishMs: 61_000, speed: 8, heading: 0.2 });
+  const racer = movingPlayer(1, 0.3, finishDistance - 1);
+  const out = stepRace([winner, racer], 1 / 60);
+
+  assert.deepEqual(
+    { distance: out[0].distance, lateral: out[0].lateral, heading: out[0].heading },
+    { distance: finishDistance, lateral: 0, heading: 0.2 },
+  );
+  assert.ok(out[1].speed > 24, 'a finished row must not drain a live racer');
+});
+
+test('contact separation never pushes live karts beyond the road corridor', () => {
+  for (const hz of [30, 60, 120]) {
+    const distance = 1_000;
+    const edge = halfWidthAt(distance) - KART_RADIUS;
+    let rows = [
+      movingPlayer(0, edge - 0.05, distance),
+      movingPlayer(1, edge - 0.55, distance),
+    ];
+    for (let frame = 0; frame < hz; frame++) {
+      rows = stepRace(rows, 1 / hz);
+      for (const row of rows) {
+        const limit = halfWidthAt(row.distance) - KART_RADIUS;
+        assert.ok(Math.abs(row.lateral) <= limit + 1e-6, `${hz}Hz row left corridor`);
+      }
+    }
+    assert.ok(Math.abs(rows[0].lateral - rows[1].lateral) >= 1.79);
+  }
 });
